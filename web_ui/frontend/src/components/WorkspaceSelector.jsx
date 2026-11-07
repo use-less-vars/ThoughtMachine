@@ -1,0 +1,439 @@
+// --- WorkspaceSelector.jsx ---
+// Global Management landing view: workspaces, active sessions, active
+// containers, shared resources, vault credentials, sysprompts and providers.
+// Data comes from /api/global/summary (degrades gracefully when the backend
+// does not expose it yet). Routing goes through the dependency-free hash
+// router (src/router.js).
+
+import React, { useCallback, useEffect, useState } from 'react'
+import { useNavigate } from '../router'
+import useWorkspaceStore from '../store/workspaceStore'
+import FolderBrowser from './FolderBrowser'
+import VaultHealthBanner from './VaultHealthBanner'
+import VaultHealthPanel from './VaultHealthPanel'
+import GlobalSessions from './GlobalSessions'
+import GlobalContainers from './GlobalContainers'
+import RecordContainerPanel from './RecordContainerPanel'
+import GlobalResources from './GlobalResources'
+import GlobalCredentials from './GlobalCredentials'
+import PromptLibrary from './PromptLibrary'
+import ManageProvidersModal from './ManageProvidersModal'
+import NewSessionModal from './workspace/modals/NewSessionModal'
+import { fetchGlobalSummary, fetchProviders, saveProvider, deleteProvider } from '../globalApi'
+import './WorkspaceSelector.css'
+
+// Trim trailing separators so '/home/jojo' and '/home/jojo/' compare equal.
+function normalizePath(p) {
+  return String(p || '').replace(/[\\/]+$/, '')
+}
+
+function formatLastActive(iso) {
+  if (!iso) return 'never'
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return String(iso)
+  return d.toLocaleString()
+}
+
+export default function WorkspaceSelector() {
+  const navigate = useNavigate()
+  const resolveWorkspacePath = useWorkspaceStore((s) => s.resolveWorkspacePath)
+
+  const [summary, setSummary] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [refreshError, setRefreshError] = useState('')
+  const [selectedPrompt, setSelectedPrompt] = useState('')
+
+  // Custom workspace modal state (Bridge 2).
+  const [showCustomModal, setShowCustomModal] = useState(false)
+  const [homeDir, setHomeDir] = useState('')
+  const [selectedFolderPath, setSelectedFolderPath] = useState('')
+  const [currentBrowsePath, setCurrentBrowsePath] = useState('')
+  const [resolving, setResolving] = useState(false)
+  const [error, setError] = useState('')
+  const [acknowledgedRisk, setAcknowledgedRisk] = useState(false)
+
+  const [showProviders, setShowProviders] = useState(false)
+  const [providersState, setProvidersState] = useState(null)
+  const [providersError, setProvidersError] = useState('')
+
+  // '+ New Session' flow: sessionTarget opens NewSessionModal directly (one
+  // workspace); chooserOpen/chooserWsId pick the target when several exist.
+  const [sessionTarget, setSessionTarget] = useState(null)
+  const [chooserOpen, setChooserOpen] = useState(false)
+  const [chooserWsId, setChooserWsId] = useState('')
+
+  const loadSummary = useCallback(async () => {
+    setLoading(true)
+    setRefreshError('')
+    const data = await fetchGlobalSummary()
+    if (data) setSummary(data)
+    setLoading(false)
+  }, [])
+
+  useEffect(() => {
+    loadSummary()
+  }, [loadSummary])
+
+  const handleSelectPrompt = useCallback((name) => {
+    setSelectedPrompt(name)
+  }, [])
+
+  const loadProviders = useCallback(async () => {
+    const data = await fetchProviders()
+    if (Array.isArray(data)) setProvidersState(data)
+  }, [])
+
+  // Adapter that lets ManageProvidersModal talk to the REST provider routes.
+  // The modal fires these commands fire-and-forget (it never awaits a reply).
+  const providerCommandAdapter = useCallback(
+    async (command, payload = {}) => {
+      if (command === 'save_provider') {
+        const result = await saveProvider(payload.provider)
+        if (!result) {
+          setProvidersError('Could not save provider.')
+          return
+        }
+        setProvidersError('')
+        await loadProviders()
+        return
+      }
+      if (command === 'delete_provider') {
+        const result = await deleteProvider(payload.provider_id)
+        if (!result) {
+          setProvidersError('Could not delete provider.')
+          return
+        }
+        setProvidersError('')
+        await loadProviders()
+        return
+      }
+      if (command === 'get_providers') {
+        await loadProviders()
+      }
+    },
+    [loadProviders]
+  )
+
+  const summaryData = summary || {}
+  const workspaces = Array.isArray(summaryData.workspaces) ? summaryData.workspaces : []
+  const sessions = Array.isArray(summaryData.active_sessions) ? summaryData.active_sessions : []
+  const containers = Array.isArray(summaryData.containers_in_use) ? summaryData.containers_in_use : []
+  const providers = Array.isArray(summaryData.providers) ? summaryData.providers : []
+  // REST-loaded providers win once a request succeeds; otherwise keep the
+  // summary-derived list so behaviour is unchanged before the first call.
+  const shownProviders = Array.isArray(providersState) ? providersState : providers
+
+  const openCustomModal = () => {
+    setError('')
+    setAcknowledgedRisk(false)
+    setSelectedFolderPath('')
+    setShowCustomModal(true)
+    // Discover the user's home directory (used by the sensitive-folder warning).
+    fetch('/api/user-home')
+      .then((r) => r.json().catch(() => ({})))
+      .then((data) => {
+        if (data && data.home) setHomeDir(data.home)
+      })
+      .catch(() => {})
+  }
+
+  // Binding a workspace to $HOME or the vault would put unconfined files at the
+  // agent's fingertips — require an explicit acknowledgement before proceeding.
+  const isPathSensitive = (path) => {
+    const p = normalizePath(path)
+    const home = normalizePath(homeDir)
+    if (!home || !p) return false
+    return p === home || p === normalizePath(`${home}/.thoughtmachine`)
+  }
+
+  const resolve = async (path) => {
+    setResolving(true)
+    setError('')
+    try {
+      const data = await resolveWorkspacePath(path)
+      setShowCustomModal(false)
+      navigate(`/workspace/${data.workspace_id}`)
+    } catch (err) {
+      setError(err.message || 'Failed to resolve workspace')
+    } finally {
+      setResolving(false)
+    }
+  }
+
+  const handleFolderSelect = (path) => {
+    setSelectedFolderPath(path)
+    try {
+      localStorage.setItem('thoughtmachine_last_workspace', path)
+    } catch {
+      // storage unavailable — the selection still works in memory
+    }
+    if (isPathSensitive(path)) return // show the acknowledgement UI instead
+    resolve(path)
+  }
+
+  const handleProceedSensitive = () => {
+    const path = currentBrowsePath || selectedFolderPath
+    if (!path) return
+    setSelectedFolderPath(path)
+    resolve(path)
+  }
+
+  const sensitiveSelected = !!selectedFolderPath && isPathSensitive(selectedFolderPath)
+
+  const openNewSession = () => {
+    if (workspaces.length === 1) {
+      const ws = workspaces[0]
+      setSessionTarget({ id: ws.id, name: ws.label || ws.id, path: ws.root || '' })
+      return
+    }
+    if (workspaces.length === 0) return
+    setChooserWsId(workspaces[0].id)
+    setChooserOpen(true)
+  }
+
+  const confirmChooser = () => {
+    const ws = workspaces.find((w) => w.id === chooserWsId)
+    if (!ws) return
+    setChooserOpen(false)
+    setSessionTarget({ id: ws.id, name: ws.label || ws.id, path: ws.root || '' })
+  }
+
+  return (
+    <div className="ws-selector">
+      <VaultHealthBanner />
+      <VaultHealthPanel defaultOpen={false} />
+      <main className="ws-main">
+        <div className="gms-header">
+          <h2 className="ws-main-title">Global Management</h2>
+          <div className="gms-header-actions">
+            <button className="ws-modal-btn" onClick={openCustomModal}>
+              + New Workspace
+            </button>
+            <button className="ws-refresh-btn" onClick={loadSummary} disabled={loading}>
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        {refreshError && <p className="gms-error">{refreshError}</p>}
+
+        <section className="gms-section" aria-label="Workspaces">
+          <h3 className="gms-section-title">Workspaces</h3>
+          {loading && workspaces.length === 0 ? (
+            <p className="gms-empty">Loading workspaces…</p>
+          ) : workspaces.length === 0 ? (
+            <p className="gms-empty">No workspaces yet. Create one to get started.</p>
+          ) : (
+            <div className="ws-grid">
+              {workspaces.map((ws) => (
+                <article
+                  className="ws-card"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => navigate(`/workspace/${ws.id}`)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      navigate(`/workspace/${ws.id}`)
+                    }
+                  }}
+                  key={ws.id}
+                >
+                  <div className="gms-card-head">
+                    <h4 className="ws-card-title" title={ws.label || ws.id}>
+                      {ws.label || ws.id}
+                    </h4>
+                    <span className={`ws-risk ${ws.allow_host_resources ? 'allow' : 'forbid'}`}>
+                      Host: {ws.allow_host_resources ? 'allowed' : 'forbidden'}
+                    </span>
+                  </div>
+                  <p className="ws-card-desc">{ws.id}</p>
+                  <div className="gms-card-stats">
+                    <span className="gms-stat">{ws.active_sessions_count ?? 0} sessions</span>
+                    <span className="gms-stat">{ws.total_workers ?? 0} workers</span>
+                  </div>
+                  <div className="ws-card-details">
+                    <div className="ws-detail-line">Status: {ws.status || 'unknown'}</div>
+                    <div className="ws-detail-line">Last active: {formatLastActive(ws.last_active)}</div>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="gms-section" aria-label="Active Sessions">
+          <div className="gms-section-head">
+            <h3 className="gms-section-title">Active Sessions</h3>
+            {workspaces.length > 0 && (
+              <button className="ws-modal-btn gms-session-new-btn" onClick={openNewSession}>
+                + New Session
+              </button>
+            )}
+          </div>
+          <GlobalSessions sessions={sessions} workspaces={workspaces} />
+        </section>
+
+        <section className="gms-section" aria-label="Active Containers">
+          <h3 className="gms-section-title">Active Containers</h3>
+          <GlobalContainers containers={containers} />
+        </section>
+
+        <section className="gms-section" aria-label="Container Records">
+          <RecordContainerPanel />
+        </section>
+
+        <section className="gms-section" aria-label="Global Resources">
+          <h3 className="gms-section-title">Global Resources</h3>
+          <GlobalResources />
+        </section>
+
+        <section className="gms-section" aria-label="Global Credentials">
+          <h3 className="gms-section-title">Global Credentials</h3>
+          <GlobalCredentials />
+        </section>
+
+        <section className="gms-section" aria-label="Global Sysprompts">
+          <h3 className="gms-section-title">Global Sysprompts</h3>
+          <PromptLibrary onSelectPrompt={handleSelectPrompt} />
+          {selectedPrompt && (
+            <p role="status" style={{ margin: '0.5rem 0 0 0', fontSize: '0.85rem', color: '#a6e3a1' }}>
+              Prompt selected - open a session to apply it
+            </p>
+          )}
+        </section>
+
+        <section className="gms-section" aria-label="Providers">
+          <h3 className="gms-section-title">Providers</h3>
+          <button
+            className="ws-modal-btn"
+            onClick={() => {
+              setProvidersError('')
+              setShowProviders(true)
+              loadProviders()
+            }}
+          >
+            ⚙ Manage Providers
+          </button>
+          {providersError && (
+            <p role="alert" style={{ margin: '0.5rem 0 0 0', fontSize: '0.85rem', color: '#f38ba8' }}>
+              {providersError}
+            </p>
+          )}
+        </section>
+
+        {chooserOpen && (
+          <div className="ws-modal-overlay" onClick={() => setChooserOpen(false)}>
+            <div
+              className="ws-modal-dialog"
+              role="dialog"
+              aria-label="New session — choose workspace"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="ws-modal-title">New Session</h3>
+              <p className="ws-modal-hint">Choose the workspace for the new session.</p>
+              <label className="ws-modal-label" htmlFor="gms-session-ws-select">
+                Workspace
+              </label>
+              <select
+                id="gms-session-ws-select"
+                className="gms-session-chooser"
+                value={chooserWsId}
+                onChange={(e) => setChooserWsId(e.target.value)}
+              >
+                {workspaces.map((ws) => (
+                  <option key={ws.id} value={ws.id}>
+                    {ws.label || ws.id}
+                  </option>
+                ))}
+              </select>
+              <div className="ws-modal-actions">
+                <button className="ws-modal-btn" onClick={() => setChooserOpen(false)}>
+                  Cancel
+                </button>
+                <button className="ws-modal-btn ws-modal-btn-primary" onClick={confirmChooser}>
+                  Create Session
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {sessionTarget && (
+          <NewSessionModal workspace={sessionTarget} onClose={() => setSessionTarget(null)} />
+        )}
+
+        {showProviders && (
+          <ManageProvidersModal
+            providers={shownProviders}
+            sendCommand={providerCommandAdapter}
+            onClose={() => setShowProviders(false)}
+            onProviderSaved={() => setShowProviders(false)}
+          />
+        )}
+
+        {showCustomModal && (
+          <div className="ws-modal-overlay" onClick={() => setShowCustomModal(false)}>
+            <div
+              className="ws-modal-dialog"
+              role="dialog"
+              aria-label="Create custom workspace"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="ws-modal-title">Create Custom Workspace</h3>
+              <p className="ws-modal-hint">
+                Pick an existing folder on this machine to use as the workspace root. It can be anywhere
+                outside the protected vault (~/.thoughtmachine).
+              </p>
+              <div className="ws-modal-label">Workspace Folder</div>
+              <FolderBrowser
+                onSelect={handleFolderSelect}
+                onNavigate={setCurrentBrowsePath}
+                startPath={selectedFolderPath || undefined}
+              />
+
+              {resolving && <p className="ws-modal-resolving">Resolving workspace…</p>}
+
+              {error && <p className="ws-modal-error">⚠ {error}</p>}
+
+              {sensitiveSelected && (
+                <div className="ws-modal-warning" role="alert">
+                  <p className="ws-modal-warning-text">
+                    You are binding this workspace to {selectedFolderPath}. Files in your home directory
+                    or vault are not confined to a workspace sandbox. Proceed only if you understand the
+                    risk.
+                  </p>
+                  <label className="ws-modal-ack">
+                    <input
+                      type="checkbox"
+                      checked={acknowledgedRisk}
+                      onChange={(e) => setAcknowledgedRisk(e.target.checked)}
+                    />
+                    I understand the risk and want to proceed
+                  </label>
+                  <button
+                    className="ws-modal-btn ws-modal-btn-danger"
+                    disabled={!acknowledgedRisk || resolving}
+                    onClick={handleProceedSensitive}
+                  >
+                    Proceed
+                  </button>
+                </div>
+              )}
+
+              <div className="ws-modal-actions">
+                <button
+                  className="ws-modal-btn"
+                  onClick={() => setShowCustomModal(false)}
+                  disabled={resolving}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  )
+}

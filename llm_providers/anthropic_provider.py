@@ -9,9 +9,15 @@ import os
 import sys
 import anthropic
 from anthropic import APIError, RateLimitError
+try:
+    from anthropic import APITimeoutError
+except ImportError:  # pragma: no cover - SDK < 1.0
+    class APITimeoutError(APIError):  # never raised by old SDKs
+        pass
 from .base import LLMProvider, ProviderConfig, LLMResponse
+from agent.config.secret import reveal_secret
 from .tool_converter import ToolFormatConverter
-from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
+from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
 from agent.logging import log
 
 class AnthropicProvider(LLMProvider):
@@ -23,21 +29,94 @@ class AnthropicProvider(LLMProvider):
 
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
-        self.client = anthropic.Anthropic(api_key=config.api_key, timeout=config.timeout, max_retries=config.max_retries)
+        # REVEAL SITE: the raw key crosses into the Anthropic SDK here (it
+        # becomes the ``x-api-key`` header inside the SDK).
+        self.client = anthropic.Anthropic(api_key=reveal_secret(config.api_key), timeout=config.timeout, max_retries=config.max_retries)
         self.converter = ToolFormatConverter()
+
+    @staticmethod
+    def _to_tool_use_block(tool_call: Any) -> Dict[str, Any]:
+        """Convert one internal tool_call entry into an Anthropic ``tool_use`` block.
+
+        Accepts both the dict shape produced by ``parse_response``
+        (``{'id', 'type': 'function', 'function': {'name', 'arguments'}}``) and
+        object-style tool calls (attribute access).
+        """
+        if isinstance(tool_call, dict):
+            call_id = tool_call.get('id')
+            function = tool_call.get('function')
+        else:
+            call_id = getattr(tool_call, 'id', None)
+            function = getattr(tool_call, 'function', None)
+        if isinstance(function, dict):
+            name = function.get('name')
+            arguments = function.get('arguments')
+        elif function is not None:
+            name = getattr(function, 'name', None)
+            arguments = getattr(function, 'arguments', None)
+        else:
+            name = None
+            arguments = None
+        if isinstance(arguments, str):
+            try:
+                parsed_input = json.loads(arguments) if arguments.strip() else {}
+            except (ValueError, TypeError):
+                parsed_input = {}
+        elif isinstance(arguments, dict):
+            parsed_input = arguments
+        else:
+            parsed_input = {}
+        return {'type': 'tool_use', 'id': call_id, 'name': name, 'input': parsed_input}
+
+    def _serialize_messages(self, messages: List[Dict[str, Any]]):
+        """Convert internal message history into Anthropic Messages API form.
+
+        The Messages API requires structured content blocks:
+          * an assistant turn that called tools carries ``tool_use`` blocks;
+          * tool output travels back as a **user** turn holding ``tool_result``
+            blocks (``role: 'tool'`` does not exist on this API).
+
+        Anthropic rejects two consecutive turns with the same role, so
+        consecutive ``role: 'tool'`` messages are merged into a single user
+        message carrying one ``tool_result`` block each (parallel tool calls).
+
+        Returns ``(system_prompt, anthropic_messages)``.
+        """
+        system_msg = None
+        anthropic_messages: List[Dict[str, Any]] = []
+        last_was_tool_result = False
+        for msg in messages:
+            role = msg.get('role')
+            if role == 'system':
+                system_msg = msg.get('content')
+                continue
+            if role == 'tool':
+                block = {'type': 'tool_result', 'tool_use_id': msg.get('tool_call_id'), 'content': msg.get('content')}
+                if last_was_tool_result and anthropic_messages and anthropic_messages[-1]['role'] == 'user':
+                    anthropic_messages[-1]['content'].append(block)
+                else:
+                    anthropic_messages.append({'role': 'user', 'content': [block]})
+                last_was_tool_result = True
+                continue
+            last_was_tool_result = False
+            tool_calls = msg.get('tool_calls') if role == 'assistant' else None
+            if tool_calls:
+                blocks: List[Dict[str, Any]] = []
+                text = msg.get('content')
+                if text:
+                    blocks.append({'type': 'text', 'text': text})
+                for tool_call in tool_calls:
+                    blocks.append(self._to_tool_use_block(tool_call))
+                anthropic_messages.append({'role': 'assistant', 'content': blocks})
+            else:
+                anthropic_messages.append({'role': 'user' if role == 'user' else 'assistant', 'content': msg.get('content', '')})
+        return system_msg, anthropic_messages
 
     def chat_completion(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]]=None, **kwargs) -> LLMResponse:
         """Execute chat completion with Claude API"""
         start_time = time.time()
         try:
-            system_msg = None
-            anthropic_messages = []
-            for msg in messages:
-                if msg['role'] == 'system':
-                    system_msg = msg['content']
-                else:
-                    role = 'user' if msg['role'] == 'user' else 'assistant'
-                    anthropic_messages.append({'role': role, 'content': msg['content']})
+            system_msg, anthropic_messages = self._serialize_messages(messages)
             api_kwargs = {'model': self.config.model, 'messages': anthropic_messages, 'max_tokens': kwargs.get('max_tokens', 4096), 'temperature': kwargs.get('temperature', self.config.temperature), **kwargs}
             if system_msg:
                 api_kwargs['system'] = system_msg
@@ -77,6 +156,8 @@ class AnthropicProvider(LLMProvider):
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] RateLimitError: {e}')
             raise RateLimitExceeded(f'Rate limit exceeded: {e}')
         except APIError as e:
+            if isinstance(e, APITimeoutError):
+                raise ProviderTimeoutError(f'Request timed out: {e}')
             if os.environ.get('DEBUG_ANTHROPIC'):
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] APIError: {e}')
                 if hasattr(e, 'response'):
@@ -87,6 +168,15 @@ class AnthropicProvider(LLMProvider):
                         log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] APIError response: {resp_text}')
                     except:
                         pass
+            # Detect context-length exceeded errors (Anthropic returns 'too many tokens' or similar)
+            error_str = str(e)
+            has_context_length_error = 'too many tokens' in error_str.lower() or 'maximum context length' in error_str.lower() or 'context length' in error_str.lower() or 'prompt is too long' in error_str.lower()
+            if has_context_length_error:
+                log('WARNING', 'llm.anthropic', f'Token limit exceeded detected: {error_str[:200]}')
+                token_error = TokenLimitExceededError(f'Token limit exceeded: {error_str[:500]}')
+                if hasattr(e, 'response'):
+                    token_error.raw_response = e.response
+                raise token_error
             if 'authentication' in str(e).lower() or 'api key' in str(e).lower():
                 auth_error = AuthenticationError(f'Authentication failed: {e}')
                 if hasattr(e, 'response'):
@@ -97,6 +187,8 @@ class AnthropicProvider(LLMProvider):
                 api_error.raw_response = e.response
             raise api_error
         except Exception as e:
+            if isinstance(e, APITimeoutError):
+                raise ProviderTimeoutError(f'Request timed out: {e}')
             if os.environ.get('DEBUG_ANTHROPIC'):
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] Exception type: {type(e)}')
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] Exception message: {e}')
@@ -147,7 +239,7 @@ class AnthropicProvider(LLMProvider):
         tool_calls = []
         for content_block in raw_response.content:
             if content_block.type == 'text':
-                content = content_block.text
+                content += content_block.text
             elif content_block.type == 'thinking':
                 if hasattr(content_block, 'thinking'):
                     reasoning += content_block.thinking + '\n'

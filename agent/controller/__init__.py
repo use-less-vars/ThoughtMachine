@@ -33,6 +33,9 @@ class AgentController:
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
         self.pause_event.set()
+        # Hard stop: unlike stop()/shutdown(), this only truncates the running
+        # turn. It is checked by the agent mid-stream via halt_check.
+        self.halt_event = threading.Event()
         self.thread = None
         self._running = False
         self._agent_override = None
@@ -83,6 +86,7 @@ class AgentController:
             except queue.Empty:
                 break
         self.stop_event.clear()
+        self.halt_event.clear()
         self.pause_event.set()
         self.thread = None
         self._running = False
@@ -189,6 +193,7 @@ class AgentController:
         if self.agent is None:
             # ── Scenario 1: No agent — start fresh thread ──
             self.stop_event.clear()
+            self.halt_event.clear()
             self.pause_event.set()
             self._keep_alive = True
             self._pause_requested = False
@@ -228,6 +233,7 @@ class AgentController:
             self.thread = None
             self.agent = None
             self.stop_event.clear()
+            self.halt_event.clear()
             self.pause_event.set()
             self._keep_alive = True
             self._pause_requested = False
@@ -267,6 +273,7 @@ class AgentController:
                 return
             raise RuntimeError('Agent is already running. Stop it first.')
         self.stop_event.clear()
+        self.halt_event.clear()
         self.pause_event.set()
         self._keep_alive = True
         self._pause_requested = False
@@ -326,6 +333,18 @@ class AgentController:
         log('DEBUG', 'core.controller', 'stop() called - delegating to shutdown()')
         self.shutdown()
 
+    def request_halt(self):
+        """
+        Request a HARD stop of the currently running turn only.
+
+        Unlike stop(), this does not shut the controller down: it sets the
+        halt flag the agent polls mid-stream, so the running turn is
+        truncated and its partial content is committed. The thread, session
+        and conversation survive for the next query.
+        """
+        log('DEBUG', 'core.controller', 'request_halt() called - truncating current turn only')
+        self.halt_event.set()
+
     def continue_session(self, query: str):
         """Submit a new query to the already running agent."""
         log('WARNING', 'core.controller', 'continue_session() is deprecated. Use process_query() instead.')
@@ -350,6 +369,42 @@ class AgentController:
         log('DEBUG', 'core.controller', f'Query queued, queue size approx {self.query_queue.qsize()}')
         if os.environ.get('PAUSE_DEBUG'):
             log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: query queued, queue size={self.query_queue.qsize()}')
+
+    def _agent_enter_reading_mode(self, where: str) -> None:
+        """Put the agent into reading mode: it concludes the current turn.
+
+        Reading mode is the Pause button's semantics: the agent finishes the
+        turn it is in (one [SYSTEM NOTIFICATION] nudge asks it to summarise and
+        reply with Respond) but every tool call is refused, because the 'pause'
+        restriction narrows the allow-list to ['Respond']. The turn is NOT
+        aborted, so no turn-truncating 'paused' event is produced.
+
+        Falls back to agent.request_pause() (the alias) for agents that predate
+        the rename, and to a no-op for agents that have neither.
+        """
+        agent = self.agent
+        if agent is None:
+            return
+        try:
+            if hasattr(agent, 'enter_reading_mode'):
+                changed = agent.enter_reading_mode('pause')
+                log('DEBUG', 'core.controller', f'{where}: enter_reading_mode(pause) -> changed={changed}')
+            elif hasattr(agent, 'request_pause'):
+                agent.request_pause()
+                log('DEBUG', 'core.controller', f'{where}: request_pause() (legacy alias)')
+        except Exception as e:
+            log('WARNING', 'core.controller', f'{where}: could not enter reading mode: {e}')
+
+    def _agent_in_reading_mode(self) -> bool:
+        """True while the agent is under a pause-owned restriction.
+
+        In reading mode the pause does NOT abort the running turn -- the agent
+        is concluding it -- so its event stream must keep being consumed.
+        """
+        agent = self.agent
+        if agent is None:
+            return False
+        return getattr(getattr(agent, 'state', None), 'restriction_reason', None) == 'pause'
 
     def request_pause(self):
         """Request agent to pause after current turn.
@@ -387,8 +442,10 @@ class AgentController:
                     'new_state': 'pausing',
                 })
                 log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request (idle)')
-            if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
-                self.agent.request_pause()
+            # Reading mode: the agent concludes whatever it is doing and takes
+            # no new action. PAUSING above is the session-level 'no new turns'
+            # signal for the UI -- it does not mean 'abort the running turn'.
+            self._agent_enter_reading_mode('request_pause[idle]')
             if hasattr(self, 'agent') and self.agent is not None:
                 from session.context_builder import ContextBuilder
                 if hasattr(self.agent, 'conversation'):
@@ -489,8 +546,8 @@ class AgentController:
                 'new_state': 'pausing',
             })
             log('DEBUG', 'core.pause', f'PAUSE REQUESTED by user (state before: {old_state}), execution_state_change emitted')
-        if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
-            self.agent.request_pause()
+        # Reading mode: conclude the current turn, refuse further tool calls.
+        self._agent_enter_reading_mode('pause')
         if hasattr(self, 'agent') and self.agent is not None:
             from session.context_builder import ContextBuilder
             if hasattr(self.agent, 'conversation'):
@@ -507,6 +564,15 @@ class AgentController:
         self.pause_event.set()
         self._pause_requested = False
         if hasattr(self, 'agent') and self.agent is not None:
+            # Leave reading mode. The clear is OWNER-SCOPED: only a 'pause'
+            # restriction is released here, so a 'token'/'timeout'/'turn'
+            # restriction owned by the agent's monitors survives the resume.
+            if hasattr(self.agent, 'leave_reading_mode'):
+                try:
+                    released = self.agent.leave_reading_mode('pause')
+                    log('DEBUG', 'core.controller', f'resume(): leave_reading_mode(pause) -> released={released}')
+                except Exception as e:
+                    log('WARNING', 'core.controller', f'resume(): leave_reading_mode failed: {e}')
             if hasattr(self.agent, '_pause_requested'):
                 log('DEBUG', 'core.controller', f'Clearing agent._pause_requested (was {self.agent._pause_requested})')
                 if os.environ.get('PAUSE_DEBUG'):
@@ -514,17 +580,37 @@ class AgentController:
                 self.agent._pause_requested = False
 
     def _emit_event(self, event):
-        """Emit event to queue and plain callbacks."""
+        """Emit event to queue, plain callbacks, and global event bus."""
         event['session_id'] = self.current_session_id
         self.event_queue.put(event)
         log('DEBUG', 'core.controller', f"Emitting event_occurred: {event.get('type')}")
+        log('DEBUG', 'pipeline.controller', f"_emit_event: type={event.get('type')}, session_id={self.current_session_id}")
         # Plain callback path (works without Qt — used by Web UI)
         for cb in self._event_callbacks:
             try:
                 cb(event)
-            except Exception:
-                import traceback as _tb
-                _tb.print_exc()
+            except Exception as exc:
+                log('WARNING', 'core.controller',
+                    f"Event callback failed for {event.get('type')}: {exc}")
+        # Publish to global event bus so EventLogger and other subscribers see it
+        try:
+            from agent.events import global_event_bus, convert_from_legacy_format
+            if global_event_bus is not None:
+                typed_event = convert_from_legacy_format(event)
+                global_event_bus.publish(typed_event)
+        except Exception:
+            pass  # Best-effort: don't crash the agent thread if event bus publish fails
+
+        # Lifecycle stream: session.log (best-effort, never raises)
+        try:
+            from agent.logging.lifecycle import log_session_event
+            log_session_event(
+                event.get('type', 'event'),
+                session_id=event.get('session_id') or self.current_session_id or '',
+                data={k: v for k, v in event.items() if k not in ('session_id', 'type')},
+            )
+        except Exception:
+            pass
 
     def _run(self):
         """Internal method that runs in the background thread."""
@@ -532,6 +618,11 @@ class AgentController:
         log('INFO', 'core.controller', f'_run: self.agent={id(self.agent) if hasattr(self, "agent") and self.agent is not None else None}')
         if hasattr(self, 'agent') and self.agent is not None:
             log('DEBUG', 'core.controller', f"[CONTROLLER _run] entering with self.agent={id(self.agent)}, agent.conversation len={len(self.agent.conversation)}, first roles={[m.get('role') for m in self.agent.conversation[:3]]}")
+
+        def should_halt():
+            # Hard stop: terminal for the current turn, but the controller
+            # thread keeps running.
+            return self.halt_event.is_set()
 
         def should_stop():
             log('DEBUG', 'core.pause', f'stop_check called, pause_event.is_set()={self.pause_event.is_set()}')
@@ -550,6 +641,7 @@ class AgentController:
             if hasattr(self, '_agent_override') and self._agent_override is not None:
                 agent = self._agent_override
                 agent.config.stop_check = should_stop
+                agent.halt_check = should_halt
                 if hasattr(self, '_session') and self._session is not None:
                     agent.session = self._session
                     agent.conversation = self._session.user_history
@@ -572,6 +664,7 @@ class AgentController:
                         run_config.api_key = api_key_val
                         log('INFO', 'core.controller', f"[CONTROLLER] Filled missing api_key from env var")
                 agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
+                agent.halt_check = should_halt
                 self.agent = agent
             # Propagate agent's session_id so events carry it (needed for Web UI bridge)
             if self.agent and not self.current_session_id:
@@ -593,6 +686,9 @@ class AgentController:
                 )
             self._emit_event({'type': 'error', 'error_type': 'AGENT_CREATION_ERROR', 'message': str(e), 'traceback': traceback.format_exc()})
 
+        # Record current thread name for verification
+        thread_name = threading.current_thread().name
+        log('INFO', 'core.controller', f'_run: entering main loop on thread {thread_name}')
         # --- Main processing loop ---
         try:
             while self._keep_alive:
@@ -612,6 +708,7 @@ class AgentController:
                                 run_config = self._pending_config
                                 run_config.stop_check = should_stop
                                 new_agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
+                                new_agent.halt_check = should_halt
                                 self.agent = new_agent
                                 self._running = True
                                 self._agent_creation_failed = False
@@ -645,10 +742,18 @@ class AgentController:
                         log('DEBUG', 'core.controller', f'Resumed from pause_event.wait()')
                         continue
                     continue
-                # Before-query_queue log removed (idle polling noise)
+                log('DEBUG', 'core.controller',
+                    f'_run: waiting for next query from queue | '
+                    f'_keep_alive={self._keep_alive} | '
+                    f'thread alive={threading.current_thread().is_alive()} | '
+                    f'agent={self.agent is not None} | '
+                    f'_processing_query={self._processing_query}')
                 try:
                     query = self.query_queue.get(timeout=1.0)
-                    log('DEBUG', 'core.controller', f"Got query from queue: '{query[:50]}...'")
+                    log('INFO', 'core.controller', f"Got query from queue: '{query[:80]}...' (type={type(query).__name__})")
+                    if thread_name != threading.current_thread().name:
+                        log('WARNING', 'core.controller', f'THREAD MISMATCH! Expected={thread_name}, got={threading.current_thread().name}')
+                    log('INFO', 'core.controller', f'_run: thread_name={threading.current_thread().name}, same thread as before={threading.current_thread().name == thread_name}')
                 except queue.Empty:
                     # Queue-empty log removed (idle polling noise)
                     continue
@@ -673,13 +778,14 @@ class AgentController:
                             log('DEBUG', 'core.controller', "[CONTROLLER _run] agent has NO conversation attribute")
                         for event in local_agent.process_query(query):
                             log('DEBUG', 'core.pause', f"POST-YIELD: event_type={event['type']}")
+                            log('DEBUG', 'pipeline.controller', f"process_query_yield: type={event.get('type')}, turn={event.get('turn')}, stop_reason={event.get('stop_reason')}")
                             self._emit_event(event)
                             if event.get('stop_reason'):
                                 log('DEBUG', 'core.controller', f"Stop reason: {event['stop_reason']}, breaking loop")
                                 self._pause_requested = False
                                 stop_reason = event['stop_reason']
                                 break
-                            if not self.pause_event.is_set():
+                            if not self.pause_event.is_set() and not self._agent_in_reading_mode():
                                 log('DEBUG', 'core.controller', f'pause_event not set between events, breaking loop')
                                 self._pause_requested = False
                                 break
@@ -688,15 +794,23 @@ class AgentController:
                     traceback.print_exc()
                     stop_reason = 'error'
                 finally:
+                    # A halt is scoped to the turn that was running; clear it so
+                    # the next query is not truncated immediately.
+                    self.halt_event.clear()
                     self._processing_query = False
                     # Reset agent's internal execution state to READY so the next query
                     # triggers a proper ready→running transition.
                     if hasattr(self, 'agent') and self.agent is not None:
                         self.agent.state.set_execution_state(ExecutionState.READY)
-                        log('DEBUG', 'core.controller', 'Resetting agent execution state to READY after query completion')
+                        log('INFO', 'core.controller',
+                            f'Query finished. Agent state reset to READY. '
+                            f'_keep_alive={self._keep_alive} | '
+                            f'_running={self._running} | '
+                            f'thread alive={self.thread.is_alive() if self.thread else False} | '
+                            f'stop_reason={stop_reason!r}')
                     self._emit_event({'type': 'session_stop', 'stop_reason': stop_reason or 'completed'})
                 if not self._keep_alive:
-                    log('DEBUG', 'core.controller', f'_keep_alive=False, breaking outer loop')
+                    log('INFO', 'core.controller', f'_keep_alive=False, breaking outer loop')
                     break
         except Exception as e:
             log('ERROR', 'core.controller', f'Exception in _run: {e}')
@@ -705,5 +819,19 @@ class AgentController:
             self._emit_event({'type': 'error', 'error_type': 'CONTROLLER_ERROR', 'message': str(e), 'traceback': traceback.format_exc()})
         finally:
             log('DEBUG', 'core.controller', f'Finally block: thread finishing')
+            # Release the thread-local stream loop and the async HTTP client
+            # bound to it. This runs on the thread that owns both, which is the
+            # only thread allowed to close them. Best-effort in every direction:
+            # cleanup must never raise out of this ``finally`` (it would replace
+            # the exception that ended _run) and must never prevent the
+            # ``thread_finished`` event from being emitted. The controller module
+            # itself has no asyncio dependency; the teardown lives next to the
+            # loop it owns.
+            try:
+                from agent.core.agent import _close_stream_resources
+                llm_client = getattr(getattr(self, 'agent', None), 'llm_client', None)
+                _close_stream_resources(getattr(llm_client, 'provider', None))
+            except Exception as cleanup_error:
+                log('WARNING', 'core.controller', f'Resource cleanup failed (ignored): {cleanup_error}')
             self._emit_event({'type': 'thread_finished'})
             self._running = False

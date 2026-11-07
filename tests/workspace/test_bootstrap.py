@@ -47,11 +47,14 @@ class TestEnsureWorkspaceDirs:
         """No subdirectories (sessions, state, knowledge) are created inside the workspace config dir."""
         ensure_workspace_dirs("test-ws")
         base = _user_dir() / "workspaces" / "test-ws"
-        # Only the five expected files should exist — no subdirectories
+        # Only the expected files should exist — no subdirectories
         expected_files = {
+            ".git-shadow-mask",
             "capabilities.json",
+            "config.json",
             "Dockerfile",
             "domain_allowlist.json",
+            "requirements.txt",
             "workers.json",
             "mcp_servers.json",
         }
@@ -85,11 +88,16 @@ class TestEnsureWorkspaceDirs:
         assert json.loads(path.read_text(encoding="utf-8")) == []
 
     def test_creates_workers_json(self, temp_user_dir):
-        """workers.json is an empty JSON array."""
+        """workers.json contains the default template worker."""
         ensure_workspace_dirs("test-ws")
         path = _user_dir() / "workspaces" / "test-ws" / "workers.json"
         assert path.exists()
-        assert json.loads(path.read_text(encoding="utf-8")) == []
+        workers = json.loads(path.read_text(encoding="utf-8"))
+        # Must contain template worker, NOT echo
+        names = {w["name"] for w in workers}
+        assert "echo" not in names
+        assert "default" in names
+        assert len(workers) == 1
 
     def test_creates_mcp_servers_json(self, temp_user_dir):
         """mcp_servers.json is an empty JSON array."""
@@ -141,16 +149,16 @@ class TestEnsureWorkspaceDirs:
         ensure_workspace_dirs("test-ws")
         base = _user_dir() / "workspaces" / "test-ws"
 
-        # Create an unexpected subdirectory and file
+        # Create a standard vault dir (sessions) and an unexpected file
         (base / "sessions").mkdir(exist_ok=True)
         (base / "container_state.json").write_text("{}", encoding="utf-8")
 
         # Call ensure_workspace_dirs again — safeguard should warn
         ensure_workspace_dirs("test-ws")
 
-        # Check that both unexpected items were logged
-        assert any("sessions" in record.message for record in caplog.records)
+        # Only the unexpected item is flagged; 'sessions' is a standard dir
         assert any("container_state.json" in record.message for record in caplog.records)
+        assert not any("sessions" in record.message for record in caplog.records)
 
     def test_safeguard_does_not_delete_unexpected_items(self, temp_user_dir, caplog):
         """The safeguard warns but does not delete unexpected items."""
@@ -160,15 +168,13 @@ class TestEnsureWorkspaceDirs:
         ensure_workspace_dirs("test-ws")
         base = _user_dir() / "workspaces" / "test-ws"
 
-        # Create an unexpected subdirectory
-        (base / "sessions").mkdir(exist_ok=True)
-        (base / "sessions" / "test.txt").write_text("data", encoding="utf-8")
+        # Create an unexpected file (container_state.json is not in the allowed set)
+        (base / "container_state.json").write_text("{}", encoding="utf-8")
 
         ensure_workspace_dirs("test-ws")
 
         # The unexpected item should still exist
-        assert (base / "sessions").is_dir()
-        assert (base / "sessions" / "test.txt").exists()
+        assert (base / "container_state.json").exists()
         # And we should have warned about it
-        assert any("sessions" in record.message for record in caplog.records)
+        assert any("container_state.json" in record.message for record in caplog.records)
 

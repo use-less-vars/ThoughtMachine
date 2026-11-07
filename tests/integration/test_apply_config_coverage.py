@@ -1,0 +1,1686 @@
+"""apply_config branch coverage (frontend Test Round K).
+
+Drives the REAL server (FastAPI app + /ws) via starlette TestClient and proves
+``apply_config`` works in every branch of ``web_ui/backend/server.py``'s
+WebSocket handler.  Hermetic harness uses the same hermetic setup as
+``tests/integration/test_ws_event_contracts.py`` (temp HOME + patched
+``Path.home()`` + purged/re-imported web_ui.backend modules), with
+hang-proof drain helpers built on a single-reader pump (see below).
+
+═╦═ REAL apply_config contract (verified against current code) ═══════════════
+
+Command / payload (server.py:716-724):
+    { "command": "apply_config", "config": {...} }       # payload key: "config"
+    empty config → status_message "⚠ apply_config: empty config received"
+
+Reply events — normal branch, no workspace change (server.py:971-1007):
+    bridge is None         → status_message "⚠ No active session to configure"
+    apply succeeds         → config_changed {config, settings, permissions,
+                             merged_config} ONLY (no status_message)
+    apply returns error    → status_message "⚠ Failed to apply config: {err}"
+    apply raises           → outer handler → status "⚠ Internal error: ..."
+                             (server.py:2039-2045; NOT an error event)
+
+Reply events — workspace-change branch (server.py:726-968):
+    Trigger: config.workspace_path is non-empty AND != connection project
+             (server.py:729-733).
+    Old bridge saved + stopped, fresh bridge + controller created (750-764).
+    Session strategy (794-894):
+      * existing session WITH conversation → NEW session created; server sends
+        session_loaded {session_id, session_name, message_count: 0,
+        workspace_id, workspace_path, config} (841-852).  Old session is NOT
+        closed — no session_closed, no state_changed; it is saved and left in
+        the store (orphaned from this connection).
+      * existing session, NO conversation → same session reused; NO
+        session_loaded (853-862).
+      * no prior session → new session + session_loaded (863-894).
+    Then: config_changed (920-925) + status "✅ Switched to project: {path}"
+    (948-951).  Exception → error event {"type": "error", "session_id": ...,
+    "message": "Failed to apply config"} (952-968).
+
+═╦═ DELTAS vs the engineer spec ══════════════════════════════════════════════
+
+  * Case 3 (no session, no workspace_path): spec expects session_loaded +
+    config_changed.  REALITY: bridge is None → ONLY status_message
+    "⚠ No active session to configure" (server.py:973-978).  No session is
+    created.  (With workspace_path in the payload, the workspace branch DOES
+    create a session + send session_loaded + config_changed — pinned by the
+    custom variant of case 3.)
+
+  * Case 4 (workspace A→B): spec expects "new session + old session closed
+    cleanly".  REALITY: a new session is created ONLY if the existing session
+    has a real conversation (_session_has_conversation, server.py:2264 — a
+    user/assistant message in user_history).  An empty/fresh session is REUSED
+    in place (same session_id, no session_loaded).  The old session is never
+    "closed" — no session_closed / state_changed events are emitted; it is
+    saved and left intact in the store (bridge stopped, connection moves to a
+    fresh bridge).
+
+  * Case 5 (invalid provider_id): spec expects an error event and previous
+    config preserved.  REALITY: there is NO provider validation in the apply
+    path.  ConfigManager.apply_config sets provider_id via plain setattr
+    (config_manager.py:545-547) BEFORE provider resolution; a resolution
+    failure is only logged as a WARNING (config_manager.py:556-566) and does
+    not raise.  The invalid provider_id is silently accepted and reflected in
+    config_changed; no error event, session remains usable.  (api_key is not
+    resolved for the unknown provider.)
+
+  * new_session command (server.py:1664-1796) is REAL and sends: session_loaded
+    → tokens_updated {0,0} → context_updated {0} → config_changed → status
+    "Ready. Type a query to start."  Used here to create sessions (the spec's
+    "new_session command → receive session_loaded").
+
+  * bridge.apply_config always returns {config, settings, permissions,
+    merged_config} (bridge.py:1357-1362) — failure is expressed by raising, so
+    the "result without config" status branch (server.py:1002-1007) is only
+    reachable in theory.
+
+Run (from repo root):
+    python -m pytest tests/integration/test_apply_config_coverage.py -v
+
+Hermetic: temp HOME + patched Path.home() + purged/re-imported server modules.
+No network, no LLM, no Docker daemon.  Agent threads are NEVER started: the
+"conversation" needed by case 4 is injected straight into the session object's
+user_history (server internals) instead of running start_session.
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import pathlib
+import queue
+import shutil
+import sys as sys_mod
+import tempfile
+import threading
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from starlette.testclient import TestClient
+
+pytestmark = pytest.mark.integration
+
+# Sentinel for "this parent-package attribute was absent before the re-import".
+_ABSENT = object()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Hermetic full-server harness (EXACT mirror of test_ws_event_contracts.py)
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture(scope="module")
+def contract_server():
+    """Temp HOME + purged modules + fresh import of web_ui.backend.server."""
+    tmp_home = tempfile.mkdtemp(prefix="test_apply_config_coverage_")
+    fake_home_path = Path(tmp_home)
+
+    old_home_env = os.environ.get("HOME")
+    os.environ["HOME"] = tmp_home
+
+    saved_env = {}
+    for key in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_COMPATIBLE_API_KEY"):
+        saved_env[key] = os.environ.pop(key, None)
+
+    patcher = patch.object(pathlib.Path, "home", return_value=fake_home_path)
+    patcher.start()
+
+    # Re-import server so module-level singletons (_session_store, registries)
+    # are built against the temp HOME, not the real one. "session" is purged
+    # too (FileSystemSessionStore class-level singleton, see the F3 harness).
+    mod_prefixes = ("web_ui.backend", "agent.config.provider_profile", "thoughtmachine.bootstrap", "session")
+
+    def _matched_modules():
+        return [
+            n for n in list(sys_mod.modules)
+            if any(n.startswith(p) for p in mod_prefixes)
+        ]
+
+    # Snapshot the exact pre-fixture sys.modules state (plus the parent-package
+    # attributes that re-importing these submodules rebinds) so teardown can put
+    # the ORIGINAL singletons back, exactly as the bb608a5 harness does.
+    saved_modules = {n: sys_mod.modules[n] for n in _matched_modules()}
+    saved_attrs: dict = {}
+    for n in saved_modules:
+        parent_name, _, child = n.rpartition(".")
+        if not parent_name or parent_name in saved_modules:
+            continue
+        parent_mod = sys_mod.modules.get(parent_name)
+        if parent_mod is not None:
+            saved_attrs.setdefault(parent_name, {})[child] = parent_mod.__dict__.get(
+                child, _ABSENT
+            )
+
+    for name in saved_modules:
+        del sys_mod.modules[name]
+
+    server_mod = importlib.import_module("web_ui.backend.server")
+    app = server_mod.app
+
+    yield app, tmp_home
+
+    patcher.stop()
+    if old_home_env is not None:
+        os.environ["HOME"] = old_home_env
+    else:
+        os.environ.pop("HOME", None)
+    for key, val in saved_env.items():
+        if val is not None:
+            os.environ[key] = val
+    shutil.rmtree(tmp_home, ignore_errors=True)
+
+    # Restore the exact pre-fixture module state: drop the modules this fixture
+    # imported, reinstate the originals, then re-point the parent-package
+    # attributes that the re-imports had rebound to the fresh duplicates.
+    # (The fixture never mutates sys.path, so there is nothing to restore there.)
+    for name in _matched_modules():
+        del sys_mod.modules[name]
+    sys_mod.modules.update(saved_modules)
+    for parent_name, attrs in saved_attrs.items():
+        parent_mod = sys_mod.modules[parent_name]
+        for child, value in attrs.items():
+            if value is _ABSENT:
+                parent_mod.__dict__.pop(child, None)
+            else:
+                parent_mod.__dict__[child] = value
+
+
+def _server_mod():
+    """Return the (purged-then-imported) web_ui.backend.server module.
+
+    The fixture re-imports it into sys.modules, so a plain importlib call
+    returns the SAME module object the running server uses (enables reading
+    server internals like ``_session_bridges`` in tests).
+    """
+    return importlib.import_module("web_ui.backend.server")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Hang-proof drain helpers (single-reader pump)
+# ════════════════════════════════════════════════════════════════════════════
+# One daemon thread per WebSocket connection drains receive_json() into a
+# queue; helpers just block on that queue.  The original per-call-thread
+# design (mirrored from test_ws_event_contracts.py) had a DETERMINISTIC race:
+# a helper whose receive timed out (_assert_quiet) left its thread blocked
+# inside ws.receive_json(), and because stream/queue waiters are FIFO that
+# leftover thread consumed the NEXT helper's event — so the get_config probe
+# sent right after a successful apply_config received ZERO events (the probe
+# helper's fresh receive thread was second in line and timed out).  A
+# single reader makes every helper a pure queue consumer: no two threads
+# ever wait on the same socket, so a timed-out quiet check can never steal
+# a later event.
+
+_READER_REGISTRY: "dict[int, '_WSReader']" = {}
+
+
+class _WSReader:
+    """Drain a TestClient websocket from one daemon thread into a queue."""
+
+    def __init__(self, ws):
+        self._ws = ws
+        self._q = queue.Queue(maxsize=64)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            try:
+                self._q.put(("ok", self._ws.receive_json()))
+            except Exception as exc:  # ws closed at test teardown
+                try:
+                    self._q.put(("exc", exc))
+                except Exception:
+                    pass
+                return
+
+    def get(self, timeout: float):
+        """Block for the next (kind, value); raises queue.Empty on timeout."""
+        return self._q.get(timeout=timeout)
+
+
+def _reader_for(ws) -> "_WSReader":
+    """Get (or lazily create) the single reader for this WebSocket connection."""
+    reader = _READER_REGISTRY.get(id(ws))
+    if reader is None or reader._ws is not ws:
+        reader = _WSReader(ws)
+        _READER_REGISTRY[id(ws)] = reader
+    return reader
+
+
+def _receive_until_session_loaded(ws, path_label: str, max_events: int = 25, timeout: float = 15.0):
+    """Drain WS events until ``session_loaded`` arrives — hang-proof, fail-fast."""
+    events = []
+    for _ in range(max_events):
+        try:
+            _kind, _val = _reader_for(ws).get(timeout=timeout)
+        except queue.Empty:
+            pytest.fail(
+                f"{path_label}: timed out after {timeout}s waiting for events; "
+                f"received so far: {[e.get('type') for e in events]}"
+            )
+        if _kind == "exc":
+            raise _val
+        evt = _val
+        events.append(evt)
+        if evt.get("type") == "error":
+            pytest.fail(f"{path_label}: received error event: {evt}")
+        if evt.get("type") == "status_message":
+            _text = str(evt.get("text", ""))
+            if any(m in _text.lower() for m in ("⚠", "failed", "internal error", "not found", "loaded")):
+                pytest.fail(
+                    f"{path_label}: server reported failure before session_loaded: {_text!r}"
+                )
+        if evt.get("type") == "session_loaded":
+            return evt, events
+    pytest.fail(
+        f"{path_label}: no session_loaded within {max_events} events "
+        f"(got types: {[e.get('type') for e in events]})"
+    )
+
+
+def _receive_until(ws, target_type: str, path_label: str, max_events: int = 25, timeout: float = 15.0):
+    """Drain WS events until ``target_type`` arrives — hang-proof, fail-fast.
+
+    Fails on ``error`` events (unless the target IS error) and on failure-ish
+    status_message texts (⚠/failed/internal error).  The apply_config success
+    status "✅ Switched to project: ..." (server.py:948-951) is legitimately
+    skipped.  Returns ``(target_event, events)``.
+    """
+    events = []
+    for _ in range(max_events):
+        try:
+            _kind, _val = _reader_for(ws).get(timeout=timeout)
+        except queue.Empty:
+            pytest.fail(
+                f"{path_label}: timed out after {timeout}s waiting for {target_type!r}; "
+                f"received so far: {[e.get('type') for e in events]}"
+            )
+        if _kind == "exc":
+            raise _val
+        evt = _val
+        events.append(evt)
+        if evt.get("type") == "error":
+            if target_type == "error":
+                return evt, events
+            pytest.fail(f"{path_label}: received unexpected error event: {evt}")
+        if evt.get("type") == "status_message":
+            _text = str(evt.get("text", ""))
+            if any(m in _text.lower() for m in ("⚠", "failed", "internal error")):
+                pytest.fail(
+                    f"{path_label}: server reported failure while waiting for "
+                    f"{target_type!r}: {_text!r}"
+                )
+        if evt.get("type") == target_type:
+            return evt, events
+    pytest.fail(
+        f"{path_label}: no {target_type} within {max_events} events "
+        f"(got types: {[e.get('type') for e in events]})"
+    )
+
+
+def _receive_next(ws, path_label: str, timeout: float = 15.0):
+    """Receive exactly ONE event — hang-proof, NO fail-fast on its content."""
+    try:
+        _kind, _val = _reader_for(ws).get(timeout=timeout)
+    except queue.Empty:
+        pytest.fail(f"{path_label}: timed out after {timeout}s waiting for next event")
+    if _kind == "exc":
+        raise _val
+    return _val
+
+
+def _expect(ws, expected_type: str, path_label: str, timeout: float = 15.0):
+    """Receive one event and assert its type; fail fast on error events."""
+    evt = _receive_next(ws, path_label, timeout=timeout)
+    if evt.get("type") == "error":
+        pytest.fail(f"{path_label}: unexpected error event: {evt}")
+    assert evt.get("type") == expected_type, (
+        f"{path_label}: expected {expected_type!r}, got {evt.get('type')!r}: {evt}"
+    )
+    return evt
+
+
+def _assert_quiet(ws, path_label: str, timeout: float = 0.75):
+    """Assert NO event arrives within ``timeout`` seconds."""
+    try:
+        _kind, _val = _reader_for(ws).get(timeout=timeout)
+    except queue.Empty:
+        return  # quiet — as expected
+    if _kind == "exc":
+        pytest.fail(f"{path_label}: ws error during quiet check: {_val}")
+    pytest.fail(f"{path_label}: expected quiet, got event: {_val}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Flow helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def _new_session(ws, path_label: str, mode: str = "custom"):
+    """Send ``new_session`` and drain the full handshake.
+
+    Real sequence (server.py:1664-1796): session_loaded → tokens_updated {0,0}
+    → context_updated {0} → config_changed → status "Ready. Type a query to
+    start."  Returns ``(session_loaded, events)``.
+    """
+    ws.send_json({"command": "new_session", "mode": mode})
+    evt, events = _receive_until_session_loaded(ws, path_label)
+    events.append(_expect(ws, "tokens_updated", path_label))
+    events.append(_expect(ws, "context_updated", path_label))
+    events.append(_expect(ws, "config_changed", path_label))
+    final = _expect(ws, "status_message", path_label)
+    events.append(final)
+    assert "Ready" in str(final.get("text", "")), (
+        f"{path_label}: unexpected final status after new_session: {final}"
+    )
+    return evt, events
+
+
+def _apply_config(ws, config: dict, path_label: str):
+    """Send apply_config and return the events until the reply sequence ends.
+
+    Default variant (no workspace_path): normal branch → config_changed only.
+    Custom variant (workspace_path != project): workspace branch → config_changed
+    + status "✅ Switched to project: ...".  Returns (config_changed_evt, events).
+    """
+    ws.send_json({"command": "apply_config", "config": config})
+    evt, events = _receive_until(ws, "config_changed", path_label)
+    return evt, events
+
+
+def _get_config(ws, path_label: str):
+    """Send ``get_config`` and drain until config_changed (bridge usability probe)."""
+    ws.send_json({"command": "get_config"})
+    evt, _ = _receive_until(ws, "config_changed", f"{path_label} → get_config")
+    return evt
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Parametrisation
+# ════════════════════════════════════════════════════════════════════════════
+
+_WORKSPACE_TYPES = ["default", "custom"]
+
+# Valid SessionPermissions profile (thoughtmachine/security.py:83-95):
+#   container: bool; network: banned|ask|write|outbound;
+#   filesystem/system/git/execution: banned|read|write|full|ask
+_NEW_PERMISSIONS = {
+    "container": True,
+    "network": "outbound",
+    "filesystem": "write",
+    "system": "read",
+    "git": "write",
+    "execution": "write",
+}
+
+
+_WS_PATH_CACHE: dict = {}
+
+
+def _ws_path(case_name: str, workspace_type: str) -> str:
+    """Unique, STABLE workspace path per case×variant (memoized).
+
+    A fresh uuid on every call made assert-side references disagree with the
+    path embedded in the config payload (send-side) — e.g. the custom-variant
+    status assert compared against a path generated AFTER the apply.  The
+    cache makes every call for the same key return the same path.  case6
+    passes distinct case names ("case6a"/"case6b") so its two rapid
+    consecutive applies keep two DISTINCT workspace paths (B2 != B1).
+    """
+    key = (case_name, workspace_type)
+    if key not in _WS_PATH_CACHE:
+        _WS_PATH_CACHE[key] = f"/tmp/round-k-{case_name}-{uuid.uuid4().hex[:8]}"
+    return _WS_PATH_CACHE[key]
+
+
+def _variant_config(case_name: str, workspace_type: str, **fields) -> dict:
+    """Build an apply_config payload for the given variant.
+
+    ``default`` → no workspace_path (normal branch).  ``custom`` → unique
+    workspace_path != connection project (workspace-change branch).
+    """
+    cfg = dict(fields)
+    if workspace_type == "custom":
+        cfg["workspace_path"] = _ws_path(case_name, workspace_type)
+    return cfg
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 1 — session exists, change session_permissions
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_case1_permissions_change(contract_server, workspace_type):
+    """apply_config of a NON-workspace change → config_changed reflects the
+    merged config; the payload's session_permissions is NOT a grant source, so
+    the emitted effective permissions stay at the fail-closed DEFAULT set
+    (filesystem 'read', git 'read', network 'banned'). No error, session alive."""
+    app, _ = contract_server
+    label = f"case1-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            # Non-empty (non-workspace) payload: a model field keeps the normal
+            # branch. The retired session_permissions grant field is dropped
+            # from the payload — it is a no-op under the new permission model.
+            cfg = _variant_config("case1", workspace_type, model="roundk-c1")
+            evt, events = _apply_config(ws, cfg, label)
+            assert evt["config"]["model"] == "roundk-c1"
+            # New model truth: a session's effective permissions come only from
+            # its grants sidecar (seeded EMPTY → fail-closed defaults). The
+            # payload's session_permissions is NOT a grant source.
+            # NOTE: the `custom` variant SWITCHES workspace; the switch now seeds
+            # an EMPTY grants sidecar for this reused session in the new
+            # workspace, so the gate serves the capped-by-ceiling DEFAULTS
+            # (filesystem/git 'read', network 'banned') -- still no grant.
+            if workspace_type == "custom":
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+                assert evt["permissions"]["network"] == "banned"
+            else:
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+                assert evt["permissions"]["network"] == "banned"
+            assert not (evt["config"] or {}).get("session_permissions"), (
+                f"apply_config payload must not surface a session_permissions "
+                f"grant; got {evt['config'].get('session_permissions')!r}"
+            )
+
+            if workspace_type == "custom":
+                # workspace branch: empty session is reused (no session_loaded);
+                # the final status confirms the project switch.
+                final = _expect(ws, "status_message", label)
+                assert "✅ Switched to project" in final.get("text", "")
+                assert final.get("permissions_reset") is True
+                assert final.get("permission_context") == "defaults_capped_by_ceiling"
+                assert "Permission context reset" in final.get("text", "")
+                assert str(Path(_ws_path("case1", workspace_type)).resolve()) in final.get("text", "")
+            else:
+                # normal branch: config_changed is the ONLY reply.
+                _assert_quiet(ws, label)
+
+            # Session still alive; permissions unchanged (payload cannot grant).
+            probe = _get_config(ws, label)
+            if workspace_type == "custom":
+                assert probe["permissions"]["filesystem"] == "read"
+            else:
+                assert probe["permissions"]["filesystem"] == "read"
+            proj_sp = (probe["config"] or {}).get("session_permissions") or {}
+            # The REST probe's canonical projection must never surface the
+            # payload's requested grant and must equal the fail-closed
+            # canonical/defaults set (filesystem read, network banned, git read,
+            # container off).
+            assert proj_sp != _NEW_PERMISSIONS, (
+                f"probe must not surface the payload's requested grant; got {proj_sp!r}"
+            )
+            assert (
+                proj_sp.get("filesystem") == "read"
+                and proj_sp.get("network") == "banned"
+                and proj_sp.get("git") == "read"
+                and proj_sp.get("container") is False
+            ), f"probe session_permissions must equal canonical/defaults; got {proj_sp!r}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fix regression A — fresh workspace: apply_config NEW perms survive the vault
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_fresh_workspace_apply_defaults_not_deny_all(contract_server, workspace_type):
+    """A FRESH workspace (provisioned by ``ensure_workspace_dirs`` with a
+    seeded ``config.json``) must resolve to the fail-closed DEFAULT permission
+    set — filesystem 'read', git 'read', network 'banned' — NOT the all-banned
+    deny-all produced when the gate's vault ceiling read fails
+    (``permission_store.workspace_ceiling`` raising on a missing
+    ``workspaces/<id>/config.json`` used to collapse every category to
+    ``banned``). A fresh session's grants sidecar is empty, so the emitted
+    effective permissions are the defaults (the payload cannot grant)."""
+    app, _ = contract_server
+    label = f"fixed-a-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            _new_session(ws, label)
+            cfg = _variant_config("fixed-a", workspace_type, model="roundk-fixed-a")
+            evt, _ = _apply_config(ws, cfg, label)
+            assert evt["config"]["model"] == "roundk-fixed-a"
+            # New model: effective permissions come only from the session's grants
+            # sidecar (empty for a fresh session → fail-closed defaults). The
+            # `custom` variant switches workspace, which now seeds an EMPTY
+            # sidecar → the gate serves the capped-by-ceiling DEFAULTS.
+            if workspace_type == "custom":
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+                assert evt["permissions"]["network"] == "banned"
+            else:
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+                assert evt["permissions"]["network"] == "banned"
+            assert not (evt["config"] or {}).get("session_permissions"), (
+                f"apply_config payload must not surface a session_permissions "
+                f"grant; got {evt['config'].get('session_permissions')!r}"
+            )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fix regression B — new_session handshake reflects DEFAULT perms (not deny-all)
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_new_session_handshake_default_permissions(contract_server, workspace_type):
+    """The ``new_session`` handshake ``config_changed`` must reflect the DEFAULT
+    session permissions for a brand-new session -- filesystem ``read``, git
+    ``read``, network ``banned`` (``container`` False) -- NOT the all-banned
+    deny-all produced when the vault session-grant read fails closed.
+
+    A brand-new session has no saved record yet, so the grant read depends on
+    the sidecar seeded at session creation; a missing config.json / failed read
+    must not collapse the handshake to deny-all."""
+    app, _ = contract_server
+    label = f"handshake-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            _loaded, events = _new_session(ws, label)
+            cc = next(e for e in events if e.get("type") == "config_changed")
+            perms = cc["permissions"]
+            assert perms["filesystem"] == "read"
+            assert perms["git"] == "read"
+            assert perms["network"] == "banned"
+            assert perms["container"] is False
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 2 — session exists, change provider/model
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_case2_provider_model_change(contract_server, workspace_type):
+    """apply_config with provider_id/model → config_changed reflects the change."""
+    app, _ = contract_server
+    label = f"case2-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            cfg = _variant_config("case2", workspace_type,
+                                  provider_id="roundk-provider",
+                                  model="roundk-model-v1")
+            evt, _ = _apply_config(ws, cfg, label)
+            # provider_id/model are SessionConfig fields (session_config.py:72-79);
+            # the invalid provider is silently accepted (no validation).
+            assert evt["config"]["provider_id"] == "roundk-provider"
+            assert evt["config"]["model"] == "roundk-model-v1"
+
+            if workspace_type == "custom":
+                final = _expect(ws, "status_message", label)
+                assert "✅ Switched to project" in final.get("text", "")
+            else:
+                _assert_quiet(ws, label)
+
+            probe = _get_config(ws, label)
+            assert probe["config"]["model"] == "roundk-model-v1"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 3 — no session
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_case3_no_session(contract_server, workspace_type):
+    """apply_config with no session at all (fresh connection, bridge is None)."""
+    app, _ = contract_server
+    label = f"case3-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            if workspace_type == "default":
+                # DELTA vs spec: no session → ONLY a warning status; no
+                # session_loaded, no config_changed (server.py:973-978).
+                ws.send_json({"command": "apply_config",
+                              "config": {"model": "roundk-no-session"}})
+                evt = _receive_next(ws, label)
+                assert evt.get("type") == "status_message", f"unexpected: {evt}"
+                assert "No active session to configure" in evt.get("text", "")
+                _assert_quiet(ws, label)
+            else:
+                # workspace branch, no prior session → session is CREATED and
+                # session_loaded + config_changed arrive (server.py:863-894).
+                cfg = _variant_config("case3", workspace_type,
+                                      model="roundk-no-session")
+                # (the send happens via _apply_config; drain session_loaded first)
+                ws.send_json({"command": "apply_config", "config": cfg})
+                loaded_evt, _ = _receive_until_session_loaded(ws, label)
+                assert loaded_evt["session_id"]
+                assert Path(loaded_evt["workspace_path"]).resolve() == Path(_ws_path("case3", workspace_type)).resolve()
+                evt, _ = _receive_until(ws, "config_changed", label)
+                assert evt["config"]["model"] == "roundk-no-session"
+                final = _expect(ws, "status_message", label)
+                assert "✅ Switched to project" in final.get("text", "")
+
+                # Session is usable.
+                probe = _get_config(ws, label)
+                assert probe["config"]["model"] == "roundk-no-session"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 4 — workspace change A → B with a real conversation
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case4_workspace_change_new_session(contract_server):
+    """Workspace switch with a conversation-bearing session → NEW session for B,
+    old session preserved (NOT closed), no session_closed/state_changed events."""
+    app, _ = contract_server
+    label = "case4"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            old_sid = loaded["session_id"]
+            assert old_sid
+
+            # Inject a real conversation WITHOUT starting an agent: append a
+            # user message straight into the session object the bridge holds
+            # (server._session_bridges[sid]._loaded_session).  This is what
+            # _session_has_conversation (server.py:2264) inspects.
+            bridge = _server_mod()._session_bridges[old_sid]
+            session = bridge._loaded_session or bridge._session
+            assert session is not None, "new_session must leave a loaded session"
+            session.user_history.append({"role": "user", "content": "hello"})
+
+            ws_b = _ws_path("case4", "custom")
+            ws.send_json({"command": "apply_config",
+                          "config": {"workspace_path": ws_b, "model": "roundk-c4"}})
+
+            # strategy: existing session HAS conversation → new session created;
+            # session_loaded carries the NEW session_id (server.py:812-852).
+            new_loaded, events = _receive_until_session_loaded(ws, label)
+            new_sid = new_loaded["session_id"]
+            assert new_sid != old_sid, f"expected new session, got same {new_sid}"
+            assert Path(new_loaded["workspace_path"]).resolve() == Path(ws_b).resolve()
+            assert new_loaded["message_count"] == 0
+
+            evt, _ = _receive_until(ws, "config_changed", label)
+            assert evt["config"]["model"] == "roundk-c4"
+            final = _expect(ws, "status_message", label)
+            assert "✅ Switched to project" in final.get("text", "")
+
+            # Old session is NOT closed: no session_closed, no state_changed for
+            # it — the old bridge was stopped (server.py:750-753) silently.
+            for e in events:
+                assert e.get("type") not in ("session_closed", "state_changed"), (
+                    f"old session should not emit close/state events, got: {e}"
+                )
+            _assert_quiet(ws, label)
+
+            # Old session is preserved intact in the store (saved, orphaned).
+            store = _server_mod()._get_session_store()
+            old = store.load_session(old_sid)
+            assert old is not None, "old session must remain in the store"
+            roles = [m.get("role") for m in old.user_history if isinstance(m, dict)]
+            assert "user" in roles, "old session must keep its conversation"
+
+            # New session usable.
+            probe = _get_config(ws, label)
+            assert probe["config"]["model"] == "roundk-c4"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 5 — invalid provider_id
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_case5_invalid_provider(contract_server, workspace_type):
+    """Invalid provider_id → NO error event; silently accepted (no validation);
+    session remains usable and later applies still work."""
+    app, _ = contract_server
+    label = f"case5-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            cfg = _variant_config("case5", workspace_type,
+                                  provider_id="no-such-provider-xyz",
+                                  model="roundk-c5a")
+            evt, _ = _apply_config(ws, cfg, label)
+            # DELTA vs spec: no error event; the invalid provider_id is set
+            # (config_manager.py:545-547), resolution failure only logged as a
+            # WARNING (config_manager.py:556-566).
+            assert evt["config"]["provider_id"] == "no-such-provider-xyz"
+
+            if workspace_type == "custom":
+                final = _expect(ws, "status_message", label)
+                assert "✅ Switched to project" in final.get("text", "")
+            else:
+                _assert_quiet(ws, label)
+
+            # Session remains usable — a follow-up apply succeeds.
+            evt2, _ = _apply_config(ws, {"model": "roundk-c5b"}, label)
+            assert evt2["config"]["model"] == "roundk-c5b"
+            probe = _get_config(ws, label)
+            assert probe["config"]["model"] == "roundk-c5b"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 6 — two rapid consecutive apply_config
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_case6_rapid_consecutive_applies(contract_server, workspace_type):
+    """Two rapid apply_config calls → both complete without crash, final config
+    matches the second call."""
+    app, _ = contract_server
+    label = f"case6-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            if workspace_type == "default":
+                cfg1 = {"model": "roundk-m6a"}
+                cfg2 = {"model": "roundk-m6b"}
+            else:
+                cfg1 = _variant_config("case6a", workspace_type, model="roundk-m6a")
+                cfg2 = _variant_config("case6b", workspace_type, model="roundk-m6b")
+                # NOTE: distinct workspace paths → the second apply is ANOTHER
+                # workspace change (B2 != B1), still completing without crash.
+
+            evt1, _ = _apply_config(ws, cfg1, label)
+            assert evt1["config"]["model"] == "roundk-m6a"
+            if workspace_type == "custom":
+                _expect(ws, "status_message", label)
+
+            evt2, _ = _apply_config(ws, cfg2, label)
+            assert evt2["config"]["model"] == "roundk-m6b"
+            if workspace_type == "custom":
+                final = _expect(ws, "status_message", label)
+                assert "✅ Switched to project" in final.get("text", "")
+            else:
+                _assert_quiet(ws, label)
+
+            probe = _get_config(ws, label)
+            assert probe["config"]["model"] == "roundk-m6b"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 7 — permission-only apply in an established workspace keeps the session
+# (locks cbe5f72 "include workspace_path in apply_config config_changed event")
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
+                         ids=["default", "custom"])
+def test_case7_permission_only_apply_keeps_session(contract_server, workspace_type):
+    """Non-workspace apply_config on an established session → SAME session_id,
+    NO session_loaded, no status_message; config_changed carries the merged
+    config and (custom workspace) the workspace_path key. The payload cannot
+    change the emitted effective permissions (they stay at the defaults)."""
+    app, _ = contract_server
+    label = f"case7-{workspace_type}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            # Establish the workspace: custom → bind to a unique workspace path
+            # (empty session reused in place, no session_loaded, server.py:853-862);
+            # default → plain model apply (normal branch).
+            cfg_setup = _variant_config("case7", workspace_type, model="roundk-c7-setup")
+            if workspace_type == "custom":
+                ws_path = _ws_path("case7", workspace_type)
+                evt, events = _apply_config(ws, cfg_setup, label)
+                assert evt["config"]["model"] == "roundk-c7-setup"
+                assert "session_loaded" not in [e.get("type") for e in events], (
+                    f"empty-session setup must not emit session_loaded: "
+                    f"{[e.get('type') for e in events]}"
+                )
+                final = _expect(ws, "status_message", label)
+                assert "✅ Switched to project" in final.get("text", "")
+                assert final.get("permissions_reset") is True
+                assert final.get("permission_context") == "defaults_capped_by_ceiling"
+                assert "Permission context reset" in final.get("text", "")
+            else:
+                ws_path = None
+                _apply_config(ws, cfg_setup, label)
+                _assert_quiet(ws, label)
+
+            bridge_before = _server_mod()._session_bridges.get(sid)
+            assert bridge_before is not None, "session must have a live bridge"
+            session = bridge_before._loaded_session or bridge_before._session
+            assert session is not None and session.session_id == sid
+
+            # The user's exact scenario: a permission-only INTENT apply, no
+            # workspace_path. The payload's session_permissions is a no-op grant
+            # source under the new model, so a non-empty model field keeps the
+            # normal branch; the emitted effective permissions stay at the
+            # fail-closed defaults.
+            evt, events = _apply_config(ws, {"model": "roundk-c7"}, label)
+            assert "session_loaded" not in [e.get("type") for e in events], (
+                f"permission-only apply must NOT replace the session; got: "
+                f"{[e.get('type') for e in events]}"
+            )
+            assert evt["config"]["model"] == "roundk-c7"
+            # Effective permissions come only from the session's grants sidecar.
+            # `custom` SWITCHED workspace during setup, which now seeds an EMPTY
+            # sidecar → the gate serves the capped-by-ceiling DEFAULTS; `default`
+            # stays at the same fail-closed defaults.
+            if workspace_type == "custom":
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+            else:
+                assert evt["permissions"]["filesystem"] == "read"
+                assert evt["permissions"]["git"] == "read"
+            assert not (evt["config"] or {}).get("session_permissions"), (
+                f"apply_config payload must not surface a session_permissions "
+                f"grant; got {evt['config'].get('session_permissions')!r}"
+            )
+            if workspace_type == "custom":
+                # cbe5f72: config_changed carries the workspace_path key.
+                assert Path(evt["config"]["workspace_path"]).resolve() == Path(ws_path).resolve(), (
+                    f"config_changed must carry workspace_path, got "
+                    f"{evt['config'].get('workspace_path')!r}"
+                )
+            # Normal branch sends config_changed ONLY — no status_message.
+            _assert_quiet(ws, label)
+
+            # Same bridge object and same session id afterwards.
+            bridge_after = _server_mod()._session_bridges.get(sid)
+            assert bridge_after is not None
+            assert bridge_after is bridge_before, (
+                "permission-only apply must not rebuild the bridge/session"
+            )
+            session = bridge_after._loaded_session or bridge_after._session
+            assert session is not None and session.session_id == sid
+
+            # Session is usable; permissions unchanged (payload cannot grant).
+            probe = _get_config(ws, label)
+            if workspace_type == "custom":
+                assert probe["permissions"]["filesystem"] == "read"
+            else:
+                assert probe["permissions"]["filesystem"] == "read"
+            proj_sp = (probe["config"] or {}).get("session_permissions") or {}
+            # The REST probe's canonical projection must never surface the
+            # payload's requested grant and must equal the fail-closed
+            # canonical/defaults set (filesystem read, network banned, git read,
+            # container off).
+            assert proj_sp != _NEW_PERMISSIONS, (
+                f"probe must not surface the payload's requested grant; got {proj_sp!r}"
+            )
+            assert (
+                proj_sp.get("filesystem") == "read"
+                and proj_sp.get("network") == "banned"
+                and proj_sp.get("git") == "read"
+                and proj_sp.get("container") is False
+            ), f"probe session_permissions must equal canonical/defaults; got {proj_sp!r}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 8 — same directory, trailing-slash form → NOT a workspace change
+# (locks e72a61a "normalize paths in apply_config workspace_changed detection")
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case8_same_workspace_trailing_slash_no_replacement(contract_server):
+    """apply_config whose workspace_path is the SAME directory with a trailing
+    slash → os.path.normpath (server.py:730-732) makes it a no-op workspace
+    change: same session_id, no session_loaded, no 'Switched to project'."""
+    app, _ = contract_server
+    label = "case8"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            ws_path = _ws_path("case8", "custom")
+            ws.send_json({"command": "apply_config",
+                          "config": {"workspace_path": ws_path, "model": "roundk-c8-setup"}})
+            evt, _ = _receive_until(ws, "config_changed", label)
+            assert evt["config"]["model"] == "roundk-c8-setup"
+            final = _expect(ws, "status_message", label)
+            assert "✅ Switched to project" in final.get("text", "")
+            assert final.get("permissions_reset") is True
+            assert final.get("permission_context") == "defaults_capped_by_ceiling"
+            assert "Permission context reset" in final.get("text", "")
+
+            bridge_before = _server_mod()._session_bridges.get(sid)
+            assert bridge_before is not None
+            session = bridge_before._loaded_session or bridge_before._session
+            assert session is not None and session.session_id == sid
+
+            # Same directory, different FORM.  Pre-e72a61a this compared raw
+            # strings → treated as a workspace change → session replaced (the
+            # user-visible stale-session banner bug).
+            evt, events = _apply_config(
+                ws,
+                {"workspace_path": ws_path + "/", "model": "roundk-c8"},
+                label,
+            )
+            assert "session_loaded" not in [e.get("type") for e in events], (
+                f"same-dir trailing-slash workspace_path must NOT replace the "
+                f"session; got: {[e.get('type') for e in events]}"
+            )
+            assert evt["config"]["model"] == "roundk-c8"
+            # Effective permissions come only from the session's grants sidecar.
+            # This test SWITCHED workspace during setup, which now seeds an EMPTY
+            # sidecar → the gate serves the capped-by-ceiling DEFAULTS (the
+            # payload still cannot grant).
+            assert evt["permissions"]["filesystem"] == "read"
+            # config_changed reflects the NORMALIZED path, not the raw form.
+            assert Path(evt["config"]["workspace_path"]).resolve() == Path(ws_path).resolve(), (
+                f"expected normalized workspace_path {ws_path!r}, got "
+                f"{evt['config'].get('workspace_path')!r}"
+            )
+            # Normal branch: config_changed ONLY — no 'Switched to project'.
+            _assert_quiet(ws, label)
+
+            bridge_after = _server_mod()._session_bridges.get(sid)
+            assert bridge_after is not None
+            assert bridge_after is bridge_before, (
+                "same-dir trailing-slash workspace_path must not rebuild the bridge"
+            )
+            session = bridge_after._loaded_session or bridge_after._session
+            assert session is not None and session.session_id == sid
+
+            probe = _get_config(ws, label)
+            # Workspace was switched during setup → no seeded sidecar → deny-all.
+            assert probe["permissions"]["filesystem"] == "read"
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 9 — idle (non-workspace) apply of model + temperature + tools together
+# (Config Change Queue: immediate path — controller idle → config_changed only)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case9_idle_apply_model_temp_tools(contract_server):
+    """apply_config while the controller is IDLE (fresh session, agent not
+    started) → immediate config_changed on the SAME session: model +
+    temperature + tools applied together, no session_loaded, no status_message;
+    tool entries carry a non-empty description."""
+    app, _ = contract_server
+    label = "case9"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge_before = _server_mod()._session_bridges.get(sid)
+            assert bridge_before is not None
+            # Fresh session: controller exists (server.py:1675-1680) but no
+            # agent started → is_busy False → the apply must go through the
+            # IMMEDIATE path (config_changed, no config_queued).
+            assert bridge_before._controller is not None
+            assert not bridge_before._controller.is_busy
+
+            cfg = {
+                "model": "roundk-c9",
+                "temperature": 0.42,
+                "tools": [
+                    {"name": "FileEditor", "enabled": True},
+                    {"name": "FileReader", "enabled": False},
+                ],
+            }
+            evt, events = _apply_config(ws, cfg, label)
+            assert "session_loaded" not in [e.get("type") for e in events], (
+                f"idle apply must not replace the session; got: "
+                f"{[e.get('type') for e in events]}"
+            )
+            assert evt["config"]["model"] == "roundk-c9"
+            assert evt["config"]["temperature"] == 0.42
+
+            tools = evt["config"].get("tools", [])
+            names = {t.get("name") for t in tools}
+            assert "FileEditor" in names, f"tools list missing FileEditor: {tools}"
+            fe = next(t for t in tools if t.get("name") == "FileEditor")
+            assert fe.get("enabled") is True
+            desc = fe.get("description", "")
+            assert isinstance(desc, str) and desc.strip(), (
+                f"tool entries must carry a non-empty description, got {desc!r}"
+            )
+
+            # Immediate (idle) path: config_changed ONLY — no status_message.
+            _assert_quiet(ws, label)
+
+            bridge_after = _server_mod()._session_bridges.get(sid)
+            assert bridge_after is not None
+            assert bridge_after is bridge_before, (
+                "idle apply must not rebuild the bridge/session"
+            )
+            session = bridge_after._loaded_session or bridge_after._session
+            assert session is not None and session.session_id == sid
+
+            probe = _get_config(ws, label)
+            assert probe["config"]["model"] == "roundk-c9"
+            assert probe["config"]["temperature"] == 0.42
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 10 — busy controller → config_queued ACK, then deferred config_changed
+# (Config Change Queue: queued path — busy → idle transition)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case10_busy_config_queued_then_deferred_apply(contract_server):
+    """apply_config while the controller is BUSY (agent RUNNING) → the server
+    ACKs with config_queued and applies NOTHING yet; once the controller becomes
+    idle the queued config is applied on the SAME bridge/session and the
+    deferred config_changed is broadcast with the normalized workspace_path
+    (the payload cannot grant permissions, so the emitted effective set stays
+    at the fail-closed defaults). No session_loaded anywhere."""
+    app, _ = contract_server
+    label = "case10"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            # Establish a workspace (mirrors case7/8 setup) so the deferred
+            # apply carries a meaningful workspace_path.
+            ws_path = _ws_path("case10", "custom")
+            cfg_setup = _variant_config("case10", "custom", model="roundk-c10-setup")
+            evt, _ = _apply_config(ws, cfg_setup, label)
+            assert evt["config"]["model"] == "roundk-c10-setup"
+            final = _expect(ws, "status_message", label)
+            assert "✅ Switched to project" in final.get("text", "")
+            assert final.get("permissions_reset") is True
+            assert final.get("permission_context") == "defaults_capped_by_ceiling"
+            assert "Permission context reset" in final.get("text", "")
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            controller = bridge._controller
+            assert controller is not None
+
+            # Simulate a busy controller WITHOUT starting a real agent thread:
+            # stub agent with a RUNNING execution state + a no-op config update;
+            # stub thread with the (alive) main thread so apply_config's
+            # controller_alive check (bridge.py) doesn't trigger _restart_controller.
+            from agent.core.state import ExecutionState
+
+            class _FakeAgentState:
+                execution_state = ExecutionState.RUNNING
+
+            class _FakeAgent:
+                state = _FakeAgentState()
+                session = None  # keep _on_controller_event session-capture quiet
+
+                def request_config_update(self, agent_config):  # noqa: D401
+                    return None
+
+            orig_agent = controller.agent
+            orig_thread = controller.thread
+            try:
+                controller.agent = _FakeAgent()
+                controller.thread = threading.main_thread()
+                assert controller.is_busy, "stub must make the controller busy"
+
+                # ── Busy: config must be QUEUED, not applied ────────────────
+                ws.send_json({"command": "apply_config",
+                              "config": {"model": "roundk-c10-queued"}})
+                evt_q, events_q = _receive_until(
+                    ws, "config_queued", f"{label} → busy apply"
+                )
+                assert evt_q.get("status") == "queued"
+                assert "config_changed" not in [e.get("type") for e in events_q], (
+                    f"busy apply must NOT emit config_changed early; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_q]
+                # Nothing else may arrive while the controller is still busy.
+                _assert_quiet(ws, f"{label} → still busy")
+
+                # ── Idle: queued config is applied and broadcast ────────────
+                controller.agent.state.execution_state = ExecutionState.READY
+                bridge._on_controller_event({"type": "thread_finished"})
+                evt_d, events_d = _receive_until(
+                    ws, "config_changed", f"{label} → deferred apply"
+                )
+                assert evt_d["config"]["model"] == "roundk-c10-queued"
+                # This test SWITCHED workspace during setup, which now seeds an
+                # EMPTY sidecar → the gate serves the capped-by-ceiling DEFAULTS.
+                assert evt_d["permissions"]["filesystem"] == "read"
+                assert evt_d["permissions"]["git"] == "read"
+                assert Path(evt_d["config"]["workspace_path"]).resolve() == Path(ws_path).resolve(), (
+                    f"deferred config_changed must carry the normalized "
+                    f"workspace_path, got {evt_d['config'].get('workspace_path')!r}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_d], (
+                    f"deferred apply must not replace the session; got: "
+                    f"{[e.get('type') for e in events_d]}"
+                )
+                # Deferred apply runs on the SAME bridge and SAME session.
+                bridge_after = _server_mod()._session_bridges.get(sid)
+                assert bridge_after is bridge, (
+                    "deferred apply must not rebuild the bridge/session"
+                )
+                session = bridge_after._loaded_session or bridge_after._session
+                assert session is not None and session.session_id == sid
+                _assert_quiet(ws, label)
+            finally:
+                controller.agent = orig_agent
+                controller.thread = orig_thread
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 11 — busy apply queued, deferred apply FAILS on idle
+# (Config Change Queue: queued path — busy → idle transition, failure branch)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case11_busy_config_queued_then_deferred_apply_fails(contract_server):
+    """apply_config while the controller is BUSY → config_queued ACK only (no
+    premature config_apply_failed); once the controller goes idle the deferred
+    apply RUNS and FAILS → status_message '⚠ Queued config apply failed: ...'
+    AND config_apply_failed are broadcast; NO config_changed is emitted."""
+    app, _ = contract_server
+    label = "case11"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            controller = bridge._controller
+            assert controller is not None
+
+            # Simulate a busy controller WITHOUT starting a real agent thread
+            # (same stub as case10): RUNNING execution state + no-op config
+            # update + the (alive) main thread so apply_config's
+            # controller_alive check doesn't trigger _restart_controller.
+            from agent.core.state import ExecutionState
+
+            class _FakeAgentState:
+                execution_state = ExecutionState.RUNNING
+
+            class _FakeAgent:
+                state = _FakeAgentState()
+                session = None  # keep _on_controller_event session-capture quiet
+
+                def request_config_update(self, agent_config):  # noqa: D401
+                    return None
+
+            orig_agent = controller.agent
+            orig_thread = controller.thread
+            try:
+                controller.agent = _FakeAgent()
+                controller.thread = threading.main_thread()
+                assert controller.is_busy, "stub must make the controller busy"
+
+                # ── Busy: config must be QUEUED, not applied ────────────────
+                ws.send_json({"command": "apply_config",
+                              "config": {"session_permissions": _NEW_PERMISSIONS}})
+                evt_q, events_q = _receive_until(
+                    ws, "config_queued", f"{label} → busy apply"
+                )
+                assert evt_q.get("status") == "queued"
+                assert "config_apply_failed" not in [e.get("type") for e in events_q], (
+                    f"busy apply must NOT emit config_apply_failed early; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                assert "config_changed" not in [e.get("type") for e in events_q], (
+                    f"busy apply must NOT emit config_changed early; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                # Nothing else may arrive while the controller is still busy.
+                _assert_quiet(ws, f"{label} → still busy")
+
+                # ── Idle: deferred apply runs and FAILS ─────────────────────
+                controller.agent.state.execution_state = ExecutionState.READY
+                with patch.object(bridge, "apply_config",
+                                  side_effect=RuntimeError("boom-deferred-apply")):
+                    bridge._on_controller_event({"type": "thread_finished"})
+                    # _receive_until fail-fasts on '⚠'/'failed' status_message
+                    # texts, so drain the two broadcasts manually: the bridge
+                    # sends status_message FIRST, then config_apply_failed
+                    # (bridge.py:2016-2026).
+                    evt_s = _receive_next(ws, f"{label} → deferred apply status")
+                    assert evt_s.get("type") == "status_message", f"unexpected: {evt_s}"
+                    assert "Queued config apply failed" in evt_s.get("text", ""), (
+                        f"deferred failure must surface as a status_message; got: {evt_s}"
+                    )
+                    assert "boom-deferred-apply" in evt_s.get("text", ""), evt_s
+                    evt_f = _receive_next(ws, f"{label} → deferred apply failed")
+                    assert evt_f.get("type") == "config_apply_failed", f"unexpected: {evt_f}"
+                    assert "boom-deferred-apply" in evt_f.get("text", ""), (
+                        f"config_apply_failed must carry the deferred error; got: {evt_f}"
+                    )
+                # A failed deferred apply must NOT emit config_changed.
+                _assert_quiet(ws, label)
+            finally:
+                controller.agent = orig_agent
+                controller.thread = orig_thread
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 12 — system_prompt sent as a file-object dict → normalized to its
+# 'content' string (never stored/leaked as a JSON object into the LLM prompt)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case12_system_prompt_file_object_dict_normalized(contract_server):
+    """apply_config whose config.system_prompt is a file-object dict
+    {"name", "content", "size_bytes", "modified_at"} (the injection shape) →
+    SessionConfig.system_prompt becomes the plain 'content' string; neither the
+    raw dict nor a json.dumps'd object string ever reaches the LLM-facing
+    config. Regression guard for the system-prompt injection bug
+    (SessionConfig.update_prompt + ConfigManager.apply_config normalization)."""
+    app, _ = contract_server
+    label = "case12"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)  # mode='custom' by default
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            # custom mode → update_prompt applies (not mode-locked).
+            assert bridge._session_config.mode == "custom"
+
+            evt, events = _apply_config(ws, {
+                "system_prompt": {
+                    "name": "test_1.txt",
+                    "content": "SECRET_PROMPT_123",
+                    "size_bytes": 11,
+                    "modified_at": "2026-01-01T00:00:00",
+                }
+            }, label)
+            assert "session_loaded" not in [e.get("type") for e in events], (
+                f"system_prompt apply must not replace the session; got: "
+                f"{[e.get('type') for e in events]}"
+            )
+            # Normal branch: config_changed ONLY — no status_message.
+            _assert_quiet(ws, label)
+
+            # PRIMARY: the effective SessionConfig prompt is the plain string.
+            effective = bridge._session_config.system_prompt
+            assert effective == "SECRET_PROMPT_123", (
+                f"expected normalized content string, got {effective!r}"
+            )
+            assert "SECRET_PROMPT_123" in str(effective)
+            assert '{"name"' not in str(effective), (
+                f"system_prompt must not be a JSON-object string: {effective!r}"
+            )
+
+            # The broadcast config_changed payload carries the plain string too.
+            assert evt["config"]["system_prompt"] == "SECRET_PROMPT_123", (
+                f"config_changed system_prompt must be the plain string, got "
+                f"{evt['config'].get('system_prompt')!r}"
+            )
+
+            # Round-trips cleanly through model_dump (persistence path).
+            dumped = bridge._session_config.model_dump(exclude_none=True)
+            assert dumped["system_prompt"] == "SECRET_PROMPT_123", dumped
+
+            # The LLM-facing handoff receives a plain string — never the dict
+            # or a json-serialized object (AgentConfig only keeps non-empty
+            # strings; the dict would previously be dropped or leaked raw).
+            agent_cfg = bridge._session_config.to_agent_config()
+            assert isinstance(agent_cfg.system_prompt, str), agent_cfg.system_prompt
+            assert '{"name"' not in (agent_cfg.system_prompt or "")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Config-change guarantee while busy — ACKed fast (config_queued), applied on
+# idle on the SAME session (no lost updates, no premature config_changed)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_config_change_guarantee_while_busy(contract_server):
+    """A NON-workspace config change sent while the controller is RUNNING is
+    GUARANTEED to be applied: the server ACKs it with config_queued within
+    200ms (applying NOTHING yet), and once the controller goes idle the SAME
+    bridge/session applies it and broadcasts config_changed (the payload cannot
+    grant permissions, so the emitted effective set stays at the defaults).
+    No session_loaded, no lost update, no premature apply."""
+    app, _ = contract_server
+    label = "case-guard"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            controller = bridge._controller
+            assert controller is not None
+
+            # Simulate a busy controller WITHOUT starting a real agent thread
+            # (same stub as case10/11): RUNNING execution state + no-op config
+            # update + the (alive) main thread so apply_config_queued's
+            # controller_alive check doesn't trigger _restart_controller.
+            from agent.core.state import ExecutionState
+
+            class _FakeAgentState:
+                execution_state = ExecutionState.RUNNING
+
+            class _FakeAgent:
+                state = _FakeAgentState()
+                session = None  # keep _on_controller_event session-capture quiet
+
+                def request_config_update(self, agent_config):  # noqa: D401
+                    return None
+
+            orig_agent = controller.agent
+            orig_thread = controller.thread
+            try:
+                controller.agent = _FakeAgent()
+                controller.thread = threading.main_thread()
+                assert controller.is_busy, "stub must make the controller busy"
+
+                # ── Busy: the change is ACKed fast, applied NOTHING yet ────
+                ws.send_json({"command": "apply_config",
+                              "config": {"model": "roundk-guard-queued"}})
+                evt_q, events_q = _receive_until(
+                    ws, "config_queued", f"{label} → busy apply", timeout=0.2
+                )
+                assert evt_q.get("status") == "queued"
+                assert "config_changed" not in [e.get("type") for e in events_q], (
+                    f"guarantee: busy apply must NOT emit config_changed early; "
+                    f"got: {[e.get('type') for e in events_q]}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_q], (
+                    f"guarantee: busy apply must NOT replace the session; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                # Nothing else may arrive while the controller is still busy.
+                _assert_quiet(ws, f"{label} → still busy")
+
+                # ── Idle: the queued change is applied, not dropped ────────
+                controller.agent.state.execution_state = ExecutionState.READY
+                bridge._on_controller_event({"type": "thread_finished"})
+                evt_d, events_d = _receive_until(
+                    ws, "config_changed", f"{label} → deferred apply"
+                )
+                # The deferred broadcast reflects the fail-closed DEFAULT set:
+                # the payload's session_permissions is NOT a grant source.
+                assert evt_d["config"]["model"] == "roundk-guard-queued"
+                assert evt_d["permissions"]["filesystem"] == "read"
+                assert evt_d["permissions"]["git"] == "read"
+                assert evt_d["permissions"]["network"] == "banned"
+                assert not (evt_d["config"] or {}).get("session_permissions"), (
+                    f"apply_config payload must not surface a session_permissions "
+                    f"grant; got {evt_d['config'].get('session_permissions')!r}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_d], (
+                    f"guarantee: deferred apply must not replace the session; got: "
+                    f"{[e.get('type') for e in events_d]}"
+                )
+                # config_changed carries no session_id key, so the "same
+                # session" guarantee is pinned via object identity: the SAME
+                # bridge still owns the SAME session_id.
+                bridge_after = _server_mod()._session_bridges.get(sid)
+                assert bridge_after is bridge, (
+                    "deferred apply must not rebuild the bridge/session"
+                )
+                session = bridge_after._loaded_session or bridge_after._session
+                assert session is not None and session.session_id == sid
+                _assert_quiet(ws, label)
+
+                # The (unchanged) permissions are still visible to get_config.
+                probe = _get_config(ws, label)
+                assert probe["permissions"]["filesystem"] == "read"
+            finally:
+                controller.agent = orig_agent
+                controller.thread = orig_thread
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 13 — model change while busy → deferred config_changed carries the new
+# model on the SAME session (Config Change Queue: busy → idle transition)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case13_model_change_while_busy(contract_server):
+    """apply_config {model: 'gpt-4o-turbo'} while the controller is RUNNING →
+    config_queued ACK only (no premature config_changed); once the controller
+    goes idle the deferred config_changed carries the new model on the SAME
+    bridge/session (no lost update)."""
+    app, _ = contract_server
+    label = "case13"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            controller = bridge._controller
+            assert controller is not None
+
+            # Same busy stub as case10/11 (see the guarantee test above).
+            from agent.core.state import ExecutionState
+
+            class _FakeAgentState:
+                execution_state = ExecutionState.RUNNING
+
+            class _FakeAgent:
+                state = _FakeAgentState()
+                session = None  # keep _on_controller_event session-capture quiet
+
+                def request_config_update(self, agent_config):  # noqa: D401
+                    return None
+
+            orig_agent = controller.agent
+            orig_thread = controller.thread
+            try:
+                controller.agent = _FakeAgent()
+                controller.thread = threading.main_thread()
+                assert controller.is_busy, "stub must make the controller busy"
+
+                # ── Busy: model change must be QUEUED, not applied ─────────
+                ws.send_json({"command": "apply_config",
+                              "config": {"model": "gpt-4o-turbo"}})
+                evt_q, events_q = _receive_until(
+                    ws, "config_queued", f"{label} → busy apply"
+                )
+                assert evt_q.get("status") == "queued"
+                assert "config_changed" not in [e.get("type") for e in events_q], (
+                    f"busy apply must NOT emit config_changed early; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_q]
+                _assert_quiet(ws, f"{label} → still busy")
+
+                # ── Idle: deferred config_changed carries the new model ────
+                controller.agent.state.execution_state = ExecutionState.READY
+                bridge._on_controller_event({"type": "thread_finished"})
+                evt_d, events_d = _receive_until(
+                    ws, "config_changed", f"{label} → deferred apply"
+                )
+                assert evt_d["config"]["model"] == "gpt-4o-turbo", (
+                    f"deferred config_changed must carry the new model, got "
+                    f"{evt_d['config'].get('model')!r}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_d], (
+                    f"deferred apply must not replace the session; got: "
+                    f"{[e.get('type') for e in events_d]}"
+                )
+                bridge_after = _server_mod()._session_bridges.get(sid)
+                assert bridge_after is bridge, (
+                    "deferred apply must not rebuild the bridge/session"
+                )
+                session = bridge_after._loaded_session or bridge_after._session
+                assert session is not None and session.session_id == sid
+                _assert_quiet(ws, label)
+
+                probe = _get_config(ws, label)
+                assert probe["config"]["model"] == "gpt-4o-turbo"
+            finally:
+                controller.agent = orig_agent
+                controller.thread = orig_thread
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 14 — temperature change while busy → deferred config_changed carries the
+# new temperature on the SAME session (Config Change Queue: busy → idle)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case14_temperature_change_while_busy(contract_server):
+    """apply_config {temperature: 0.7} while the controller is RUNNING →
+    config_queued ACK only (no premature config_changed); once the controller
+    goes idle the deferred config_changed carries the new temperature on the
+    SAME bridge/session (no lost update)."""
+    app, _ = contract_server
+    label = "case14"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            controller = bridge._controller
+            assert controller is not None
+
+            # Same busy stub as case10/11 (see the guarantee test above).
+            from agent.core.state import ExecutionState
+
+            class _FakeAgentState:
+                execution_state = ExecutionState.RUNNING
+
+            class _FakeAgent:
+                state = _FakeAgentState()
+                session = None  # keep _on_controller_event session-capture quiet
+
+                def request_config_update(self, agent_config):  # noqa: D401
+                    return None
+
+            orig_agent = controller.agent
+            orig_thread = controller.thread
+            try:
+                controller.agent = _FakeAgent()
+                controller.thread = threading.main_thread()
+                assert controller.is_busy, "stub must make the controller busy"
+
+                # ── Busy: temperature change must be QUEUED, not applied ───
+                ws.send_json({"command": "apply_config",
+                              "config": {"temperature": 0.7}})
+                evt_q, events_q = _receive_until(
+                    ws, "config_queued", f"{label} → busy apply"
+                )
+                assert evt_q.get("status") == "queued"
+                assert "config_changed" not in [e.get("type") for e in events_q], (
+                    f"busy apply must NOT emit config_changed early; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_q]
+                _assert_quiet(ws, f"{label} → still busy")
+
+                # ── Idle: deferred config_changed carries the new temperature ──
+                controller.agent.state.execution_state = ExecutionState.READY
+                bridge._on_controller_event({"type": "thread_finished"})
+                evt_d, events_d = _receive_until(
+                    ws, "config_changed", f"{label} → deferred apply"
+                )
+                assert evt_d["config"]["temperature"] == 0.7, (
+                    f"deferred config_changed must carry the new temperature, "
+                    f"got {evt_d['config'].get('temperature')!r}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_d], (
+                    f"deferred apply must not replace the session; got: "
+                    f"{[e.get('type') for e in events_d]}"
+                )
+                bridge_after = _server_mod()._session_bridges.get(sid)
+                assert bridge_after is bridge, (
+                    "deferred apply must not rebuild the bridge/session"
+                )
+                session = bridge_after._loaded_session or bridge_after._session
+                assert session is not None and session.session_id == sid
+                _assert_quiet(ws, label)
+
+                probe = _get_config(ws, label)
+                assert probe["config"]["temperature"] == 0.7
+            finally:
+                controller.agent = orig_agent
+                controller.thread = orig_thread
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Invariant — an apply_config payload can NEVER write session grants
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_apply_config_payload_cannot_write_grants(contract_server):
+    """``session_permissions`` in an apply_config payload is NOT a grants writer.
+
+    The canonical grants store is the on-disk sidecar (``permission_store``),
+    written ONLY by the REST endpoint.  Applying a config that carries a
+    ``session_permissions`` field must therefore (i) leave the emitted effective
+    permissions at the fail-closed DEFAULTS (filesystem 'read', git 'read',
+    network 'banned') and (ii) leave the on-disk canonical store byte-for-byte
+    unchanged.  Any other outcome would let a config payload escalate
+    privileges."""
+    from thoughtmachine.vault import vault_root
+    from thoughtmachine.permission_store import read_session_permissions
+
+    app, _ = contract_server
+    label = "invariant-no-grant"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+            ws_id = loaded.get("workspace_id")
+            if not ws_id:
+                bridge = _server_mod()._session_bridges.get(sid)
+                assert bridge is not None, "session must have a live bridge"
+                ws_id = bridge.workspace_id
+
+            def _canonical():
+                """Read the canonical grants store; capture fail-closed raises."""
+                try:
+                    return read_session_permissions(vault_root(), ws_id, sid)
+                except Exception as exc:  # noqa: BLE001 — fail-closed read
+                    return ("__raises__", type(exc).__name__)
+
+            before = _canonical()
+
+            evt, _ = _apply_config(
+                ws,
+                {"model": "roundk-invariant",
+                 "session_permissions": dict(_NEW_PERMISSIONS)},
+                label,
+            )
+
+            # (i) the payload cannot grant: emitted effective perms stay DEFAULT.
+            assert evt["permissions"]["filesystem"] == "read", (
+                f"apply_config payload must not grant filesystem; got "
+                f"{evt['permissions'].get('filesystem')!r}"
+            )
+            assert evt["permissions"]["git"] == "read", (
+                f"apply_config payload must not grant git; got "
+                f"{evt['permissions'].get('git')!r}"
+            )
+            assert evt["permissions"]["network"] == "banned", (
+                f"apply_config payload must not grant network; got "
+                f"{evt['permissions'].get('network')!r}"
+            )
+            # NOTE: the payload's ``session_permissions`` block IS echoed back
+            # inside ``config_changed['config']`` as a SessionConfig REQUEST
+            # field (agent/config/session_config.py:200).  That echo is NOT a
+            # grant: the emitted EFFECTIVE permissions above stay at the
+            # fail-closed defaults, and the canonical store below is untouched.
+
+            # (ii) the payload did NOT write the canonical on-disk grants store.
+            after = _canonical()
+            assert after == before, (
+                f"apply_config payload mutated the canonical grants store: "
+                f"{before!r} -> {after!r}"
+            )
+
+            _assert_quiet(ws, label)
+

@@ -108,10 +108,14 @@ class TestPutDomainAllowlist:
 
 
 class TestGetWorkers:
-    def test_returns_empty_list_initially(self, client):
+    def test_returns_seeded_default_initially(self, client):
+        """GET workers on a fresh workspace returns the seeded 'default' worker."""
         resp = client.get("/api/workspace/test-ws/workers")
         assert resp.status_code == 200
-        assert resp.json() == []
+        data = resp.json()
+        # ensure_workspace_dirs seeds workers.json with the 'default' template
+        assert len(data) == 1
+        assert data[0]["name"] == "default"
 
 
 class TestGetMcpServers:
@@ -134,8 +138,8 @@ class TestEffectivePermissions:
         assert "network" in eff
         assert "container" in eff
         assert "git" in eff
-        assert "system" in eff
-        assert "execution" in eff
+        assert "mcp" in eff
+        assert "host_bash" in eff
 
     def test_with_session_id(self, client, temp_user_dir):
         """When session_id is provided, permissions are loaded from the session."""
@@ -151,9 +155,9 @@ class TestEffectivePermissions:
                         "container": True,
                         "network": "write",
                         "filesystem": "write",
-                        "system": "write",
                         "git": "write",
-                        "execution": "read",
+                        "mcp": "connect",
+                        "host_bash": "allow",
                     }
                 }
             },

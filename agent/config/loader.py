@@ -19,6 +19,7 @@ LEGACY_SYSTEM_PROMPT_PATH = str(USER_DIR / "system_prompt.txt")
 # ── Factory config ──────────────────────────────────────────────────────────
 FACTORY_CONFIG_PATH = str(Path(__file__).resolve().parent.parent.parent / "resources" / "default_config.json")
 DEFAULT_SYSTEM_PROMPT_PATH = str(Path(__file__).resolve().parent.parent.parent / "resources" / "default_system_prompt.txt")
+ENGINEER_SYSTEM_PROMPT_PATH = str(Path(__file__).resolve().parent.parent.parent / "resources" / "engineer_system_prompt.txt")
 _factory_config_cache: Optional[Dict[str, Any]] = None
 
 
@@ -57,6 +58,26 @@ def load_default_system_prompt_text() -> str:
     except (IOError, OSError) as exc:
         log("WARNING", "config.loader",
             f"Failed to read default system prompt from {DEFAULT_SYSTEM_PROMPT_PATH}: {exc}")
+        return ""
+
+
+def load_engineer_system_prompt_text() -> str:
+    """Load the engineer system prompt from ``resources/engineer_system_prompt.txt``.
+
+    This prompt is used when the session mode is "engineer".
+
+    Returns:
+        The engineer prompt text. If the file cannot be read, returns an empty
+        string so callers can treat it as "no default".
+    """
+    path = Path(ENGINEER_SYSTEM_PROMPT_PATH)
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+    except (IOError, OSError) as exc:
+        log("WARNING", "config.loader",
+            f"Failed to read engineer system prompt from {ENGINEER_SYSTEM_PROMPT_PATH}: {exc}")
         return ""
 
 
@@ -176,15 +197,13 @@ def _migrate_legacy_system_prompt() -> None:
             f"Failed to migrate legacy system prompt {LEGACY_SYSTEM_PROMPT_PATH}: {exc}")
 
 # ── Backup safety ───────────────────────────────────────────────────────────
-BACKUP_DIR_NAME = '.config_backups'
+VAULT_BACKUP_DIR = os.path.join(os.path.expanduser("~"), ".thoughtmachine", "config_backups")
 
 
 def _ensure_backup_dir() -> str:
-    """Return path to config backup directory, creating it if needed."""
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    backup_dir = os.path.join(project_root, BACKUP_DIR_NAME)
-    os.makedirs(backup_dir, exist_ok=True)
-    return backup_dir
+    """Return path to config backup directory (vault), creating it if needed."""
+    os.makedirs(VAULT_BACKUP_DIR, exist_ok=True)
+    return VAULT_BACKUP_DIR
 
 
 def _backup_config(config_path: str) -> Optional[str]:
@@ -308,6 +327,14 @@ def load_config(config_path: str) -> Dict[str, Any]:
         merged_config = _deep_merge_config(factory_config, saved_config)
         log('DEBUG', 'config.loader', f'Loaded config from {config_path} (overlay on factory)')
         merged_config = _backfill_nulls(merged_config)
+        # Drop stray keys (not in AgentConfig schema) before returning so that
+        # strict construction (AgentConfig(**config)) cannot raise.  Preserve
+        # agent_soft_budget_seconds: it is not a model field but is consumed
+        # by AgentConfig's before-validator (map_agent_soft_budget_seconds).
+        _soft_budget = merged_config.pop('agent_soft_budget_seconds', None)
+        _warn_stray_keys(merged_config)
+        if _soft_budget is not None:
+            merged_config['agent_soft_budget_seconds'] = _soft_budget
         return merged_config
     except json.JSONDecodeError as e:
         log('WARNING', 'config.loader',

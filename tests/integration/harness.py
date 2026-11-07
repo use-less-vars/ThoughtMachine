@@ -1,0 +1,518 @@
+"""Hermetic test harness for ``web_ui.backend`` integration tests.
+
+Restart simulation
+------------------
+``start_backend()`` redirects ``HOME`` to a throwaway directory, patches
+``pathlib.Path.home`` to match, purges every app module from ``sys.modules``
+and then imports ``web_ui.backend.server`` fresh.  The returned ``stop_fn``
+restores the environment; calling ``stop_fn(rmtree=False, restore_env=False)``
+keeps the fake HOME alive so a *second* import (``restart()``) simulates a
+process restart against the same persisted ``~/.thoughtmachine`` state.
+
+Isolation rules
+---------------
+* No ``web_ui.backend`` / ``session`` / app imports at module level - the
+  backend is imported lazily inside ``start_backend`` / ``restart``.
+* API-key environment variables are popped before import; only mock providers
+  are registered (``register_mock_provider``) - never real credentials.
+* WebSocket receives always go through a daemon thread + bounded queue so a
+  dead socket cannot hang a test (see ``_receive_json``).
+"""
+from __future__ import annotations
+
+import importlib
+import os
+import pathlib
+import queue
+import shutil
+import sys
+import tempfile
+import threading
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from starlette.testclient import TestClient
+
+_PURGE_PREFIXES = (
+    "web_ui.backend",
+    "agent.config.provider_profile",
+    "thoughtmachine.bootstrap",
+    "session",
+)
+
+
+# Sentinel for "the sys.modules entry / parent-package attribute was absent in
+# the snapshot" -- distinct from any real module object or None.
+_ABSENT = object()
+
+
+def _module_parent(name):
+    """Return ``(parent_package_name, leaf)`` for a dotted module name."""
+    parent_name, _, leaf = name.rpartition(".")
+    if not parent_name or not leaf:
+        return "", ""
+    return parent_name, leaf
+
+
+class SysModulesSnapshot:
+    """Snapshot/purge/restore of ``sys.modules`` entries AND parent attrs.
+
+    A purge that removes a sys.modules entry must also remove the parent-package
+    attribute that holds the stale reference, or a later reload/import will fail.
+
+    A bare ``del sys.modules[name]`` leaves ``package.submodule`` bound on the
+    parent package; a re-import rebinds that attribute to a fresh object while a
+    naive restore puts the OLD object back into ``sys.modules``.  The parent
+    attribute and the ``sys.modules`` entry then disagree in IDENTITY, so
+    ``importlib.reload`` fails its ``sys.modules.get(name) is module`` check with
+    ``ImportError: module ... not in sys.modules``.  This helper keeps the two in
+    lockstep.  Usable as a context manager or via explicit ``snapshot()`` /
+    ``purge()`` / ``restore()`` calls.
+    """
+
+    def __init__(self, prefixes):
+        self._prefixes = tuple(prefixes)
+        self._saved_modules: dict = {}
+        self._saved_attrs: dict = {}
+        self._active = False
+
+    def _matched(self):
+        prefixes = self._prefixes
+        return [
+            n
+            for n in list(sys.modules)
+            if any(n == p or n.startswith(p + ".") for p in prefixes)
+        ]
+
+    def snapshot(self):
+        """Record the matched ``sys.modules`` entries + parent-package attrs."""
+        self._saved_modules = {n: sys.modules[n] for n in self._matched()}
+        self._saved_attrs = {}
+        for n in self._saved_modules:
+            parent_name, child = _module_parent(n)
+            if not parent_name or parent_name in self._saved_modules:
+                continue
+            parent_mod = sys.modules.get(parent_name)
+            if parent_mod is not None:
+                self._saved_attrs.setdefault(parent_name, {})[child] = (
+                    parent_mod.__dict__.get(child, _ABSENT)
+                )
+        self._active = True
+        return self
+
+    def purge(self):
+        """Drop matched modules AND their parent-package attributes."""
+        for name in self._matched():
+            parent_name, leaf = _module_parent(name)
+            parent_pkg = sys.modules.get(parent_name)
+            del sys.modules[name]
+            if parent_pkg is not None and leaf:
+                try:
+                    delattr(parent_pkg, leaf)
+                except AttributeError:
+                    pass
+        return self
+
+    def restore(self):
+        """Drop current matches, reinstate saved modules, re-point parent attrs."""
+        if not self._active:
+            return self
+        for name in self._matched():
+            del sys.modules[name]
+        sys.modules.update(self._saved_modules)
+        for parent_name, attrs in self._saved_attrs.items():
+            parent_mod = sys.modules.get(parent_name)
+            if parent_mod is None:
+                continue
+            for child, value in attrs.items():
+                if value is _ABSENT:
+                    parent_mod.__dict__.pop(child, None)
+                else:
+                    parent_mod.__dict__[child] = value
+        self._active = False
+        return self
+
+    def __enter__(self):
+        return self.snapshot().purge()
+
+    def __exit__(self, *exc):
+        self.restore()
+        return False
+
+
+def purged_sys_modules(prefixes):
+    """Context manager: snapshot+purge matched modules, restore on exit."""
+    return SysModulesSnapshot(prefixes)
+
+
+def _purge_modules() -> None:
+    """Drop every app module so the next import is a cold start.
+
+    Delegates to :class:`SysModulesSnapshot` so the parent-package attributes
+    stay in lockstep with ``sys.modules``: a bare ``del sys.modules[name]``
+    leaves a stale parent attribute, and ``from package import submodule`` then
+    keeps binding that stale object, so a later
+    ``importlib.reload(<stale submodule>)`` raises
+    ``ImportError: module <submodule> not in sys.modules``.
+    """
+    SysModulesSnapshot(_PURGE_PREFIXES).purge()
+
+
+def _snapshot_provider_registry():
+    """Shallow-copy the process-global ProviderFactory registry.
+
+    ``llm_providers.factory`` is intentionally NOT purged by
+    ``_purge_modules()`` (it is not under any purge prefix), so its
+    ``ProviderFactory._providers`` dict survives module purges and is shared
+    by every test file in the process.  Snapshot the clean baseline here so
+    ``stop_fn`` can restore it after this test's mock registrations.
+    """
+    from llm_providers.factory import ProviderFactory
+
+    return dict(ProviderFactory._get_providers())
+
+
+def _restore_provider_registry(snapshot) -> None:
+    """Reset the process-global ProviderFactory registry to ``snapshot``."""
+    from llm_providers.factory import ProviderFactory
+
+    providers = ProviderFactory._get_providers()
+    providers.clear()
+    providers.update(snapshot)
+
+
+# Module-level holder for the pre-purge ``sys.modules`` snapshot (see
+# ``_snapshot_module_state`` / ``_restore_module_state``).  ``None`` means no
+# snapshot is currently held.
+_MODULE_STATE = None
+
+
+def _snapshot_module_state() -> None:
+    """Snapshot the pre-purge app-module state (idempotent guard).
+
+    Captures the ``_PURGE_PREFIXES``-matched ``sys.modules`` entries plus the
+    parent-package attributes that ``_purge_modules()`` deletes and the
+    re-imports rebind, so ``_restore_module_state()`` can put the ORIGINAL
+    singletons back (mirrors the bb608a5 harness).  Guards against clobbering:
+    if a snapshot is already held (e.g. a second ``start_backend()`` in the same
+    process, or ``restart()`` in flight) this is a silent no-op, so the pristine
+    baseline is never overwritten.
+    """
+    global _MODULE_STATE
+    if _MODULE_STATE is not None:
+        return
+    _MODULE_STATE = SysModulesSnapshot(_PURGE_PREFIXES).snapshot()
+
+
+def _restore_module_state() -> None:
+    """Restore the snapshot taken by ``_snapshot_module_state()`` (no-op if none).
+
+    Drops the currently-matched modules, reinstates the saved originals, then
+    re-points the parent-package attributes that the re-imports had rebound to
+    the fresh duplicates (popping attributes that did not exist before).
+    Clears the holder so a later ``start_backend()`` can snapshot again.  A
+    silent no-op when nothing was ever snapshotted.
+    """
+    global _MODULE_STATE
+    if _MODULE_STATE is None:
+        return
+    snapshot = _MODULE_STATE
+    _MODULE_STATE = None
+    snapshot.restore()
+
+
+def start_backend(tmp_home=None):
+    """Start an isolated backend.
+
+    Returns ``(app, tmp_home, stop_fn)``.  ``stop_fn(rmtree=True,
+    restore_env=True)`` tears everything down; pass ``rmtree=False`` and
+    ``restore_env=False`` to keep the fake HOME alive for a restart.
+    """
+    if tmp_home is None:
+        tmp_home = tempfile.mkdtemp(prefix="tm_home_")
+    else:
+        Path(tmp_home).mkdir(parents=True, exist_ok=True)
+    old_home_env = os.environ.get("HOME")
+    os.environ["HOME"] = tmp_home
+    saved_env = {
+        k: os.environ.pop(k, None)
+        for k in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_COMPATIBLE_API_KEY")
+    }
+    patcher = patch.object(pathlib.Path, "home", return_value=Path(tmp_home))
+    patcher.start()
+    _snapshot_module_state()
+    _purge_modules()
+    server_mod = importlib.import_module("web_ui.backend.server")
+    app = server_mod.app
+    provider_snapshot = _snapshot_provider_registry()
+
+    state = {"env_restored": False}
+
+    def stop_fn(rmtree=True, restore_env=True):
+        if restore_env and not state["env_restored"]:
+            try:
+                patcher.stop()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            if old_home_env is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home_env
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            _restore_provider_registry(provider_snapshot)
+            _restore_module_state()
+            state["env_restored"] = True
+        if rmtree:
+            shutil.rmtree(tmp_home, ignore_errors=True)
+
+    return app, tmp_home, stop_fn
+
+
+def restart(tmp_home):
+    """Simulate a process restart against the same ``tmp_home``.
+
+    Assumes the fake HOME is still active (i.e. ``stop_fn(rmtree=False,
+    restore_env=False)`` was used); purges app modules and imports a fresh
+    backend, which reloads the persisted ``~/.thoughtmachine`` state.
+    """
+    _purge_modules()
+    server_mod = importlib.import_module("web_ui.backend.server")
+    return server_mod.app
+
+
+def enable_in_process_trust() -> None:
+    """Declare the in-process harness allowance for THIS interpreter.
+
+    ``auth_boundary`` refuses every request it cannot authenticate, and the
+    harness peer address (``testclient``) is not a credential: the boundary
+    only lets it through while ``auth_boundary.TRUST_TEST_HARNESS`` is on.
+    Under pytest the repository-root ``conftest.py`` turns that flag on for the
+    session AND re-applies it to the module every time it is re-imported (its
+    ``sys.meta_path`` hook), so a test loaded by pytest needs nothing here.
+
+    A child interpreter started by a test has neither: no pytest, therefore no
+    conftest, therefore no hook -- the freshly imported module keeps the shipped
+    default and the child's very first uncredentialed request is refused.  Such
+    a child must declare the allowance itself, which is the only reason this
+    helper exists; it is the other side of the same seam, not a substitute for
+    the hook.
+
+    Call it AFTER the backend has been (re)imported -- i.e. after
+    ``start_backend()`` or ``restart()``, at every such point, because each one
+    purges ``web_ui.backend`` from ``sys.modules`` and the next import builds a
+    cold module whose body assigns the shipped default.  The module is resolved
+    from ``sys.modules`` at call time (and imported first if it is not there
+    yet, so a caller cannot get the order wrong), and the flag is set on the
+    live object the app's middleware closes over.
+    """
+    boundary = sys.modules.get("web_ui.backend.auth_boundary")
+    if boundary is None:
+        boundary = importlib.import_module("web_ui.backend.auth_boundary")
+    boundary.enable_test_harness_trust(True)
+
+
+def make_client(app):
+    return TestClient(app)
+
+
+# ---------------------------------------------------------------------------
+# REST helpers
+# ---------------------------------------------------------------------------
+
+def create_workspace(client, tmp_home, name="ws"):
+    root = os.path.join(tmp_home, name)
+    os.makedirs(root, exist_ok=True)
+    resp = client.post(
+        "/api/workspace", json={"path": root, "purpose": "general"}
+    )
+    assert resp.status_code in (200, 201), (
+        f"create workspace failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()
+
+
+def create_session(client, workspace_id=None, workspace_path=None):
+    payload = {"mode": "custom"}
+    if workspace_id is not None:
+        payload["workspace_id"] = workspace_id
+    if workspace_path is not None:
+        payload["workspace_path"] = workspace_path
+    resp = client.post("/api/session/create", json=payload)
+    assert resp.status_code == 200, (
+        f"create session failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()["session_id"]
+
+
+def put_permissions(client, ws_id, permissions, allow_host_resources=None):
+    payload = {"permissions": permissions}
+    if allow_host_resources is not None:
+        payload["allow_host_resources"] = allow_host_resources
+    resp = client.put(f"/api/workspace/{ws_id}/permissions", json=payload)
+    assert resp.status_code == 200, (
+        f"put permissions failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()
+
+
+def put_session_permissions(client, session_id, permissions):
+    resp = client.put(f"/api/session/{session_id}/permissions", json=permissions)
+    assert resp.status_code == 200, (
+        f"put session permissions failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()
+
+
+def get_summary(client, ws_id):
+    resp = client.get(f"/api/workspace/{ws_id}/summary")
+    assert resp.status_code == 200, (
+        f"workspace summary failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()
+
+
+def get_effective_permissions(client, ws_id, session_id=None):
+    url = f"/api/workspace/{ws_id}/effective_permissions"
+    if session_id is not None:
+        url += f"?session_id={session_id}"
+    resp = client.get(url)
+    assert resp.status_code == 200, (
+        f"effective_permissions failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()
+
+
+def get_providers(client):
+    resp = client.get("/api/providers")
+    assert resp.status_code == 200, (
+        f"get providers failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()
+
+
+def post_provider(client, **fields):
+    resp = client.post("/api/providers", json={"provider": fields})
+    assert resp.status_code in (200, 201), (
+        f"post provider failed: {resp.status_code} {resp.text}"
+    )
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# WebSocket helpers (thread + queue; never a bare receive_json)
+# ---------------------------------------------------------------------------
+
+def _receive_json(ws, timeout=15.0):
+    box = queue.Queue(maxsize=1)
+
+    def _receive_one(_box=box):
+        try:
+            _box.put(("ok", ws.receive_json()))
+        except Exception as exc:  # noqa: BLE001
+            _box.put(("exc", exc))
+
+    threading.Thread(target=_receive_one, daemon=True).start()
+    kind, value = box.get(timeout=timeout)
+    if kind == "exc":
+        raise value
+    return value
+
+
+def ws_connect(client):
+    return client.websocket_connect("/ws")
+
+
+def receive_until_type(ws, target_type, timeout=15.0, max_events=25):
+    """Receive events until ``target_type``; fails on error events."""
+    events = []
+    for _ in range(max_events):
+        evt = _receive_json(ws, timeout=timeout)
+        events.append(evt)
+        if evt.get("type") == "error":
+            pytest.fail(f"[{target_type}] received error event: {evt}")
+        if evt.get("type") == target_type:
+            return evt, events
+    pytest.fail(
+        f"no '{target_type}' event received; got types: "
+        f"{[e.get('type') for e in events]}"
+    )
+
+
+_BAD_STATUS_MARKERS = ("⚠", "failed", "internal error", "not found", "loaded")
+
+
+def receive_until_session_loaded(ws, timeout=15.0, max_events=25):
+    """Receive until a ``session_loaded`` event (with status fail-fast)."""
+    events = []
+    for _ in range(max_events):
+        evt = _receive_json(ws, timeout=timeout)
+        events.append(evt)
+        if evt.get("type") == "error":
+            pytest.fail(f"received error event: {evt}")
+        status = (evt.get("status_message") or "").lower()
+        if any(marker in status for marker in _BAD_STATUS_MARKERS):
+            pytest.fail(f"unexpected status_message in event: {evt}")
+        if evt.get("type") == "session_loaded":
+            return evt, events
+    pytest.fail(
+        "no session_loaded event received; got types: "
+        f"{[e.get('type') for e in events]}"
+    )
+
+
+def drain_more(ws, events, n=3, timeout=5.0):
+    """Best-effort drain of any trailing events (tolerates empty queue)."""
+    for _ in range(n):
+        try:
+            events.append(_receive_json(ws, timeout=timeout))
+        except queue.Empty:
+            return events
+    return events
+
+
+# ---------------------------------------------------------------------------
+# Mock provider
+# ---------------------------------------------------------------------------
+
+def register_mock_provider(server_mod=None, name="mock"):
+    """Register a canned-response mock provider with ProviderFactory.
+
+    Must be called again after every ``start_backend``/``restart`` because
+    ``ProviderFactory`` is re-created on each import.  Returns the previously
+    registered class (or None).
+    """
+    from llm_providers.base import LLMProvider, LLMResponse
+    from llm_providers.factory import ProviderFactory
+
+    class MockProvider(LLMProvider):
+        def __init__(self, config):
+            super().__init__(config)
+            self.call_count = 0
+            self.last_messages = None
+            self.last_tools = None
+
+        def chat_completion(self, messages, tools=None, **kwargs):
+            self.call_count += 1
+            self.last_messages = messages
+            self.last_tools = tools
+            return LLMResponse(
+                content="This is a mock response from the test provider.",
+                reasoning="",
+                tool_calls=None,
+                usage={"prompt_tokens": 10, "completion_tokens": 5},
+                provider=name,
+                model="mock-model",
+            )
+
+        def count_tokens(self, messages, tools=None):
+            return 42
+
+    providers = ProviderFactory._get_providers()
+    prev = providers.get(name)
+    ProviderFactory.register_provider(name, MockProvider)
+    return prev

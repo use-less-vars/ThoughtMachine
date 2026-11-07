@@ -1,0 +1,254 @@
+#===============================================================================
+# python-version-matrix.yml - Python-version compatibility matrix CI.
+#
+# WHY: the install pipeline accepts Python 3.11+ with NO upper ceiling
+# (3.14 is the current supported release line - see
+# install_thoughtmachine.bat and install_thoughtmachine.sh). This workflow
+# makes that promise testable:
+#
+#   * unit-tests - the full pytest suite (minus docker/e2e marked tests)
+#     runs on every supported CPython line: 3.11, 3.12, 3.13 and 3.14.
+#     3.14 is where pip cp314 wheel availability actually gets exercised,
+#     so a failure here is the early-warning signal this change is about.
+#
+#   * installer-contract - static assertions that the installer scripts
+#     really are floor-only: they probe python3.14 FIRST, the winget
+#     auto-install pins Python.Python.3.14, and the 3.15+ warning threshold
+#     is in place. Regression greps prove the old 3.11-3.13 ceiling text is
+#     gone from both installers.
+#
+#   * windows-python-314 - runs the EXACT version-probe snippet used by
+#     install_thoughtmachine.bat on a real Windows runner with Python 3.14:
+#     the new floor-only probe must accept 3.14 (exit 0) and the legacy
+#     capped probe must reject it (non-zero) - proof that 3.14 would have
+#     been blocked before this change.
+#===============================================================================
+name: Python Version Matrix
+
+on:
+  push:
+    branches: [dev, master]
+  pull_request:
+
+concurrency:
+  group: python-version-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests - Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+    # ── Docker Hub rate limiting (anonymous pulls) ─────────────────────────
+    # Docker Hub limits ANONYMOUS pulls to 100 per 6 hours per source IP.
+    # GitHub-hosted runners share their egress IP with other jobs (and other
+    # customers), so a bare `docker pull` can fail with
+    # `toomanyrequests: You have reached your unauthenticated pull rate limit`
+    # through no fault of this repo. Authenticating the daemon against a
+    # Docker Hub account raises that ceiling; the DOCKERHUB_USERNAME guard
+    # below makes the login step a NO-OP until the secrets exist, so this
+    # workflow stays green before the account is wired up and simply falls
+    # back to the old anonymous behaviour.
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      # Images this job's tests pull from Docker Hub. ONE place to edit when a
+      # test starts using a new image. Provenance:
+      #   alpine:3.19      tests/docker/test_reuse_isolation.py:98 (default IMAGE)
+      #   alpine:latest    tests/docker/test_restart_policy_live.py:57 (_IMAGE)
+      #   python:3.11-slim build base of tests/docker/test_persistence.py:75 and
+      #                    tests/docker/test_container_lifecycle.py:85
+      # Deliberately NOT listed: agent-executor / tm-workspace-runtime /
+      # tm-resource-git (built locally), python:3.12(-slim) (only ever written
+      # into a Dockerfile string with a faked client), and alpine:3.19 in
+      # tests/test_worker_sync_query_timeout_containment.py (behind the
+      # WORKER_LIVE_DOCKER gate, so it never pulls in CI).
+      TM_DOCKER_IMAGES: "alpine:3.19 alpine:latest python:3.11-slim"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The directory must exist before actions/cache validates the path, but
+      # the tarball itself must NOT exist yet -- creating it here would make
+      # every run restore a cache hit over an empty/partial archive.
+      - name: Ensure image-cache directory exists
+        run: mkdir -p "$HOME/.cache"
+
+      # A real image cache means caching the IMAGES, not a directory that
+      # Docker happens to fill: `docker pull` writes to /var/lib/docker (root
+      # owned, not restorable on a hosted runner), so caching a custom path
+      # would cache nothing. Instead the warm step below saves every needed
+      # image into ONE tarball and this action caches that tarball. The key
+      # tracks the docker tests (hashFiles) with a restore-keys prefix so an
+      # edited test file still gets the previous run's images as a fallback
+      # and only pulls the delta.
+      - name: Restore cached Docker images
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tm-docker-images.tar
+          key: tm-docker-images-${{ runner.os }}-${{ hashFiles('tests/docker/**') }}
+          restore-keys: |
+            tm-docker-images-${{ runner.os }}-
+
+      # Guarded so it is a no-op today: with no DOCKERHUB_USERNAME secret the
+      # step is skipped and pulls stay anonymous (old behaviour).
+      - name: Log in to Docker Hub (authenticated pulls)
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Load the cached tarball (if any), then pull ONLY what is still
+      # missing. The pull is deliberately NOT `|| true`: if the account is
+      # still rate-limited we want the real daemon error in the log, not a
+      # silent skip that resurfaces as a confusing test failure later.
+      - name: Warm Docker images (load cache, pull what is missing)
+        run: |
+          set -euo pipefail
+          TAR="$HOME/.cache/tm-docker-images.tar"
+          if [ -f "$TAR" ]; then
+            echo "restored cache: $TAR ($(du -h "$TAR" | cut -f1))"
+            docker load -i "$TAR"
+          else
+            echo "no cached tarball: every image below will be pulled"
+          fi
+          for img in $TM_DOCKER_IMAGES; do
+            if docker image inspect "$img" >/dev/null 2>&1; then
+              echo "already present: $img"
+            else
+              echo "pulling: $img"
+              docker pull "$img"
+            fi
+          done
+          if [ ! -f "$TAR" ]; then
+            echo "saving $(echo $TM_DOCKER_IMAGES | wc -w) image(s) to $TAR for the next run"
+            docker save -o "$TAR" $TM_DOCKER_IMAGES
+            ls -lh "$TAR"
+          fi
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      # docker/e2e tests need a real Docker daemon / Playwright browsers;
+      # the plain unit + integration suite must pass on every supported line.
+      #
+      # The two vault-hook tests in tests/security/test_git_hardening.py were
+      # previously deselected because they failed the fail-closed host-git
+      # gate (no allow_host_resources in their workspace config). They now
+      # seed their own <vault>/workspaces/<ws_id>/config.json, so they run
+      # on every matrix line again.
+      - name: Run unit tests
+        run: >
+          python -m pytest -m "not docker and not e2e" --timeout 600 -ra
+
+  installer-contract:
+    name: Installer version-contract assertions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax check
+        run: bash -n install.sh install_thoughtmachine.sh start_thoughtmachine.sh
+
+      - name: install_thoughtmachine.sh probes python3.14 first
+        run: |
+          grep -qF -- "for cmd in python3.14 python3.13 python3.12 python3.11 python3 python; do" install_thoughtmachine.sh \
+            || { echo "::error::install_thoughtmachine.sh must probe python3.14 first"; exit 1; }
+
+      - name: install_thoughtmachine.sh winget auto-install pins Python 3.14
+        run: |
+          grep -qF -- "Python.Python.3.14" install_thoughtmachine.sh \
+            || { echo "::error::winget install must pin Python.Python.3.14"; exit 1; }
+          if grep -qF -- "Python.Python.3.12" install_thoughtmachine.sh; then
+            echo "::error::stale Python.Python.3.12 winget pin still present"
+            exit 1
+          fi
+
+      - name: install_thoughtmachine.sh warns only on 3.15+ (floor-only)
+        run: |
+          grep -qF -- "-ge 15" install_thoughtmachine.sh \
+            || { echo "::error::3.15+ warning threshold missing"; exit 1; }
+          if grep -qF -- 'minor" -ge 14' install_thoughtmachine.sh; then
+            echo "::error::old 3.14+ warning threshold still present (should be 3.15+)"
+            exit 1
+          fi
+
+      - name: install_thoughtmachine.bat gate is floor-only (3.11+)
+        run: |
+          grep -qF -- "sys.version_info[:2] else 1" install_thoughtmachine.bat \
+            || { echo "::error::install_thoughtmachine.bat probe must accept any Python >= 3.11"; exit 1; }
+          grep -qF -- "(3,15)" install_thoughtmachine.bat \
+            || { echo "::error::3.15+ warning probe missing in install_thoughtmachine.bat"; exit 1; }
+          if grep -qF -- "sys.version_info[:2]<=(3,13)" install_thoughtmachine.bat; then
+            echo "::error::old 3.11-3.13 ceiling still present in install_thoughtmachine.bat"
+            exit 1
+          fi
+          if grep -qF -- "3.11-3.13" install_thoughtmachine.bat; then
+            echo "::error::old 3.11-3.13 message still present in install_thoughtmachine.bat"
+            exit 1
+          fi
+
+      - name: Windows .bat files must keep CRLF line endings
+        run: |
+          # cmd.exe REQUIRES CRLF: an LF-only .bat mis-parses multi-line
+          # blocks ("... was unexpected at this time" crashes). .gitattributes
+          # marks *.bat -text, so the CRLF bytes are stored as-is in the repo
+          # and every checkout delivers them - this guard proves they never
+          # drift back to LF.
+          bad=0
+          for f in \
+            install_thoughtmachine.bat start_thoughtmachine.bat check_tm.bat \
+            kill_thoughtmachine.bat build_thoughtmachine_exe.bat; do
+            if [ "$(wc -c < "$f")" -eq "$(tr -d '\r' < "$f" | wc -c)" ]; then
+              echo "::error::$f has NO CRLF bytes - LF-only .bat files crash cmd.exe"
+              bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::run: git add --renormalize on the .bat files (or fix the editor EOL setting)"
+            exit 1
+          fi
+          echo "OK: all 5 .bat files carry CRLF line endings"
+
+  windows-python-314:
+    name: Windows Python 3.14 gate proof
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: New floor-only probe accepts Python 3.14
+        run: |
+          python -c "import sys;sys.exit(0 if (3,11)<=sys.version_info[:2] else 1)"
+          echo "OK: floor-only gate accepted $(python --version 2>&1)"
+
+      - name: Legacy capped probe would have rejected 3.14
+        run: |
+          if python -c "import sys;sys.exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)"; then
+            echo "::error::legacy 3.11-3.13 ceiling unexpectedly accepted Python 3.14"
+            exit 1
+          fi
+          echo "OK: legacy 3.11-3.13 ceiling correctly rejects $(python --version 2>&1)"

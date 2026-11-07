@@ -1,0 +1,149 @@
+{
+  "description": "Reusable worker configuration.\n\nAll fields are flat (no nesting).  Optional fields (``timeout_seconds``,\n``max_turns``, etc.) default to ``None``, meaning the value is inherited\nfrom the spawning session at spawn time.  ``system_prompt`` is required\nand is never inherited from the main agent (workers always get their own\nprompt).",
+  "properties": {
+    "name": {
+      "description": "Unique name for this worker definition.",
+      "title": "Name",
+      "type": "string"
+    },
+    "description": {
+      "description": "Human-readable description of what this worker does.",
+      "title": "Description",
+      "type": "string"
+    },
+    "system_prompt": {
+      "description": "System prompt used to initialise the worker agent.",
+      "title": "System Prompt",
+      "type": "string"
+    },
+    "tools": {
+      "description": "List of tool names this worker is allowed to call.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Tools",
+      "type": "array"
+    },
+    "worker_permissions": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Permission categories required by this worker, e.g. ``{\"filesystem\": \"read\"}``.",
+      "title": "Worker Permissions",
+      "type": "object"
+    },
+    "timeout_seconds": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Maximum wall-clock time for a single worker turn.",
+      "title": "Timeout Seconds"
+    },
+    "max_retries": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Per-worker retry limit for a single worker turn. None means the value is inherited from the spawning session (session_config.worker_max_retries, default WORKER_MAX_RETRIES).",
+      "title": "Max Retries"
+    },
+    "max_turns": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Maximum number of turns before the worker stops.",
+      "title": "Max Turns"
+    },
+    "temperature": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "LLM temperature override for this worker.",
+      "title": "Temperature"
+    },
+    "max_tokens": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Maximum number of tokens for worker LLM responses. None means the worker default (no explicit cap).",
+      "title": "Max Tokens"
+    },
+    "truncation_limit": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Token truncation limit for worker conversations. None means the worker default.",
+      "title": "Truncation Limit"
+    },
+    "warning_threshold_tokens": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": 65000,
+      "description": "Token count threshold for warning state. Used as ``token_monitor_warning_threshold`` in this worker's AgentConfig. Defaults to 65000.",
+      "title": "Warning Threshold Tokens"
+    },
+    "critical_threshold_tokens": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": 80000,
+      "description": "Token count threshold for critical warning. Used as ``token_monitor_critical_threshold`` in this worker's AgentConfig. Defaults to 80000.",
+      "title": "Critical Threshold Tokens"
+    }
+  },
+  "required": [
+    "name",
+    "description",
+    "system_prompt",
+    "tools",
+    "worker_permissions"
+  ],
+  "title": "WorkerDefinition",
+  "type": "object"
+}

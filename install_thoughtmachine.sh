@@ -55,7 +55,7 @@ if $IS_WINDOWS; then
 
     # Python
     PYTHON=""
-    for cmd in python3.12 python3.11 python3 python; do
+    for cmd in python3.14 python3.13 python3.12 python3.11 python3 python; do
         if command -v "$cmd" &>/dev/null; then
             PYTHON="$cmd"
             break
@@ -64,10 +64,10 @@ if $IS_WINDOWS; then
 
     if [[ -z "$PYTHON" ]]; then
         echo "  → Python not found. Installing via winget..."
-        echo "    (Pin: Python 3.12 — 3.14+ lacks package wheels)"
-        winget install --silent --accept-package-agreements Python.Python.3.12 2>&1
+        echo "    (Pin: Python 3.14 — current supported release line)"
+        winget install --silent --accept-package-agreements Python.Python.3.14 2>&1
         # Re-check after install
-        for cmd in python3.12 python3 python; do
+        for cmd in python3.14 python3.13 python3.12 python3 python; do
             if command -v "$cmd" &>/dev/null; then
                 version=$("$cmd" --version 2>&1)
                 major=$(echo "$version" | awk '{print $2}' | cut -d. -f1)
@@ -100,6 +100,7 @@ if $IS_WINDOWS; then
         fi
         echo "  ✓ Python installed: $($PYTHON --version 2>&1)"
         # Refresh PATH so winget-installed python is found
+        export PATH="$PATH:/c/Program Files/Python314:/c/Program Files/Python314/Scripts"
         export PATH="$PATH:/c/Program Files/Python312:/c/Program Files/Python312/Scripts"
         export PATH="$PATH:/c/Program Files/Python311:/c/Program Files/Python311/Scripts"
     else
@@ -133,17 +134,17 @@ echo ""
 echo "[1/5] Checking prerequisites..."
 
 PYTHON=""
-for cmd in python3.12 python3.11 python3 python; do
+for cmd in python3.14 python3.13 python3.12 python3.11 python3 python; do
     if command -v "$cmd" &>/dev/null; then
         version=$("$cmd" --version 2>&1)
         # Parse major.minor — works with "Python 3.12.0" or "Python 3.11"
         major=$(echo "$version" | awk '{print $2}' | cut -d. -f1)
         minor=$(echo "$version" | awk '{print $2}' | cut -d. -f2)
-        # Accept 3.11+. Warn about very new versions (3.14+) but let them try.
+        # Accept 3.11+ (3.14 is supported). Warn only on very new (3.15+) versions.
         if [[ -n "$major" && -n "$minor" && "$major" -eq 3 && "$minor" -ge 11 ]]; then
             PYTHON="$cmd"
             echo "  ✓ Found $PYTHON ($version)"
-            if [[ "$minor" -ge 14 ]]; then
+            if [[ "$minor" -ge 15 ]]; then
                 echo "  ⚠  Python $major.$minor is very new — some packages may lack wheels."
                 echo "     If pip install fails, try Python 3.11 or 3.12."
             fi
@@ -289,6 +290,27 @@ else
 fi
 
 # ── Make scripts executable ────────────────────────────────────────────
+echo "[+] Initialising user vault (~/.thoughtmachine) ..."
+DOCTOR="$PROJECT_DIR/scripts/doctor_checks.py"
+if [[ -x "$VENV_DIR/Scripts/python.exe" ]]; then
+    VAULT_PY="$VENV_DIR/Scripts/python.exe"
+else
+    VAULT_PY="$VENV_DIR/bin/python"
+fi
+[[ -x "$VAULT_PY" ]] || VAULT_PY="$PYTHON"
+if (cd "$PROJECT_DIR" && "$VAULT_PY" -m thoughtmachine.bootstrap); then
+    echo "  ✓ User vault initialised"
+else
+    echo "  ✗ Failed to initialise the user vault (~/.thoughtmachine)"
+    exit 1
+fi
+# Read-only post-condition: the vault must now be present and writable.
+if (cd "$PROJECT_DIR" && "$VAULT_PY" "$DOCTOR" --check-dotthoughtmachine >/dev/null 2>&1); then
+    echo "  ✓ Vault present and writable"
+else
+    echo "  ✗ Vault not writable. Fix with: sudo chown -R $USER ~/.thoughtmachine"
+    exit 1
+fi
 echo ""
 echo "[+] Making scripts executable..."
 chmod +x "$PROJECT_DIR/start_thoughtmachine.sh" 2>/dev/null || true

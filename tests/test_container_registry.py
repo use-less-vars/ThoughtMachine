@@ -1,0 +1,1083 @@
+"""
+Unit tests for infra/container_registry (phase 2 — registry core).
+
+The Docker SDK surface is fully mocked (NO real daemon): docker.from_env,
+client.containers.run, client.containers.get, client.images.get,
+container.stop, container.remove.  A small FakeClient/FakeContainer helper
+pair stands in for the SDK.
+
+Run:  pytest tests/test_container_registry.py -q --tb=short
+"""
+
+import os
+import re
+import sys
+import threading
+import time
+from unittest import mock
+
+import docker
+import pytest
+
+# Make the repository root importable when running this file directly.
+_SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _SRC_ROOT not in sys.path:
+    sys.path.insert(0, _SRC_ROOT)
+
+from infra.container_registry import (  # noqa: E402
+    CONTAINER_NAME_LABEL,
+    CONTAINER_TYPES,
+    DEFAULT_COMMAND,
+    DEFAULT_CPU_QUOTA,
+    DEFAULT_IMAGE,
+    DEFAULT_MAX_CONTAINERS,
+    DEFAULT_MEM_LIMIT,
+    DEFAULT_RESOURCE_OOM_SCORE_ADJ,
+    DEFAULT_TMPFS,
+    DEFAULT_USER_OOM_SCORE_ADJ,
+    HARDENED_CAP_DROP,
+    HARDENED_READ_ONLY,
+    HARDENED_SECURITY_OPT,
+    HARDENED_USER,
+    RESOURCE_IMAGE_TAG,
+    STOP_TIMEOUT,
+    ContainerProfile,
+    ContainerRegistry,
+    create_hardened_container,
+    get_container_registry,
+    _resolve_network_mode_via_gate,
+)
+from thoughtmachine.container_record import (  # noqa: E402
+    LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_PERSISTENT,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fake Docker surface
+# ---------------------------------------------------------------------------
+
+
+class FakeContainer:
+    """Minimal stand-in for docker.models.containers.Container."""
+
+    def __init__(self, name):
+        self.name = name
+        self.id = f"id-{name}"
+        self.stopped = False
+        self.removed = False
+        self.force_removed = False
+        self.stop_timeout = None
+
+    def stop(self, timeout=None):
+        self.stop_timeout = timeout
+        self.stopped = True
+
+    def remove(self, force=False):
+        if force:
+            self.force_removed = True
+        self.removed = True
+
+
+class FakeClient:
+    """Minimal stand-in for docker.client.DockerClient.
+
+    ``containers.run`` returns a FakeContainer named after the ``name`` kwarg;
+    ``containers.get`` returns a FakeContainer and records it in ``gotten`` so
+    tests can inspect stop/remove behavior.
+    """
+
+    def __init__(self):
+        self.gotten = {}
+        self.containers = mock.Mock()
+        self.images = mock.Mock()
+        self.containers.run = mock.Mock(
+            side_effect=lambda image, command=None, **kwargs: FakeContainer(kwargs["name"])
+        )
+        self.containers.get = mock.Mock(side_effect=self._get)
+        self.containers.list = mock.Mock(return_value=[])
+
+    def ping(self):
+        return True
+
+    def _get(self, name):
+        container = FakeContainer(name)
+        self.gotten[name] = container
+        return container
+
+
+class _RecordingLock:
+    """A real lock wrapper that records acquire/release and exposes ``.held``."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.held = False
+        self.events = []
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.held = True
+        self.events.append("acquire")
+        return self
+
+    def __exit__(self, *exc):
+        self.held = False
+        self.events.append("release")
+        self._lock.release()
+        return False
+
+
+class _TracingDict(dict):
+    """A dict that records, at each read/write, whether the lock was held."""
+
+    def __init__(self, trace, lock):
+        super().__init__()
+        self._trace = trace
+        self._lock = lock
+
+    def values(self):
+        self._trace.append(("read", self._lock.held))
+        return super().values()
+
+    def __setitem__(self, key, value):
+        self._trace.append(("write", self._lock.held))
+        super().__setitem__(key, value)
+
+
+@pytest.fixture
+def fake_client():
+    return FakeClient()
+
+
+@pytest.fixture
+def registry(fake_client):
+    return ContainerRegistry(docker_client=fake_client, feature_flag_check=lambda: True)
+
+
+def _run_kwargs(fake_client):
+    """kwargs of the last containers.run call, folding the positional
+    image/command args in (the factory calls run(image, command, ...))."""
+    call = fake_client.containers.run.call_args
+    merged = {}
+    if call.args:
+        merged["image"] = call.args[0]
+    if len(call.args) > 1:
+        merged["command"] = call.args[1]
+    merged.update(call.kwargs)
+    return merged
+
+
+def _default_caps():
+    """The fully-permissive default ``WorkspaceCapabilities`` set."""
+    from security.security_gate import WorkspaceCapabilities
+
+    return WorkspaceCapabilities.default()
+
+
+@pytest.fixture
+def permissive_caps(monkeypatch):
+    """Seed a permissive capability set so the gate resolves network positively.
+
+    ``request_container`` / ``on_permission_changed`` resolve the network mode
+    through ``security.security_gate`` -- whose canonical loader reads the
+    workspace vault from disk and fail-closes to the restrictive ceiling in a
+    hermetic test environment.  Patch the module-level loader so bridge-
+    expecting assertions actually exercise the positive path.
+    """
+    monkeypatch.setattr(
+        "security.security_gate.get_workspace_capabilities",
+        lambda workspace_id=None: _default_caps(),
+    )
+
+
+def _write_disk_grant(vault, workspace_id, session_id, grants):
+    """Seed the on-disk permission store so disk-mode resolution is portable.
+
+    ``request_container`` / ``on_permission_changed`` resolve the network mode
+    through the security gate with BOTH the session and workspace ids, so the
+    vault permission store is the source of truth and the ``permissions``
+    mirror argument is ignored.  A test therefore seeds the session grant
+    (sidecar) AND the matching workspace ceiling (``config.json``) under the
+    hermetic vault.  Re-call with new ``grants`` to change the grant between a
+    create and a reconcile.
+    """
+    import json as _json
+
+    from thoughtmachine.permission_store import write_session_permissions
+
+    write_session_permissions(vault, workspace_id, session_id, grants)
+    cfg_dir = vault / "workspaces" / workspace_id
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(
+        _json.dumps({"permissions": dict(grants)})
+    )
+
+
+# ---------------------------------------------------------------------------
+# ContainerProfile
+# ---------------------------------------------------------------------------
+
+
+class TestContainerProfile:
+    def test_oom_default_by_type(self):
+        assert ContainerProfile(image="i").oom_score_adj == DEFAULT_USER_OOM_SCORE_ADJ
+        assert ContainerProfile(image="i", container_type="user").oom_score_adj == 1000
+        assert ContainerProfile(image="i", container_type="resource").oom_score_adj == 500
+        assert ContainerProfile(image="i", container_type="mcp").oom_score_adj == 500
+        assert ContainerProfile(image="i", container_type="proxy").oom_score_adj == 500
+
+    def test_explicit_oom_wins(self):
+        profile = ContainerProfile(image="i", oom_score_adj=777)
+        assert profile.oom_score_adj == 777
+
+    def test_defaults_command_tmpfs_limits(self):
+        profile = ContainerProfile(image="i")
+        assert profile.command == ["tail", "-f", "/dev/null"]
+        assert profile.tmpfs == DEFAULT_TMPFS
+        assert profile.mem_limit == DEFAULT_MEM_LIMIT
+        assert profile.cpu_quota == DEFAULT_CPU_QUOTA
+        assert profile.network_mode == "none"
+        assert profile.image == "i"
+
+    def test_invalid_container_type_raises(self):
+        with pytest.raises(ValueError, match="Unknown container type"):
+            ContainerProfile(image="i", container_type="bogus")
+
+    def test_containers_type_constant(self):
+        assert CONTAINER_TYPES == ("user", "resource", "mcp", "proxy")
+
+
+# ---------------------------------------------------------------------------
+# create_hardened_container
+# ---------------------------------------------------------------------------
+
+
+class TestCreateHardenedContainer:
+    def test_passes_profile_and_full_hardening(self, fake_client):
+        profile = ContainerProfile(
+            image="img",
+            command=["echo", "hi"],
+            container_type="user",
+            mem_limit="2g",
+            cpu_quota=50000,
+            oom_score_adj=42,
+            network_mode="bridge",
+            labels={"thoughtmachine.workspace_id": "ws1"},
+            environment={"FOO": "bar"},
+            mounts=[{"source": "/host", "target": "/guest", "mode": "rw"}],
+            tmpfs={"/tmp": "rw,size=8m"},
+            extra_hosts={"host.docker.internal": "1.2.3.4"},
+            volumes=["vol1:/data"],
+        )
+        container = create_hardened_container(fake_client, profile, "tm-user-x")
+        assert container.name == "tm-user-x"
+        kwargs = _run_kwargs(fake_client)
+        assert kwargs["image"] == "img"
+        assert kwargs["command"] == ["echo", "hi"]
+        assert kwargs["name"] == "tm-user-x"
+        assert kwargs["oom_score_adj"] == 42
+        assert kwargs["network_mode"] == "bridge"
+        assert kwargs["mem_limit"] == "2g"
+        assert kwargs["memswap_limit"] == "2g"
+        assert kwargs["cpu_quota"] == 50000
+        assert kwargs["cap_drop"] == HARDENED_CAP_DROP
+        assert kwargs["security_opt"] == HARDENED_SECURITY_OPT
+        assert kwargs["read_only"] is HARDENED_READ_ONLY
+        assert kwargs["user"] == HARDENED_USER
+        assert kwargs["detach"] is True
+        assert kwargs["tty"] is True
+        assert kwargs["stdin_open"] is True
+        assert kwargs["labels"] == {"thoughtmachine.workspace_id": "ws1"}
+        assert kwargs["environment"] == {"FOO": "bar"}
+        assert kwargs["tmpfs"] == {"/tmp": "rw,size=8m"}
+        assert kwargs["extra_hosts"] == {"host.docker.internal": "1.2.3.4"}
+        # No raw ``volumes=`` kwarg: volume shorthands are folded into the
+        # ``mounts`` list as real ``docker.types.Mount`` objects.
+        assert "volumes" not in kwargs
+        mounts = kwargs["mounts"]
+        assert all(isinstance(m, docker.types.Mount) for m in mounts)
+        assert [(m["Source"], m["Target"], m["Type"], m["ReadOnly"]) for m in mounts] == [
+            ("/host", "/guest", "bind", False),
+            ("vol1", "/data", "volume", False),
+        ]
+
+    def test_default_profile_hardening(self, fake_client):
+        create_hardened_container(fake_client, ContainerProfile(image="i"), "n1")
+        kwargs = _run_kwargs(fake_client)
+        assert kwargs["command"] == DEFAULT_COMMAND
+        assert kwargs["oom_score_adj"] == DEFAULT_USER_OOM_SCORE_ADJ
+        assert kwargs["network_mode"] == "none"
+        assert kwargs["mem_limit"] == DEFAULT_MEM_LIMIT
+        assert kwargs["memswap_limit"] == DEFAULT_MEM_LIMIT
+        assert kwargs["cpu_quota"] == DEFAULT_CPU_QUOTA
+        assert kwargs["tmpfs"] == DEFAULT_TMPFS
+        assert kwargs["mounts"] == []
+        assert "volumes" not in kwargs
+        assert kwargs["labels"] == {}
+        assert kwargs["environment"] == {}
+        assert kwargs["extra_hosts"] == {}
+
+    def test_mount_conversion_ro_and_default_mode(self, fake_client):
+        profile = ContainerProfile(
+            image="i",
+            mounts=[
+                {"source": "/a", "target": "/b", "mode": "ro"},
+                {"source": "/c", "target": "/d"},
+                {"source": "/e", "target": "/f", "mode": "rw"},
+            ],
+        )
+        create_hardened_container(fake_client, profile, "n2")
+        mounts = _run_kwargs(fake_client)["mounts"]
+        assert all(isinstance(m, docker.types.Mount) for m in mounts)
+        assert [(m["Source"], m["Target"], m["Type"], m["ReadOnly"]) for m in mounts] == [
+            ("/a", "/b", "bind", True),
+            ("/c", "/d", "bind", False),
+            ("/e", "/f", "bind", False),
+        ]
+
+    def test_path_like_volume_source_raises(self, fake_client):
+        path_like = [
+            "/host/path:/ctr",         # absolute host path
+            "./data:/ctr",             # relative host path
+            "~/data:/ctr",             # home-relative host path
+            "\\\\server\\share:/ctr",  # UNC path (backslash)
+        ]
+        for entry in path_like:
+            profile = ContainerProfile(image="i", volumes=[entry])
+            with pytest.raises(ValueError, match="named-volume shorthands") as exc:
+                create_hardened_container(fake_client, profile, "n-path")
+            source = str(entry).split(":")[0]
+            assert repr(source) in str(exc.value)
+
+    def test_drive_letter_volume_source_raises(self, fake_client):
+        # A Windows drive-letter volume source ("C:\\data:/ctr") splits on ":"
+        # into a single-letter ``source``; it must be rejected as path-like
+        # rather than silently accepted as a bogus named volume.
+        path_like = [
+            "C:\\data:/ctr",
+            "D:\\work:/ctr",
+        ]
+        for entry in path_like:
+            profile = ContainerProfile(image="i", volumes=[entry])
+            with pytest.raises(ValueError, match="named-volume shorthands") as exc:
+                create_hardened_container(fake_client, profile, "n-drive")
+            source = str(entry).split(":")[0]
+            assert repr(source) in str(exc.value)
+
+    def test_docker_exception_propagates(self, fake_client):
+        fake_client.containers.run.side_effect = docker.errors.DockerException("boom")
+        with pytest.raises(docker.errors.DockerException):
+            create_hardened_container(fake_client, ContainerProfile(image="i"), "n3")
+
+    def test_inputs_are_copied_not_mutated(self, fake_client):
+        profile = ContainerProfile(
+            image="i", mounts=[{"source": "/a", "target": "/b", "mode": "rw"}]
+        )
+        create_hardened_container(fake_client, profile, "n4")
+        assert profile.mounts == [{"source": "/a", "target": "/b", "mode": "rw"}]
+
+
+# ---------------------------------------------------------------------------
+# register / unregister / listing
+# ---------------------------------------------------------------------------
+
+
+class TestRegistration:
+    def test_register_and_listing(self, registry):
+        profile = ContainerProfile(image="i", container_type="user")
+        registry.register("c1", "sess1", "ws1", "user", profile)
+        registry.register("c2", "sess1", "ws1", "resource", profile)
+        registry.register("c3", "sess2", "ws2", "user", profile)
+
+        assert registry.list_all() == [
+            {"id": "", "name": "c1", "status": "registered", "container_type": "user"},
+            {"id": "", "name": "c2", "status": "registered", "container_type": "resource"},
+            {"id": "", "name": "c3", "status": "registered", "container_type": "user"},
+        ]
+        assert registry.get_containers_for_session("sess1") == [
+            {"id": "", "name": "c1", "status": "registered", "container_type": "user"},
+            {"id": "", "name": "c2", "status": "registered", "container_type": "resource"},
+        ]
+        assert registry.get_containers_for_session("nope") == []
+
+    def test_register_duplicate_raises_valueerror(self, registry):
+        profile = ContainerProfile(image="i")
+        registry.register("c1", "s1", "w1", "user", profile)
+        with pytest.raises(ValueError, match="already registered"):
+            registry.register("c1", "s1", "w1", "user", profile)
+
+    def test_register_invalid_type_raises_valueerror(self, registry):
+        with pytest.raises(ValueError, match="Unknown container type"):
+            registry.register("c1", "s1", "w1", "bogus", ContainerProfile(image="i"))
+
+    def test_unregister(self, registry):
+        profile = ContainerProfile(image="i")
+        registry.register("c1", "s1", "w1", "user", profile)
+        registry.register("c2", "s1", "w1", "user", profile)
+        assert registry.unregister("c1") is True
+        assert "c1" not in registry._containers
+        assert "c1" not in registry._session_map["s1"]
+        assert registry.get_containers_for_session("s1") == [
+            {"id": "", "name": "c2", "status": "registered", "container_type": "user"}
+        ]
+
+    def test_unregister_absent_returns_false(self, registry):
+        assert registry.unregister("ghost") is False
+
+
+# ---------------------------------------------------------------------------
+# request_container
+# ---------------------------------------------------------------------------
+
+
+class TestRequestContainer:
+    def test_request_creates_registers_and_returns_handle(
+        self, registry, fake_client, permissive_caps, hermetic_vault
+    ):
+        _write_disk_grant(
+            hermetic_vault, "ws-123", "sess-1",
+            {"network": "write", "filesystem": "write"},
+        )
+        handle = registry.request_container(
+            "worker-1", "sess-1", {"network": "write", "filesystem": "write"},
+            workspace_id="ws-123",
+        )
+        assert set(handle) == {"id", "name", "status", "container_type"}
+        assert handle["status"] == "running"
+        assert handle["container_type"] == "user"
+        assert re.fullmatch(r"tm-user-ws-123-[0-9a-f]{8}", handle["name"])
+        assert handle["id"] == f"id-{handle['name']}"
+
+        kwargs = _run_kwargs(fake_client)
+        assert kwargs["name"] == handle["name"]
+        assert kwargs["image"] == DEFAULT_IMAGE
+        assert kwargs["command"] == DEFAULT_COMMAND
+        assert kwargs["network_mode"] == "bridge"  # network write -> bridge
+        assert kwargs["oom_score_adj"] == DEFAULT_USER_OOM_SCORE_ADJ
+        assert kwargs["cap_drop"] == HARDENED_CAP_DROP
+        assert kwargs["security_opt"] == HARDENED_SECURITY_OPT
+        assert kwargs["read_only"] is True
+        assert kwargs["user"] == HARDENED_USER
+        assert kwargs["detach"] is True
+
+        # registered with a running status + container id
+        state = registry._containers[handle["name"]]
+        assert state["status"] == "running"
+        assert state["container_id"] == handle["id"]
+        assert state["session_id"] == "sess-1"
+        assert state["workspace_id"] == "ws-123"
+        assert state["quarantined"] is False
+        assert registry.get_containers_for_session("sess-1") == [handle]
+
+    def test_request_network_resolution(
+        self, registry, fake_client, permissive_caps, hermetic_vault
+    ):
+        # The network mode is now resolved from the disk-side permission store
+        # (both ids present), not the ``permissions`` mirror argument, so each
+        # request's grant is seeded on disk first.
+        _write_disk_grant(hermetic_vault, "ws", "s", {"network": "write"})
+        registry.request_container("w", "s", {"network": "write"}, workspace_id="ws")
+        assert _run_kwargs(fake_client)["network_mode"] == "bridge"
+        # all calls here share the explicit workspace "ws"; the 5 requests stay
+        # under DEFAULT_MAX_CONTAINERS (6) so the budget is never reached
+        _write_disk_grant(hermetic_vault, "ws", "s2", {"network": "outbound"})
+        registry.request_container("w", "s2", {"network": "outbound"}, workspace_id="ws")
+        assert _run_kwargs(fake_client)["network_mode"] == "bridge"
+        # ``True`` is not a catalog level for ``network``; the disk grant must be
+        # the canonical ``"write"`` to resolve to bridge.
+        _write_disk_grant(hermetic_vault, "ws", "s", {"network": "write"})
+        registry.request_container("w", "s", {"network": True}, workspace_id="ws")
+        assert _run_kwargs(fake_client)["network_mode"] == "bridge"
+        _write_disk_grant(hermetic_vault, "ws", "s", {"network": "banned"})
+        registry.request_container("w", "s", {"network": False}, workspace_id="ws")
+        assert _run_kwargs(fake_client)["network_mode"] == "none"
+        _write_disk_grant(hermetic_vault, "ws", "s", {})
+        registry.request_container("w", "s", {}, workspace_id="ws")
+        assert _run_kwargs(fake_client)["network_mode"] == "none"
+
+    def test_request_unique_names(self, registry):
+        h1 = registry.request_container("w", "s", {}, workspace_id="ws")
+        h2 = registry.request_container("w", "s", {}, workspace_id="ws")
+        assert h1["name"] != h2["name"]
+        assert len(registry._session_map["s"]) == 2
+
+    def test_request_kwargs_flow_into_profile(self, registry, fake_client):
+        handle = registry.request_container(
+            "w", "s", {}, workspace_id="ws9", mem_limit="512m", cpu_quota=50000,
+            oom_score_adj=500, labels={"a": "b"}, environment={"X": "1"},
+            mounts=[{"source": "/s", "target": "/t", "mode": "ro"}],
+            tmpfs={"/tmp": "rw,size=4m"}, extra_hosts={"h": "1.2.3.4"},
+            volumes=["v:/d"],
+        )
+        kwargs = _run_kwargs(fake_client)
+        assert kwargs["name"] == handle["name"]
+        assert kwargs["mem_limit"] == "512m"
+        assert kwargs["memswap_limit"] == "512m"
+        assert kwargs["cpu_quota"] == 50000
+        assert kwargs["oom_score_adj"] == 500
+        # The record-creation hook (§7) injects the record-owned label into the
+        # SAME dict that reaches containers.run; pop it off and assert the rest
+        # is unchanged, then confirm the injected id names a real record.
+        from thoughtmachine.container_record import RECORD_LABEL_KEY, load_record
+
+        run_labels = dict(kwargs["labels"])
+        record_id = run_labels.pop(RECORD_LABEL_KEY)
+        assert record_id  # non-empty record id was injected
+        # v3 identity: the free-use path stamps the workspace-scoped
+        # container-name label so the record and container agree on identity;
+        # assert it names this handle, then the rest of the labels are unchanged.
+        assert run_labels.pop(CONTAINER_NAME_LABEL) == handle["name"]
+        # The record-creation hook also stamps creator attribution (§7); the
+        # registry create is session-driven, so it names the session.
+        from thoughtmachine.container_record.hook import CREATED_BY_LABEL
+
+        assert run_labels.pop(CREATED_BY_LABEL) == "agent:session:s"
+        assert run_labels == {
+            "a": "b",
+            "thoughtmachine.container_type": "free_use",
+        }
+        record = load_record("ws9", record_id)
+        assert record is not None
+        assert record.docker_id == handle["id"]
+        # The identity env is merged unconditionally by the create primitive:
+        # the caller's env vars survive, plus the workspace/session identity.
+        assert kwargs["environment"] == {
+            "X": "1",
+            "THOUGHTMACHINE_SESSION_ID": "s",
+            "THOUGHTMACHINE_WORKSPACE_ID": "ws9",
+        }
+        assert kwargs["tmpfs"] == {"/tmp": "rw,size=4m"}
+        assert kwargs["extra_hosts"] == {"h": "1.2.3.4"}
+        # ``volumes=`` is gone; the ``"v:/d"`` shorthand is a volume mount.
+        assert "volumes" not in kwargs
+        mounts = kwargs["mounts"]
+        assert all(isinstance(m, docker.types.Mount) for m in mounts)
+        assert [(m["Source"], m["Target"], m["Type"], m["ReadOnly"]) for m in mounts] == [
+            ("/s", "/t", "bind", True),
+            ("v", "/d", "volume", False),
+        ]
+
+    def test_request_network_mode_kwarg_overridden_by_permissions(self, registry, fake_client):
+        registry.request_container("w", "s", {"network": False}, workspace_id="ws", network_mode="bridge")
+        assert _run_kwargs(fake_client)["network_mode"] == "none"
+
+    def test_request_resource_guard(self, registry):
+        with pytest.raises(PermissionError, match="Resource container access denied"):
+            registry.request_container("w", "s", {}, image=RESOURCE_IMAGE_TAG, workspace_id="ws")
+        with pytest.raises(PermissionError, match="Resource container access denied"):
+            registry.request_container("w", "s", {}, container_type="resource", workspace_id="ws")
+        with pytest.raises(PermissionError, match="Resource container access denied"):
+            registry.request_container("w", "s", {}, name="tm-res-x", workspace_id="ws")
+
+    def test_request_container_limit_reached(self, registry, fake_client):
+        profile = ContainerProfile(image="i")
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            registry.register(f"c{i}", "sess-l", "ws", "user", profile)
+        assert fake_client.containers.run.call_count == 0
+        with pytest.raises(RuntimeError, match="Container limit reached"):
+            registry.request_container("w", "sess-l", {}, workspace_id="ws")
+        assert fake_client.containers.run.call_count == 0
+
+    def test_request_limit_from_session_config(self, registry, fake_client):
+        registry.request_container(
+            "w", "sess-c", {}, workspace_id="ws",
+            session_config={"container_limits": {"max_containers": 1}}
+        )
+        with pytest.raises(RuntimeError, match="Container limit reached"):
+            registry.request_container(
+                "w", "sess-c", {}, workspace_id="ws",
+                session_config={"container_limits": {"max_containers": 1}}
+            )
+        # a different WORKSPACE has its own budget (the limit is per-workspace,
+        # not per-session)
+        registry.request_container(
+            "w", "sess-d", {}, workspace_id="ws-other",
+            session_config={"container_limits": {"max_containers": 1}},
+        )
+
+    def test_limit_is_per_workspace_not_per_session(self, registry, fake_client):
+        profile = ContainerProfile(image="i")
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            registry.register(f"c{i}", f"sess-{i}", "ws-shared", "user", profile)
+        assert fake_client.containers.run.call_count == 0
+        # a NEW session in the SAME workspace is blocked by the shared budget
+        with pytest.raises(RuntimeError, match="Container limit reached"):
+            registry.request_container("w", "sess-new", {}, workspace_id="ws-shared")
+        assert fake_client.containers.run.call_count == 0
+        # a DIFFERENT workspace has its own, independent budget
+        handle = registry.request_container("w", "sess-new", {}, workspace_id="ws-other")
+        assert handle["status"] == "running"
+        assert fake_client.containers.run.call_count == 1
+
+    def test_request_budget_read_and_reserve_are_atomic(self, registry, fake_client):
+        """The per-workspace count read and the reservation write must happen
+        under ONE held lock (deterministic -- no threads/timing)."""
+        lock = _RecordingLock()
+        trace = []
+        registry._lock = lock
+        registry._containers = _TracingDict(trace, lock)
+        registry.request_container("w", "sess-atomic", {}, workspace_id="ws-a")
+        assert trace == [("read", True), ("write", True)]
+        # request_container takes the lock twice (budget+reserve, then the
+        # post-create status update); a read/write SPLIT would add a third
+        # acquisition pair, so pin the exact two-pair sequence.
+        assert lock.events == ["acquire", "release", "acquire", "release"]
+        assert lock.events[0] == "acquire"
+        assert lock.events[-1] == "release"
+
+    def test_request_invalid_type_raises_before_docker(self, registry, fake_client):
+        with pytest.raises(ValueError, match="Unknown container type"):
+            registry.request_container("w", "s", {}, container_type="bogus", workspace_id="ws")
+        assert fake_client.containers.run.call_count == 0
+
+    def test_request_missing_or_blank_workspace_id_fails_closed(self, registry, fake_client):
+        # A missing/blank workspace_id must fail closed BEFORE any docker call:
+        # there is no default "ws" bucket (it would silently merge budgets).
+        with pytest.raises(ValueError, match="workspace_id"):
+            registry.request_container("w", "s", {})
+        for bad in (None, "", "   "):
+            with pytest.raises(ValueError, match="workspace_id"):
+                registry.request_container("w", "s", {}, workspace_id=bad)
+        assert fake_client.containers.run.call_count == 0
+
+    def test_request_disabled_raises(self):
+        reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: False)
+        assert reg.is_enabled() is False
+        with pytest.raises(RuntimeError, match="ContainerRegistry is disabled"):
+            reg.request_container("w", "s", {}, workspace_id="ws")
+
+    def test_request_without_docker_client_raises(self):
+        with mock.patch(
+            "docker.from_env",
+            side_effect=docker.errors.DockerException("no daemon"),
+        ):
+            reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: True)
+            with pytest.raises(RuntimeError, match="Docker client unavailable"):
+                reg.request_container("w", "s", {}, workspace_id="ws")
+
+
+# ---------------------------------------------------------------------------
+# workspace container-cap slot accounting (availability fix)
+# ---------------------------------------------------------------------------
+
+
+def _seed_record(registry, name, workspace_id, status, container_id="",
+                 lifecycle_class=LIFECYCLE_PERSISTENT, session_id="sess-cap"):
+    """Seed a registry record in an arbitrary lifecycle state."""
+    profile = ContainerProfile(image="i")
+    registry.register(name, session_id, workspace_id, "user", profile)
+    state = registry._containers[name]
+    state["status"] = status
+    state["container_id"] = container_id
+    state["lifecycle_class"] = lifecycle_class
+
+
+def _raise_not_found(cid):
+    raise docker.errors.NotFound(f"no such container: {cid}")
+
+
+class TestWorkspaceCapSlotAccounting:
+    """The per-workspace cap must bound LIVE PERSISTENT containers only, so a
+    workspace whose containers have stopped is never deadlocked."""
+
+    def test_exited_records_do_not_consume_slots(self, registry, fake_client):
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            _seed_record(registry, f"c{i}", "ws", "running", f"id-live{i}")
+        # 3 of the 6 records have actually stopped (exited/dead); one even names
+        # a docker id that no longer exists.
+        registry._containers["c0"]["status"] = "exited"
+        registry._containers["c1"]["status"] = "dead"
+        registry._containers["c2"]["status"] = "exited"
+        registry._containers["c2"]["container_id"] = "id-gone"
+        fake_client.containers.get.side_effect = (
+            lambda cid: _raise_not_found(cid) if cid == "id-gone"
+            else FakeContainer(cid)
+        )
+        assert registry._count_consuming_slots("ws") == 3
+        handle = registry.request_container("w", "s", {}, workspace_id="ws")
+        assert handle["status"] == "running"
+        assert fake_client.containers.run.call_count == 1
+
+    def test_gone_container_id_does_not_consume_a_slot(self, registry, fake_client):
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            _seed_record(registry, f"c{i}", "ws", "running", f"id-{i}")
+        fake_client.containers.get.side_effect = (
+            lambda cid: _raise_not_found(cid) if cid == "id-4"
+            else FakeContainer(cid)
+        )
+        assert registry._count_consuming_slots("ws") == DEFAULT_MAX_CONTAINERS - 1
+        handle = registry.request_container("w", "s", {}, workspace_id="ws")
+        assert handle["status"] == "running"
+
+    def test_live_persistent_cap_still_refuses(self, registry, fake_client):
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            _seed_record(registry, f"c{i}", "ws", "running", f"id-{i}")
+        assert registry._count_consuming_slots("ws") == DEFAULT_MAX_CONTAINERS
+        with pytest.raises(RuntimeError, match="Container limit reached"):
+            registry.request_container("w", "s", {}, workspace_id="ws")
+        assert fake_client.containers.run.call_count == 0
+        # the refused reservation was never inserted (no slot leak)
+        assert len(registry._containers) == DEFAULT_MAX_CONTAINERS
+
+    def test_ephemeral_records_do_not_consume_the_persistent_budget(
+        self, registry, fake_client
+    ):
+        for i in range(DEFAULT_MAX_CONTAINERS - 1):
+            _seed_record(registry, f"p{i}", "ws", "running", f"pid-{i}")
+        for i in range(3):
+            _seed_record(registry, f"e{i}", "ws", "running", f"eid-{i}",
+                         lifecycle_class=LIFECYCLE_EPHEMERAL)
+        assert registry._count_consuming_slots("ws") == DEFAULT_MAX_CONTAINERS - 1
+        handle = registry.request_container("w", "s", {}, workspace_id="ws")
+        assert handle["status"] == "running"
+        assert fake_client.containers.run.call_count == 1
+
+    def test_refusal_message_is_actionable_and_accurate(self, registry, fake_client):
+        for i in range(DEFAULT_MAX_CONTAINERS):
+            _seed_record(registry, f"c{i}", "ws", "running", f"id-{i}")
+        # 3 extra EXITED records must not inflate the reported number.
+        for i in range(3):
+            _seed_record(registry, f"x{i}", "ws", "exited", f"xid-{i}")
+        with pytest.raises(RuntimeError) as excinfo:
+            registry.request_container("w", "s", {}, workspace_id="ws")
+        msg = str(excinfo.value)
+        assert "Container limit reached" in msg
+        # reports the LIVE count (6), not the raw record count (9)
+        assert "6/6" in msg
+        assert "9" not in msg
+        # names an action that actually exists
+        from tools.container_control import ContainerRemoveTool
+        assert ContainerRemoveTool is not None
+        assert "ContainerRemoveTool" in msg
+        # and does not reuse the misleading "active container(s)" phrasing
+        assert "active container(s)" not in msg
+
+
+# ---------------------------------------------------------------------------
+# destroy_container
+# ---------------------------------------------------------------------------
+
+
+class TestDestroyContainer:
+    def test_graceful_stop_remove_unregister(self, registry, fake_client):
+        handle = registry.request_container("w", "sess-d", {}, workspace_id="ws")
+        registry.destroy_container(handle["name"])
+        gotten = fake_client.gotten[handle["name"]]
+        assert gotten.stop_timeout == STOP_TIMEOUT
+        assert gotten.stopped is True
+        assert gotten.removed is True
+        assert gotten.force_removed is False
+        assert handle["name"] not in registry._containers
+        # unregister removes the now-empty session key entirely
+        assert handle["name"] not in registry._session_map.get("sess-d", set())
+
+    def test_force_remove_fallback_on_docker_exception(self, registry, fake_client):
+        handle = registry.request_container("w", "sess-f", {}, workspace_id="ws")
+
+        class BoomStop(FakeContainer):
+            def stop(self, timeout=None):
+                raise docker.errors.DockerException("stop failed")
+
+        def get_boom(name):
+            container = BoomStop(name)
+            fake_client.gotten[name] = container
+            return container
+
+        fake_client.containers.get.side_effect = get_boom
+        registry.destroy_container(handle["name"])
+        assert fake_client.gotten[handle["name"]].force_removed is True
+        assert handle["name"] not in registry._containers
+
+    def test_destroy_unregistered_is_noop(self, registry, fake_client):
+        registry.destroy_container("ghost")
+        assert fake_client.containers.get.call_count == 0
+
+    def test_destroy_unregisters_even_when_docker_get_fails(self, registry, fake_client):
+        handle = registry.request_container("w", "sess-g", {}, workspace_id="ws")
+        fake_client.containers.get.side_effect = docker.errors.DockerException("missing")
+        registry.destroy_container(handle["name"])
+        assert handle["name"] not in registry._containers
+
+
+# ---------------------------------------------------------------------------
+# on_permission_changed
+# ---------------------------------------------------------------------------
+
+
+class TestPermissionReconciliation:
+    def test_noop_when_network_unchanged(self, registry, fake_client):
+        handle = registry.request_container("w", "sess-p", {"network": False}, workspace_id="ws")
+        registry.on_permission_changed("sess-p", {"network": False})
+        assert fake_client.containers.run.call_count == 1  # only the initial create
+        assert fake_client.containers.get.call_count == 0
+        assert registry._containers[handle["name"]]["status"] == "running"
+
+    def test_recreate_on_network_change_same_name(
+        self, registry, fake_client, permissive_caps, hermetic_vault
+    ):
+        _write_disk_grant(hermetic_vault, "ws", "sess-p", {"network": "banned"})
+        handle = registry.request_container("w", "sess-p", {"network": False}, workspace_id="ws")
+        assert _run_kwargs(fake_client)["network_mode"] == "none"
+
+        _write_disk_grant(hermetic_vault, "ws", "sess-p", {"network": "write"})
+        registry.on_permission_changed("sess-p", {"network": "write"})
+        assert fake_client.containers.run.call_count == 2
+        assert _run_kwargs(fake_client)["network_mode"] == "bridge"
+        assert _run_kwargs(fake_client)["name"] == handle["name"]  # SAME name
+        # teardown used the graceful path on the old container
+        assert fake_client.gotten[handle["name"]].stopped is True
+        assert fake_client.gotten[handle["name"]].removed is True
+        # state updated: still one registered container, running, new profile
+        assert registry.get_containers_for_session("sess-p") == [
+            {"id": f"id-{handle['name']}", "name": handle["name"],
+             "status": "running", "container_type": "user"}
+        ]
+        state = registry._containers[handle["name"]]
+        assert state["profile"].network_mode == "bridge"
+        assert state["quarantined"] is False
+
+    def test_idempotent_second_event_is_noop(
+        self, registry, fake_client, permissive_caps, hermetic_vault
+    ):
+        _write_disk_grant(hermetic_vault, "ws", "sess-p", {"network": "banned"})
+        registry.request_container("w", "sess-p", {"network": False}, workspace_id="ws")
+        _write_disk_grant(hermetic_vault, "ws", "sess-p", {"network": "write"})
+        registry.on_permission_changed("sess-p", {"network": "write"})
+        assert fake_client.containers.run.call_count == 2
+        registry.on_permission_changed("sess-p", {"network": "write"})
+        assert fake_client.containers.run.call_count == 2  # no third create
+
+    def test_teardown_failure_quarantines(
+        self, registry, fake_client, permissive_caps, hermetic_vault
+    ):
+        _write_disk_grant(hermetic_vault, "ws", "sess-q", {"network": "banned"})
+        handle = registry.request_container("w", "sess-q", {"network": False}, workspace_id="ws")
+        _write_disk_grant(hermetic_vault, "ws", "sess-q", {"network": "write"})
+
+        class BoomStop(FakeContainer):
+            def stop(self, timeout=None):
+                raise docker.errors.DockerException("stop failed")
+
+        fake_client.containers.get.side_effect = lambda name: BoomStop(name)
+        registry.on_permission_changed("sess-q", {"network": "write"})
+        # quarantined: removed from the session map, no recreate
+        assert fake_client.containers.run.call_count == 1
+        state = registry._containers[handle["name"]]
+        assert state["quarantined"] is True
+        assert state["status"] == "quarantined"
+        assert handle["name"] not in registry._session_map["sess-q"]
+
+    def test_recreate_failure_does_not_raise(
+        self, registry, fake_client, permissive_caps, hermetic_vault
+    ):
+        _write_disk_grant(hermetic_vault, "ws", "sess-r", {"network": "banned"})
+        handle = registry.request_container("w", "sess-r", {"network": False}, workspace_id="ws")
+        _write_disk_grant(hermetic_vault, "ws", "sess-r", {"network": "write"})
+        fake_client.containers.run.side_effect = docker.errors.DockerException("create failed")
+        registry.on_permission_changed("sess-r", {"network": "write"})
+        state = registry._containers[handle["name"]]
+        assert state["status"] == "recreate_failed"
+        assert handle["name"] in registry._session_map["sess-r"]  # slot kept for retry
+        assert state["quarantined"] is False
+
+
+class TestDriftEventBindingConstraint:
+    """The drift event must be bound to the container record's id.
+
+    ``on_permission_changed`` emits exactly ONE ``drift.policy_config_changed``
+    event per network-mode change, recorded against the container's record via
+    the ``RECORD_LABEL_KEY`` label.  The id survives the recreate because the
+    profile's ``labels`` dict (mutated in place by the record-creation hook) is
+    carried across ``dataclasses.replace``.
+    """
+
+    def test_drift_event_recorded_once_and_is_idempotent(
+        self, registry, fake_client, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        monkeypatch.setattr(
+            "security.security_gate.get_workspace_capabilities",
+            lambda workspace_id=None: _default_caps(),
+        )
+        from thoughtmachine.container_record import RECORD_LABEL_KEY, read_event_log
+
+        vault = tmp_path / "vault"
+        _write_disk_grant(vault, "ws-drift", "sess-drift", {"network": "banned"})
+        handle = registry.request_container(
+            "w", "sess-drift", {"network": False}, workspace_id="ws-drift"
+        )
+        name = handle["name"]
+        record_id = registry._containers[name]["profile"].labels[RECORD_LABEL_KEY]
+        assert record_id  # the record-creation hook injected a record id
+
+        _write_disk_grant(vault, "ws-drift", "sess-drift", {"network": "write"})
+        registry.on_permission_changed("sess-drift", {"network": "write"})
+
+        events = [
+            e for e in read_event_log("ws-drift", record_id)
+            if e["event_type"] == "drift.policy_config_changed"
+        ]
+        assert len(events) == 1
+        assert events[0]["actor"] == "infra.container_registry.on_permission_changed"
+        assert events[0]["payload"]["container"] == name
+        assert events[0]["payload"]["old_mode"] == "none"
+        assert events[0]["payload"]["new_mode"] == "bridge"
+
+        # A second identical event is an idempotent no-op: no new drift event.
+        registry.on_permission_changed("sess-drift", {"network": "write"})
+        events_again = [
+            e for e in read_event_log("ws-drift", record_id)
+            if e["event_type"] == "drift.policy_config_changed"
+        ]
+        assert len(events_again) == 1
+
+    def test_drift_event_skipped_when_no_record_id(
+        self, registry, fake_client, monkeypatch, hermetic_vault
+    ):
+        monkeypatch.setattr(
+            "security.security_gate.get_workspace_capabilities",
+            lambda workspace_id=None: _default_caps(),
+        )
+        _write_disk_grant(hermetic_vault, "ws-nr", "sess-nr", {"network": "write"})
+        name = "tm-user-norecord"
+        registry.register(
+            name,
+            "sess-nr",
+            "ws-nr",
+            "user",
+            ContainerProfile(image="i", network_mode="none"),
+        )
+        calls = []
+        monkeypatch.setattr(
+            "thoughtmachine.container_record.append_event",
+            lambda *a, **k: calls.append((a, k)),
+        )
+
+        # No RECORD_LABEL_KEY in the profile labels and the fake container has
+        # no ``labels`` attribute -> unresolvable record id: no event, no raise.
+        registry.on_permission_changed("sess-nr", {"network": "write"})
+        assert calls == []
+        assert registry._containers[name]["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# feature flag / helpers / docker init
+# ---------------------------------------------------------------------------
+
+
+class TestFeatureFlagAndHelpers:
+    def test_get_container_registry_ignores_retired_flag(self):
+        # ``is_container_registry_enabled`` is deleted: the retained factory no
+        # longer gates on the retired ``use_container_registry`` key -- it always
+        # returns an enabled registry that connects to the daemon.
+        with mock.patch("docker.from_env", return_value=FakeClient()) as from_env:
+            reg = get_container_registry(session_config={"use_container_registry": False})
+            from_env.assert_called_once()
+        assert reg.is_enabled() is True
+        assert reg._docker_client is not None
+
+    def test_get_container_registry_enabled_config(self, fake_client):
+        reg = get_container_registry(docker_client=fake_client, session_config={})
+        assert reg.is_enabled() is True
+        handle = reg.request_container("w", "s", {}, workspace_id="ws")
+        assert handle["status"] == "running"
+
+    def test_constructor_skips_docker_when_flag_off(self):
+        with mock.patch("docker.from_env") as from_env:
+            reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: False)
+            from_env.assert_not_called()
+        assert reg._docker_available is False
+
+    def test_constructor_connects_when_flag_on(self):
+        with mock.patch("docker.from_env", return_value=FakeClient()) as from_env:
+            reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: True)
+            from_env.assert_called_once()
+        assert reg._docker_available is True
+
+    def test_constructor_from_env_failure_is_graceful(self):
+        with mock.patch("docker.from_env", side_effect=docker.errors.DockerException("no daemon")):
+            reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: True)
+        assert reg._docker_available is False
+        with pytest.raises(RuntimeError, match="Docker client unavailable"):
+            reg.request_container("w", "s", {}, workspace_id="ws")
+
+    def test_default_flag_check_means_enabled(self, fake_client):
+        reg = ContainerRegistry(docker_client=fake_client)
+        assert reg.is_enabled() is True
+        assert reg.request_container("w", "s", {}, workspace_id="ws")["status"] == "running"
+
+    def test_is_resource_image_available(self, fake_client):
+        reg = ContainerRegistry(docker_client=fake_client, feature_flag_check=lambda: True)
+        fake_client.images.get.return_value = object()
+        assert reg.is_resource_image_available() is True
+        fake_client.images.get.side_effect = docker.errors.ImageNotFound("missing")
+        assert reg.is_resource_image_available() is False
+        fake_client.images.get.side_effect = docker.errors.DockerException("daemon down")
+        assert reg.is_resource_image_available() is False
+
+    def test_is_resource_image_available_without_client(self):
+        reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: False)
+        assert reg.is_resource_image_available() is False
+
+    def test_resolve_network_mode(self, permissive_caps):
+        # ``ContainerRegistry.resolve_network_mode`` was removed in the
+        # SSOT migration; the module-level gate adapter is the replacement
+        # leaf for the same permissions-dict -> network-mode mapping.
+        #
+        # Disk-authoritative: the vault is the source of truth, so the seam is
+        # stubbed per-call to the corresponding on-disk grant.
+        def _resolve(perms):
+            with mock.patch(
+                "security.security_gate._read_disk_permission_sources",
+                return_value=(perms or {}, None),
+            ):
+                return _resolve_network_mode_via_gate("ws", perms)
+
+        assert _resolve({"network": "write"}) == "bridge"
+        assert _resolve({"network": "outbound"}) == "bridge"
+        # A bare bool is NOT a canonical stored network level (the disk store
+        # holds only "banned"/"ask"/"write"/"outbound"); the loader drops it
+        # fail-closed to "none".
+        assert _resolve({"network": True}) == "none"
+        assert _resolve({"network": False}) == "none"
+        assert _resolve({"network": "banned"}) == "none"
+        assert _resolve({"network": "ask"}) == "none"
+        assert _resolve({}) == "none"
+        assert _resolve(None) == "none"
+
+
+# ---------------------------------------------------------------------------
+# concurrency
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrency:
+    def test_concurrent_request_containers(self, fake_client):
+        real_run = fake_client.containers.run.side_effect
+
+        def slow_run(image, command=None, **kwargs):
+            time.sleep(0.01)
+            return real_run(image, command, **kwargs)
+
+        fake_client.containers.run.side_effect = slow_run
+        reg = ContainerRegistry(docker_client=fake_client, feature_flag_check=lambda: True)
+
+        errors, results = [], []
+
+        def worker(n):
+            try:
+                results.append(reg.request_container(f"w{n}", "sess-cc", {"network": False}, workspace_id="ws"))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert len(results) == 2
+        assert len({h["name"] for h in results}) == 2  # unique names
+        assert len(reg._session_map["sess-cc"]) == 2
+        assert len(reg._containers) == 2

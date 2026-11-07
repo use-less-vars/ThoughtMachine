@@ -1,17 +1,76 @@
 /*
  * useStore.js — Zustand store
  *
- * After the multi-tab refactoring, the store only holds data that is
- * shared across all tabs: the sessions list.
+ * The store is the single source of truth for all per-session state. Each
+ * session's { name, status, history, tokens, config, permissions, error }
+ * lives in the slices below, so every consumer (SessionTab, TabBar, header,
+ * sidebar) reads the same data and stays consistent:
+ *   - sessions: the sessions list
+ *   - sessionModes: per-session mode ('agent' | 'engineer' | 'custom'),
+ *     written by App handlers and read by SessionTab
+ *   - tabRunningStates: per-session running status string
+ *     ('RUNNING' | 'PAUSED' | 'WAITING_FOR_USER' | ...), written by
+ *     SessionTab and consumed (via a tabId-keyed map) by TabBar.
+ *   - sessionConfigs: per-session config snapshot
+ *     ({ [sessionId]: { config, permissions, providers, tools, isLoaded } })
+ *   - sessionMessages: per-session conversation
+ *     ({ [sessionId]: [messages] })
+ *   - sessionStates: per-session runtime state
+ *     ({ [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } })
+ *   - sessionErrors: per-session last error message string
+ *     ({ [sessionId]: '...' }), written by SessionTab on 'error' / abnormal
+ *     'session_stop' events and cleared on dismiss or session close.
+ *   - sessionDrafts: per-session ConfigPanel draft with unsaved edits
+ *     ({ [sessionId]: draft }), written by ConfigPanel so unsaved changes
+ *     survive tab switches that unmount the panel.
+ *   - addendumEntries: per-session addendum entries keyed by entry_id
+ *     ({ [sessionId]: { [entryId]: entry } }), written from the
+ *     'addendum_updated' runtime event. Keying by entry_id is what makes a
+ *     duplicate or out-of-order event converge instead of duplicating.
+ *   - runtimeNotices: per-session Tier-2 notices for REJECTED addendum writes
+ *     ({ [sessionId]: [{ level, code, message }] }).
  *
- * Each SessionTab manages its own local state (status, history, tokens,
- * config, etc.) via useState, since those are per-tab concerns.
+ * SessionTab does not keep status/history/tokens/config in local useState —
+ * it subscribes via useStore selectors, and the WS event handlers in this
+ * file (receiveSessionLoaded, receiveConfigChanged, receiveConversationChanged,
+ * receiveStateChanged, receiveTokensUpdated, updateSessionName, the
+ * sessionErrors slice, ...) mutate the store as events arrive.
  */
 
 import { create } from 'zustand'
+import { fetchPermissionDefaults } from '../globalApi'
+
+// Permission safe defaults have a SINGLE OWNER: the backend
+// (thoughtmachine.security.SAFE_DEFAULTS), served via GET
+// /api/permission-defaults and fetched with fetchPermissionDefaults()
+// (globalApi.js).  The store mirrors that response verbatim in the
+// `permissionDefaults` slice -- there is NO hand-copied literal here (the
+// frontend must never become a second source of truth).  Until the fetch
+// resolves the slice stays {} (fail-closed: consumers render no defaults
+// rather than guessing a value).
+
+// Default per-session entries created by registerSession / receive* actions.
+const DEFAULT_SESSION_CONFIG = { config: null, permissions: null, providers: [], tools: [], isLoaded: false }
+const DEFAULT_SESSION_STATE = { isRunning: false, state: null, contextLength: 0, tokensIn: 0, tokensOut: 0 }
+
+// Normalize a tools list to plain names: string entries stay as-is,
+// object entries (e.g. { name, enabled }) become their name.
+function normalizeTools(tools) {
+  return (tools || []).map((t) => (typeof t === 'string' ? t : t?.name ?? ''))
+}
 
 const initialState = {
-  sessions: [],  // list of { session_id, name, created_at, updated_at, preview }
+  sessions: [],            // list of { session_id, name, created_at, updated_at, preview }
+  sessionModes: {},        // { [sessionId]: 'agent' | 'engineer' | 'custom' }
+  tabRunningStates: {},    // { [sessionId]: status string ('RUNNING' | 'PAUSED' | ...) }
+  sessionConfigs: {},      // { [sessionId]: { config, permissions, providers, tools, isLoaded } }
+  sessionMessages: {},     // { [sessionId]: [messages] }
+  sessionStates: {},       // { [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } }
+  sessionErrors: {},        // { [sessionId]: last error message string }
+  sessionDrafts: {},        // { [sessionId]: ConfigPanel draft with unsaved edits (survives tab unmount) }
+  addendumEntries: {},      // { [sessionId]: { [entryId]: { id, ts, source, text, pinned } } }
+  runtimeNotices: {},       // { [sessionId]: [{ level, code, message }] }
+  permissionDefaults: {},   // safe defaults served by GET /api/permission-defaults (single owner: backend)
 }
 
 const useStore = create((set) => ({
@@ -19,7 +78,304 @@ const useStore = create((set) => ({
 
   setSessions: (sessions) => set({ sessions }),
 
+  // Upsert a session's display name into the sessions list (the single source
+  // of truth for names). Called on session_loaded / session_renamed / optimistic
+  // rename so the header, TabBar and sidebar stay consistent immediately.
+  updateSessionName: (sessionId, name) =>
+    set((state) => {
+      const exists = state.sessions.some((s) => s.session_id === sessionId)
+      if (exists) {
+        return { sessions: state.sessions.map((s) => (s.session_id === sessionId ? { ...s, name } : s)) }
+      }
+      return { sessions: [...state.sessions, { session_id: sessionId, name }] }
+    }),
+
+  setSessionMode: (sessionId, mode) =>
+    set((state) => ({ sessionModes: { ...state.sessionModes, [sessionId]: mode } })),
+
+  setTabRunningState: (sessionId, status) =>
+    set((state) => ({ tabRunningStates: { ...state.tabRunningStates, [sessionId]: status } })),
+
+  // Persist ConfigPanel's in-progress draft so unsaved edits survive tab
+  // switches (the panel unmounts when the user leaves the Config tab).
+  setSessionDraft: (sessionId, draft) =>
+    set((state) => ({ sessionDrafts: { ...state.sessionDrafts, [sessionId]: draft } })),
+
+  clearSessionDraft: (sessionId) =>
+    set((state) => {
+      const { [sessionId]: _removedDraft, ...sessionDrafts } = state.sessionDrafts
+      return { sessionDrafts }
+    }),
+
+  registerSession: (sessionId) =>
+    set((state) => {
+      // Create per-session entries if missing; never overwrite existing data.
+      const config = state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG
+      const messages = state.sessionMessages[sessionId] || []
+      const runtimeState = state.sessionStates[sessionId] || DEFAULT_SESSION_STATE
+      return {
+        sessionConfigs: { ...state.sessionConfigs, [sessionId]: config },
+        sessionMessages: { ...state.sessionMessages, [sessionId]: messages },
+        sessionStates: { ...state.sessionStates, [sessionId]: runtimeState },
+      }
+    }),
+
+  // Full purge — must touch every per-session slice in initialState.
+  removeSession: (sessionId) =>
+    set((state) => {
+      // Destructure-rest: drop the session's entries from ALL per-session slices
+      // (including the sessions list, sessionModes and tabRunningStates).
+      const { [sessionId]: _removedConfig, ...sessionConfigs } = state.sessionConfigs
+      const { [sessionId]: _removedMessages, ...sessionMessages } = state.sessionMessages
+      const { [sessionId]: _removedStates, ...sessionStates } = state.sessionStates
+      const { [sessionId]: _removedErrors, ...sessionErrors } = state.sessionErrors
+      const { [sessionId]: _removedMode, ...sessionModes } = state.sessionModes
+      const { [sessionId]: _removedRunning, ...tabRunningStates } = state.tabRunningStates
+      const { [sessionId]: _removedDraft, ...sessionDrafts } = state.sessionDrafts
+      const { [sessionId]: _removedAddendum, ...addendumEntries } = state.addendumEntries
+      const { [sessionId]: _removedNotices, ...runtimeNotices } = state.runtimeNotices
+      return {
+        sessionConfigs,
+        sessionMessages,
+        sessionStates,
+        sessionErrors,
+        sessionModes,
+        tabRunningStates,
+        sessionDrafts,
+        addendumEntries,
+        runtimeNotices,
+        sessions: state.sessions.filter((s) => s.session_id !== sessionId),
+      }
+    }),
+
+  receiveSessionLoaded: (sessionId, payload) =>
+    set((state) => ({
+      // session_loaded is the authoritative snapshot: it carries metadata
+      // (session_id/name/workspace) plus is_running so the session's runtime
+      // state is set atomically on (re)load. Config / permissions / providers /
+      // tools arrive via their own events, so default any missing fields here.
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: {
+          config: payload?.config ?? null,
+          permissions: payload?.permissions ?? null,
+          providers: payload?.providers || [],
+          tools: normalizeTools(payload?.tools),
+          isLoaded: true,
+        },
+      },
+      // is_running from the payload is authoritative; a missing is_running
+      // (older payloads) defaults to IDLE/False so nothing breaks.
+      sessionStates: {
+        ...state.sessionStates,
+        [sessionId]: {
+          ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE),
+          state: payload?.is_running ? 'RUNNING' : 'IDLE',
+          isRunning: !!payload?.is_running,
+        },
+      },
+    })),
+
+  receiveConfigChanged: (sessionId, payload) =>
+    set((state) => {
+      // The backend's config_changed is authoritative for config/permissions,
+      // but it does NOT always carry top-level providers/tools (those arrive
+      // via providers_list / tools_list, and the deferred queued apply sends
+      // only config/settings/permissions/merged_config).  Preserve the previous
+      // lists when the payload omits them so a partial config_changed never
+      // wipes the Tools tab to 0 / 'Loading tool list...'.
+      const existing = state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG
+      return {
+        sessionConfigs: {
+          ...state.sessionConfigs,
+          [sessionId]: {
+            config: payload?.config ?? null,
+            permissions: payload?.permissions ?? null,
+            providers: payload?.providers || existing.providers || [],
+            tools: payload?.tools !== undefined ? normalizeTools(payload.tools) : (existing.tools ?? []),
+            isLoaded: true,
+          },
+        },
+      }
+    }),
+
+  // Controller busy → config queued for deferred apply (FIX7).  Keeps
+  // ConfigPanel's Apply button in a visible "queued" state and disarms its
+  // 6s timeout instead of showing a false 'Apply timed out' error.
+  receiveConfigQueued: (sessionId) =>
+    set((state) => ({
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: {
+          ...(state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG),
+          configQueued: true,
+        },
+      },
+    })),
+
+  // The (possibly queued) apply failed — clear queued state and surface the
+  // real server error to ConfigPanel (FIX7).
+  receiveConfigApplyFailed: (sessionId, text) =>
+    set((state) => ({
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: {
+          ...(state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG),
+          configQueued: false,
+          applyFailed: text || 'Config apply failed',
+        },
+      },
+    })),
+
+  receiveProvidersList: (sessionId, providers) =>
+    set((state) => ({
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: { ...(state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG), providers },
+      },
+    })),
+
+  receiveToolsList: (sessionId, tools) =>
+    set((state) => ({
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: { ...(state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG), tools: normalizeTools(tools) },
+      },
+    })),
+
+  // The merge strategy is EXPLICIT at every call site (cold-start
+  // status-notice fix).  `mode`:
+  //   'replace' — the server payload is authoritative; the previous array is
+  //               discarded.  When `preserveClientOnly` is true, client-only
+  //               notices flagged `client_only: true` (e.g. the CASE-3 cold
+  //               start status notice) are kept and re-appended at the tail,
+  //               because the server never knows about them and would
+  //               otherwise silently wipe them on the next conversation_changed.
+  //   'append'  — append the incoming messages after the existing history.
+  //   'prepend' — insert the incoming (older) messages before the history.
+  receiveConversationChanged: (sessionId, messages, { mode = 'replace', preserveClientOnly = false } = {}) =>
+    set((state) => {
+      const incoming = messages || [];
+      const prev = state.sessionMessages[sessionId] || [];
+      let next;
+      if (mode === 'append') {
+        next = [...prev, ...incoming];
+      } else if (mode === 'prepend') {
+        next = [...incoming, ...prev];
+      } else {
+        const preserved = preserveClientOnly
+          ? prev.filter((m) => m && m.client_only === true)
+          : [];
+        next = [...incoming, ...preserved];
+      }
+      return { sessionMessages: { ...state.sessionMessages, [sessionId]: next } };
+    }),
+
+  receiveStateChanged: (sessionId, newState) =>
+    set((state) => ({
+      sessionStates: {
+        ...state.sessionStates,
+        [sessionId]: {
+          ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE),
+          isRunning: newState === 'RUNNING',
+          state: newState,
+        },
+      },
+    })),
+
+  // Store the last error message for a session ("dead events → visible errors").
+  // Written by SessionTab on 'error' events and abnormal 'session_stop' events;
+  // read via s.sessionErrors[storeKey] to render the dismissible banner.
+  setSessionError: (sessionId, message) =>
+    set((state) => ({ sessionErrors: { ...state.sessionErrors, [sessionId]: message } })),
+
+  clearSessionError: (sessionId) =>
+    set((state) => {
+      const { [sessionId]: _removedError, ...sessionErrors } = state.sessionErrors
+      return { sessionErrors }
+    }),
+
+  updateContextLength: (sessionId, length) =>
+    set((state) => ({
+      sessionStates: {
+        ...state.sessionStates,
+        [sessionId]: { ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE), contextLength: length },
+      },
+    })),
+
+  receiveTokensUpdated: (sessionId, payload) =>
+    set((state) => ({
+      // tokens_updated payload carries { input, output } — FLAGGED EXTENSION:
+      // tokensIn/tokensOut live in sessionStates so token info can be read from
+      // the store instead of SessionTab local state.
+      sessionStates: {
+        ...state.sessionStates,
+        [sessionId]: {
+          ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE),
+          tokensIn: payload?.input ?? 0,
+          tokensOut: payload?.output ?? 0,
+        },
+      },
+    })),
+
+  // Tier-1 addendum write notification (design doc §7.3). D-6 requires every
+  // client arm to converge on the same display for duplicate and out-of-order
+  // arrival, so this MERGES the payload's FULL resulting entry set into a map
+  // keyed by entry_id instead of appending: a repeat writes the same keys, and
+  // a late-arriving older set cannot resurrect evicted entries by position.
+  // `entry_id`/`ts`/`source` ride along on the event but the authoritative
+  // list is `entries`, so they are not stored separately.
+  receiveAddendumUpdated: (sessionId, payload) =>
+    set((state) => {
+      const merged = { ...(state.addendumEntries[sessionId] || {}) }
+      for (const entry of payload?.entries || []) {
+        // Entries are { id, ts, source, text, pinned }; skip anything without
+        // an id rather than inventing a key that could collide.
+        if (entry && entry.id) merged[entry.id] = entry
+      }
+      return { addendumEntries: { ...state.addendumEntries, [sessionId]: merged } }
+    }),
+
+  // Tier-2 notice for a REJECTED addendum write. Appended (not overwritten) so
+  // consecutive rejections stay visible; the message alone is useless without
+  // its code, so both are kept.
+  receiveRuntimeNotice: (sessionId, payload) =>
+    set((state) => ({
+      runtimeNotices: {
+        ...state.runtimeNotices,
+        [sessionId]: [
+          ...(state.runtimeNotices[sessionId] || []),
+          {
+            level: payload?.level || 'warning',
+            code: payload?.code || '',
+            message: payload?.message || '',
+          },
+        ],
+      },
+    })),
+
+  // Replace the permission-defaults mirror with the backend's response.  Any
+  // non-object (null / array / undefined) resets it to {} (fail-closed).
+  setPermissionDefaults: (defaults) =>
+    set({
+      permissionDefaults:
+        defaults && typeof defaults === 'object' && !Array.isArray(defaults) ? defaults : {},
+    }),
+
   reset: () => set({ ...initialState }),
 }))
+
+// Hydrate the permission-defaults mirror from the backend SINGLE OWNER
+// (GET /api/permission-defaults) at module init.  Exposed so callers/tests can
+// await or re-run it; a failed fetch leaves the slice {} (fail-closed).
+export async function hydratePermissionDefaults() {
+  const defaults = await fetchPermissionDefaults()
+  if (defaults) useStore.getState().setPermissionDefaults(defaults)
+  return defaults
+}
+
+// Boot hydration: fire once when the store module loads.  Not awaited -- the
+// app renders immediately and updates when the response lands (or stays {}).
+void hydratePermissionDefaults()
 
 export default useStore

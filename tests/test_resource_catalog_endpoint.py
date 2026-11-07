@@ -1,0 +1,118 @@
+"""Tests for GET /api/resource-catalog — bare resource catalog array.
+
+Hermetic: the endpoint reads the repo-relative resource catalog JSON
+(``agent/config/resource_catalog.json``) and returns it as a bare array;
+no vault or runtime state is touched, so the fresh server module (temp HOME
++ prefix purge) is the only hermetic machinery needed.
+"""
+
+import sys
+
+import pytest
+from starlette.testclient import TestClient
+
+_EXPECTED_NAMES = {
+    "git",
+    "filesystem",
+    "container",
+    "host_bash",
+    "tty",
+    "jtag",
+    "network",
+    "mcp",
+    "ci",
+    "credential",
+    "visual",
+}
+_EXPECTED_KEYS = {
+    "name",
+    "display_name",
+    "description",
+    "permission_grain_set",
+    "execution_mode",
+    "container_image",
+    "dockerfile_reference",
+    "tools",
+    "risk_level",
+    "ui_category",
+    "required_workspace_switch",
+}
+
+
+@pytest.fixture(scope="module")
+def server_module():
+    """Fresh import of web_ui.backend.server (temp HOME + prefix purge)."""
+    import os
+    import tempfile
+
+    from tests.integration.harness import purged_sys_modules
+
+    prefixes = (
+        "web_ui.backend",
+        "agent.config.provider_profile",
+        "thoughtmachine.bootstrap",
+        "session",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_home:
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = tmp_home
+        with purged_sys_modules(prefixes):
+            try:
+                import web_ui.backend.server as server_mod
+
+                yield server_mod
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
+
+@pytest.fixture(scope="module")
+def client(server_module):
+    with TestClient(server_module.app) as test_client:
+        yield test_client
+
+
+def test_resource_catalog_returns_bare_array(client):
+    """The response body IS the array — no {items: [...]} wrapper."""
+    resp = client.get("/api/resource-catalog")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, list)
+    assert len(body) == 11
+
+
+def test_resource_catalog_nine_resources_with_exact_keys(client):
+    """Each entry carries exactly the 8 declared resource keys."""
+    resp = client.get("/api/resource-catalog")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert {entry["name"] for entry in body} == _EXPECTED_NAMES
+    for entry in body:
+        assert set(entry.keys()) == _EXPECTED_KEYS, entry["name"]
+        if entry["name"] in ("tty", "jtag"):
+            assert entry["risk_level"] is None
+            assert entry["ui_category"] is None
+            assert entry["required_workspace_switch"] is None
+
+
+def test_resource_catalog_git_entry_exact_fields(client):
+    """The git resource pins the dockerfile reference, tools and defaults."""
+    resp = client.get("/api/resource-catalog")
+
+    assert resp.status_code == 200
+    git = next(entry for entry in resp.json() if entry["name"] == "git")
+    assert git["dockerfile_reference"] == "docker/resource/git_overlay.Dockerfile"
+    assert git["tools"] == ["git_read", "git_write"]
+    assert git["execution_mode"] == "container"
+    assert git["permission_grain_set"] == [
+        "banned",
+        "ask",
+        "read",
+        "write",
+        "write_on_feature_branch",
+    ]

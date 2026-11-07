@@ -24,6 +24,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent._log_root import get_log_root
 from agent.logging import log
 from agent.config.loader import (
     load_config,
@@ -31,6 +32,7 @@ from agent.config.loader import (
     migrate_config,
     get_config_paths,
 )
+from thoughtmachine.vault import vault_root
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -195,9 +197,14 @@ def _check_api_key(report: HealthReport) -> None:
 def _check_directories(report: HealthReport) -> None:
     """Verify required directories exist or can be created."""
     dirs_to_check = {
-        'Log directory': './logs',
-        'Config backups': '.config_backups',
-        'Knowledge base': '.thoughtmachine/knowledge',
+        # Canonical log root (agent._log_root.get_log_root): honors
+        # THOUGHTMACHINE_VAULT_ROOT, else ~/.thoughtmachine/logs.
+        'Log directory': str(get_log_root()),
+        'Config backups': '~/.thoughtmachine/config_backups',
+        # Global knowledge base lives in the vault "global" compartment
+        # (agent.knowledge.global_kb.GLOBAL_KB_DIR).  Resolve against the
+        # vault root so nothing is ever created relative to the CWD.
+        'Knowledge base': str(vault_root() / 'global'),
     }
 
     # Also check workspace_path from config if available
@@ -210,7 +217,8 @@ def _check_directories(report: HealthReport) -> None:
 
     for label, path in dirs_to_check.items():
         try:
-            os.makedirs(path, exist_ok=True)
+            expanded_path = os.path.expanduser(path)
+            os.makedirs(expanded_path, exist_ok=True)
             report.add(
                 f'Directory accessible: {label}',
                 True, path,
@@ -308,16 +316,16 @@ def run_health_check(
     # Log results
     for c in report.checks:
         if not c.passed:
-            log('WARNING', 'startup_health_check', c.message)
+            log('WARNING', 'core.health_check', c.message)
         elif verbose:
-            log('INFO', 'startup_health_check', c.message)
+            log('INFO', 'core.health_check', c.message)
 
     if not report.ok:
-        log('WARNING', 'startup_health_check',
+        log('WARNING', 'core.health_check',
             f'{len(report.failed)} health check(s) FAILED — review warnings above')
 
     if exit_on_fail and not report.ok:
-        log('ERROR', 'startup_health_check', 'Aborting startup due to health check failure')
+        log('ERROR', 'core.health_check', 'Aborting startup due to health check failure')
         sys.exit(1)
 
     return report

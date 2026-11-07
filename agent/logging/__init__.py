@@ -6,6 +6,23 @@ import json
 import logging as python_logging
 import os
 import threading
+
+from agent._log_root import get_log_root
+from agent.logging.redaction import redact
+
+
+def _safe_err_print(message: str) -> None:
+    """Print *message* to stderr without crashing when stderr is None.
+
+    In headless daemon launches CPython may set ``sys.stderr`` to ``None``;
+    ``print(x, file=None)`` then raises
+    ``AttributeError: 'NoneType' object has no attribute 'write'``.
+    """
+    try:
+        import sys
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
 from datetime import datetime
 from enum import Enum
 try:
@@ -23,6 +40,7 @@ CURRENT_SESSION_VERSION = '1.0'
 
 class LogLevel(Enum):
     """Logging verbosity levels."""
+    TRACE = 'TRACE'
     DEBUG = 'DEBUG'
     INFO = 'INFO'
     WARNING = 'WARNING'
@@ -71,10 +89,11 @@ class LogEventType(Enum):
     ERROR = 'error'
     LATENCY_MEASUREMENT = 'latency_measurement'
     TOKEN_USAGE_TREND = 'token_usage_trend'
+    TIME_WARNING = 'time_warning'
     MEMORY_USAGE = 'memory_usage'
     THROUGHPUT_METRIC = 'throughput_metric'
     RESOURCE_UTILIZATION = 'resource_utilization'
-EVENT_TYPE_TO_CATEGORY = {LogEventType.AGENT_START: LogCategory.SESSION, LogEventType.AGENT_END: LogCategory.SESSION, LogEventType.LLM_REQUEST: LogCategory.LLM, LogEventType.LLM_RESPONSE: LogCategory.LLM, LogEventType.RAW_RESPONSE: LogCategory.LLM, LogEventType.TOOL_CALL: LogCategory.TOOLS, LogEventType.TOOL_RESULT: LogCategory.TOOLS, LogEventType.TOOL_DEBUG: LogCategory.TOOLS, LogEventType.TOOL_WARNING: LogCategory.TOOLS, LogEventType.TOOL_ERROR: LogCategory.TOOLS, LogEventType.TOOL_INTERNAL: LogCategory.TOOLS, LogEventType.TOOL_PERFORMANCE: LogCategory.TOOLS, LogEventType.CONVERSATION_UPDATE: LogCategory.SESSION, LogEventType.CONVERSATION_PRUNE: LogCategory.SESSION, LogEventType.TOKEN_WARNING: LogCategory.UI, LogEventType.TURN_WARNING: LogCategory.UI, LogEventType.TURN_START: LogCategory.SESSION, LogEventType.TURN_COMPLETE: LogCategory.SESSION, LogEventType.USER_INTERACTION_REQUESTED: LogCategory.UI, LogEventType.FINAL_DETECTED: LogCategory.SESSION, LogEventType.STOP_SIGNAL: LogCategory.SESSION, LogEventType.MAX_TURNS_REACHED: LogCategory.SESSION, LogEventType.EXECUTION_STATE_CHANGE: LogCategory.SESSION, LogEventType.SESSION_STATE_CHANGE: LogCategory.SESSION, LogEventType.FILE_ACCESS: LogCategory.SECURITY, LogEventType.SECURITY_VIOLATION: LogCategory.SECURITY, LogEventType.DOCKER_SANDBOX: LogCategory.SECURITY, LogEventType.CAPABILITY_CHECK: LogCategory.SECURITY, LogEventType.ERROR: LogCategory.UI, LogEventType.LATENCY_MEASUREMENT: LogCategory.PERFORMANCE, LogEventType.TOKEN_USAGE_TREND: LogCategory.PERFORMANCE, LogEventType.MEMORY_USAGE: LogCategory.PERFORMANCE, LogEventType.THROUGHPUT_METRIC: LogCategory.PERFORMANCE, LogEventType.RESOURCE_UTILIZATION: LogCategory.PERFORMANCE}
+EVENT_TYPE_TO_CATEGORY = {LogEventType.AGENT_START: LogCategory.SESSION, LogEventType.AGENT_END: LogCategory.SESSION, LogEventType.LLM_REQUEST: LogCategory.LLM, LogEventType.LLM_RESPONSE: LogCategory.LLM, LogEventType.RAW_RESPONSE: LogCategory.LLM, LogEventType.TOOL_CALL: LogCategory.TOOLS, LogEventType.TOOL_RESULT: LogCategory.TOOLS, LogEventType.TOOL_DEBUG: LogCategory.TOOLS, LogEventType.TOOL_WARNING: LogCategory.TOOLS, LogEventType.TOOL_ERROR: LogCategory.TOOLS, LogEventType.TOOL_INTERNAL: LogCategory.TOOLS, LogEventType.TOOL_PERFORMANCE: LogCategory.TOOLS, LogEventType.CONVERSATION_UPDATE: LogCategory.SESSION, LogEventType.CONVERSATION_PRUNE: LogCategory.SESSION, LogEventType.TOKEN_WARNING: LogCategory.UI, LogEventType.TURN_WARNING: LogCategory.UI, LogEventType.TURN_START: LogCategory.SESSION, LogEventType.TURN_COMPLETE: LogCategory.SESSION, LogEventType.USER_INTERACTION_REQUESTED: LogCategory.UI, LogEventType.FINAL_DETECTED: LogCategory.SESSION, LogEventType.STOP_SIGNAL: LogCategory.SESSION, LogEventType.MAX_TURNS_REACHED: LogCategory.SESSION, LogEventType.EXECUTION_STATE_CHANGE: LogCategory.SESSION, LogEventType.SESSION_STATE_CHANGE: LogCategory.SESSION, LogEventType.FILE_ACCESS: LogCategory.SECURITY, LogEventType.SECURITY_VIOLATION: LogCategory.SECURITY, LogEventType.DOCKER_SANDBOX: LogCategory.SECURITY, LogEventType.CAPABILITY_CHECK: LogCategory.SECURITY, LogEventType.ERROR: LogCategory.UI, LogEventType.LATENCY_MEASUREMENT: LogCategory.PERFORMANCE, LogEventType.TOKEN_USAGE_TREND: LogCategory.PERFORMANCE, LogEventType.TIME_WARNING: LogCategory.UI, LogEventType.MEMORY_USAGE: LogCategory.PERFORMANCE, LogEventType.THROUGHPUT_METRIC: LogCategory.PERFORMANCE, LogEventType.RESOURCE_UTILIZATION: LogCategory.PERFORMANCE}
 
 class _AgentLogger:
     """
@@ -84,7 +103,7 @@ class _AgentLogger:
     Thread-safe for use in the agent's background thread.
     """
 
-    def __init__(self, config: 'AgentConfig', log_dir: str='./logs', log_level: Union[str, LogLevel]=LogLevel.INFO, file_log_level: Union[str, LogLevel]=LogLevel.DEBUG, enable_file_logging: bool=True, jsonl_format: bool=True, max_file_size_mb: int=10, session_id: Optional[str]=None):
+    def __init__(self, config: 'AgentConfig', log_dir: str=None, log_level: Union[str, LogLevel]=LogLevel.INFO, file_log_level: Union[str, LogLevel]=LogLevel.DEBUG, enable_file_logging: bool=True, jsonl_format: bool=True, max_file_size_mb: int=10, session_id: Optional[str]=None):
         """
         Initialize the logger.
 
@@ -105,6 +124,8 @@ class _AgentLogger:
             env_list = [cat.strip().upper() for cat in env_categories.split(',') if cat.strip()]
             if env_list:
                 self.enabled_categories = [LogCategory(cat) for cat in env_list]
+        if log_dir is None:
+            log_dir = str(get_log_root())
         self.log_dir = os.path.abspath(log_dir)
         if log_level == LogLevel.INFO and hasattr(config, 'log_level'):
             log_level = config.log_level
@@ -161,12 +182,19 @@ class _AgentLogger:
     def _initialize_logging(self):
         """Initialize logging handlers."""
         self.py_logger.handlers.clear()
+        # Add a NullHandler so stdlib logging NEVER falls back to
+        # logging.lastResort (which writes to sys.stderr and crashes with
+        # AttributeError when sys.stderr is None in headless daemon
+        # launches).  With at least one handler present on the logger,
+        # debug/warning/error calls on py_logger are silently dropped
+        # instead of touching stderr.
+        self.py_logger.addHandler(python_logging.NullHandler())
         if self.enable_file_logging:
             try:
                 self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
                 self._current_file_size = os.path.getsize(self.log_file_path) if os.path.exists(self.log_file_path) else 0
             except Exception as e:
-                print(f"[LOGGING ERROR] Failed to open log file {self.log_file_path}: {e}", file=__import__('sys').stderr)
+                _safe_err_print(f"[LOGGING ERROR] Failed to open log file {self.log_file_path}: {e}")
                 self.enable_file_logging = False
 
     def _should_log(self, level: LogLevel) -> bool:
@@ -195,7 +223,7 @@ class _AgentLogger:
         # Use a timeout to prevent indefinite blocking if lock is contended
         acquired = self._lock.acquire(timeout=5.0)
         if not acquired:
-            print(f"[LOGGING WARNING] _write_jsonl: could not acquire lock within 5s, skipping", file=__import__('sys').stderr)
+            _safe_err_print(f"[LOGGING WARNING] _write_jsonl: could not acquire lock within 5s, skipping")
             return
         try:
             if not self.enable_file_logging or not self._file_handle or self._file_handle.closed:
@@ -204,7 +232,9 @@ class _AgentLogger:
                 event['timestamp'] = datetime.now().isoformat()
                 event['session_id'] = self.session_id
                 event['version'] = CURRENT_SESSION_VERSION
-                json_line = json.dumps(event, ensure_ascii=False) + '\n'
+                # Redact before serialising to disk: secrets must never hit
+                # the session log file.
+                json_line = redact(json.dumps(event, ensure_ascii=False)) + '\n'
                 self._file_handle.write(json_line)
                 self._file_handle.flush()
                 self._current_file_size += len(json_line.encode('utf-8'))
@@ -220,7 +250,7 @@ class _AgentLogger:
                         self._current_file_size = 0
                         _prune_logs_by_size(self.log_dir)
                     except Exception as rotate_e:
-                        print(f"[LOGGING ERROR] Failed to archive log file: {rotate_e}", file=__import__('sys').stderr)
+                        _safe_err_print(f"[LOGGING ERROR] Failed to archive log file: {rotate_e}")
                         self._file_handle = None
                         try:
                             self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
@@ -228,14 +258,15 @@ class _AgentLogger:
                             self._file_handle = None
                             self.enable_file_logging = False
             except Exception as e:
-                print(f"[LOGGING ERROR] Failed to write log entry: {e}", file=__import__('sys').stderr)
+                _safe_err_print(f"[LOGGING ERROR] Failed to write log entry: {e}")
                 # Attempt fallback write to agent_fallback.jsonl
                 try:
                     fallback_dir = os.path.dirname(self.log_file_path) if hasattr(self, 'log_file_path') and self.log_file_path else self.log_dir
                     fallback_path = os.path.join(fallback_dir, 'agent_fallback.jsonl')
                     with open(fallback_path, 'a', encoding='utf-8') as f:
                         event['timestamp'] = datetime.now().isoformat()
-                        f.write(json.dumps(event, ensure_ascii=False) + '\n')
+                        # Same rule as the primary path: no raw secrets on disk.
+                        f.write(redact(json.dumps(event, ensure_ascii=False)) + '\n')
                         f.flush()
                 except Exception:
                     pass
@@ -459,6 +490,10 @@ class _AgentLogger:
     def log_turn_warning(self, old_state: str, new_state: str, turn_count: int, warning_message: str):
         """Log turn limit warning."""
         self._log_event(LogEventType.TURN_WARNING, LogLevel.WARNING, f'Turn limit warning: {old_state} -> {new_state} ({turn_count} turns)', {'old_state': old_state, 'new_state': new_state, 'turn_count': turn_count, 'warning_message': warning_message}, self.current_turn)
+
+    def log_time_warning(self, old_state: str, new_state: str, elapsed_seconds: float, warning_message: str):
+        """Log time-based execution warning."""
+        self._log_event(LogEventType.TIME_WARNING, LogLevel.WARNING, f'Time warning: {old_state} -> {new_state} ({elapsed_seconds:.1f}s elapsed)', {'old_state': old_state, 'new_state': new_state, 'elapsed_seconds': elapsed_seconds, 'warning_message': warning_message}, self.current_turn)
 
     def log_user_interaction_requested(self, message: str):
         """Log when user interaction is requested."""
@@ -691,7 +726,7 @@ def create_logger(config: 'AgentConfig') -> Optional[_AgentLogger]:
         
         logger = _AgentLogger(
             config=config,
-            log_dir=getattr(config, 'log_dir', './logs'),
+            log_dir=getattr(config, 'log_dir', None),
             log_level=getattr(config, 'log_level', LogLevel.INFO),
             file_log_level=file_log_level,
             enable_file_logging=getattr(config, 'enable_file_logging', True),
@@ -701,6 +736,6 @@ def create_logger(config: 'AgentConfig') -> Optional[_AgentLogger]:
         )
         return logger
     except Exception as e:
-        print(f"[LOGGING ERROR] Failed to create logger: {e}", file=__import__('sys').stderr)
+        _safe_err_print(f"[LOGGING ERROR] Failed to create logger: {e}")
 from .unified import log, set_log_level, set_log_tags, show_log_config
 __all__ = ['log', 'set_log_level', 'set_log_tags', 'show_log_config', 'LogLevel', 'LogCategory', 'LogEventType', 'create_logger', 'AgentLogger']

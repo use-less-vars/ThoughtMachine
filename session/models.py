@@ -13,27 +13,40 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 import uuid, hashlib, json, os, threading
 from typing import Any
-from thoughtmachine.security import merge_security_config, get_default_security_config, coerce_session_permissions
+from thoughtmachine.security import merge_security_config, get_default_security_config
 from agent.logging import log
 from agent.core.message import Message
+
+# Sentinel attribute name marking that a Session instance has finished
+# __post_init__. Its ABSENCE means "still under construction": a plain-list wrap
+# performed during construction is expected and logged at DEBUG, whereas a live
+# (post-construction) wrap keeps the original WARNING.
+_SESSION_INITIALISED_FLAG = '_tm_session_initialised'
+
+# Addendum schema defaults (brief §4.1, Path A; rulings R2/R3). The addendum is
+# a first-class session field -- a sibling of `summary` -- with the shape
+# {"entries": [...], "budget_chars": int, "max_entries": int}.
+# `budget_chars` is an exact character count (R2: no estimator); `max_entries`
+# caps the entry count separately at 64 (R3).
+DEFAULT_ADDENDUM_BUDGET_CHARS = 8000
+DEFAULT_ADDENDUM_MAX_ENTRIES = 64
+# R4: `tool` is NOT a legal source -- C2 forbids the model writing its own
+# memory, so no entry in this wave could legitimately carry it.
+ADDENDUM_SOURCES = ('operator', 'mailbox')
 
 class ObservableList(list):
     """A list that notifies a callback when mutated."""
 
     def __init__(self, iterable=(), callback=None):
-        import sys
-        log('DEBUG', 'debug.unknown', f"[ObservableList.__init__] Creating ObservableList id={id(self)}, input type={type(iterable)}, len={(len(iterable) if hasattr(iterable, '__len__') else 'N/A')}, callback={(callback.__qualname__ if callback else None)}")
         try:
             super().__init__(iterable)
-            log('DEBUG', 'debug.unknown', f'[ObservableList.__init__] Success, list length={len(self)}, id={id(self)}')
         except Exception as e:
-            log('ERROR', 'debug.unknown', f'[ObservableList.__init__] ERROR during initialization: {e}')
+            log('ERROR', 'core.history', f'[ObservableList.__init__] ERROR during initialization: {e}')
             raise
         self.callback = callback
         self._lock = threading.Lock()
 
     def _notify(self):
-        log('DEBUG', 'core.history_notify', f"_notify called: len={len(self)}, version will bump")
         with self._lock:
             if self.callback:
                 self.callback()
@@ -54,11 +67,6 @@ class ObservableList(list):
         self._notify()
 
     def extend(self, iterable):
-        try:
-            length = len(iterable) if hasattr(iterable, '__len__') else 'unknown'
-        except:
-            length = 'unknown'
-        log('DEBUG', 'debug.unknown', f'[ObservableList.extend] called on id={id(self)} with iterable length={length}')
         with self._lock:
             super().extend(iterable)
         self._notify()
@@ -140,6 +148,94 @@ class ContainerMetadata:
         """Create from dictionary."""
         return cls(**data)
 
+
+def _default_addendum() -> Dict[str, Any]:
+    """A fresh, empty addendum in its canonical default state."""
+    return {
+        'entries': [],
+        'budget_chars': DEFAULT_ADDENDUM_BUDGET_CHARS,
+        'max_entries': DEFAULT_ADDENDUM_MAX_ENTRIES,
+    }
+
+
+def _normalize_addendum_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    """Normalise one addendum entry, or return None when it is not legal.
+
+    A legal entry carries `id` (non-empty str), `source` in ADDENDUM_SOURCES and
+    `text` (str); `ts` defaults to '' and `pinned` is coerced to bool. Unknown
+    keys are dropped, which is what makes a later version's extra field
+    harmless on read.
+    """
+    if not isinstance(entry, dict):
+        return None
+    entry_id = entry.get('id')
+    source = entry.get('source')
+    text = entry.get('text')
+    if not isinstance(entry_id, str) or not entry_id:
+        return None
+    if source not in ADDENDUM_SOURCES:
+        return None
+    if not isinstance(text, str):
+        return None
+    ts = entry.get('ts', '')
+    return {
+        'id': entry_id,
+        'ts': ts if isinstance(ts, str) else str(ts),
+        'source': source,
+        'text': text,
+        'pinned': bool(entry.get('pinned', False)),
+    }
+
+
+def normalize_addendum(raw: Any) -> Dict[str, Any]:
+    """Coerce a persisted (or partial) addendum into the canonical shape.
+
+    Missing keys are defaulted rather than rejected, so a session file written
+    before the field existed loads as an empty addendum. An entry that fails
+    validation is DROPPED with a WARNING and never raised: the store's
+    load_session treats any exception here as a failed load, and one malformed
+    entry must not cost the whole session.
+    """
+    addendum = _default_addendum()
+    if raw is None:
+        return addendum
+    if not isinstance(raw, dict):
+        log('WARNING', 'core.session',
+            f'[addendum] ignoring non-dict addendum of type {type(raw).__name__}')
+        return addendum
+
+    raw_entries = raw.get('entries', [])
+    if isinstance(raw_entries, list):
+        for raw_entry in raw_entries:
+            entry = _normalize_addendum_entry(raw_entry)
+            if entry is None:
+                log('WARNING', 'core.session',
+                    f'[addendum] dropping invalid entry on load: {raw_entry!r}')
+                continue
+            addendum['entries'].append(entry)
+    elif raw_entries is not None:
+        log('WARNING', 'core.session',
+            f"[addendum] ignoring non-list 'entries' of type {type(raw_entries).__name__}")
+
+    budget_chars = raw.get('budget_chars', DEFAULT_ADDENDUM_BUDGET_CHARS)
+    if isinstance(budget_chars, int) and not isinstance(budget_chars, bool):
+        addendum['budget_chars'] = budget_chars
+    else:
+        log('WARNING', 'core.session',
+            f'[addendum] budget_chars={budget_chars!r} is not an int; '
+            f'using {DEFAULT_ADDENDUM_BUDGET_CHARS}')
+
+    max_entries = raw.get('max_entries', DEFAULT_ADDENDUM_MAX_ENTRIES)
+    if isinstance(max_entries, int) and not isinstance(max_entries, bool):
+        addendum['max_entries'] = max_entries
+    else:
+        log('WARNING', 'core.session',
+            f'[addendum] max_entries={max_entries!r} is not an int; '
+            f'using {DEFAULT_ADDENDUM_MAX_ENTRIES}')
+
+    return addendum
+
+
 @dataclass
 class Session:
     """An atomic conversation unit with all its state."""
@@ -158,8 +254,11 @@ class Session:
     version: int = 1
     next_seq: int = 0
     summary: Optional[Dict[str, Any]] = field(default=None, compare=False, repr=False)
+    addendum: Dict[str, Any] = field(default_factory=_default_addendum)
     agent_instance: Optional[Any] = field(default=None, compare=False, repr=False)
     workspace_id: Optional[str] = field(default=None, compare=False)
+    mode: str = "agent"  # "agent", "engineer", or "custom"
+    last_active: str = ""  # ISO datetime string, updated on each use
     metadata: Dict[str, Any] = field(default_factory=dict)
     security_config: Dict[str, Any] = field(default_factory=get_default_security_config)
     _conversation_changed_callbacks: List[Any] = field(default_factory=list, compare=False, repr=False)
@@ -170,11 +269,27 @@ class Session:
         # Intercept assignment to user_history to ensure it always stays ObservableList.
         if name == 'user_history':
             if not isinstance(value, ObservableList):
-                log('WARNING', 'core.history', f"Plain list assignment to user_history intercepted — auto-wrapped to ObservableList")
+                if getattr(self, _SESSION_INITIALISED_FLAG, False):
+                    # Live (post-construction) assignment: keep the original WARNING.
+                    log('WARNING', 'core.history', f"Plain list assignment to user_history intercepted — auto-wrapped to ObservableList")
+                else:
+                    # Construction-time wrap is expected: log at DEBUG (original text kept for greps).
+                    log('DEBUG', 'core.history', f"Construction-time plain list assignment to user_history intercepted — auto-wrapped to ObservableList")
                 # Wrap plain list back into ObservableList, preserving callback.
                 new_list = ObservableList(list(value), callback=self._on_conversation_changed)
                 object.__setattr__(self, name, new_list)
+                # A live wholesale replacement bypasses ObservableList's mutation callback, so announce it now.
+                if getattr(self, _SESSION_INITIALISED_FLAG, False):
+                    self._on_conversation_changed()
                 return
+        # Guard workspace_id from being changed once set (immutable after initial assignment).
+        if name == 'workspace_id':
+            try:
+                current = object.__getattribute__(self, 'workspace_id')
+            except AttributeError:
+                current = None
+            if current is not None and value != current:
+                raise AttributeError("workspace_id is immutable once set")
         # Default behavior for all other attributes.
         super().__setattr__(name, value)
 
@@ -183,6 +298,7 @@ class Session:
         # total_input_tokens + total_output_tokens is the cumulative total,
         # NOT the current conversation's context length, so do NOT use it as fallback.
         self._wrap_user_history()
+        object.__setattr__(self, _SESSION_INITIALISED_FLAG, True)
         self.ensure_name()
         try:
             conv_str = self._normalize_conversation_for_hash(self.user_history)
@@ -194,15 +310,15 @@ class Session:
         """Wrap user_history with ObservableList if not already wrapped."""
         log('DEBUG', 'core.history', f"wrapping user_history: is_ObservableList={isinstance(self.user_history, ObservableList)}")
         if not isinstance(self.user_history, ObservableList):
-            log('DEBUG', 'debug.unknown', f'[Session] _wrap_user_history: Creating ObservableList from current user_history')
+            log('DEBUG', 'core.history', f'[Session] _wrap_user_history: Creating ObservableList from current user_history')
             new_list = ObservableList(self.user_history, callback=self._on_conversation_changed)
-            log('DEBUG', 'debug.unknown', f'[Session] _wrap_user_history: Created ObservableList, id={id(new_list)}, len={len(new_list)}')
+            log('DEBUG', 'core.history', f'[Session] _wrap_user_history: Created ObservableList, id={id(new_list)}, len={len(new_list)}')
             self.user_history = new_list
         else:
             self.user_history.callback = self._on_conversation_changed
-            log('DEBUG', 'debug.unknown', f'[Session] _wrap_user_history: Already ObservableList, ensuring session callback, id={id(self.user_history)}, len={len(self.user_history)}')
+            log('DEBUG', 'core.history', f'[Session] _wrap_user_history: Already ObservableList, ensuring session callback, id={id(self.user_history)}, len={len(self.user_history)}')
         callback_repr = self.user_history.callback.__qualname__ if self.user_history.callback else None
-        log('DEBUG', 'debug.unknown', f'[Session] _wrap_user_history: after, len={len(self.user_history)}, id={id(self.user_history)}, callback={callback_repr}')
+        log('DEBUG', 'core.history', f'[Session] _wrap_user_history: after, len={len(self.user_history)}, id={id(self.user_history)}, callback={callback_repr}')
 
     def _get_next_seq(self) -> int:
         """Return the next sequence number and increment the counter."""
@@ -214,7 +330,7 @@ class Session:
         """Ensure session has a name for display/persistence.
         
         If metadata doesn't have a 'name' key, generates a default name
-        based on creation timestamp.
+        based on creation timestamp and session mode.
         """
         name = self.metadata.get('name', '')
         if not name or not str(name).strip():
@@ -223,7 +339,12 @@ class Session:
                 timestamp = self.created_at
             else:
                 timestamp = datetime.now()
-            self.metadata['name'] = f'Session {timestamp:%Y-%m-%d %H:%M}'
+            mode_prefix = {
+                "agent": "Agent Session",
+                "engineer": "Engineer Session",
+                "custom": "Custom Session",
+            }.get(self.mode, "Session")
+            self.metadata['name'] = f'{mode_prefix} {timestamp:%Y-%m-%d %H:%M}'
 
     @staticmethod
     def _normalize_conversation_for_hash(conversation: List[Dict[str, Any]]) -> str:
@@ -238,10 +359,10 @@ class Session:
         """Called when user_history is mutated."""
         import os
         old_version = self._conversation_version
-        log('DEBUG', 'core.history_notify', f"conversation version: {old_version} → {old_version + 1}, hash={self.conversation_hash}, callbacks={len(self._conversation_changed_callbacks)}")
+        log('DEBUG', 'core.history', f"conversation version: {old_version} → {old_version + 1}, hash={self.conversation_hash}, callbacks={len(self._conversation_changed_callbacks)}")
         for i, cb in enumerate(self._conversation_changed_callbacks):
             cb_repr = cb.__qualname__ if hasattr(cb, '__qualname__') else repr(cb)
-            log('DEBUG', 'session.session', f'  Callback {i}: {cb_repr}')
+            log('DEBUG', 'core.session', f'  Callback {i}: {cb_repr}')
         self.updated_at = datetime.now()
         self._conversation_version += 1
         try:
@@ -252,23 +373,23 @@ class Session:
         for callback in self._conversation_changed_callbacks:
             try:
                 callback_repr = callback.__qualname__ if hasattr(callback, '__qualname__') else repr(callback)
-                log('DEBUG', 'session.session', f'invoking callback {callback_repr}')
+                log('DEBUG', 'core.session', f'invoking callback {callback_repr}')
                 callback()
             except Exception as e:
                 import traceback
-                log('ERROR', 'session.session', f'callback error: {e}')
-                log('ERROR', 'session.session', f'[SESSION] _on_conversation_changed callback error')
+                log('ERROR', 'core.session', f'callback error: {e}')
+                log('ERROR', 'core.session', f'[SESSION] _on_conversation_changed callback error')
 
     def connect_conversation_changed(self, callback):
         """Register a callback to be invoked when user_history changes."""
-        log('DEBUG', 'session.session', f'[SESSION] connect_conversation_changed: adding callback, total {len(self._conversation_changed_callbacks) + 1}')
+        log('DEBUG', 'core.session', f'[SESSION] connect_conversation_changed: adding callback, total {len(self._conversation_changed_callbacks) + 1}')
         self._conversation_changed_callbacks.append(callback)
 
     def disconnect_conversation_changed(self, callback):
         """Remove a previously registered callback."""
-        log('DEBUG', 'session.session', f'[SESSION] disconnect_conversation_changed: looking for callback {callback}, total callbacks {len(self._conversation_changed_callbacks)}')
+        log('DEBUG', 'core.session', f'[SESSION] disconnect_conversation_changed: looking for callback {callback}, total callbacks {len(self._conversation_changed_callbacks)}')
         if callback in self._conversation_changed_callbacks:
-            log('DEBUG', 'session.session', f'[SESSION] disconnect_conversation_changed: removing callback, remaining {len(self._conversation_changed_callbacks) - 1}')
+            log('DEBUG', 'core.session', f'[SESSION] disconnect_conversation_changed: removing callback, remaining {len(self._conversation_changed_callbacks) - 1}')
             self._conversation_changed_callbacks.remove(callback)
 
     @property
@@ -302,7 +423,7 @@ class Session:
         Convert session to a dictionary suitable for JSON serialization.
         Excludes non-persistable fields like agent_context (derived) and objects.
         """
-        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'workspace_id': self.workspace_id, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
+        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'workspace_id': self.workspace_id, 'mode': self.mode, 'last_active': self.last_active, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'addendum': self.addendum, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
         return data
 
     @classmethod
@@ -322,13 +443,6 @@ class Session:
             if isinstance(config_data, dict):
                 metadata['agent_config'] = config_data
 
-        # Coerce session_permissions on load to reject stale / tampered values
-        agent_cfg = metadata.get('agent_config', {})
-        if 'session_permissions' in agent_cfg:
-            agent_cfg['session_permissions'] = coerce_session_permissions(
-                agent_cfg['session_permissions'],
-            )
-
         # Derive runtime params from metadata.agent_config (sole source of truth)
         agent_cfg = metadata.get('agent_config', {})
         runtime_params = RuntimeParams(
@@ -358,15 +472,11 @@ class Session:
         security_config_data = data.get('security_config', {})
         security_config = merge_security_config(security_config_data)
 
-        # Coerce session_permissions embedded in security_config
-        session_policy = security_config.get('session_policy', {})
-        if 'session_permissions' in session_policy:
-            session_policy['session_permissions'] = coerce_session_permissions(
-                session_policy['session_permissions'],
-            )
-
         version = data.get('version', 1)
-        session = cls(session_id=str(data.get('session_id', str(uuid.uuid4()))), created_at=created_at, updated_at=updated_at, runtime_params=runtime_params, user_history=user_history, containers=containers, preset_name=data.get('preset_name'), workspace_id=data.get('workspace_id'), metadata=metadata, security_config=security_config, version=version, summary=data.get('summary'), total_input_tokens=data.get('total_input_tokens', 0), total_output_tokens=data.get('total_output_tokens', 0), next_seq=next_seq_value, context_length=data.get('context_length', 0))
+        # Backward compat: mode and last_active (legacy sessions may lack these)
+        mode = data.get('mode', 'agent')
+        last_active = data.get('last_active', '')
+        session = cls(session_id=str(data.get('session_id', str(uuid.uuid4()))), created_at=created_at, updated_at=updated_at, runtime_params=runtime_params, user_history=user_history, containers=containers, preset_name=data.get('preset_name'), workspace_id=data.get('workspace_id'), mode=mode, last_active=last_active, metadata=metadata, security_config=security_config, version=version, summary=data.get('summary'), addendum=normalize_addendum(data.get('addendum')), total_input_tokens=data.get('total_input_tokens', 0), total_output_tokens=data.get('total_output_tokens', 0), next_seq=next_seq_value, context_length=data.get('context_length', 0))
         return session
 
     def update_from_persistable_dict(self, data: Dict[str, Any]) -> None:
@@ -380,12 +490,6 @@ class Session:
         if config_data and 'agent_config' not in metadata:
             if isinstance(config_data, dict):
                 metadata['agent_config'] = config_data
-        # Coerce session_permissions on load to reject stale / tampered values
-        agent_cfg = metadata.get('agent_config', {})
-        if 'session_permissions' in agent_cfg:
-            agent_cfg['session_permissions'] = coerce_session_permissions(
-                agent_cfg['session_permissions'],
-            )
         # Derive runtime params from metadata.agent_config (sole source of truth)
         agent_cfg = metadata.get('agent_config', {})
         runtime_params = RuntimeParams(
@@ -415,14 +519,9 @@ class Session:
         security_config_data = data.get('security_config', {})
         security_config = merge_security_config(security_config_data)
 
-        # Coerce session_permissions embedded in security_config
-        session_policy = security_config.get('session_policy', {})
-        if 'session_permissions' in session_policy:
-            session_policy['session_permissions'] = coerce_session_permissions(
-                session_policy['session_permissions'],
-            )
-
         version = data.get('version', 1)
+        self.mode = data.get('mode', self.mode)
+        self.last_active = data.get('last_active', self.last_active)
         self.session_id = str(data.get('session_id', str(uuid.uuid4())))
         self.created_at = created_at
         self.updated_at = updated_at
@@ -436,11 +535,36 @@ class Session:
         self.security_config = security_config
         self.version = version
         self.summary = data.get('summary')
+        self.addendum = normalize_addendum(data.get('addendum'))
         self.total_input_tokens = data.get('total_input_tokens', 0)
         self.total_output_tokens = data.get('total_output_tokens', 0)
         self.next_seq = next_seq_value
         self.context_length = data.get('context_length', 0)
         self.agent_context = []
+
+    def rebind_workspace(self, workspace_id: Optional[str], *, reason: str = "") -> Optional[str]:
+        """Move this session to a different workspace, returning the previous one.
+
+        This is the ONLY sanctioned way to move a session between workspaces.
+        ``workspace_id`` is immutable once stamped (see ``__setattr__``), which
+        protects the store from non-owner writes; but the OWNER of a session
+        (the server, when a fresh tab applies a config that switches the active
+        workspace) legitimately needs the record to follow the tab.  The
+        immutability guard stays in place for every other caller: this method
+        is a single audited escape hatch, it logs the move, and it never
+        touches the filesystem -- the caller saves and deletes afterwards.
+        """
+        current = self.workspace_id
+        if workspace_id == current:
+            return current
+        log(
+            'INFO',
+            'core.session',
+            f"Session {self.session_id} workspace rebind: {current!r} -> {workspace_id!r} "
+            f"(reason={reason or 'unspecified'})",
+        )
+        object.__setattr__(self, 'workspace_id', workspace_id)
+        return current
 
     def add_message(self, role: str, content: str, **kwargs) -> None:
         """

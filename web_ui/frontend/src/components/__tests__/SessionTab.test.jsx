@@ -1,0 +1,1091 @@
+// @vitest-environment jsdom
+/*
+ * SessionTab.test.jsx
+ *
+ * Phase 0 — Frontend Truthfulness Sprint.
+ * Tests the self-contained session tab: WebSocket lifecycle, command
+ * emission (new_session / load_session / security_response), event
+ * handling (state_changed, tokens_updated, conversation_changed,
+ * config_changed, session_loaded, security_prompt, worker:* forwarding),
+ * and auto-reconnect after an unexpected close.
+ *
+ * STATUS: EXECUTED AND PASSING — 25/25 tests green via
+ * `npx vitest run src/components/__tests__/SessionTab.test.jsx`
+ * (R6b header truthfulness fix; the earlier "predicted / not yet
+ * executed" note was stale).
+ */
+
+import React from 'react';
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+} from 'vitest';
+import {
+  render,
+  screen,
+  fireEvent,
+  cleanup,
+  act,
+  waitFor,
+} from '@testing-library/react';
+import '@testing-library/jest-dom/vitest';
+import SessionTab from '../SessionTab';
+import useStore from '../../store/useStore';
+
+// ────────────────────────────────────────────────────────────────────────────
+// Mock WebSocket (SessionTab uses the global WebSocket.OPEN constant)
+// ────────────────────────────────────────────────────────────────────────────
+class MockWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+  static instances = [];
+
+  constructor(url) {
+    this.url = url;
+    this.readyState = MockWebSocket.CONNECTING;
+    this.sent = [];
+    this.closed = false; // set true by close() — lets tests assert lifecycle cleanup
+    this.onopen = null;
+    this.onmessage = null;
+    this.onclose = null;
+    this.onerror = null;
+    MockWebSocket.instances.push(this);
+  }
+
+  send(data) {
+    this.sent.push(data);
+  }
+
+  close(code = 1001) {
+    this.closed = true;
+    this.readyState = MockWebSocket.CLOSED;
+    this.onclose?.({ code });
+  }
+
+  open() {
+    this.readyState = MockWebSocket.OPEN;
+    this.onopen?.({});
+  }
+
+  receive(msg) {
+    this.onmessage?.({ data: JSON.stringify(msg) });
+  }
+}
+
+// ─── Mock ResizeObserver (jsdom lacks it; ChatPanel constructs one on mount) ───
+class MockResizeObserver {
+  constructor(callback) {
+    this.callback = callback;
+  }
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test helpers
+// ────────────────────────────────────────────────────────────────────────────
+function lastWs() {
+  return MockWebSocket.instances[MockWebSocket.instances.length - 1];
+}
+
+function sentCommands(ws) {
+  return ws.sent.map((data) => JSON.parse(data));
+}
+
+async function connectWs() {
+  await waitFor(() => {
+    expect(MockWebSocket.instances.length).toBeGreaterThan(0);
+  });
+  const ws = lastWs();
+  await act(async () => ws.open());
+  return ws;
+}
+
+function renderTab(props = {}) {
+  const onClose = vi.fn();
+  const onNewSession = vi.fn();
+  const onOpenNewTab = vi.fn();
+  const onSessionSaved = vi.fn();
+  const onRegister = vi.fn();
+  const onSessionRenamed = vi.fn();
+  const onWorkerEvent = vi.fn();
+  const onLoggingConfigChanged = vi.fn();
+  const onSessionAdopted = vi.fn();
+  const mergedProps = {
+    sessionId: null,
+    tabId: 'tab-1',
+    hubReady: true,
+    staggerMs: 0,
+    loadOnConnect: true,
+    isActive: true,
+    onClose,
+    onNewSession,
+    onOpenNewTab,
+    onSessionSaved,
+    onRegister,
+    onSessionRenamed,
+    onWorkerEvent,
+    onLoggingConfigChanged,
+    onSessionAdopted,
+    ...props,
+  };
+  const utils = render(<SessionTab {...mergedProps} />);
+  return {
+    onClose,
+    onNewSession,
+    onOpenNewTab,
+    onSessionSaved,
+    onRegister,
+    onSessionRenamed,
+    onWorkerEvent,
+    onLoggingConfigChanged,
+    onSessionAdopted,
+    rerender: (nextProps) =>
+      utils.rerender(<SessionTab {...{ ...mergedProps, ...nextProps }} />),
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Setup / teardown
+// ────────────────────────────────────────────────────────────────────────────
+beforeEach(() => {
+  MockWebSocket.instances = [];
+  vi.stubGlobal('WebSocket', MockWebSocket);
+  vi.stubGlobal('ResizeObserver', MockResizeObserver);
+  vi.stubGlobal('fetch', vi.fn(async () => ({
+    ok: true,
+    json: async () => ({ tools: [] }),
+    text: async () => '',
+  })));
+  useStore.getState().reset();
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// WebSocket lifecycle
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — WebSocket lifecycle', () => {
+  it('opens a WebSocket to the backend /ws endpoint', async () => {
+    renderTab();
+    const ws = await connectWs();
+    expect(ws.url).toMatch(/^ws:\/\//);
+    expect(ws.url.endsWith('/ws')).toBe(true);
+  });
+
+  it('fresh tab sends new_session (mode custom), get_providers and get_available_tools on open', async () => {
+    renderTab();
+    const ws = await connectWs();
+    const commands = sentCommands(ws).map((c) => c.command);
+    expect(commands).toContain('new_session');
+    expect(commands).toContain('get_providers');
+    expect(commands).toContain('get_available_tools');
+    const newSession = sentCommands(ws).find((c) => c.command === 'new_session');
+    expect(newSession.mode).toBe('custom');
+  });
+
+  it('existing session sends load_session with its session_id', async () => {
+    renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    // load_session is deliberately deferred by one tick on open (SessionTab.jsx:
+    // "Defer load_session by one tick so the parent's synchronous setup
+    // (handlers, etc.) completes first"), so it arrives in a later macrotask
+    // than the synchronous new_session/get_providers sends — poll for it.
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+      expect(load.session_id).toBe('sess-1');
+    });
+  });
+
+  it('does not send load_session twice on first connect', async () => {
+    renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    // Duplicate onopen on the same socket (StrictMode / backend race) must
+    // not double-send: loadSentRef dedupes per connection (Fix 4b).
+    act(() => ws.open());
+    act(() => ws.open());
+    await waitFor(() => {
+      const loads = sentCommands(ws).filter((c) => c.command === 'load_session');
+      expect(loads).toHaveLength(1);
+      expect(loads[0].session_id).toBe('sess-1');
+    });
+  });
+
+  it('inactive tab with existing session still sends load_session but shows deferred placeholder', async () => {
+    renderTab({ sessionId: 'sess-1', loadOnConnect: false });
+    await connectWs();
+    // Fix 4b: inactive tabs still send load_session on connect (session state
+    // may have changed while disconnected), but keep the placeholder until
+    // the data arrives (or the tab is activated).
+    expect(screen.getByText('Click tab to load conversation')).toBeInTheDocument();
+    const ws = lastWs();
+    await waitFor(() => {
+      const loads = sentCommands(ws).filter((c) => c.command === 'load_session');
+      expect(loads).toHaveLength(1);
+      expect(loads[0].session_id).toBe('sess-1');
+    });
+  });
+
+  it('keeps the deferred placeholder on activation and clears it when the load response arrives', async () => {
+    const { rerender } = renderTab({ sessionId: 'sess-1', loadOnConnect: false, isActive: false });
+    const ws = await connectWs();
+    // Fix 4b: inactive tabs still send load_session on connect.
+    await waitFor(() => {
+      const loads = sentCommands(ws).filter((c) => c.command === 'load_session');
+      expect(loads).toHaveLength(1);
+      expect(loads[0].session_id).toBe('sess-1');
+    });
+    expect(screen.getByText('Click tab to load conversation')).toBeInTheDocument();
+    // Activating the tab with the socket still OPEN neither reconnects nor
+    // resends load_session nor clears the placeholder (the deferred-clear
+    // effect is driven by the server response, not by isActive alone).
+    rerender({ isActive: true });
+    expect(screen.getByText('Click tab to load conversation')).toBeInTheDocument();
+    expect(sentCommands(ws).filter((c) => c.command === 'load_session')).toHaveLength(1);
+    // The placeholder clears only once the backend responds with the session.
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-1',
+        session_name: 'My Session',
+        // Fix 4a: backend embeds config in session_loaded so the UI renders immediately
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    expect(await screen.findByText('My Session')).toBeInTheDocument();
+    expect(screen.queryByText('Click tab to load conversation')).not.toBeInTheDocument();
+  });
+
+  it('reconnects after an unexpected close (code != 1001)', async () => {
+    vi.useFakeTimers();
+    try {
+      renderTab();
+      // The mount effect always defers the first connection via
+      // setTimeout(connectSessionWs, staggerMs) — even with staggerMs=0 —
+      // so flush the timer before grabbing the instance (fake timers).
+      act(() => vi.advanceTimersByTime(0));
+      const ws = lastWs();
+      expect(ws).toBeTruthy();
+      act(() => ws.open());
+      const before = MockWebSocket.instances.length;
+      act(() => ws.close(1006));
+      act(() => vi.advanceTimersByTime(5000));
+      expect(MockWebSocket.instances.length).toBeGreaterThan(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resends load_session after an unexpected close (forced reload on reconnect)', async () => {
+    vi.useFakeTimers();
+    try {
+      renderTab({ sessionId: 'sess-1' });
+      // Flush the mount-effect stagger timer (see reconnect test above).
+      act(() => vi.advanceTimersByTime(0));
+      const ws1 = lastWs();
+      act(() => ws1.open());
+      // Flush the one-tick load_session deferral inside onopen.
+      act(() => vi.advanceTimersByTime(0));
+      expect(sentCommands(ws1).filter((c) => c.command === 'load_session')).toHaveLength(1);
+
+      const before = MockWebSocket.instances.length;
+      act(() => ws1.close(1006));
+      act(() => vi.advanceTimersByTime(5000));
+      expect(MockWebSocket.instances.length).toBeGreaterThan(before);
+
+      // Fix 4b: onclose resets loadSentRef, so the reconnected socket must
+      // send load_session again (forced reload on reconnect).
+      const ws2 = lastWs();
+      act(() => ws2.open());
+      act(() => vi.advanceTimersByTime(0));
+      const loads2 = sentCommands(ws2).filter((c) => c.command === 'load_session');
+      expect(loads2).toHaveLength(1);
+      expect(loads2[0].session_id).toBe('sess-1');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('closes its WebSocket on unmount (hubReady effect cleanup)', async () => {
+    renderTab();
+    const ws = await connectWs();
+    expect(ws.closed).toBe(false);
+    // Unmounting the component must run the hubReady effect cleanup, which
+    // closes the socket the tab opened (SessionTab.jsx cleanup: wsRef.current?.close()).
+    cleanup();
+    expect(ws.closed).toBe(true);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Event handling
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — event handling', () => {
+  it('renders initial Idle status', async () => {
+    renderTab();
+    await connectWs();
+    expect(screen.getByText('● Idle')).toBeInTheDocument();
+  });
+
+  it('state_changed updates the status indicator', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() => ws.receive({ type: 'state_changed', state: 'RUNNING', is_running: true }));
+    expect(await screen.findByText('● Running')).toBeInTheDocument();
+  });
+
+  it('ignores state_changed for a different session', async () => {
+    renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    act(() => ws.receive({ type: 'state_changed', session_id: 'other-session', state: 'RUNNING', is_running: true }));
+    expect(screen.getByText('● Idle')).toBeInTheDocument();
+  });
+
+  it('conversation_changed renders user and assistant messages', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [
+          { role: 'user', content: 'Hello there' },
+          { role: 'assistant', content: 'Hi!' },
+        ],
+      })
+    );
+    expect(await screen.findByText('Hello there')).toBeInTheDocument();
+    expect(screen.getByText('Hi!')).toBeInTheDocument();
+  });
+
+  it('status_message renders the server notice (query is not silently dropped)', async () => {
+    // The backend CASE-3 cold-start path emits a status_message that echoes
+    // the operator's query back to the client so the text is preserved in
+    // the transcript rather than dropped. This asserts the frontend renders
+    // that frame as a visible system notice (it does not swallow it).
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'status_message',
+        text:
+          '\u26a0 No active session \u2014 your message was not sent. ' +
+          'Start a session, then resend:\nhello from the cold start',
+      })
+    );
+    expect(
+      await screen.findByText(/No active session \u2014 your message was not sent/)
+    ).toBeInTheDocument();
+    // The echoed query text must survive into the rendered notice.
+    expect(screen.getByText(/hello from the cold start/)).toBeInTheDocument();
+  });
+
+  it('tokens_updated updates the token counter', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() => ws.receive({ type: 'tokens_updated', input: 100, output: 50 }));
+    expect(await screen.findByText('Tokens: In=100 / Out=50')).toBeInTheDocument();
+  });
+
+  it('tokens_updated with source=worker is forwarded to onWorkerEvent', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    act(() => ws.receive({ type: 'tokens_updated', source: 'worker', input: 7, output: 3 }));
+    await waitFor(() => {
+      expect(mocks.onWorkerEvent).toHaveBeenCalledWith(
+        'sess-1',
+        expect.objectContaining({ type: 'tokens_updated', source: 'worker' })
+      );
+    });
+  });
+
+  it('worker:worker_message is forwarded to onWorkerEvent', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'worker:worker_message',
+        session_id: 'sess-1',
+        data: { content: 'worker says hi' },
+      })
+    );
+    await waitFor(() => {
+      expect(mocks.onWorkerEvent).toHaveBeenCalledWith(
+        'sess-1',
+        expect.objectContaining({ type: 'worker:worker_message' })
+      );
+    });
+  });
+
+  it('does NOT forward worker events for a different session', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'worker:worker_message',
+        session_id: 'other-session',
+        data: { content: 'not mine' },
+      })
+    );
+    // Give the handler a tick to (wrongly) forward — it must not.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(mocks.onWorkerEvent).not.toHaveBeenCalled();
+  });
+
+  it('config_changed renders ConfigPanel with heading and no loading placeholder', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'config_changed',
+        config: { mode: 'custom', provider: 'openai', model: 'gpt-4o' },
+      })
+    );
+    expect(await screen.findByText('Session Panel')).toBeInTheDocument();
+    expect(screen.queryByText('Loading config...')).not.toBeInTheDocument();
+  });
+
+  it('config_queued marks the session as queued for ConfigPanel (FIX7)', async () => {
+    renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    act(() => ws.receive({ type: 'config_queued', status: 'queued', session_id: 'sess-1' }));
+    await waitFor(() => {
+      expect(useStore.getState().sessionConfigs['sess-1'].configQueued).toBe(true);
+    });
+  });
+
+  it('config_apply_failed stores the error and clears the queued state (FIX7)', async () => {
+    renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    act(() => ws.receive({ type: 'config_queued', status: 'queued', session_id: 'sess-1' }));
+    act(() =>
+      ws.receive({
+        type: 'config_apply_failed',
+        session_id: 'sess-1',
+        text: '⚠ Failed to apply queued config: boom',
+      })
+    );
+    await waitFor(() => {
+      const entry = useStore.getState().sessionConfigs['sess-1'];
+      expect(entry.configQueued).toBe(false);
+      expect(entry.applyFailed).toBe('⚠ Failed to apply queued config: boom');
+    });
+  });
+
+  it('session_loaded on a fresh tab registers the new session and shows its name', async () => {
+    const mocks = renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-new',
+        session_name: 'My Session',
+        // Fix 4a: backend now embeds config in session_loaded so the chat UI renders immediately
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    expect(await screen.findByText('My Session')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mocks.onNewSession).toHaveBeenCalledWith('sess-new', 'My Session');
+    });
+  });
+
+  // Fix 3b: after a backend restart, load_session on a dead id makes the
+  // backend create a REPLACEMENT session and reply session_loaded with a
+  // DIFFERENT session_id. The tab must NOT silently rebind — it shows a
+  // recovery banner and blocks further commands until 'Start New Session'.
+  it(
+    'session_loaded with a DIFFERENT session id shows the stale-session recovery banner',
+    async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    // load_session for sess-1 is deferred by one tick on open — wait for it so
+    // the tab is in the "loaded session" state before the stale reply arrives.
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    // Seed store slices for the dead session so the Fix 4c purge is observable.
+    act(() => {
+      useStore.getState().setSessions([{ session_id: 'sess-1', name: 'Dead Session' }]);
+      useStore.getState().setSessionMode('sess-1', 'agent');
+      useStore.getState().setTabRunningState('sess-1', 'RUNNING');
+      useStore.getState().registerSession('sess-1');
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'replacement-sess',
+        session_name: 'Replacement Session',
+        workspace_id: 'ws-2',
+        // Fix 4a: config field is inert for the stale-branch path
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    // Recovery banner with the stale-session message + Start New Session action.
+    expect(await screen.findByText(/no longer available/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start New Session' })).toBeInTheDocument();
+    // Fix 4c: the dead session's store slices are purged so nothing can leak
+    // into the replacement session.
+    expect(useStore.getState().sessionModes['sess-1']).toBeUndefined();
+    expect(useStore.getState().tabRunningStates['sess-1']).toBeUndefined();
+    expect(useStore.getState().sessionConfigs['sess-1']).toBeUndefined();
+    expect(useStore.getState().sessions.some((s) => s.session_id === 'sess-1')).toBe(false);
+    // The tab was NOT silently rebound to the replacement session.
+    expect(screen.queryByText('Replacement Session')).not.toBeInTheDocument();
+    // sendCommand is gated: further commands are blocked (nothing sent on the WS).
+    const registered = mocks.onRegister.mock.calls[0][0];
+    act(() => registered.sendCommand('start_session', { query: 'ignored' }));
+    expect(sentCommands(ws).some((c) => c.command === 'start_session')).toBe(false);
+    // 'Start New Session' adopts the stashed replacement through onNewSession.
+    fireEvent.click(screen.getByRole('button', { name: 'Start New Session' }));
+    await waitFor(() => {
+      expect(mocks.onNewSession).toHaveBeenCalledWith('replacement-sess', 'Replacement Session');
+    });
+    expect(screen.queryByText(/no longer available/i)).not.toBeInTheDocument();
+  }, 20000);
+
+  // Fix 3C: a command routed through sendCommand while the session is stale is
+  // blocked (unchanged) but the user must get visual feedback — the ALREADY-
+  // EXISTING recovery banner pulses briefly. No new banner/text/retry is added.
+  it('a blocked command on a stale session pulses the recovery banner briefly', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    act(() => {
+      useStore.getState().setSessions([{ session_id: 'sess-1', name: 'Dead Session' }]);
+      useStore.getState().setSessionMode('sess-1', 'agent');
+      useStore.getState().setTabRunningState('sess-1', 'RUNNING');
+      useStore.getState().registerSession('sess-1');
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'replacement-sess',
+        session_name: 'Replacement Session',
+        workspace_id: 'ws-2',
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    await screen.findByText(/no longer available/i);
+    // The banner is present but not pulsing before the blocked click.
+    const bannerBefore = document.querySelector('.session-error-banner');
+    expect(bannerBefore).not.toBeNull();
+    expect(bannerBefore).not.toHaveClass('session-error-banner--pulse');
+    // A command routed through the gate pulses the banner (and stays blocked).
+    const registered = mocks.onRegister.mock.calls[0][0];
+    act(() => registered.sendCommand('start_session', { query: 'ignored' }));
+    expect(document.querySelector('.session-error-banner')).toHaveClass('session-error-banner--pulse');
+    expect(sentCommands(ws).some((c) => c.command === 'start_session')).toBe(false);
+  }, 20000);
+
+  // Intentional replacement (workspace switch via apply_config): the backend
+  // flags the new session_loaded with `replacement: true`. The tab must adopt
+  // it SILENTLY — no stale banner, no purge of the old session's store slices
+  // (the old session still exists server-side), and App is notified via
+  // onSessionAdopted so the tab entry tracks the new session id.
+  it('session_loaded with replacement:true silently adopts the new session (no stale banner)', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    // Seed store slices for the old session — they must SURVIVE the adoption
+    // (the backend-restart stale path purges them; intentional replacement does not).
+    act(() => {
+      useStore.getState().setSessions([{ session_id: 'sess-1', name: 'Old Session' }]);
+      useStore.getState().setSessionMode('sess-1', 'agent');
+      useStore.getState().setTabRunningState('sess-1', 'RUNNING');
+      useStore.getState().registerSession('sess-1');
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'replacement-sess',
+        session_name: 'Replacement Session',
+        workspace_id: 'ws-2',
+        replacement: true,
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    // No stale-session banner and no recovery action.
+    expect(screen.queryByText(/no longer available/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start New Session' })).not.toBeInTheDocument();
+    // Old session slices are NOT purged (the old session still exists server-side).
+    expect(useStore.getState().sessionModes['sess-1']).toBe('agent');
+    expect(useStore.getState().tabRunningStates['sess-1']).toBe('RUNNING');
+    expect(useStore.getState().sessions.some((s) => s.session_id === 'sess-1')).toBe(true);
+    // The replacement session is adopted through the store...
+    await waitFor(() => {
+      expect(useStore.getState().sessionConfigs['replacement-sess']).toBeDefined();
+      expect(useStore.getState().sessionConfigs['replacement-sess'].isLoaded).toBe(true);
+    });
+    // ...the tab shows the new session name...
+    expect(await screen.findByText('Replacement Session')).toBeInTheDocument();
+    // ...and App is notified so the tab entry follows the new session id.
+    await waitFor(() => {
+      expect(mocks.onSessionAdopted).toHaveBeenCalledWith('replacement-sess');
+    });
+    // This is a rebind, not a new-tab creation — onNewSession must NOT fire.
+    expect(mocks.onNewSession).not.toHaveBeenCalled();
+  });
+
+  // Fix 4d: a dead session id (backend restart) now makes the backend reply
+  // session_loaded with load_error: true and the SAME session_id the tab asked
+  // for. The tab must show the recovery banner and must NOT register the
+  // phantom session in the store (no config, no sessions-list entry, no
+  // onSessionAdopted / onNewSession notifications).
+  it('session_loaded with load_error renders the load-failed state and does not register the session', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    // load_session for sess-1 is deferred by one tick on open — wait for it so
+    // the tab is in the "loaded session" state before the load_error reply.
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-1',
+        load_error: true,
+        workspace_id: 'ws-1',
+      })
+    );
+    // Recovery banner: load-failed message + Start New Session action.
+    expect(await screen.findByText(/could not be loaded/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start New Session' })).toBeInTheDocument();
+    // The phantom session is NOT registered in the store (no config snapshot,
+    // no sessions-list entry).
+    expect(useStore.getState().sessionConfigs['sess-1']).toBeUndefined();
+    expect(useStore.getState().sessions.some((s) => s.session_id === 'sess-1')).toBe(false);
+    // No adoption, no rebind, no new-session notification.
+    expect(mocks.onSessionAdopted).not.toHaveBeenCalled();
+    expect(mocks.onNewSession).not.toHaveBeenCalled();
+  });
+
+  // Fix 4d: 'Start New Session' after load_error has no stashed replacement —
+  // it asks the backend for a brand new session and accepts the reply through
+  // the normal path (expectingNewSessionRef bypasses stale detection for the
+  // dead id, and wasExpectingNew routes onNewSession to App).
+  it('Start New Session after load_error sends new_session and accepts the reply', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-1',
+        load_error: true,
+      })
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Start New Session' }));
+    // The tab asks the backend for a brand new session (custom mode), exactly
+    // like a fresh tab does on open.
+    await waitFor(() => {
+      const ns = sentCommands(ws).find((c) => c.command === 'new_session');
+      expect(ns).toBeTruthy();
+      expect(ns.mode).toBe('custom');
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-new',
+        session_name: 'Fresh Session',
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    // The new session is adopted and rendered; the recovery banner is gone.
+    expect(await screen.findByText('Fresh Session')).toBeInTheDocument();
+    expect(screen.queryByText(/could not be loaded/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/no longer available/i)).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(mocks.onNewSession).toHaveBeenCalledWith('sess-new', 'Fresh Session');
+    });
+    expect(useStore.getState().sessionConfigs['sess-new'].isLoaded).toBe(true);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Security prompt
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — security prompt', () => {
+  it('renders SecurityDialog and Approve sends security_response', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'security_prompt',
+        request_id: 'req-1',
+        tool_name: 'read_file',
+        capabilities: ['read'],
+        arguments: { path: '/tmp/x' },
+        description: 'Tool requires your approval.',
+      })
+    );
+    expect(await screen.findByText('Security Prompt')).toBeInTheDocument();
+    expect(screen.getByText('read_file')).toBeInTheDocument();
+    const approve = screen.getByText('Approve');
+    fireEvent.click(approve);
+    const response = sentCommands(ws).find((c) => c.command === 'security_response');
+    expect(response).toBeTruthy();
+    expect(response.request_id).toBe('req-1');
+    expect(response.approved).toBe(true);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Cold-start status notice survives a server-driven conversation_changed
+// replace (d2-cold-start-status-notice-wiped-by-session-load).
+//
+// The CASE-3 cold-start path emits a `status_message` whose echoed query text
+// becomes a CLIENT-ONLY bubble. A later server `conversation_changed` (cached
+// reuse, load_session, clear_loaded_session) carries only server-known history
+// and would otherwise wipe that bubble. These are integration tests over the
+// real WS event handlers, not the store primitive.
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — cold-start status notice vs conversation_changed', () => {
+  it('keeps the client-only notice after a server conversation_changed replace', async () => {
+    renderTab();
+    const ws = await connectWs();
+
+    // 1. Cold-start CASE-3 notice → client-only system bubble.
+    act(() => ws.receive({ type: 'status_message', text: 'cold-start-notice-marker' }));
+    expect(await screen.findByText('cold-start-notice-marker')).toBeInTheDocument();
+
+    // 2. A server-driven replace arrives carrying only server-known history.
+    //    The client-only notice must survive it.
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'user', content: 'server-history-marker' }],
+      })
+    );
+    expect(await screen.findByText('server-history-marker')).toBeInTheDocument();
+    expect(screen.getByText('cold-start-notice-marker')).toBeInTheDocument();
+  });
+
+  it('conversation_changed still replaces (no stale server messages linger)', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'user', content: 'first-payload' }],
+      })
+    );
+    expect(await screen.findByText('first-payload')).toBeInTheDocument();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'user', content: 'second-payload' }],
+      })
+    );
+    expect(await screen.findByText('second-payload')).toBeInTheDocument();
+    expect(screen.queryByText('first-payload')).not.toBeInTheDocument();
+  });
+
+  it('status_message appends to existing history (does not replace it)', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'user', content: 'existing-history' }],
+      })
+    );
+    expect(await screen.findByText('existing-history')).toBeInTheDocument();
+    act(() => ws.receive({ type: 'status_message', text: 'appended-notice-marker' }));
+    expect(await screen.findByText('appended-notice-marker')).toBeInTheDocument();
+    expect(screen.getByText('existing-history')).toBeInTheDocument();
+  });
+
+  it('more_messages prepends older history (does not replace it)', async () => {
+    renderTab();
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        messages: [{ role: 'assistant', content: 'recent-line' }],
+      })
+    );
+    expect(await screen.findByText('recent-line')).toBeInTheDocument();
+    act(() =>
+      ws.receive({
+        type: 'more_messages',
+        messages: [{ role: 'user', content: 'older-line' }],
+        has_more: false,
+      })
+    );
+    expect(await screen.findByText('older-line')).toBeInTheDocument();
+    expect(screen.getByText('recent-line')).toBeInTheDocument();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// feat/token-streaming — assistant_delta → in-flight bubble reconciliation.
+//
+// The backend streams `assistant_delta` ({session_id, text, turn}) per token and
+// still sends the terminal `turn` as a `conversation_changed` replace. The tab
+// appends deltas to a LOCAL in-flight bubble (never a store write) and must
+// reconcile it against that replace: if both survive, the streamed text renders
+// twice. Coalescing is per animation frame, so the assertions wait for the flush.
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — assistant_delta streaming', () => {
+  it('reconciles streamed deltas with the terminal turn (text rendered exactly once)', async () => {
+    renderTab({ sessionId: 'sess-stream' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({ type: 'conversation_changed', session_id: 'sess-stream', messages: [] })
+    );
+
+    // Two deltas for the SAME turn coalesce into one in-flight assistant bubble.
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-stream', text: 'Hel', turn: 1 }));
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-stream', text: 'lo', turn: 1 }));
+    expect(await screen.findByText('Hello')).toBeInTheDocument();
+
+    // The terminal `turn` arrives as a conversation_changed replace carrying the
+    // persisted message: it must REPLACE the in-flight bubble, not join it.
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-stream',
+        messages: [
+          { role: 'user', content: 'prompt-marker' },
+          { role: 'assistant', content: 'Hello' },
+        ],
+      })
+    );
+    expect(await screen.findByText('prompt-marker')).toBeInTheDocument();
+
+    // Visible-text proof (not element-count only): the streamed text must be
+    // really present, exactly once, and never as the in-flight buffer glued to
+    // the persisted copy.
+    const helloEls = screen.getAllByText('Hello');
+    expect(helloEls).toHaveLength(1);
+    expect(helloEls[0].textContent).toBe('Hello');
+    const bodyText = document.body.textContent || '';
+    expect(bodyText.match(/Hello/g) || []).toHaveLength(1);
+    expect(bodyText).not.toContain('HelHelo');
+    expect(bodyText).not.toContain('HelloHello');
+  });
+
+  it('retains the streamed partial as a final message when the run is interrupted', async () => {
+    renderTab({ sessionId: 'sess-halt' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-halt',
+        messages: [{ role: 'user', content: 'stop-midstream-prompt' }],
+      })
+    );
+    expect(await screen.findByText('stop-midstream-prompt')).toBeInTheDocument();
+
+    // Two deltas for the SAME turn coalesce into one local in-flight bubble.
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-halt', text: 'Par', turn: 1 }));
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-halt', text: 'tial', turn: 1 }));
+    expect(await screen.findByText('Partial')).toBeInTheDocument();
+
+    // Hard stop: the backend truncated the stream and committed the text it had
+    // already produced, announcing it with `interrupted` instead of a terminal
+    // `conversation_changed` for that turn.
+    act(() =>
+      ws.receive({
+        type: 'interrupted',
+        session_id: 'sess-halt',
+        text: 'Partial',
+        stop_reason: 'interrupted',
+      })
+    );
+
+    // The text the user watched stream in survives as a FINAL message: it is
+    // present exactly once (the in-flight bubble was folded away, not joined),
+    // and no empty assistant bubble was added in its place.
+    const partialEls = screen.getAllByText('Partial');
+    expect(partialEls).toHaveLength(1);
+    const bodyText = document.body.textContent || '';
+    expect(bodyText.match(/Partial/g) || []).toHaveLength(1);
+    expect(bodyText).not.toContain('ParPartial');
+    expect(bodyText).not.toContain('PartialPartial');
+
+    // Store truth: user prompt + the retained partial, nothing else. An empty
+    // assistant message here would render as a blank bubble.
+    const stored = useStore.getState().sessionMessages['sess-halt'];
+    expect(stored).toHaveLength(2);
+    expect(stored[1]).toEqual({ role: 'assistant', content: 'Partial' });
+
+    // In-flight state is cleared, so a later render pass cannot resurrect it.
+    await waitFor(() =>
+      expect((document.body.textContent || '').match(/Partial/g) || []).toHaveLength(1)
+    );
+  });
+
+  it('discards the in-flight bubble when the run ends without a terminal turn', async () => {
+    renderTab({ sessionId: 'sess-crash' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-crash',
+        messages: [{ role: 'user', content: 'prompt-marker' }],
+      })
+    );
+    expect(await screen.findByText('prompt-marker')).toBeInTheDocument();
+
+    act(() =>
+      ws.receive({ type: 'assistant_delta', session_id: 'sess-crash', text: 'partial-text-marker', turn: 1 })
+    );
+    expect(await screen.findByText('partial-text-marker')).toBeInTheDocument();
+    // The in-flight bubble is local state only — the store never sees a
+    // delta-only message (pagination offsets and reloads stay server-truthful).
+    expect(useStore.getState().sessionMessages['sess-crash']).toHaveLength(1);
+
+    // Crash / hard stop: the run ends with state_changed is_running:false and no
+    // conversation_changed for the streamed turn — the phantom text must go.
+    act(() =>
+      ws.receive({
+        type: 'state_changed',
+        session_id: 'sess-crash',
+        state: 'IDLE',
+        is_running: false,
+      })
+    );
+    await waitFor(() => expect(screen.queryByText('partial-text-marker')).toBeNull());
+    expect(screen.getByText('prompt-marker')).toBeInTheDocument();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// feat/reasoning-streaming — `reasoning_delta` → in-flight THINKING block.
+//
+// Before this, the thinking phase only reached the UI at turn end (inside the
+// terminal `conversation_changed`), so the bubble looked frozen while the model
+// reasoned. The tab now appends `reasoning_delta` chunks to the SAME per-frame
+// coalesced in-flight buffer as `assistant_delta`, but under a separate key, so
+// thinking never leaks into the answer body. It also had to stop bailing out of
+// the in-flight bubble when only reasoning had arrived (see the second test).
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — reasoning_delta streaming', () => {
+  it('renders reasoning_delta into the thinking block, never into the answer body', async () => {
+    renderTab({ sessionId: 'sess-reason' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-reason',
+        messages: [{ role: 'user', content: 'think-prompt' }],
+      })
+    );
+    expect(await screen.findByText('think-prompt')).toBeInTheDocument();
+
+    // Two chunks of the SAME turn coalesce into one in-flight reasoning buffer.
+    act(() => ws.receive({ type: 'reasoning_delta', session_id: 'sess-reason', text: 'ponder', turn: 1 }));
+    act(() => ws.receive({ type: 'reasoning_delta', session_id: 'sess-reason', text: 'ing', turn: 1 }));
+
+    // Coalescing is per animation frame (with a 16ms setTimeout fallback), so poll.
+    expect(await screen.findByText('pondering')).toBeInTheDocument();
+
+    // It lands in the Thinking block...
+    const block = document.querySelector('.reasoning-block');
+    expect(block).not.toBeNull();
+    expect(block.textContent).toContain('Thinking');
+    expect(block.textContent).toContain('pondering');
+
+    // ...and NOT in the assistant answer body.
+    const answer = document.querySelector('.assistant-markdown');
+    expect(answer).not.toBeNull();
+    expect(answer.textContent).toBe('');
+  });
+
+  it('shows an in-flight bubble for a reasoning-only stream (before any text arrives)', async () => {
+    // Regression guard: the old viewMessages guard was
+    //   if (!inFlight || !inFlight.content) return history
+    // so a reasoning-only stream (content === '') was structurally invisible —
+    // the bubble never appeared until the first assistant_delta chunk.
+    renderTab({ sessionId: 'sess-reason-only' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-reason-only',
+        messages: [{ role: 'user', content: 'reason-only-prompt' }],
+      })
+    );
+    expect(await screen.findByText('reason-only-prompt')).toBeInTheDocument();
+
+    // ONLY reasoning frames — no assistant_delta has been sent at this point.
+    act(() =>
+      ws.receive({
+        type: 'reasoning_delta',
+        session_id: 'sess-reason-only',
+        text: 'reasoning-only-marker',
+        turn: 1,
+      })
+    );
+
+    expect(await screen.findByText('reasoning-only-marker')).toBeInTheDocument();
+    // The bubble itself exists (not just the text inside some hidden node).
+    expect(document.querySelector('.reasoning-block')).not.toBeNull();
+  });
+
+  it('reconciles streamed reasoning with the terminal turn (each text rendered exactly once)', async () => {
+    renderTab({ sessionId: 'sess-reason-final' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-reason-final',
+        messages: [{ role: 'user', content: 'reconcile-prompt' }],
+      })
+    );
+    expect(await screen.findByText('reconcile-prompt')).toBeInTheDocument();
+
+    act(() => ws.receive({ type: 'reasoning_delta', session_id: 'sess-reason-final', text: 'ponder', turn: 1 }));
+    expect(await screen.findByText('ponder')).toBeInTheDocument();
+
+    // The terminal turn arrives as a conversation_changed replace whose
+    // persisted message carries BOTH the answer and the reasoning.
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-reason-final',
+        messages: [
+          { role: 'user', content: 'reconcile-prompt' },
+          { role: 'assistant', content: 'Done', reasoning_content: 'ponder' },
+        ],
+      })
+    );
+    expect(await screen.findByText('Done')).toBeInTheDocument();
+
+    // Exactly one copy of each — the in-flight bubble was folded away, not joined.
+    const bodyText = document.body.textContent || '';
+    expect((bodyText.match(/ponder/g) || [])).toHaveLength(1);
+    expect((bodyText.match(/Done/g) || [])).toHaveLength(1);
+    expect(bodyText).not.toContain('ponderponder');
+
+    // The reconciled message is no longer streaming, so the markdown path is
+    // back in charge (no plain pre-wrapped text node left behind).
+    expect(document.querySelector('.assistant-markdown [style*="pre-wrap"]')).toBeNull();
+    expect(document.querySelector('.reasoning-content [style*="pre-wrap"]')).toBeNull();
+  });
+});
+

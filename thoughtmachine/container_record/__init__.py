@@ -1,0 +1,136 @@
+"""Container Record subsystem.
+
+Persistent, record-owned container metadata (design: ``docs/container_record_design.md``).
+A *record* is the durable identity for a container; the Docker container is an
+ephemeral attachment to it.
+
+Layout:
+    * :mod:`thoughtmachine.container_record.models`    — schema + exceptions (§1)
+    * :mod:`thoughtmachine.container_record.storage`   — on-disk primitives (§2)
+    * :mod:`thoughtmachine.container_record.api`       — lookup/mutation API (§3)
+    * :mod:`thoughtmachine.container_record.migration` — legacy synthesis (§4)
+"""
+
+from __future__ import annotations
+
+from .api import (
+    RECORD_LABEL_KEY,
+    append_event,
+    attach_container,
+    begin_record,
+    create_record,
+    delete_record,
+    find_by_docker_label,
+    lifecycle_class_from_labels,
+    list_records,
+    load_record,
+    read_event_log,
+    record_label,
+    update_record,
+)
+from .migration import migrate_records
+from .models import (
+    EVENT_ENTRY_KEYS,
+    INTENT_SNAPSHOT_KEYS,
+    LIFECYCLE_CLASSES,
+    LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_PERSISTENT,
+    LIFECYCLE_RESOURCE,
+    LIFECYCLE_SERVICE,
+    OWNER_SYSTEM,
+    OWNER_VALUES,
+    OWNER_WORKSPACE,
+    SCHEMA_FIELD_NAMES,
+    SCHEMA_VERSION_CURRENT,
+    SCHEMA_VERSION_LEGACY,
+    STATE_CREATING,
+    STATE_RUNNING,
+    ContainerRecordError,
+    Record,
+    RecordCorrupt,
+    RecordLocked,
+    RecordNotFound,
+)
+from .lifecycle_policy import (
+    POLICY_BY_CLASS,
+    RESOURCE_IMAGE,
+    RESOURCE_LABEL,
+    RESOURCE_NAME_PREFIX,
+    TERMINAL_CONTAINER_STATUSES,
+    LifecyclePolicy,
+    UnknownLifecycleClass,
+    consumes_workspace_slot,
+    is_resource_like,
+    docker_restart_policy,
+    normalise_restart_policy,
+    policy_for,
+)
+from .snapshot import (
+    HARDENING_KEYS,
+    MEM_LIMIT_UNITS,
+    mem_limit_bytes,
+    rebuild_config_from_snapshot,
+    snapshot_from_attrs,
+)
+from .hook import snapshot_has_evidence
+
+__all__ = [
+    # exceptions (§3.1)
+    "ContainerRecordError",
+    "RecordNotFound",
+    "RecordCorrupt",
+    "RecordLocked",
+    # model (§1)
+    "Record",
+    "SCHEMA_VERSION_LEGACY",
+    "SCHEMA_VERSION_CURRENT",
+    "SCHEMA_FIELD_NAMES",
+    "INTENT_SNAPSHOT_KEYS",
+    "EVENT_ENTRY_KEYS",
+    "LIFECYCLE_CLASSES",
+    "LIFECYCLE_EPHEMERAL",
+    "LIFECYCLE_PERSISTENT",
+    "LIFECYCLE_RESOURCE",
+    "LIFECYCLE_SERVICE",
+    "OWNER_VALUES",
+    "OWNER_WORKSPACE",
+    "OWNER_SYSTEM",
+    "STATE_CREATING",
+    "STATE_RUNNING",
+    # snapshot extraction (§1.1 / §4)
+    "snapshot_from_attrs",
+    "snapshot_has_evidence",
+    "rebuild_config_from_snapshot",
+    "HARDENING_KEYS",
+    "mem_limit_bytes",
+    "MEM_LIMIT_UNITS",
+    # api (§3 / §7)
+    "RECORD_LABEL_KEY",
+    "record_label",
+    "create_record",
+    "begin_record",
+    "attach_container",
+    "load_record",
+    "list_records",
+    "find_by_docker_label",
+    "lifecycle_class_from_labels",
+    "read_event_log",
+    "update_record",
+    "append_event",
+    "delete_record",
+    # migration (§4)
+    "migrate_records",
+    # lifecycle policy
+    "LifecyclePolicy",
+    "POLICY_BY_CLASS",
+    "policy_for",
+    "UnknownLifecycleClass",
+    "is_resource_like",
+    "docker_restart_policy",
+    "normalise_restart_policy",
+    "RESOURCE_LABEL",
+    "RESOURCE_NAME_PREFIX",
+    "RESOURCE_IMAGE",
+    "TERMINAL_CONTAINER_STATUSES",
+    "consumes_workspace_slot",
+]

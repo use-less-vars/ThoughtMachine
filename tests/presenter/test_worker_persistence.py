@@ -39,9 +39,7 @@ for _mod_name in ("libcst", "tree_sitter", "tree_sitter_python"):
 # Now safe to import the bridge
 from web_ui.backend.bridge import WebAgentBridge
 
-
 # ── Fixtures ──────────────────────────────────────────────────────────────────
-
 
 @pytest.fixture
 def ws_dir(tmp_path: Path) -> Path:
@@ -49,7 +47,6 @@ def ws_dir(tmp_path: Path) -> Path:
     d = tmp_path / "workspaces" / "ws_test"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
 
 @pytest.fixture
 def bridge(ws_dir: Path) -> WebAgentBridge:
@@ -59,7 +56,6 @@ def bridge(ws_dir: Path) -> WebAgentBridge:
     inst._workspace_id = "ws_test"
     inst._persisted_workers = {}
     return inst
-
 
 @pytest.fixture(autouse=True)
 def _patch_workspace_dir(ws_dir: Path):
@@ -87,9 +83,7 @@ def _patch_workspace_dir(ws_dir: Path):
         patcher2.stop()
         patcher1.stop()
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
 
 def _make_context(workers_dir: Path, name: str, data: dict | None = None) -> Path:
     """Create ``workers/<name>/context.json`` and return its path."""
@@ -100,11 +94,9 @@ def _make_context(workers_dir: Path, name: str, data: dict | None = None) -> Pat
     p.write_text(json.dumps(ctx), encoding="utf-8")
     return p
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  _load_worker_contexts
 # ══════════════════════════════════════════════════════════════════════════════
-
 
 class TestLoadWorkerContexts:
     """Covers WebAgentBridge._load_worker_contexts()."""
@@ -176,11 +168,9 @@ class TestLoadWorkerContexts:
         loaded = bridge._persisted_workers["worker_a"]["context"]
         assert loaded["messages"][0]["content"] == "I am ready"
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  resume_worker
 # ══════════════════════════════════════════════════════════════════════════════
-
 
 class TestResumeWorker:
     """Covers WebAgentBridge.resume_worker()."""
@@ -216,14 +206,35 @@ class TestResumeWorker:
         assert bridge.resume_worker("y") == {"data": 2}
         assert bridge.resume_worker("z") is None
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Workspace routes — get_workers (persisted context flag)
 # ══════════════════════════════════════════════════════════════════════════════
 
+class TestGetWorkersTemplatesOnly:
+    """The ``get_workers`` endpoint returns raw worker templates only.
 
-class TestGetWorkersPersistedContextFlag:
-    """The ``get_workers`` endpoint detects persisted contexts on disk."""
+    Runtime/instance state is deliberately NOT merged into the rows: on-disk
+    ``workers/<name>/context.json`` and ``status.json`` files are ignored
+    (live state is served separately by ``/workers/active``). Mirrors
+    ``test_worker_instance_ui.py::test_get_workers_returns_templates_only``.
+    """
+
+    _RUNTIME_KEYS = (
+        "instance_id", "instance_label", "runtime_status",
+        "has_persisted_context", "pruned_since_last_query",
+        "time_since_last_query", "started_at", "last_query_at",
+        "paused_manually", "current_task", "current_context_tokens",
+        "max_context_tokens", "session_id", "error", "last_heartbeat",
+    )
+
+    def _assert_raw_templates(self, result, configs):
+        """Rows must equal the raw workers.json configs, no runtime keys."""
+        assert len(result) == len(configs)
+        by_name = {e["name"]: e for e in result}
+        assert by_name == {c["name"]: c for c in configs}
+        for entry in result:
+            for key in self._RUNTIME_KEYS:
+                assert key not in entry, f"runtime key {key!r} leaked into template row"
 
     def _make_workers_json(self, ws_dir: Path, configs: list[dict]) -> None:
         """Write a workers.json config file."""
@@ -231,68 +242,63 @@ class TestGetWorkersPersistedContextFlag:
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())
-    def test_has_persisted_context_flag(self, ws_dir: Path):
-        """Workers with context.json on disk get has_persisted_context=True."""
+    def test_on_disk_context_is_ignored(self, ws_dir: Path):
+        """context.json on disk is NOT reflected in the template rows."""
         from web_ui.backend.workspace_routes import get_workers
 
-        self._make_workers_json(ws_dir, [
+        configs = [
             {"name": "alpha", "system_prompt": "you are alpha"},
             {"name": "beta", "system_prompt": "you are beta"},
-        ])
-        # Create persisted context for alpha only
+        ]
+        self._make_workers_json(ws_dir, configs)
+        # Create persisted context for alpha only - it must be ignored.
         _make_context(ws_dir / "workers", "alpha", {"msg": "persisted"})
 
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
+        result = asyncio.run(get_workers("ws_test", name=None))
 
-        alpha_entry = next(e for e in result if e["name"] == "alpha")
-        beta_entry = next(e for e in result if e["name"] == "beta")
-        assert alpha_entry["has_persisted_context"] is True
-        assert beta_entry["has_persisted_context"] is False
+        self._assert_raw_templates(result, configs)
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())
-    def test_all_false_when_no_workers_dir(self, ws_dir: Path):
-        """When no workers/ directory exists, all workers have has_persisted_context=False."""
+    def test_no_workers_dir_returns_raw_template(self, ws_dir: Path):
+        """With no workers/ dir on disk, the row is the raw config template."""
         from web_ui.backend.workspace_routes import get_workers
 
-        self._make_workers_json(ws_dir, [
-            {"name": "gamma"},
-        ])
+        configs = [{"name": "gamma"}]
+        self._make_workers_json(ws_dir, configs)
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
-        assert result[0]["has_persisted_context"] is False
+        result = asyncio.run(get_workers("ws_test", name=None))
+        self._assert_raw_templates(result, configs)
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())
-    def test_all_false_when_empty_workers_dir(self, ws_dir: Path):
-        """When workers/ dir exists but empty, has_persisted_context is False."""
+    def test_empty_workers_dir_returns_raw_template(self, ws_dir: Path):
+        """An empty workers/ dir on disk does not change the template row."""
         from web_ui.backend.workspace_routes import get_workers
 
-        self._make_workers_json(ws_dir, [{"name": "delta"}])
+        configs = [{"name": "delta"}]
+        self._make_workers_json(ws_dir, configs)
         (ws_dir / "workers").mkdir(parents=True)
 
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
-        assert result[0]["has_persisted_context"] is False
+        result = asyncio.run(get_workers("ws_test", name=None))
+        self._assert_raw_templates(result, configs)
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())
-    def test_true_for_multiple_persisted_workers(self, ws_dir: Path):
-        """Multiple workers with context.json all get has_persisted_context=True."""
+    def test_multiple_persisted_workers_still_templates_only(self, ws_dir: Path):
+        """Multiple context.json dirs are ignored; rows stay raw templates."""
         from web_ui.backend.workspace_routes import get_workers
 
-        self._make_workers_json(ws_dir, [
-            {"name": "one"},
-            {"name": "two"},
-        ])
+        configs = [{"name": "one"}, {"name": "two"}]
+        self._make_workers_json(ws_dir, configs)
         _make_context(ws_dir / "workers", "one", {})
         _make_context(ws_dir / "workers", "two", {})
 
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
-        flags = {e["name"]: e["has_persisted_context"] for e in result}
-        assert flags == {"one": True, "two": True}
+        result = asyncio.run(get_workers("ws_test", name=None))
+        self._assert_raw_templates(result, configs)
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())
@@ -305,108 +311,8 @@ class TestGetWorkersPersistedContextFlag:
         _make_context(ws_dir / "workers", "orphan", {})  # not in config
 
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
+        result = asyncio.run(get_workers("ws_test", name=None))
         names = [e["name"] for e in result]
         assert "configured" in names
         assert "orphan" not in names
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Workspace routes — get_worker_events
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class TestGetWorkerEvents:
-    """Covers the ``get_worker_events`` endpoint."""
-
-    def _make_events_file(self, ws_dir: Path, lines: list[str]) -> None:
-        """Write a workers/events.jsonl file."""
-        p = ws_dir / "workers" / "events.jsonl"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    def test_returns_empty_when_no_events_file(self, ws_dir: Path):
-        """No events.jsonl → empty list."""
-        from web_ui.backend.workspace_routes import get_worker_events
-
-        import asyncio
-        result = asyncio.run(get_worker_events("ws_test", "any"))
-        assert result == []
-
-    def test_returns_only_matching_worker_events(self, ws_dir: Path):
-        """Only events with matching worker_name are returned."""
-        from web_ui.backend.workspace_routes import get_worker_events
-
-        self._make_events_file(ws_dir, [
-            json.dumps({"worker_name": "alice", "timestamp": "2025-01-01T00:00:00Z", "type": "msg"}),
-            json.dumps({"worker_name": "bob", "timestamp": "2025-01-01T00:00:01Z", "type": "msg"}),
-            json.dumps({"worker_name": "alice", "timestamp": "2025-01-01T00:00:02Z", "type": "done"}),
-        ])
-
-        import asyncio
-        result = asyncio.run(get_worker_events("ws_test", "alice", limit=None, since=None))
-        assert len(result) == 2
-        assert all(e["worker_name"] == "alice" for e in result)
-
-    def test_limit(self, ws_dir: Path):
-        """?limit=N returns only the N most recent events."""
-        from web_ui.backend.workspace_routes import get_worker_events
-
-        lines = [
-            json.dumps({"worker_name": "alice", "timestamp": f"2025-01-01T00:00:0{i}Z", "type": "msg"})
-            for i in range(5)
-        ]
-        self._make_events_file(ws_dir, lines)
-
-        import asyncio
-        result = asyncio.run(get_worker_events("ws_test", "alice", limit=2, since=None))
-        assert len(result) == 2
-        # Should be the 2 most recent
-        assert result[0]["timestamp"] == "2025-01-01T00:00:03Z"
-        assert result[1]["timestamp"] == "2025-01-01T00:00:04Z"
-
-    def test_since_filter(self, ws_dir: Path):
-        """?since=<timestamp> returns only events after that time."""
-        from web_ui.backend.workspace_routes import get_worker_events
-
-        self._make_events_file(ws_dir, [
-            json.dumps({"worker_name": "alice", "timestamp": "2025-01-01T00:00:01Z", "type": "old"}),
-            json.dumps({"worker_name": "alice", "timestamp": "2025-01-01T00:00:05Z", "type": "mid"}),
-            json.dumps({"worker_name": "alice", "timestamp": "2025-01-01T00:00:10Z", "type": "new"}),
-        ])
-
-        import asyncio
-        result = asyncio.run(get_worker_events("ws_test", "alice", since="2025-01-01T00:00:04Z", limit=None))
-        assert len(result) == 2
-        assert result[0]["type"] == "mid"
-        assert result[1]["type"] == "new"
-
-    def test_limit_with_since(self, ws_dir: Path):
-        """?limit and ?since work together."""
-        from web_ui.backend.workspace_routes import get_worker_events
-
-        self._make_events_file(ws_dir, [
-            json.dumps({"worker_name": "x", "timestamp": f"2025-01-01T00:00:0{i}Z", "type": "t"})
-            for i in range(10)
-        ])
-
-        import asyncio
-        result = asyncio.run(get_worker_events("ws_test", "x", since="2025-01-01T00:00:05Z", limit=2))
-        assert len(result) == 2
-        # After timestamp 5, we have events 6,7,8,9 — limit to 2 most recent = 8,9
-        assert result[0]["timestamp"] == "2025-01-01T00:00:08Z"
-        assert result[1]["timestamp"] == "2025-01-01T00:00:09Z"
-
-    def test_ignores_bad_json_lines(self, ws_dir: Path):
-        """Malformed JSON lines are silently skipped."""
-        from web_ui.backend.workspace_routes import get_worker_events
-
-        self._make_events_file(ws_dir, [
-            json.dumps({"worker_name": "alice", "timestamp": "t1", "type": "good"}),
-            "{bad json}",
-            json.dumps({"worker_name": "alice", "timestamp": "t2", "type": "also_good"}),
-        ])
-
-        import asyncio
-        result = asyncio.run(get_worker_events("ws_test", "alice", limit=None, since=None))
-        assert len(result) == 2

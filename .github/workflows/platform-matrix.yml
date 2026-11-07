@@ -1,0 +1,728 @@
+# Platform Matrix CI (additive)
+# ---------------------------------------------------------------------------
+# Runs the project's test suite, an import smoke, a thin cross-platform test
+# slice and macOS-specific probes across Linux / Windows / macOS.
+#
+# The repository is PUBLIC, so GitHub-hosted runners consume free minutes for
+# all three operating systems; every job therefore runs on every push and
+# pull_request (no path/label gating, no manual dispatch).
+#
+# This file is intentionally additive: it has its own concurrency group and
+# does not modify or replace python-version-matrix.yml or cross-platform-
+# smoke.yml.
+#
+# Anti-vacuity: every job that runs pytest first runs
+# scripts/ci_assert_collected.py, which fails the job when the number of
+# *collected* tests is lower than expected (a suite that silently collects
+# zero tests must not be able to report green).
+#
+# Measured collection counts (branch fix/git-host-fallback-closure):
+#   * total (gate floor) = 3827
+#   * -m "not docker and not e2e"                 = 3836 (5 deselected)
+#   * thin node set (4 files below)              = 77
+#
+# macOS install note: install.sh supports Darwin (it runs the same prerequisite
+# and venv checks as on Linux, minus the Linux-only apt / docker-group steps),
+# and no macOS-specific installer exists in the repo, so the macOS install smoke
+# job reports the selected installer, runs it best-effort, then falls back to a
+# manual venv + pip install if the installer left no usable .venv, so the backend
+# can still be started and probed.
+# All macOS jobs are advisory (continue-on-error: true).
+# ---------------------------------------------------------------------------
+name: Platform Matrix
+
+on:
+  push:
+    branches: [dev, master]
+  pull_request:
+
+concurrency:
+  group: platform-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Ubuntu / Linux: the authoritative full suite on the primary platform.
+  # -------------------------------------------------------------------------
+  ubuntu-suite:
+    name: Ubuntu - full test suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 3827
+          --marker "not docker and not e2e"
+
+      - name: Run test suite
+        run: python -m pytest -m "not docker and not e2e" --timeout 600 -ra
+
+  # -------------------------------------------------------------------------
+  # Linux: install + startup smoke (BLOCKING).
+  #
+  # Runs the real end-to-end smoke: it drives the real install.sh and the real
+  # start_thoughtmachine.sh (on free TM_BACKEND_PORT / TM_FRONTEND_PORT
+  # values), then makes one live turn through the running backend. Unlike the
+  # macOS install-smoke job this one is NOT advisory: a failure fails the
+  # workflow (no continue-on-error).
+  # -------------------------------------------------------------------------
+  linux-install-smoke:
+    name: Linux - install/startup smoke (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 1
+          tests/e2e/test_install_and_start_smoke.py
+
+      - name: Run install + startup smoke test
+        run: |
+          # --run-e2e is required; tests/e2e/conftest.py:49-55 skips e2e-keyworded items without it. Missing this flag means the job runs zero tests and passes.
+          python -m pytest tests/e2e/test_install_and_start_smoke.py --run-e2e -v -rA --timeout 900
+
+      - name: Upload install-smoke logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-install-smoke-logs
+          path: |
+            .tmp-test/**
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Linux: auth-boundary browser e2e (BLOCKING when it runs).
+  #
+  # WHY THIS JOB EXISTS
+  # The credential check lives in AuthBoundaryMiddleware, i.e. in front of every
+  # route, so a regression there can leave the ordinary pytest suite green: the
+  # unit tests drive a TestClient with fabricated credentials and never cross
+  # the real browser -> Vite proxy -> backend path the product uses. These three
+  # Playwright suites are the ones that cross it (the Permissions tab is only
+  # reachable from an authenticated UI session), and until this job existed no
+  # CI job ran them at all -- they are marked ``e2e`` and skipped unless
+  # ``--run-e2e`` is passed.
+  #
+  # COST CONTROL WITHOUT A WORKFLOW-LEVEL PATHS FILTER
+  # This workflow has no ``paths:`` filter on purpose (see the header comment),
+  # so the job diffs its own change set and skips the expensive browser run
+  # when no auth-relevant file is touched. Ambiguity -- no usable base commit, a
+  # failed diff -- resolves to auth=true, because a gate that can silently skip
+  # itself is worse than one that runs unnecessarily. The skip prints a notice,
+  # so a green check that executed nothing says so in the log.
+  #
+  # BLOCKING, not advisory: a red run is meant to stop an auth change. If it
+  # turns out to be flaky in practice the one-line remedy is
+  # ``continue-on-error: true``; report the flake rather than adding retries to
+  # a credential gate.
+  # -------------------------------------------------------------------------
+  linux-e2e-auth:
+    name: Linux - auth e2e (browser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # The e2e harness repoints HOME to a hermetic temp vault at import time
+    # (tests/conftest.py:149 -- os.environ["HOME"] = HERMETIC_BASE_DIR, a
+    # tempfile.mkdtemp(prefix="hermetic-vault-base-"); pathlib.Path.home and
+    # os.path.expanduser are repointed to match). Playwright's default browser
+    # directory is $HOME/.cache/ms-playwright, so the Chromium this job installs
+    # under the runner's real HOME is invisible inside the test process. Observed
+    # in CI, verbatim:
+    #   playwright._impl._errors.Error: BrowserType.launch: Executable doesn't exist at
+    #   /tmp/hermetic-vault-base-1rrrvaa0/.cache/ms-playwright/chromium_headless_shell-1248/chrome-headless-shell-linux64/chrome-headless-shell
+    # Hence the absolute override below: PLAYWRIGHT_BROWSERS_PATH is an absolute
+    # path, so it survives the HOME move, and nothing in the repo sets or unsets
+    # it (it is documented for humans at tests/e2e/README.md:37).
+    #
+    # The value is a deliberate LITERAL, not ${{ runner.temp }}: a job-level
+    # ``env:`` block cannot reference the ``runner`` context (only github, needs,
+    # strategy, matrix, vars, secrets and inputs are allowed there), and GitHub
+    # rejects the whole workflow before any job starts with
+    # "Unrecognized named-value: 'runner'". The remedy for that is a literal, not
+    # a move to step level: the install step and the pytest step must both
+    # inherit the SAME path, and two step-level envs are how they come to
+    # disagree.
+    #
+    # /home/runner/ms-playwright assumes the standard GitHub-hosted ubuntu
+    # runner (user ``runner``, home ``/home/runner``). If this job ever moves to
+    # a self-hosted runner with a different user, THIS is the line to change.
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/ms-playwright
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Change detection diffs against the base commit, so the full history
+          # is required (the default depth-1 clone has no base to diff from).
+          fetch-depth: 0
+
+      - name: Detect auth-relevant changes
+        id: changed
+        run: |
+          set -uo pipefail
+
+          base=""
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+
+          if [ -z "${base}" ] \
+             || [ "${base}" = "0000000000000000000000000000000000000000" ] \
+             || ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            echo "auth=true" >> "${GITHUB_OUTPUT}"
+            echo "::notice::no usable base commit (base='${base}'); defaulting auth=true so the gate cannot skip itself"
+            exit 0
+          fi
+
+          if ! files="$(git diff --name-only "${base}" HEAD)"; then
+            echo "auth=true" >> "${GITHUB_OUTPUT}"
+            echo "::notice::git diff against ${base} failed; defaulting auth=true"
+            exit 0
+          fi
+
+          # Matched by keyword over the whole path: the boundary, the token, the
+          # credential, the permission model and the session layer are all auth
+          # surface. Over-running costs runner minutes; under-running silently
+          # disables the gate, so the pattern errs wide on purpose.
+          pattern='auth|token|credential|permission|session|health|conftest\.py|platform-matrix\.yml'
+          # ``grep -q`` would exit on the first match and SIGPIPE the writer, and
+          # under ``pipefail`` that reports the pipeline as failed -- i.e. it
+          # would turn a real change into a silent skip. Collect the output
+          # instead and test it for emptiness.
+          matches="$(printf '%s\n' "${files}" | grep -Ei "${pattern}" || true)"
+          if [ -n "${matches}" ]; then
+            echo "auth=true" >> "${GITHUB_OUTPUT}"
+            echo "auth-relevant files changed:"
+            printf '%s\n' "${matches}" | sed 's/^/  - /'
+          else
+            echo "auth=false" >> "${GITHUB_OUTPUT}"
+            echo "no auth-relevant file changed (${base}..HEAD):"
+            printf '%s\n' "${files}" | sed 's/^/  - /'
+          fi
+
+      - name: Report the skip (nothing is proven by a skipped gate)
+        if: steps.changed.outputs.auth != 'true'
+        run: |
+          echo "::notice::SKIPPED -- no auth-relevant file changed between the base commit and HEAD."
+          echo "The three Playwright auth e2e suites did NOT run; this green check says nothing about the auth boundary."
+
+      - name: Set up Python
+        if: steps.changed.outputs.auth == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Set up Node (the Vite dev server the suites drive)
+        if: steps.changed.outputs.auth == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: web_ui/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: web_ui/frontend/package-lock.json
+
+      - name: Upgrade pip
+        if: steps.changed.outputs.auth == 'true'
+        run: python -m pip install --upgrade pip
+
+      - name: Install Python dependencies
+        if: steps.changed.outputs.auth == 'true'
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Install Chromium for Playwright
+        if: steps.changed.outputs.auth == 'true'
+        run: |
+          # PLAYWRIGHT_BROWSERS_PATH is job-level env, so it inherits here: make
+          # the install target explicit and prove where the browser landed.
+          mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"
+          python -m playwright install --with-deps chromium
+          python -m playwright install --dry-run chromium
+          ls "${PLAYWRIGHT_BROWSERS_PATH}"
+
+      - name: Install frontend dependencies
+        if: steps.changed.outputs.auth == 'true'
+        working-directory: web_ui/frontend
+        run: npm ci
+
+      - name: Assert collected test count (anti-vacuity)
+        if: steps.changed.outputs.auth == 'true'
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 3
+          tests/e2e/test_permission_persistence.py
+          tests/e2e/test_permission_mutation_ui_persistence.py
+          tests/e2e/test_tab_switch_permission_state.py
+
+      - name: Run auth e2e suites
+        if: steps.changed.outputs.auth == 'true'
+        run: |
+          # --run-e2e is required; tests/e2e/conftest.py skips e2e-keyworded items
+          # without it. The anti-vacuity assert above runs in collection-only mode,
+          # where the flag does not matter -- but here it does: without it this
+          # step would run zero tests and pass.
+          python -m pytest \
+            tests/e2e/test_permission_persistence.py \
+            tests/e2e/test_permission_mutation_ui_persistence.py \
+            tests/e2e/test_tab_switch_permission_state.py \
+            --run-e2e -v -rA --timeout 900
+
+      - name: Upload e2e backend/vite logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-e2e-auth-logs
+          path: |
+            /tmp/e2e_vault_*/**
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Windows: import smoke. Proves the application package imports cleanly on
+  # Windows even though the platform-specific code paths are exercised fully
+  # only by the thin pytest slice below.
+  # -------------------------------------------------------------------------
+  windows-import-smoke:
+    name: Windows - import smoke
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install runtime dependencies
+        run: |
+          source .venv/Scripts/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Verify critical imports
+        run: |
+          source .venv/Scripts/activate
+          python -c "import web_ui.backend.server; print('IMPORTS_OK')"
+
+  # -------------------------------------------------------------------------
+  # Windows: thin, self-contained pytest slice. These four modules were
+  # selected because they exercise container registry / ownership / global
+  # default logic without requiring Docker, so they are safe to run on a
+  # Windows runner. 76 tests are expected.
+  # -------------------------------------------------------------------------
+  windows-thin-pytest:
+    name: Windows - thin pytest slice
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install dependencies
+        run: |
+          source .venv/Scripts/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: |
+          source .venv/Scripts/activate
+          python scripts/ci_assert_collected.py \
+            --expected 77 \
+            tests/test_container_registry.py \
+            tests/test_container_user_and_git_ownership.py \
+            tests/test_global_defaults.py \
+            tests/test_container_ownership_user_fallback.py
+
+      - name: Run thin pytest slice
+        run: |
+          source .venv/Scripts/activate
+          python -m pytest \
+            tests/test_container_registry.py \
+            tests/test_container_user_and_git_ownership.py \
+            tests/test_global_defaults.py \
+            tests/test_container_ownership_user_fallback.py \
+            --timeout 600 -ra
+
+  # -------------------------------------------------------------------------
+  # macOS: full suite (advisory).
+  # -------------------------------------------------------------------------
+  macos-suite:
+    name: macOS - full test suite (advisory)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 3827
+          --marker "not docker and not e2e"
+
+      - name: Run test suite
+        run: python -m pytest -m "not docker and not e2e" --timeout 600 -ra
+
+  # -------------------------------------------------------------------------
+  # web_ui backend: full suite (advisory).
+  #
+  # Scoped to web_ui/backend/tests only (the main testpaths suite does not
+  # collect it), so this job's anti-vacuity floor is 125, the number that
+  # directory currently collects. Advisory only: a failure never fails the
+  # workflow (continue-on-error).
+  # -------------------------------------------------------------------------
+  web-ui-backend-suite:
+    name: web-ui-backend-suite (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Assert collected test count (anti-vacuity)
+        run: >
+          python scripts/ci_assert_collected.py
+          --expected 125
+          web_ui/backend/tests/
+
+      - name: Run web-ui backend suite
+        run: python -m pytest web_ui/backend/tests/ --timeout 600 -ra
+
+  # ---------------------------------------------------------------------------
+  # Web UI frontend suite (BLOCKING)
+  #
+  # Runs the Vitest component/store suite in web_ui/frontend. BLOCKING: no
+  # continue-on-error, so a red frontend run fails this workflow. Promoted
+  # because the alternative -- report the failure and merge anyway -- let real
+  # frontend regressions land green: the suite covers the components and stores
+  # the UI actually renders from, and the floor assertion below means a silently
+  # shrinking collection is caught too.
+  #
+  # `npm ci` (not `npm install`) installs exactly the locked tree from
+  # web_ui/frontend/package-lock.json, and `node-version-file` pins Node to the
+  # repo's own web_ui/frontend/.nvmrc instead of hard-coding it a second time.
+  #
+  # The JSON report is not decoration: a job that exits 0 having collected three
+  # files is worse than no job at all, so the count is asserted against a floor.
+  # Measured on dev (64cfa5d2): the 55 test files under web_ui/frontend/src
+  # collect 697 tests, all passing. Floor 650 sits 47 below that, so losing more
+  # than 47 tests fails the job.
+  #
+  # The trade-off is wall-clock and strictness: the suite is serial
+  # (`fileParallelism: false` in web_ui/frontend/vite.config.js, because
+  # parallel forks OOM under a 512 MiB cgroup), so it costs several minutes of
+  # runner time, and a red run now blocks the workflow instead of being merely
+  # noted. On failure the JSON report is uploaded as an artifact.
+  # ---------------------------------------------------------------------------
+  web-ui-frontend-suite:
+    name: web-ui-frontend-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: web_ui/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: web_ui/frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web_ui/frontend
+        run: npm ci
+
+      - name: Run frontend suite
+        working-directory: web_ui/frontend
+        run: npx vitest run --reporter=default --reporter=json --outputFile.json=vitest-report.json
+
+      - name: Assert the suite actually collected tests
+        working-directory: web_ui/frontend
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+          report = pathlib.Path("vitest-report.json")
+          if not report.exists():
+              sys.exit("vitest wrote no JSON report; collection is unverifiable")
+          data = json.loads(report.read_text())
+          total = data.get("numTotalTests", 0)
+          suites = data.get("numTotalTestSuites", 0)
+          print(f"collected {total} tests in {suites} files")
+          if total < 650:
+              sys.exit(f"FAIL: only {total} tests collected (floor 650); the suite is silently shrinking")
+          PY
+
+      - name: Upload vitest report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-ui-frontend-vitest-report
+          path: |
+            web_ui/frontend/vitest-report.json
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # macOS: install + startup smoke (advisory).
+  #
+  # Reports the host facts (uname -m / sw_vers / id -u / id -g), selects the
+  # best available installer (prefer a macOS-specific script if one is added,
+  # otherwise `bash install.sh`, which installs on Darwin too), then starts the
+  # backend and probes the health endpoints. If the installer left no usable
+  # .venv, the job falls back to a manual venv so the probes still run.
+  # -------------------------------------------------------------------------
+  macos-install-smoke:
+    name: macOS - install/startup smoke (advisory)
+    runs-on: macos-latest
+    continue-on-error: true
+    env:
+      PORT: "8000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Report host facts
+        run: |
+          echo "uname -m : $(uname -m)"
+          echo "uname -s : $(uname -s)"
+          echo "sw_vers  : $(sw_vers -productVersion 2>/dev/null || echo n/a)"
+          echo "id -u    : $(id -u)"
+          echo "id -g    : $(id -g)"
+
+      - name: Select and run installer (best effort)
+        run: |
+          set -x
+          if [ -f install_macos.sh ]; then
+            INSTALLER="bash install_macos.sh"
+          elif [ -f scripts/install_macos.sh ]; then
+            INSTALLER="bash scripts/install_macos.sh"
+          elif [ -f scripts/install_macos.command ]; then
+            INSTALLER="bash scripts/install_macos.command"
+          else
+            # No macOS-specific installer exists; install.sh is the only path.
+            INSTALLER="bash install.sh"
+          fi
+          echo "SELECTED_INSTALLER: ${INSTALLER}"
+          ${INSTALLER} || echo "INSTALLER_EXIT=$? (non-fatal: advisory job)"
+
+      - name: Fallback - ensure a usable environment
+        run: |
+          if [ ! -x .venv/bin/python ]; then
+            echo "No .venv from installer; creating one manually (macOS fallback)."
+            python -m venv .venv
+            .venv/bin/python -m pip install --upgrade pip
+            .venv/bin/python -m pip install -r requirements.txt
+            .venv/bin/python -m pip install -e .
+          else
+            echo "Using .venv created by the installer."
+          fi
+
+      - name: Start backend and probe health endpoints
+        run: |
+          set -x
+          .venv/bin/python -m uvicorn web_ui.backend.server:app --host 127.0.0.1 --port "${PORT}" &
+          SERVER_PID=$!
+          echo "SERVER_PID=${SERVER_PID}"
+
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${PORT}/api/health" -o /tmp/health.json; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${ok}" -eq 1 ]; then
+            echo "HEALTH_OK: $(cat /tmp/health.json)"
+          else
+            echo "HEALTH_UNREACHABLE after 60s"
+          fi
+
+          if curl -fsS "http://127.0.0.1:${PORT}/api/health/containers" -o /tmp/health_containers.json; then
+            echo "HEALTH_CONTAINERS: $(cat /tmp/health_containers.json)"
+          else
+            echo "HEALTH_CONTAINERS_UNREACHABLE"
+          fi
+
+          kill "${SERVER_PID}" 2>/dev/null || true
+
+      - name: Containerized git_read status probe (only if Docker present)
+        run: |
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            echo "Docker daemon reachable; exercising GitReadTool containerized status."
+            python - <<'PY'
+          import os
+          try:
+              from tools.git_info_tool import GitReadTool
+              tool = GitReadTool(
+                  operation="status",
+                  session_id="ci-macos-smoke",
+                  workspace_id=os.environ.get("GITHUB_WORKSPACE", "ws"),
+                  session_permissions={},
+              )
+              text = tool.execute()
+              print(text)
+              print("execution_mode:", getattr(tool, "_last_execution_mode", "?"))
+              print("failure_reason:", getattr(tool, "_last_failure_reason", "?"))
+              print("fallback_used:", getattr(tool, "_last_fallback_used", "?"))
+          except Exception as exc:  # noqa: BLE001 - advisory probe
+              print("GIT_READ_PROBE_ERROR:", repr(exc))
+          PY
+          else
+            echo "Docker not available on this runner; skipping git_read probe."
+          fi
+
+      - name: Shutdown / cleanup
+        if: always()
+        run: pkill -f "uvicorn web_ui.backend.server:app" 2>/dev/null || true
+
+  # -------------------------------------------------------------------------
+  # macOS: Docker Desktop availability probe (advisory).
+  #
+  # WHAT THIS PROVES (when Docker Desktop is present and the daemon is up):
+  #   * the Docker CLI + daemon are reachable from the macOS runner,
+  #   * `docker run --user` reports the in-container uid, and
+  #   * `git status` works *inside a container against the bind-mounted
+  #     workspace* (i.e. the mount is readable/writable in-container).
+  #
+  # WHAT THIS DOES NOT PROVE:
+  #   * It does NOT prove Linux bind-mount host-ownership semantics: on macOS,
+  #     Docker Desktop runs containers inside a Linux VM using a file-sharing
+  #     layer (VirtioFS/gRPC-FUSE), so uid/gid mapping between the macOS host
+  #     and the container is NOT the same as on a native Linux host. The
+  #     in-container uid shown here is the container's uid, not the macOS
+  #     host user's uid.
+  # -------------------------------------------------------------------------
+  macos-docker-probe:
+    name: macOS - Docker availability probe (advisory)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Probe Docker CLI and daemon
+        run: |
+          set -x
+          if command -v docker >/dev/null 2>&1; then
+            echo "DOCKER_CLI: present ($(command -v docker))"
+            docker --version || true
+          else
+            echo "DOCKER_CLI: absent"
+          fi
+
+          if ls -d /Applications/Docker.app* >/dev/null 2>&1; then
+            echo "DOCKER_DESKTOP_APP: present"
+          else
+            echo "DOCKER_DESKTOP_APP: absent"
+          fi
+
+          if command -v docker >/dev/null 2>&1; then
+            if docker info >/dev/null 2>&1; then
+              echo "DOCKER_DAEMON: reachable"
+              echo "--- branch: present + startable ---"
+              docker run --rm --user "$(id -u):$(id -g)" alpine:3 sh -c 'echo in-container-id=$(id -u):$(id -g)'
+            else
+              echo "DOCKER_DAEMON: not reachable (branch: needs-install / not-running)"
+            fi
+          else
+            echo "DOCKER_DAEMON: unavailable (branch: unavailable)"
+          fi
+
+      - name: git status inside container against bind-mounted workspace
+        run: |
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            docker run --rm --user "$(id -u):$(id -g)" \
+              -v "${GITHUB_WORKSPACE}:/workspace" -w /workspace \
+              alpine:3 sh -c 'command -v git >/dev/null 2>&1 && git status --porcelain=v1 | head -n 5 || echo "git not present in probe image"'
+          else
+            echo "Skipping in-container git status: Docker unavailable."
+          fi

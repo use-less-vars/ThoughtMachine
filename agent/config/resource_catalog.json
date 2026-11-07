@@ -1,0 +1,203 @@
+[
+  {
+    "name": "git",
+    "display_name": "Git",
+    "description": "Git repository operations (read and write) via the git tools.",
+    "permission_grain_set": [
+      "banned",
+      "ask",
+      "read",
+      "write",
+      "write_on_feature_branch"
+    ],
+    "execution_mode": "container",
+    "container_image": null,
+    "dockerfile_reference": "docker/resource/git_overlay.Dockerfile",
+    "tools": [
+      "git_read",
+      "git_write"
+    ],
+    "risk_level": "low",
+    "ui_category": "git",
+    "required_workspace_switch": null
+  },
+  {
+    "name": "filesystem",
+    "display_name": "Filesystem",
+    "description": "File read/write access to the workspace tree.",
+    "permission_grain_set": [
+      "banned",
+      "ask",
+      "read",
+      "write"
+    ],
+    "execution_mode": "container",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [
+      "read_file",
+      "file_editor",
+      "apply_edits",
+      "file_search",
+      "glob"
+    ],
+    "risk_level": "low",
+    "ui_category": "filesystem",
+    "required_workspace_switch": null
+  },
+  {
+    "name": "container",
+    "display_name": "Container",
+    "description": "Container lifecycle and sandboxed code execution (Docker runtime).",
+    "permission_grain_set": [
+      "banned",
+      "read",
+      "ask",
+      "write"
+    ],
+    "execution_mode": "container",
+    "container_image": null,
+    "dockerfile_reference": "docker/resource/default_runtime.Dockerfile",
+    "tools": [
+      "docker_code_runner",
+      "container_control"
+    ],
+    "risk_level": "medium",
+    "ui_category": "sandbox",
+    "required_workspace_switch": "allow_docker"
+  },
+  {
+    "name": "host_bash",
+    "display_name": "Host Bash",
+    "description": "Supervised shell command execution on the host machine.",
+    "permission_grain_set": [
+      "banned",
+      "ask",
+      "allow"
+    ],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [
+      "host_bash"
+    ],
+    "risk_level": "high",
+    "ui_category": "host",
+    "required_workspace_switch": "allow_host_resources"
+  },
+  {
+    "name": "tty",
+    "display_name": "TTY",
+    "description": "Interactive terminal sessions.",
+    "permission_grain_set": [],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [],
+    "risk_level": null,
+    "ui_category": null,
+    "required_workspace_switch": null
+  },
+  {
+    "name": "jtag",
+    "display_name": "JTAG",
+    "description": "JTAG hardware debug probe access.",
+    "permission_grain_set": [],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [],
+    "risk_level": null,
+    "ui_category": null,
+    "required_workspace_switch": null
+  },
+  {
+    "name": "network",
+    "display_name": "Network",
+    "description": "Outbound network access (HTTP requests, downloads, API calls).",
+    "permission_grain_set": [
+      "banned",
+      "ask",
+      "write",
+      "outbound"
+    ],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [],
+    "risk_level": "medium",
+    "ui_category": "network",
+    "required_workspace_switch": null
+  },
+  {
+    "name": "mcp",
+    "display_name": "MCP",
+    "description": "External MCP server tool integrations.",
+    "permission_grain_set": [
+      "banned",
+      "connect",
+      "full"
+    ],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [],
+    "risk_level": "high",
+    "ui_category": "integrations",
+    "required_workspace_switch": null
+  },
+  {
+    "name": "ci",
+    "display_name": "CI",
+    "description": "Read-only CI pipeline status/log monitoring.",
+    "permission_grain_set": [
+      "banned",
+      "read"
+    ],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [
+      "ci_read"
+    ],
+    "risk_level": "low",
+    "ui_category": "host",
+    "required_workspace_switch": "allow_host_resources"
+  },
+  {
+    "name": "credential",
+    "display_name": "Credential",
+    "description": "Stored credentials: list names (read) and inject values (use).",
+    "permission_grain_set": [
+      "banned",
+      "read",
+      "use"
+    ],
+    "execution_mode": "host",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [],
+    "risk_level": "high",
+    "ui_category": "integrations",
+    "required_workspace_switch": null
+  },
+  {
+    "name": "visual",
+    "display_name": "Visual",
+    "description": "Screenshots one file from the workspace (file:///workspace/...) in an ephemeral container and returns its path; no network access, one render per call. Requires a provisioned render image; refuses to run until one is admitted.",
+    "permission_grain_set": [
+      "banned",
+      "ask",
+      "view"
+    ],
+    "execution_mode": "container",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [
+      "VisualTool"
+    ],
+    "risk_level": "medium",
+    "ui_category": "sandbox",
+    "required_workspace_switch": "allow_docker"
+  }
+]

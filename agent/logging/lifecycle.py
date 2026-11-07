@@ -1,0 +1,334 @@
+"""Lifecycle event streams — canonical structured logs for session, worker,
+and container lifecycle events.
+
+Streams (JSONL, written via :class:`~agent.logging.streams.JsonlStreamWriter`)
+all live under the canonical vault log directory -- ``~/.thoughtmachine/logs``
+by default, or ``$THOUGHTMACHINE_VAULT_ROOT/logs`` when that env var is set.
+The root is resolved at runtime via :func:`agent._log_root.get_log_root`,
+never bound at import time:
+
+- ``session.log``          — controller events (wired in ``_emit_event``)
+- ``worker_<name>.log``    — per-worker lifecycle (spawned / stopped)
+- ``container.log``        — container lifecycle (started / stopped / ...)
+- ``provider_raw.jsonl``   — raw provider responses (whole-line redacted)
+- ``tool_calls_raw_debug.log`` — raw tool-call argument diagnostics (whole-line redacted)
+
+Every function is best-effort and NEVER raises: lifecycle logging must never
+break the caller's control flow.  A concise, secret-free summary line is
+also emitted through the stdlib ``logging`` hierarchy (logger
+``thoughtmachine.lifecycle``) for human-readable console output when
+:func:`agent.logging.console.configure_console_logging` is active.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import threading
+from typing import Dict, Optional
+
+from agent.logging.streams import JsonlStreamWriter
+from agent._log_root import get_log_root
+
+#: stdlib logger used for the human-readable console summary lines.
+_console_logger = logging.getLogger("thoughtmachine.lifecycle")
+_console_logger.setLevel(logging.INFO)
+
+
+class _ClosedStreamSafeHandler(logging.StreamHandler):
+    """StreamHandler that silently drops records once the stream is closed.
+
+    The stdlib ``StreamHandler.emit`` catches write errors on a closed stream
+    and routes them through ``handleError``, which prints a
+    "--- Logging error ---" traceback to stderr.  During interpreter teardown
+    ``sys.stderr`` may already be closed, so lifecycle logging must tolerate
+    that without producing noise or raising.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        stream = self.stream
+        if stream is None or getattr(stream, "closed", False):
+            return
+        try:
+            msg = self.format(record)
+            stream.write(msg + self.terminator)
+            self.flush()
+        except RecursionError:
+            raise
+        except (ValueError, OSError):
+            # Stream closed between the check above and the write.
+            pass
+        except Exception:
+            self.handleError(record)
+
+
+#: Console handler for lifecycle summary lines; tolerates a closed stderr.
+#: The formatter mirrors agent.logging.console._FORMAT/_DATEFMT so console
+#: output stays identical to the parent logger's plain handler.
+_console_handler = _ClosedStreamSafeHandler()
+_console_handler.setFormatter(
+    logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+)
+_console_logger.addHandler(_console_handler)
+# Lifecycle records must not reach the parent "thoughtmachine" logger's plain
+# StreamHandler (attached by configure_console_logging): with stderr closed
+# that handler would print "--- Logging error ---" noise via handleError.
+_console_logger.propagate = False
+
+_writers: Dict[str, JsonlStreamWriter] = {}
+_writers_lock = threading.Lock()
+
+
+def get_log_dir() -> str:
+    """Return the canonical vault log directory, creating it if needed.
+
+    The directory is resolved dynamically from
+    :func:`agent._log_root.get_log_root` on every call, so
+    ``THOUGHTMACHINE_VAULT_ROOT`` takes effect even when set after import.
+    """
+    log_dir = str(get_log_root())
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except Exception:
+        pass
+    return log_dir
+
+
+def _safe_name(name: str) -> str:
+    """Sanitize a name for use in a file name."""
+    return re.sub(r"[^A-Za-z0-9_.\-]", "_", str(name or ""))
+
+
+def _writer(filename: str) -> JsonlStreamWriter:
+    """Return the lazily-created JsonlStreamWriter for *filename*.
+
+    Writers are cached by full resolved path so a change of log root
+    (e.g. via the THOUGHTMACHINE_VAULT_ROOT env var) takes effect even
+    when a writer for the same file name was already created under a
+    different directory.
+    """
+    with _writers_lock:
+        path = os.path.join(get_log_dir(), filename)
+        writer = _writers.get(path)
+        if writer is None:
+            writer = JsonlStreamWriter(path)
+            _writers[path] = writer
+        return writer
+
+
+def log_session_event(
+    event_type: str,
+    *,
+    session_id: str = "",
+    workspace_id: str = "",
+    data: Optional[dict] = None,
+) -> None:
+    """Append a session lifecycle event to ``session.log`` (never raises)."""
+    try:
+        record = {
+            "event": event_type,
+            "stream": "session",
+            "session_id": session_id or "",
+            "workspace_id": workspace_id or "",
+            "data": data or {},
+        }
+        _writer("session.log").write(record)
+        try:
+            _console_logger.info(
+                "session %s session_id=%s", event_type, session_id or "-"
+            )
+        except ValueError:
+            # Console stream may already be closed during teardown; lifecycle
+            # logging must never raise.
+            pass
+    except Exception:
+        pass
+
+
+def log_worker_event(
+    worker_name: str,
+    event_type: str,
+    *,
+    session_id: str = "",
+    worker_id: str = "",
+    data: Optional[dict] = None,
+) -> None:
+    """Append a worker lifecycle event to ``worker_<name>.log`` (never raises)."""
+    try:
+        record = {
+            "event": event_type,
+            "stream": "worker",
+            "worker_name": worker_name,
+            "worker_id": worker_id or "",
+            "session_id": session_id or "",
+            "data": data or {},
+        }
+        _writer(f"worker_{_safe_name(worker_name)}.log").write(record)
+        _console_logger.info(
+            "worker %s name=%s session_id=%s",
+            event_type,
+            worker_name,
+            session_id or "-",
+        )
+    except Exception:
+        pass
+
+
+def log_container_event(
+    event_type: str,
+    *,
+    container_id: str = "",
+    session_id: str = "",
+    workspace_id: str = "",
+    data: Optional[dict] = None,
+) -> None:
+    """Append a container lifecycle event to ``container.log`` (never raises)."""
+    try:
+        record = {
+            "event": event_type,
+            "stream": "container",
+            "container_id": container_id or "",
+            "session_id": session_id or "",
+            "workspace_id": workspace_id or "",
+            "data": data or {},
+        }
+        _writer("container.log").write(record)
+        _console_logger.info(
+            "container %s container_id=%s session_id=%s",
+            event_type,
+            container_id or "-",
+            session_id or "-",
+        )
+    except Exception:
+        pass
+
+
+def log_provider_event(
+    *,
+    content: str = "",
+    model_name: str = "",
+    request_id: str = "",
+    token_usage: Optional[dict] = None,
+    latency: Optional[float] = None,
+    finish_reason: str = "",
+    stop_reason: str = "",
+    tool_call_count: int = 0,
+    temperature: Optional[float] = None,
+    session_id: str = "",
+    worker_id: str = "",
+    query_id: str = "",
+    correlation_id: str = "",
+    container_id: str = "",
+) -> None:
+    """Append a provider-response record to ``provider_raw.jsonl`` (never raises).
+
+    ``content`` is the raw provider text — only a 500-char preview is stored
+    (``content_preview``), and the whole serialized line is redacted before
+    writing, so secrets embedded in the preview never reach disk.  Fields
+    without a value (request_id, token_usage, latency, finish_reason,
+    stop_reason, temperature, model_name) are omitted from the record.
+    """
+    try:
+        raw = content if isinstance(content, str) else ("" if content is None else str(content))
+        content_empty = raw == ""
+        record = {
+            "event": "provider_response",
+            "stream": "provider",
+            "tool_call_count": int(tool_call_count or 0),
+            "content_preview": raw[:500] if not content_empty else "",
+            "content_empty": content_empty,
+            "empty_content": content_empty,
+            "session_id": session_id or "",
+            "worker_id": worker_id or "",
+            "query_id": query_id or "",
+            "correlation_id": correlation_id or "",
+            "container_id": container_id or "",
+        }
+        if model_name:
+            record["model_name"] = model_name
+        if request_id:
+            record["request_id"] = request_id
+        if token_usage:
+            try:
+                record["token_usage"] = dict(token_usage)
+            except Exception:
+                record["token_usage"] = token_usage
+        if latency is not None:
+            try:
+                record["latency"] = float(latency)
+            except (TypeError, ValueError):
+                record["latency"] = latency
+        if finish_reason:
+            record["finish_reason"] = finish_reason
+        if stop_reason:
+            record["stop_reason"] = stop_reason
+        if temperature is not None:
+            try:
+                record["temperature"] = float(temperature)
+            except (TypeError, ValueError):
+                record["temperature"] = temperature
+        _writer("provider_raw.jsonl").write(record, redact_line=True)
+        _console_logger.info(
+            "provider response model=%s request_id=%s tool_calls=%d empty=%s",
+            model_name or "-",
+            request_id or "-",
+            int(tool_call_count or 0),
+            content_empty,
+        )
+    except Exception:
+        pass
+
+
+def log_tool_call_raw(
+    *,
+    tool_name: str = "",
+    tool_call_id: str = "",
+    arguments_raw: str = "",
+    json_repair_needed: bool = False,
+    session_id: str = "",
+) -> None:
+    """Append a raw tool-call argument diagnostic to ``tool_calls_raw_debug.log`` (never raises).
+
+    Diagnostic aid for malformed tool-call argument JSON: only the first
+    500 chars of the raw pre-parse argument string are stored
+    (``arguments_preview``), and the whole serialized line is redacted
+    before writing, so secrets embedded in the arguments never reach disk.
+    """
+    try:
+        raw = (
+            arguments_raw
+            if isinstance(arguments_raw, str)
+            else ("" if arguments_raw is None else str(arguments_raw))
+        )
+        record = {
+            "event": "tool_call_raw",
+            "stream": "tool_call",
+            "tool_name": tool_name or "",
+            "tool_call_id": tool_call_id or "",
+            "arguments_preview": raw[:500],
+            "arguments_truncated": len(raw) > 500,
+            "json_repair_needed": bool(json_repair_needed),
+            "session_id": session_id or "",
+        }
+        _writer("tool_calls_raw_debug.log").write(record, redact_line=True)
+        _console_logger.info(
+            "tool call raw name=%s tool_call_id=%s repaired=%s",
+            tool_name or "-",
+            tool_call_id or "-",
+            bool(json_repair_needed),
+        )
+    except Exception:
+        pass
+
+
+def close_streams() -> None:
+    """Best-effort flush and close of all writers (process shutdown hook)."""
+    with _writers_lock:
+        writers = list(_writers.values())
+        _writers.clear()
+    for writer in writers:
+        writer.close()

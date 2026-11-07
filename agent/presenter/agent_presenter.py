@@ -70,10 +70,11 @@ class RefactoredAgentPresenter:
 
     def save_config(self, config: Dict[str, Any], path: str='') -> bool:
         """Save configuration to file path."""
+        session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
         if path:
-            return self.state_bridge.save_config(config, path)
+            return self.state_bridge.save_config(config, path, mode=session_mode)
         else:
-            return self.state_bridge.save_config(config)
+            return self.state_bridge.save_config(config, mode=session_mode)
 
     def update_config_from_gui(self, config_dict: Dict[str, Any]):
         """Update configuration from GUI dictionary."""

@@ -69,6 +69,11 @@ class PresetLoader:
                 if missing:
                     log('WARNING', 'config.preset', f'Preset {yaml_file} missing required fields: {missing}; skipping.')
                     continue
+                allowed = {'name', 'system_prompt', 'model', 'temperature', 'tools', 'safety_level'}
+                unknown = [k for k in data if k not in allowed]
+                if unknown:
+                    log('WARNING', 'config.preset', f'Preset {yaml_file} has unknown fields {unknown}; skipping.')
+                    continue
                 preset = Preset(name=data['name'], system_prompt=data['system_prompt'], model=data['model'], temperature=data.get('temperature', 0.2), tools=data.get('tools', []), safety_level=data.get('safety_level', 'standard'))
                 self._presets[preset.name] = preset
                 log('DEBUG', 'config.preset', f'Loaded preset: {preset.name}')

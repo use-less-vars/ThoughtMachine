@@ -1,0 +1,940 @@
+/* --- WorkspaceSelector.css (Phase 1) --- */
+
+.ws-selector {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.ws-selector > .vault-health-panel {
+  flex: none;
+}
+
+/* --- Sidebar: existing workspaces --- */
+
+.ws-sidebar {
+  width: 30%;
+  min-width: 230px;
+  max-width: 360px;
+  border-right: 1px solid #313244;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow-y: auto;
+}
+
+.ws-sidebar-title {
+  margin: 0;
+  font-size: 1rem;
+  color: #cdd6f4;
+}
+
+.ws-sidebar-empty {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #6c7086;
+}
+
+.ws-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.ws-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.25rem 0.5rem;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 8px;
+  padding: 0.5rem 0.65rem;
+  color: #cdd6f4;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.ws-item:hover {
+  border-color: #585b70;
+}
+
+.ws-item-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-item-path {
+  grid-column: 1 / -1;
+  font-size: 0.72rem;
+  color: #6c7086;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-refresh-btn {
+  margin-top: auto;
+  background: #313244;
+  color: #cdd6f4;
+  border: 1px solid #313244;
+  border-radius: 6px;
+  padding: 0.45rem 0.75rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.ws-refresh-btn:hover {
+  background: #45475a;
+  border-color: #585b70;
+}
+
+/* --- Main: purpose cards --- */
+
+.ws-main {
+  flex: 1;
+  min-height: 0;
+  padding: 1.5rem;
+  overflow-y: auto;
+}
+
+.ws-main-title {
+  margin: 0 0 1.25rem;
+  font-size: 1.15rem;
+  color: #cdd6f4;
+}
+
+.ws-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 1rem;
+}
+
+.ws-card {
+  position: relative;
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 10px;
+  padding: 1rem;
+  cursor: pointer;
+  color: #cdd6f4;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.ws-card:hover,
+.ws-card:focus-visible {
+  border-color: #89b4fa;
+  box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.25);
+  transform: translateY(-2px);
+}
+
+.ws-card-icon {
+  font-size: 1.6rem;
+  display: inline-block;
+  margin-bottom: 0.4rem;
+}
+
+.ws-card-title {
+  margin: 0 0 0.4rem;
+  font-size: 0.98rem;
+  color: #cdd6f4;
+  /* The title is a flex item of .gms-card-head, sat next to the risk badge.
+     A flex item refuses to shrink below its min-content width (the longest
+     unbroken word of a folder-name label), so without min-width: 0 the row
+     pushes past the card and the card spills out of its grid track. With it,
+     a long label shrinks and the three properties below ellipsize it. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-card-desc {
+  margin: 0 0 0.5rem;
+  font-size: 0.83rem;
+  color: #a6adc8;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2; /* standard property; the WebKit one stays for compat */
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 2.3em;
+}
+
+.ws-card-details {
+  display: none;
+  border-top: 1px solid #313244;
+  padding-top: 0.6rem;
+  margin-top: 0.4rem;
+}
+
+.ws-card:hover .ws-card-details,
+.ws-card:focus-visible .ws-card-details {
+  display: block;
+}
+
+.ws-detail-line {
+  font-size: 0.78rem;
+  color: #a6adc8;
+  line-height: 1.4;
+}
+
+/* --- Risk badge --- */
+
+.ws-risk {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.ws-risk.low {
+  background: #a6e3a1;
+  color: #1e1e2e;
+}
+
+.ws-risk.medium {
+  background: #f9e2af;
+  color: #1e1e2e;
+}
+
+.ws-risk.high,
+.ws-risk.critical {
+  background: #f38ba8;
+  color: #1e1e2e;
+}
+
+/* The card's risk badge is NOT absolutely positioned. The rule deleted here
+   (`.ws-card .ws-risk { position: absolute; top: 0.7rem; right: 0.7rem }`)
+   was dead: it competes at the same specificity (0-2-0) with
+   `.gms-card-head .ws-risk` further down this file, which comes later in
+   source order and therefore always won. The badge lives in normal flow as
+   the second flex item of .gms-card-head -- see that rule (single source of
+   truth for the badge's positioning) in the GMS section below. */
+
+/* --- Sessions sidebar (Bridge 1) --- */
+
+.ws-sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  border-top: 1px solid #313244;
+  padding-top: 0.75rem;
+}
+
+.ws-sessions-title {
+  font-size: 1rem;
+  color: #cdd6f4;
+}
+
+.ws-sessions-empty {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #6c7086;
+}
+
+.ws-sessions-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.ws-session-item {
+  width: 100%;
+  text-align: left;
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  color: #a6adc8;
+  cursor: pointer;
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-session-item:hover {
+  border-color: #89b4fa;
+  color: #cdd6f4;
+}
+
+/* --- Custom workspace card (Bridge 2) --- */
+
+.ws-card-custom {
+  border-style: dashed;
+  border-color: #585b70;
+}
+
+.ws-card-custom:hover,
+.ws-card-custom:focus-visible {
+  border-style: dashed;
+  border-color: #f9e2af;
+  box-shadow: 0 0 0 2px rgba(249, 226, 175, 0.25);
+}
+
+/* The custom card's title is a <span> (not an <h4>) to keep the heading
+   hierarchy clean — make it render like the purpose-card titles. */
+.ws-card-title {
+  display: block;
+}
+
+/* --- Custom workspace modal --- */
+
+.ws-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(30, 30, 46, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.ws-modal-dialog {
+  background: #181825;
+  border: 1px solid #45475a;
+  border-radius: 10px;
+  padding: 1.2rem 1.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-width: 560px;
+  width: 90%;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.ws-modal-title {
+  margin: 0;
+  color: #cdd6f4;
+  font-size: 1.05rem;
+}
+
+.ws-modal-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #6c7086;
+}
+
+.ws-modal-label {
+  font-size: 0.8rem;
+  color: #a6adc8;
+}
+
+.ws-modal-resolving {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #a6adc8;
+}
+
+.ws-modal-error {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #f38ba8;
+  background: rgba(243, 139, 168, 0.1);
+  border: 1px solid #f38ba8;
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+}
+
+.ws-modal-warning {
+  border: 1px solid #fab387;
+  background: rgba(250, 179, 135, 0.1);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.ws-modal-warning-text {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #fab387;
+  line-height: 1.45;
+}
+
+.ws-modal-ack {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: #cdd6f4;
+  cursor: pointer;
+}
+
+.ws-modal-ack input {
+  accent-color: #f9e2af;
+}
+
+.ws-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.ws-modal-btn {
+  background: #313244;
+  border: 1px solid #45475a;
+  color: #cdd6f4;
+  padding: 0.35rem 0.85rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.ws-modal-btn:hover:not(:disabled) {
+  background: #45475a;
+}
+
+.ws-modal-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ws-modal-btn-danger {
+  border-color: #f38ba8;
+  color: #f38ba8;
+  background: transparent;
+  align-self: flex-start;
+}
+
+.ws-modal-btn-danger:hover:not(:disabled) {
+  background: rgba(243, 139, 168, 0.12);
+}
+
+
+/* --- Global Management sections (GMS) --- */
+
+.gms-header{display:flex;justify-content:space-between;align-items:center;gap:1rem;margin-bottom:1.25rem} .gms-header-actions{display:flex;gap:0.5rem} .gms-section{margin-bottom:1.75rem} .gms-section-title{margin:0 0 0.75rem;font-size:1rem;color:#cdd6f4} .gms-empty{margin:0;font-size:0.85rem;color:#6c7086} .gms-error{color:#f38ba8;font-size:0.85rem} .ws-risk.allow{background:#a6e3a1;color:#1e1e2e} .ws-risk.forbid{background:#f38ba8;color:#1e1e2e} .gms-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:0.5rem} /* Card risk badge: THIS rule is the single source of truth for its position (in normal flow, right of the title, never shrinking). */ .gms-card-head .ws-risk{position:static;white-space:nowrap;text-transform:none;flex-shrink:0} .gms-card-stats{display:flex;gap:0.75rem;margin-top:0.5rem} .gms-stat{font-size:0.78rem;color:#a6adc8} .gms-badge{display:inline-block;padding:0.1rem 0.5rem;border-radius:10px;font-size:0.68rem;font-weight:600} .gms-badge-container{background:#89b4fa;color:#1e1e2e} .gms-grain{background:#313244;color:#a6adc8} .gms-type-free{background:#a6e3a1;color:#1e1e2e} .gms-type-resource{background:#f9e2af;color:#1e1e2e} .gms-resource-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:1rem} .gms-resource-card{background:#181825;border:1px solid #313244;border-radius:10px;padding:1rem} .gms-resource-head{display:flex;justify-content:space-between;align-items:center;gap:0.5rem;margin-bottom:0.4rem} .gms-resource-name{margin:0;font-size:0.95rem;color:#cdd6f4} .gms-resource-desc{margin:0 0 0.5rem;font-size:0.83rem;color:#a6adc8} .gms-resource-line{font-size:0.78rem;color:#a6adc8;margin-top:0.35rem} .gms-grain-row{display:flex;flex-wrap:wrap;gap:0.3rem;margin-top:0.4rem} .gms-btn-disabled{margin-top:0.6rem;background:#313244;border:1px solid #45475a;color:#6c7086;padding:0.3rem 0.7rem;border-radius:6px;font-size:0.75rem;cursor:not-allowed;opacity:0.6} .gms-cred-row{display:flex;align-items:center;gap:0.75rem;background:#181825;border:1px solid #313244;border-radius:8px;padding:0.5rem 0.7rem;margin-bottom:0.4rem} .gms-cred-name{flex:1;font-size:0.85rem;color:#cdd6f4} .gms-cred-mask{font-size:0.85rem;color:#6c7086;letter-spacing:0.1em} .gms-cred-delete,.gms-cred-cancel{background:#313244;border:1px solid #45475a;color:#a6adc8;border-radius:6px;padding:0.25rem 0.6rem;font-size:0.75rem;cursor:pointer} .gms-cred-confirm{background:transparent;border:1px solid #f38ba8;color:#f38ba8;border-radius:6px;padding:0.25rem 0.6rem;font-size:0.75rem;cursor:pointer} .gms-modal-overlay{position:fixed;inset:0;background:rgba(30,30,46,0.7);display:flex;align-items:center;justify-content:center;z-index:100} .gms-modal-dialog{background:#181825;border:1px solid #45475a;border-radius:10px;padding:1.2rem 1.4rem;max-width:420px;width:90%;display:flex;flex-direction:column;gap:0.75rem} .gms-form-field{display:flex;flex-direction:column;gap:0.25rem;font-size:0.8rem;color:#a6adc8} .gms-form-input{background:#1e1e2e;border:1px solid #45475a;border-radius:6px;color:#cdd6f4;padding:0.4rem 0.6rem;font-size:0.85rem} .gms-modal-error{margin:0;font-size:0.82rem;color:#f38ba8} .gms-session-groups{display:flex;flex-direction:column;gap:0.9rem} .gms-session-group-title{font-size:0.85rem;color:#a6adc8;margin-bottom:0.35rem} .gms-session-row{display:flex;flex-wrap:wrap;gap:0.5rem 1rem;align-items:center;width:100%;text-align:left;background:#181825;border:1px solid #313244;border-radius:8px;padding:0.5rem 0.7rem;color:#cdd6f4;cursor:pointer;font-size:0.83rem} .gms-session-row:hover{border-color:#89b4fa} .gms-session-name{font-weight:600} .gms-session-mode,.gms-session-workers,.gms-session-started{font-size:0.75rem;color:#a6adc8} .gms-container-list{display:flex;flex-direction:column;gap:0.4rem} .gms-container-row{display:flex;flex-wrap:wrap;gap:0.5rem 1rem;align-items:center;background:#181825;border:1px solid #313244;border-radius:8px;padding:0.5rem 0.7rem;font-size:0.83rem;color:#cdd6f4} .gms-container-name{font-weight:600} .gms-container-ws,.gms-container-status{font-size:0.75rem;color:#a6adc8}
+
+/* --- '+ New Session' flow (Active Sessions section head + chooser) --- */
+
+.gms-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.gms-section-head .gms-section-title {
+  margin: 0;
+}
+
+.gms-session-new-btn {
+  flex-shrink: 0;
+}
+
+.gms-session-chooser {
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #cdd6f4;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.85rem;
+  width: 100%;
+}
+
+.ws-modal-btn-primary {
+  background: #89b4fa;
+  border-color: #89b4fa;
+  color: #11111b;
+  font-weight: 600;
+}
+
+.ws-modal-btn-primary:hover:not(:disabled) {
+  background: #b4d0fb;
+  border-color: #b4d0fb;
+  color: #11111b;
+}
+
+
+
+/* --- Container records panel (RecordContainerPanel) --- */
+
+.rcp-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.rcp-refresh-btn {
+  flex-shrink: 0;
+}
+
+.rcp-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #6c7086;
+}
+
+.rcp-error {
+  margin: 0;
+}
+
+.rcp-empty {
+  margin: 0;
+}
+
+/* Row list --------------------------------------------------------------- */
+
+.rcp-record-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.rcp-record-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  color: #cdd6f4;
+  cursor: pointer;
+  font-size: 0.83rem;
+}
+
+.rcp-record-row:hover {
+  border-color: #89b4fa;
+}
+
+.rcp-record-row-selected {
+  border-color: #89b4fa;
+  background: #1e1e2e;
+}
+
+.rcp-record-name {
+  font-weight: 600;
+}
+
+.rcp-state {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: #89b4fa;
+  color: #1e1e2e;
+}
+
+.rcp-record-lifecycle {
+  font-size: 0.75rem;
+  color: #a6adc8;
+}
+
+.rcp-record-updated {
+  margin-left: auto;
+  font-size: 0.72rem;
+  color: #6c7086;
+}
+
+.rcp-drift-indicator {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: #313244;
+  color: #a6adc8;
+}
+
+.rcp-drift-indicator.rcp-drift-clean {
+  background: #a6e3a1;
+  color: #1e1e2e;
+}
+
+.rcp-drift-indicator.rcp-drift-drift {
+  background: #f38ba8;
+  color: #1e1e2e;
+}
+
+.rcp-drift-indicator.rcp-drift-unknown {
+  background: #f9e2af;
+  color: #1e1e2e;
+}
+
+/* Detail ----------------------------------------------------------------- */
+
+.rcp-detail {
+  margin-top: 0.4rem;
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.rcp-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.rcp-detail-title {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #cdd6f4;
+}
+
+.rcp-fields {
+  display: grid;
+  grid-template-columns: minmax(120px, max-content) 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.rcp-field-label {
+  color: #a6adc8;
+}
+
+.rcp-field-value {
+  margin: 0;
+  color: #cdd6f4;
+  overflow-wrap: anywhere;
+}
+
+.rcp-notes {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #a6adc8;
+}
+
+.rcp-subsection-title {
+  margin: 0.3rem 0 0;
+  font-size: 0.85rem;
+  color: #cdd6f4;
+}
+
+.rcp-intent {
+  margin-top: 0.2rem;
+}
+
+p.rcp-drift-unknown {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #f9e2af;
+}
+
+p.rcp-drift-clean {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #a6e3a1;
+}
+
+p.rcp-drift-detected {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #f38ba8;
+}
+
+/* Drift table ------------------------------------------------------------ */
+
+.rcp-drift-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.76rem;
+}
+
+.rcp-drift-caption {
+  caption-side: top;
+  text-align: left;
+  color: #6c7086;
+  font-size: 0.74rem;
+  padding-bottom: 0.25rem;
+}
+
+.rcp-drift-row td,
+.rcp-drift-table th {
+  border: 1px solid #313244;
+  padding: 0.25rem 0.4rem;
+  text-align: left;
+  color: #cdd6f4;
+  vertical-align: top;
+}
+
+.rcp-drift-table th {
+  color: #a6adc8;
+  font-weight: 600;
+  background: #1e1e2e;
+}
+
+.rcp-drift-class {
+  font-weight: 600;
+}
+
+.rcp-drift-value {
+  color: #a6adc8;
+}
+
+.rcp-drift-signature {
+  font-family: monospace;
+  color: #fab387;
+}
+
+.rcp-drift-toggle {
+  background: #313244;
+  border: 1px solid #45475a;
+  color: #cdd6f4;
+  border-radius: 4px;
+  padding: 0 0.4rem;
+  cursor: pointer;
+  font-size: 0.72rem;
+}
+
+.rcp-drift-toggle:hover {
+  background: #45475a;
+}
+
+.rcp-drift-raw-row td {
+  background: #1e1e2e;
+}
+
+.rcp-drift-raw {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.72rem;
+  color: #a6adc8;
+}
+
+/* Event log -------------------------------------------------------------- */
+
+.rcp-events {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.rcp-event-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.rcp-event-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.75rem;
+  align-items: center;
+  border: 1px solid #313244;
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.76rem;
+  color: #cdd6f4;
+}
+
+.rcp-event-time {
+  color: #6c7086;
+}
+
+.rcp-event-type {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: #313244;
+  color: #a6adc8;
+}
+
+.rcp-event-actor {
+  color: #a6adc8;
+}
+
+.rcp-event-payload {
+  font-family: monospace;
+  font-size: 0.72rem;
+  color: #6c7086;
+  overflow-wrap: anywhere;
+}
+
+/* Pass-2b action context ------------------------------------------------- */
+
+.rcp-action-context {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-top: 0.3rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #313244;
+  font-size: 0.78rem;
+  color: #a6adc8;
+}
+
+.rcp-actor {
+  color: #cdd6f4;
+}
+
+.rcp-reason-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: #a6adc8;
+}
+
+.rcp-reason-input {
+  flex: 1;
+  min-width: 180px;
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #cdd6f4;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.rcp-reason-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Pass-2b action bar (kill / restart / recreate) ------------------------- */
+
+.rcp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.3rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #313244;
+}
+
+/* The actor/reason row lives inside the action bar (full-width, no second
+   divider -- the bar's own top border already separates it from the log). */
+.rcp-actions .rcp-action-context {
+  flex: 1 1 100%;
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.rcp-action-btn {
+  font-weight: 600;
+}
+
+.rcp-action-kill {
+  border-color: #f38ba8;
+  color: #f38ba8;
+  background: transparent;
+}
+
+.rcp-action-kill:hover:not(:disabled) {
+  background: rgba(243, 139, 168, 0.12);
+}
+
+.rcp-action-pending {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #f9e2af;
+}
+
+.rcp-action-notice {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #a6e3a1;
+}
+
+
+/* Hardening verdict + freshness (B4-UI) ----------------------------------- */
+
+.rcp-hardening {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.2rem;
+}
+
+.rcp-hardening-verdict {
+  display: inline-block;
+  align-self: flex-start;
+  margin: 0;
+  padding: 0.15rem 0.55rem;
+  border-radius: 10px;
+  font-size: 0.82rem;
+}
+
+.rcp-hardening-conformant {
+  background: #a6e3a1;
+  color: #1e1e2e;
+}
+
+.rcp-hardening-drifted {
+  background: #f38ba8;
+  color: #1e1e2e;
+}
+
+.rcp-hardening-unknown {
+  background: #f9e2af;
+  color: #1e1e2e;
+}
+
+.rcp-hardening-failed {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 0.6rem;
+}
+
+.rcp-hardening-failed-axis {
+  font-family: monospace;
+  font-size: 0.76rem;
+  color: #f38ba8;
+}
+
+.rcp-freshness {
+  margin-top: 0.2rem;
+}
+
+.rcp-freshness-status {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.rcp-freshness-matches {
+  color: #a6e3a1;
+}
+
+.rcp-freshness-differs {
+  color: #f38ba8;
+}
+
+.rcp-freshness-unknown {
+  color: #f9e2af;
+}

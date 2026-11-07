@@ -1,0 +1,303 @@
+"""Centralized literal defaults for the agent runtime (Phase A consolidation).
+
+Single source of truth for configuration *literal constants* that were
+previously scattered across agent modules. This module imports only
+``thoughtmachine.timeout_constants`` (a dependency-free leaf) so any module
+can import from it without import-cycle risk.
+
+Consumers use the re-export idiom: each source module does
+``from agent.config.defaults import ...`` at module level so existing
+importers (including tests) keep seeing the same names on the source
+module.
+
+Deliberately NOT here (stays in the source modules): mutable runtime
+state, env-derived values, path computations, type aliases, lazy-import
+None placeholders, derived aliases (e.g. STALE_AFTER_S,
+GLOBAL_RESOURCE_IMAGES, *_BUILD_CMD) and private/underscored constants.
+"""
+
+import os
+
+# ── thoughtmachine/timeout_constants.py (re-exported) ────────────────────────
+# Unified idle/cleanup + soft-budget timeouts. The canonical definitions live
+# in the dependency-free thoughtmachine.timeout_constants leaf; they are
+# re-exported here so the consolidated defaults table stays complete.
+from thoughtmachine.timeout_constants import (
+    IDLE_TIMEOUT_SECONDS,
+    SOFT_BUDGET_FALLBACK_SECONDS,
+    SHIPPED_SOFT_BUDGET_SECONDS,
+)
+
+# ── tools/workspace/worker.py ────────────────────────────────────────────────
+# Spawn-queue drain timeout (generous fixed value, NOT tied to agent timeout).
+SPAWN_QUEUE_TIMEOUT = 600
+# A caller waiting for a worker reply must wait at least
+# ``timeout_seconds + QUERY_WAIT_GRACE_SECONDS`` so the worker's own timeout
+# envelope arrives before the caller force-stops it.
+QUERY_WAIT_GRACE_SECONDS = 60
+# Session-level worker spawn cap (safe default).
+MAX_WORKERS_PER_SESSION = 3
+# Publisher-side heartbeat cadence (worker.py throttles heartbeats to this).
+HEARTBEAT_INTERVAL_S = 30
+# A worker whose last heartbeat is older than this is considered stale.
+HEARTBEAT_STALE_AFTER_S = 600
+# Default per-worker container budget (unified with the workspace budget
+# DEFAULT_MAX_CONTAINERS, below).
+WORKER_DEFAULT_MAX_CONTAINERS = 6
+# Default system prompt for worker sub-agents.
+DEFAULT_WORKER_SYSTEM_PROMPT = (
+    "You are a capable autonomous sub-agent of ThoughtMachine. "
+    "Complete the task given to you thoroughly, using all available tools. "
+    "Think, research, write, edit, test, review. "
+    "When finished, use the Respond tool to return your final result. "
+    "Be concise but complete. "
+    "Do not ask the user for clarification — the main agent already understood the request."
+)
+# Default worker LLM sampling temperature.
+WORKER_DEFAULT_TEMPERATURE = 0.7
+# Default per-worker query timeout (seconds) when nothing is configured at
+# the tool-definition, agent-config or session level (SESSION-owned chain;
+# see docs/param_ownership_map.md).
+WORKER_TIMEOUT_SECONDS = 600
+# Default per-worker retry limit when nothing is configured at the
+# tool-definition, agent-config or session level (SESSION-owned chain).
+WORKER_MAX_RETRIES = 3
+
+# ── tools/workspace/worker_lifecycle.py ──────────────────────────────────────
+# Lifecycle event types the observer subscribes to (Phase 2A).
+WORKER_LIFECYCLE_EVENT_TYPES = (
+    "worker_spawned",
+    "worker_status",
+    "worker_running",
+    "worker_heartbeat",
+    "worker_stopping",
+    "worker_completed",
+    "worker_error",
+    "worker_timeout",
+    "worker_partial_result",
+)
+# Per-worker ring buffer size and global ring buffer size.
+PER_WORKER_RING_SIZE = 50
+GLOBAL_RING_SIZE = 500
+# Extra time past staleness before a worker is reported as "hung". 0 means a
+# stale worker is immediately hung.
+WORKER_HUNG_GRACE_S = 0
+
+# ── tools/workspace/worker_stale_watchdog.py ─────────────────────────────────
+# How often the ANNOUNCE-ONLY stale watchdog scans (seconds). One heartbeat
+# cadence: the watchdog exists to notice silence, so reacting more often than
+# the worker is asked to speak would only add noise.
+WORKER_STALE_WATCHDOG_INTERVAL_S = 30
+# A worker whose cached runtime frame is older than this is ANNOUNCED (never
+# killed, cancelled or interrupted -- phase A is announcement only). Three
+# missed heartbeats at the shipped cadence: one missed tick is jitter, three is
+# silence. Deliberately much shorter than HEARTBEAT_STALE_AFTER_S (600), which
+# measures the in-process heartbeat and drives the INTERRUPTING path.
+WORKER_STALE_ANNOUNCE_AFTER_S = 3 * HEARTBEAT_INTERVAL_S
+# The escalation ladder's three budgets (S7c-3: ping-ack liveness, then cancel,
+# then kill). Read by ``worker_stale_watchdog.WorkerStaleWatchdog`` as its
+# per-instance defaults, so the ladder lands in the constants table rather than
+# as literals at its call sites.
+WORKER_STALE_PROBE_TIMEOUT_S = 15
+WORKER_STALE_CANCEL_TIMEOUT_S = 15
+WORKER_STALE_KILL_TIMEOUT_S = 15
+
+# ── tools/workspace/job_registry.py ──────────────────────────────────────────
+# Maximum number of job records kept (bounded; oldest evicted when full).
+JOB_REGISTRY_MAX_JOBS = 200
+# Preview cap for completed-job results (full envelope stored separately).
+PREVIEW_CAP = 8000
+# Preview cap for partial/error/timeout snippets.
+PARTIAL_PREVIEW_CAP = 2000
+# Statuses that are final: once a job reaches one of these it must never
+# transition again (no overwriting a paused/timeout/completed job).
+TERMINAL_STATUSES = ("completed", "paused", "timeout", "error", "stopped", "interrupted")
+
+# ── tools/host_bash_tool.py ──────────────────────────────────────────────────
+# Execution timeout for the spawned shell (seconds).
+HOST_BASH_TIMEOUT = 120
+# How long to wait for the operator's approval decision (seconds).
+HOST_BASH_APPROVAL_TIMEOUT = 120.0
+
+# ── tools/git_info_tool.py ───────────────────────────────────────────────────
+# Clone URL protocol allowlist. ``git clone`` accepts arbitrary transport URLs
+# (including ``ext::`` shell executors and ``file://`` local access), so clone
+# URLs are restricted to these schemes plus scp-like ``user@host:path`` syntax.
+ALLOWED_GIT_PROTOCOLS = ["https://", "http://", "git://", "ssh://"]
+
+# ── infra/workspace_lifecycle_manager.py ─────────────────────────────────────
+# Timeouts (seconds).
+SOFT_TIMEOUT = 300    # default per-query wait bound
+HARD_TIMEOUT = 600    # upper bound for the underlying worker loop
+EXEC_KILL_GRACE = 10  # grace period for terminating a docker exec
+QUERY_ID_PREFIX = "q_"
+
+# ── infra/container_registry.py ──────────────────────────────────────────────
+# The resource git image tag (mirrored from infra/resource_container_manager).
+RESOURCE_IMAGE_TAG = "tm-resource-git"
+# Resource-container identity labels.
+RESOURCE_LABEL = "thoughtmachine.resource"
+RESOURCE_KIND = "git"
+WORKSPACE_ID_LABEL = "thoughtmachine.workspace_id"
+CONTAINER_NAME_LABEL = "thoughtmachine.container_name"
+# Container-type labeling standard (container & resource access control):
+# every thoughtmachine container carries a ``container_type`` label with
+# value ``free_use`` (worker/user containers) or ``resource`` (hidden
+# resource containers, which additionally carry ``resource_name``).
+CONTAINER_TYPE_LABEL = "thoughtmachine.container_type"
+CONTAINER_TYPE_FREE_USE = "free_use"
+CONTAINER_TYPE_RESOURCE = "resource"
+RESOURCE_NAME_LABEL = "thoughtmachine.resource_name"
+RESOURCE_MEM_LIMIT = "512m"
+RESOURCE_CPU_QUOTA = 50000
+# Default image used by container_manager.
+DEFAULT_IMAGE = "agent-executor"
+# Dedicated render image for tools/visual_tool.py (the working name the
+# operator ruling in docs/design-worker-lifecycle.md settles on).  ``None``
+# means NO render image is provisioned in this build: the visual tool then
+# refuses fail-closed and never falls back to DEFAULT_IMAGE /
+# RESOURCE_IMAGE_TAG.  When a reference is configured it must ALSO appear in
+# ADMISSION_IMAGE_ALLOWLIST below -- the gate stays the single authority for
+# what may run -- and the tool refuses before creating any container when it
+# does not.
+VISUAL_RENDER_IMAGE: str | None = None
+# Workspace config.json default max_containers (infra/container_manager.py: ContainerManager.max_containers).
+DEFAULT_MAX_CONTAINERS = 6
+# Valid container_type values ("git" is represented as "resource"; mcp/proxy
+# are future types reserved by the registry).
+CONTAINER_TYPES = ("user", "resource", "mcp", "proxy")
+# OOM score defaults by container type (None sentinel in ContainerProfile):
+#   user     -> 1000  first OOM-kill victims (infra/container_manager.py: oom_score_adj).
+#   resource ->  500  moderate score (infra/resource_container_manager.py: oom_score_adj).
+DEFAULT_USER_OOM_SCORE_ADJ = 1000
+DEFAULT_RESOURCE_OOM_SCORE_ADJ = 500
+
+# ── security/admission_gate.py ──────────────────────────────────────────────
+# Admission-control disk policy (two-tier).  WARN is advisory: it is attached
+# as a note on an otherwise-admitted container.  DENY blocks container
+# creation.  EITHER axis tripping its threshold triggers the tier, so the
+# more aggressive of the two conditions wins.
+ADMISSION_DISK_MAX_USED_PCT = 95
+ADMISSION_DISK_MIN_FREE_BYTES = 2 * 1024 ** 3
+ADMISSION_DISK_WARN_USED_PCT = 90
+ADMISSION_DISK_WARN_MIN_FREE_BYTES = 10 * 1024 ** 3
+# Images an admitted container may run.  Derived from the two base images the
+# runtime actually builds; no proxy/mcp dedicated base image exists yet
+# (mcp/proxy are future CONTAINER_TYPES reserved by the registry).
+ADMISSION_IMAGE_ALLOWLIST = (DEFAULT_IMAGE, RESOURCE_IMAGE_TAG)
+# Hardening recipe — the union of the three create stacks (design doc §1.1).
+HARDENED_CAP_DROP = ["ALL"]
+HARDENED_SECURITY_OPT = ["no-new-privileges:true"]
+HARDENED_READ_ONLY = True
+
+
+def _host_ids() -> tuple[int, int] | None:
+    """Host uid/gid as ``(uid, gid)``, or ``None`` on platforms without one.
+
+    Single source of truth for the host ids; resolved at CALL time so tests
+    can monkeypatch ``os.getuid``/``os.getgid`` for determinism.
+    """
+    if os.name == "nt":
+        return None
+    return os.getuid(), os.getgid()
+
+
+def host_user() -> str | None:
+    """Return the host ``uid:gid`` the container user must match, or ``None``.
+
+    The container runs as the HOST user so bind-mounted workspace files are
+    owned by the in-container process (git ownership checks pass without a
+    ``safe.directory`` override).  Resolved at CALL time so tests can
+    monkeypatch ``os.getuid``/``os.getgid`` for determinism.
+    """
+    ids = _host_ids()
+    if ids is None:
+        return None
+    uid, gid = ids
+    return f"{uid}:{gid}"
+
+
+# Mount options for the ``/tmp`` tmpfs of every exec container (single source
+# of truth -- importers must not respell the string).
+# Size is 512m rather than 64m because pytest's ``tmp_path`` defaults to /tmp
+# and a 64m tmpfs ENOSPCs part-way through a suite. 512m is still a hard
+# ceiling (a runaway writer cannot fill the host disk) and the mount stays
+# ``noexec``/``nosuid`` so /tmp can never host an executed or setuid binary.
+EXEC_TMPFS_OPTIONS = "rw,noexec,nosuid,size=512m"
+
+
+def host_tmpfs() -> dict:
+    """Fresh tmpfs recipe with the live host uid/gid (resolved at call time).
+
+    On Windows (no host uid:gid) the ``/home/agent`` entry is kept but the
+    ``uid=``/``gid=`` parameters are omitted.
+    """
+    ids = _host_ids()
+    home = "rw,exec,size=256m"
+    if ids is not None:
+        uid, gid = ids
+        home = f"{home},uid={uid},gid={gid}"
+    return {
+        "/tmp": EXEC_TMPFS_OPTIONS,
+        "/home/agent": home,
+    }
+
+
+# Frozen at import-time (per-process, stable): host uid/gid do not change within a process.
+# Windows: host_user() returns None. Fall back to "0:0" to match Docker
+# Desktop's root:root bind mounts; on POSIX the real uid:gid is used.
+HARDENED_USER = host_user() or "0:0"
+# tmpfs recipe (design doc §1.1; dispatch spelling "256m").
+_TMPFS_HOME = "rw,exec,size=256m"
+_HIDS = _host_ids()
+if _HIDS is not None:
+    _TMPFS_HOME = f"{_TMPFS_HOME},uid={_HIDS[0]},gid={_HIDS[1]}"
+DEFAULT_TMPFS = {
+    "/tmp": EXEC_TMPFS_OPTIONS,
+    "/home/agent": _TMPFS_HOME,
+}
+DEFAULT_COMMAND = ["tail", "-f", "/dev/null"]
+DEFAULT_MEM_LIMIT = "512m"
+DEFAULT_CPU_QUOTA = 100000
+# PID ceiling for created containers (unset -> Docker applies no pids limit).
+DEFAULT_PIDS_LIMIT = 512
+# Graceful-stop timeout used by destroy_container / permission reconciliation.
+STOP_TIMEOUT = 10
+
+# ── infra/container_manager.py ───────────────────────────────────────────────
+# Output truncation for exec streams (mirrors DockerCodeRunner._truncate_output).
+EXEC_OUTPUT_LIMIT_BYTES = 100 * 1024
+
+# ── infra/resource_container_manager.py ──────────────────────────────────────
+RUNTIME_IMAGE_TAG = "tm-workspace-runtime:latest"
+# Known hidden resources. Every entry runs inside the same hardened
+# ``RESOURCE_IMAGE_TAG`` image, so the build-hash drift check applies to all.
+RESOURCE_REGISTRY = {
+    "git": {"kind": "git", "permission": "git"},
+}
+# Docker label carrying the image build hash for drift detection.
+RESOURCE_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
+
+# ── security/security_gate.py ────────────────────────────────────────────────
+# How long check_required_categories waits for the user's approve/deny decision.
+PROMPT_TIMEOUT = 120.0
+
+# ── agent/core/agent.py ──────────────────────────────────────────────────────
+# Default response-token budget for the Agent class.
+DEFAULT_RESPONSE_TOKENS = 4096
+
+# ── agent/core/tool_executor.py ──────────────────────────────────────────────
+# Fallback session-permissions profile used when no live SessionPermissions
+# model is available on config.  NOTE: this literal is still the LEGACY SUBSET
+# of ``thoughtmachine.security.SAFE_DEFAULTS`` -- ``ci``/``credential`` are
+# absent (a pre-existing drift, tracked separately).
+DEFAULT_SESSION_PERMISSIONS = {
+    "container": False,
+    "network": "banned",
+    "filesystem": "read",
+    "git": "read",
+    "mcp": "banned",
+    "host_bash": "banned",
+    "visual": "banned",
+}
+

@@ -1,0 +1,548 @@
+"""Task 3: git subprocess hardening contract for GitInfoTool.
+
+Verifies that:
+1. Every git subprocess runs with a sanitized environment: system/global
+   config (~/.gitconfig, /etc/gitconfig) and the host HOME are ignored, so
+   ambient aliases, credential helpers, and include.path tricks cannot be
+   injected into the subprocess.
+2. Git hooks never execute on the HOST fallback path: core.hooksPath is
+   pointed at /dev/null for every invocation and commit additionally passes
+   --no-verify. The container path (resource container = security boundary)
+   runs hooks ONLY from the workspace-local .githooks directory via a
+   core.hooksPath=/workspace/.githooks override (the container-mapped
+   absolute workspace path); repo-local .git/hooks is never consulted and
+   no --no-verify is injected (see
+   test_container_path_commit_runs_githooks_only).
+3. External diff drivers / textconv filters and the fsmonitor helper are
+   disabled on every invocation.
+4. A repository root that resolves OUTSIDE the workspace is rejected before
+   any git operation runs against it.
+
+NOTE: this suite intentionally never writes to the real $HOME. Any hostile
+.gitconfig is created inside tmp_path only (the tool overrides HOME itself,
+so even monkeypatched HOME values in this file are purely belt-and-braces).
+"""
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from tools.git_info_tool import GitInfoTool
+from tools.git_write_tool import GitWriteTool
+
+# Workspace the host-path helpers bind so the workspace ceiling admits host
+# git; its ``allow_host_resources`` config is provisioned by the autouse
+# ``_allow_host_resources_gate`` fixture below (mirrors
+# tests/test_permission_routing_fix.py / test_worker_permission_hardening.py).
+HOST_TEST_WS = "host-test-ws"
+
+
+@pytest.fixture(autouse=True)
+def _allow_host_resources_gate(tmp_path, monkeypatch):
+    """Provision an ``allow_host_resources`` config for ``HOST_TEST_WS``.
+
+    Host-side git is fail-CLOSED on an unbound workspace id: with no workspace
+    id there is no ``allow_host_resources`` ceiling to resolve, so the host path
+    is denied.  This suite exercises the hermetic HOST fallback (direct
+    ``workspace_path=`` callers), so its tools bind ``HOST_TEST_WS`` and this
+    fixture gives that workspace an ``allow_host_resources: true`` config.
+    """
+    vault = tmp_path / "_host_gate_vault"
+    cfg_dir = vault / "workspaces" / HOST_TEST_WS
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"allow_host_resources": True}), encoding="utf-8"
+    )
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+
+
+# Canonical fail-closed gate denial returned by GitWriteTool for direct calls
+# when the session git permission is not write-capable (byte-identical to
+# test_git_info_tool_operations.FLAG_ERROR and to the tool's
+# _flag_gate_error(); the in-tool gate is governed SOLELY by the effective
+# ``git`` grain in ``effective_permissions`` -- the legacy
+# ``agent_config['session_permissions']`` field and the ``git_write`` agent
+# key are never consulted).
+FLAG_ERROR = 'Error: git:write denied: session git_write permission is not "write"'
+
+
+def _run_git_clean(cwd: Path, *args) -> subprocess.CompletedProcess:
+    """Run git with a sanitized environment (mirrors the tool's hardening)."""
+    env = os.environ.copy()
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    env["GIT_CONFIG_SYSTEM"] = "/dev/null"
+    env["HOME"] = "/dev/null"
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def git_available():
+    """Skip the whole module when git is not installed (e.g. minimal containers).
+
+    The hardening contract is exercised with real git on hosts that have it;
+    in sandboxes without a git binary the suite skips instead of erroring.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git binary not available in this environment")
+
+
+@pytest.fixture
+def hardened_repo(tmp_path):
+    """A repo inside a workspace, with a hostile pre-commit hook installed."""
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    _run_git_clean(repo, "init", "-q")
+    # Repo-LOCAL identity (global config is ignored by the tool, so commits
+    # must not depend on it).
+    _run_git_clean(repo, "config", "user.name", "Test User")
+    _run_git_clean(repo, "config", "user.email", "test@example.com")
+    # Hostile hook: would create marker.txt if it ever ran.
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho PWNED > marker.txt\n")
+    hook.chmod(0o111)
+    marker = repo / "marker.txt"
+    return workspace, repo, marker
+
+
+def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
+    return GitWriteTool(
+        operation="commit",
+        message=message,
+        file_path=file_path,
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write", "filesystem": "write"},  # explicit perms: required for the host sandbox guard (an unresolved session fails closed)
+        effective_permissions={"git": "write", "filesystem": "write"},  # effective grant: the git + filesystem gates are governed solely by effective_permissions
+    )
+
+
+def test_host_path_pre_commit_hook_does_not_run(hardened_repo):
+    """HOST path: a pre-commit hook in the repo must never execute.
+
+    This caller passes ``workspace_path=`` directly (no registry workspace),
+    so git runs through the host hermetic sandbox, which neutralizes hooks
+    via core.hooksPath=/dev/null + --no-verify.
+    """
+    workspace, repo, marker = hardened_repo
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    result = _commit_tool(workspace, repo).execute()
+    assert "PWNED" not in result
+    assert not marker.exists() or "PWNED" not in marker.read_text()
+
+
+class _FakeManager:
+    """Resource-container stand-in recording exec() invocations."""
+
+    def __init__(self):
+        self.calls = []
+
+    def exec(self, command, **kwargs):
+        self.calls.append((command, kwargs))
+        return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+
+def test_container_path_commit_runs_githooks_only(tmp_path):
+    """Container mode runs workspace .githooks, never repo .git/hooks.
+
+    The resource container IS the security boundary, but hooks may only
+    originate from the policy-owned .githooks directory: the container git
+    path injects ``-c core.hooksPath=/workspace/.githooks`` (the
+    container-mapped absolute workspace path) and does NOT inject
+    --no-verify.
+    """
+    manager = _FakeManager()
+    tool = GitWriteTool(
+        operation="commit",
+        message="x",
+        session_permissions={"git": "write"},
+        effective_permissions={"git": "write"},  # container path enforces the atomic git:write category
+    )
+    object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+    object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+    object.__setattr__(tool, "_ensure_resource_container", lambda: manager)
+
+    tool._exec_container_raw(tmp_path, ["commit", "-m", "x"])
+
+    assert len(manager.calls) == 1
+    command, _kwargs = manager.calls[0]
+    assert command == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
+    assert "--no-verify" not in command
+
+    # Non-commit operations are unaffected by the hook-path override.
+    tool._exec_container_raw(tmp_path, ["status"])
+    command2, _kwargs2 = manager.calls[1]
+    assert command2 == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "status"]
+
+
+def test_commit_still_succeeds(hardened_repo):
+    """Hardening must not break normal commits."""
+    workspace, repo, marker = hardened_repo
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    result = _commit_tool(workspace, repo).execute()
+    assert "Git command failed" not in result
+    assert not marker.exists() or "PWNED" not in marker.read_text()
+    log = _run_git_clean(repo, "log", "--oneline")
+    assert log.returncode == 0
+    assert "test commit" in log.stdout
+
+
+def test_repo_root_outside_workspace_rejected(tmp_path):
+    """A repo whose root sits ABOVE the workspace must be rejected.
+
+    Flow: proj/ has no .git, so rev-parse --show-toplevel resolves up to
+    tmp_path (the repo that CONTAINS the workspace); _validate_repo_root
+    must refuse to run git there.
+    """
+    _run_git_clean(tmp_path, "init", "-q")
+    workspace = tmp_path / "workspace"
+    proj = workspace / "proj"
+    proj.mkdir(parents=True)
+    tool = GitInfoTool(
+        operation="status",
+        working_dir=str(proj),
+        workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+    )
+    result = tool.execute()
+    assert isinstance(result, str)
+    assert "outside the workspace" in result
+    assert "Git command failed" not in result
+
+
+def test_status_still_works(hardened_repo):
+    """A normal status operation inside the workspace is unaffected."""
+    workspace, repo, _ = hardened_repo
+    (repo / "a.txt").write_text("a\n")
+    tool = GitInfoTool(
+        operation="status",
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+    )
+    result = tool.execute()
+    assert "a.txt" in result
+    assert "Git command failed" not in result
+
+
+def test_ambient_global_config_is_ignored(hardened_repo, monkeypatch, tmp_path):
+    """A hostile ~/.gitconfig must never influence commits made by the tool.
+
+    The tool overrides HOME=/dev/null itself, so this passes even though the
+    ambient HOME points at a directory full of evil settings.
+    """
+    # Belt-and-braces: ``tests/conftest.py`` already scrubs these at import
+    # time, but this test asserts the AUTHOR of a real commit, so it must not
+    # depend on that scrub still being there. Kept BELOW the docstring -- a
+    # statement above it turns the docstring into a no-op expression.
+    monkeypatch.delenv("GIT_AUTHOR_NAME", raising=False)
+    monkeypatch.delenv("GIT_AUTHOR_EMAIL", raising=False)
+    monkeypatch.delenv("GIT_COMMITTER_NAME", raising=False)
+    monkeypatch.delenv("GIT_COMMITTER_EMAIL", raising=False)
+    workspace, repo, _ = hardened_repo
+    hostile_home = tmp_path / "hostile_home"
+    hostile_home.mkdir()
+    (hostile_home / ".gitconfig").write_text(
+        "[user]\n\tname = EVIL_GLOBAL\n\temail = evil@example.com\n"
+    )
+    monkeypatch.setenv("HOME", str(hostile_home))  # safe: tmp only
+
+    (repo / "a.txt").write_text("a\n")
+    _run_git_clean(repo, "add", "a.txt")
+    result = _commit_tool(workspace, repo, message="config-isolated commit", file_path="a.txt").execute()
+    assert "Git command failed" not in result
+
+    log = _run_git_clean(repo, "log", "--format=%an <%ae>")
+    assert "EVIL_GLOBAL" not in log.stdout
+    assert "Test User <test@example.com>" in log.stdout
+
+
+# -- Deliverable 2: vault-backed hooks + hardened runner extensions ----------
+
+FULL_PERMISSIONS = {
+    "git": "write",
+    "container": False,
+    "network": "banned",
+    "filesystem": "write",
+    "system": "read",
+    "execution": "banned",
+}
+
+
+def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit", file_path="hello.txt"):
+    return GitWriteTool(
+        operation="commit",
+        message=message,
+        file_path=file_path,
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+        workspace_id=ws_id,
+        session_permissions=dict(FULL_PERMISSIONS),
+        effective_permissions=dict(FULL_PERMISSIONS),
+    )
+
+
+def test_repo_hooks_never_execute(hardened_repo):
+    """A post-commit hook in the repo must never run during a commit."""
+    workspace, repo, _ = hardened_repo
+    hook = repo / ".git" / "hooks" / "post-commit"
+    hook.write_text("#!/bin/sh\necho PWNED > post_commit_marker.txt\n")
+    hook.chmod(0o111)
+    post_marker = repo / "post_commit_marker.txt"
+
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    result = _commit_tool(workspace, repo).execute()
+    assert "Git command failed" not in result
+    assert not post_marker.exists()
+
+
+def test_fsmonitor_config_not_executed(hardened_repo):
+    """A repo-local core.fsmonitor helper must never be executed."""
+    workspace, repo, _ = hardened_repo
+    helper = repo / "fsmonitor_helper.sh"
+    helper.write_text("#!/bin/sh\necho PWNED > fsmonitor_marker.txt\n")
+    helper.chmod(0o111)
+    _run_git_clean(repo, "config", "core.fsmonitor", str(helper))
+    fsmon_marker = repo / "fsmonitor_marker.txt"
+
+    (repo / "a.txt").write_text("a\n")
+    tool = GitInfoTool(
+        operation="status",
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+    )
+    result = tool.execute()
+    assert "a.txt" in result
+    assert "Git command failed" not in result
+    assert not fsmon_marker.exists()
+
+
+def test_vault_pre_commit_hook_never_runs(tmp_path, monkeypatch):
+    """A vault-managed pre-commit hook must NEVER execute anymore.
+
+    The vault hook mechanism was removed: hooks are now either the
+    workspace-local .githooks dir (container) or fully neutralized (host).
+    A marker hook planted at ~/.thoughtmachine/hooks/<ws>/pre-commit must
+    leave no trace.
+    """
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    _run_git_clean(repo, "init", "-q")
+    _run_git_clean(repo, "config", "user.name", "Test User")
+    _run_git_clean(repo, "config", "user.email", "test@example.com")
+
+    ws_id = "ws-vault-test"
+    # Vault pinned via THOUGHTMACHINE_VAULT_ROOT (test-side harness only).
+    # Host-side git is fail-closed without allow_host_resources: true in
+    # <vault>/workspaces/<ws_id>/config.json, so seed it to keep the commit
+    # flowing through the hermetic host path this test exercises.
+    vault = tmp_path / ".thoughtmachine"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+    ws_cfg_dir = vault / "workspaces" / ws_id
+    ws_cfg_dir.mkdir(parents=True)
+    (ws_cfg_dir / "config.json").write_text(
+        json.dumps({"allow_host_resources": True})
+    )
+    hooks_dir = vault / "hooks" / ws_id
+    hooks_dir.mkdir(parents=True)
+    hook = hooks_dir / "pre-commit"
+    hook.write_text("#!/bin/sh\ntouch vault_marker.txt\n")
+    # sh must READ the script file to interpret it, so hooks need read+exec.
+    hook.chmod(0o755)
+    vault_marker = repo / "vault_marker.txt"
+
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    result = _vault_commit_tool(workspace, repo, ws_id).execute()
+    assert "Git command failed" not in result
+    assert "Error executing git operation" not in result
+    assert not vault_marker.exists()  # the vault hook never ran
+
+    log = _run_git_clean(repo, "log", "--oneline")
+    assert log.returncode == 0
+    assert "vault hook commit" in log.stdout
+
+
+def test_failing_vault_pre_commit_hook_does_not_abort(tmp_path, monkeypatch):
+    """A failing vault pre-commit hook must NOT abort the commit anymore.
+
+    Vault hooks are no longer consulted at all, so even an exit-1 vault
+    hook cannot block the commit.
+    """
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    _run_git_clean(repo, "init", "-q")
+    _run_git_clean(repo, "config", "user.name", "Test User")
+    _run_git_clean(repo, "config", "user.email", "test@example.com")
+
+    ws_id = "ws-vault-fail"
+    # Vault pinned via THOUGHTMACHINE_VAULT_ROOT (test-side harness only).
+    # Host-side git is fail-closed without allow_host_resources: true in
+    # <vault>/workspaces/<ws_id>/config.json, so seed it to keep the commit
+    # flowing through the hermetic host path this test exercises.
+    vault = tmp_path / ".thoughtmachine"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+    ws_cfg_dir = vault / "workspaces" / ws_id
+    ws_cfg_dir.mkdir(parents=True)
+    (ws_cfg_dir / "config.json").write_text(
+        json.dumps({"allow_host_resources": True})
+    )
+    hooks_dir = vault / "hooks" / ws_id
+    hooks_dir.mkdir(parents=True)
+    hook = hooks_dir / "pre-commit"
+    hook.write_text("#!/bin/sh\necho 'blocked by policy' >&2\nexit 1\n")
+    # sh must READ the script file to interpret it, so hooks need read+exec.
+    hook.chmod(0o755)
+
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    # Must NOT raise RuntimeError: vault hooks are no longer consulted.
+    result = _vault_commit_tool(workspace, repo, ws_id).execute()
+    assert "Git command failed" not in result
+
+    log = _run_git_clean(repo, "log", "--oneline")
+    assert log.returncode == 0  # the commit was created
+
+
+def test_commit_denied_without_git_write_permission(hardened_repo):
+    """Committing without a write-capable session git permission fails closed.
+
+    The in-tool gate returns the canonical denial string (FLAG_ERROR) before
+    any git subprocess can run -- direct-call semantics mirroring
+    test_git_info_tool_operations -- so nothing is committed.
+    """
+    workspace, repo, _ = hardened_repo
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    tool = GitWriteTool(
+        operation="commit",
+        message="nope",
+        file_path="hello.txt",
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+        effective_permissions={"git": "read"},
+    )
+    result = tool.execute()
+    assert result == FLAG_ERROR
+    log = _run_git_clean(repo, "log", "--oneline")
+    assert log.returncode != 0  # nothing was committed
+
+
+def test_normal_git_operations(hardened_repo):
+    """Read-only operations keep working through the hardened runner."""
+    workspace, repo, _ = hardened_repo
+    (repo / "a.txt").write_text("a\n")
+    _run_git_clean(repo, "add", "a.txt")
+    _commit_tool(workspace, repo, message="base", file_path="a.txt").execute()
+
+    for op, kwargs in (
+        ("status", {}),
+        ("diff", {}),
+        ("log", {}),
+        ("show", {"commit": "HEAD"}),
+        ("config", {}),
+    ):
+        tool = GitInfoTool(
+            operation=op,
+            working_dir=str(repo),
+            workspace_path=str(workspace),
+            workspace_id=HOST_TEST_WS,
+            session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+            **kwargs,
+        )
+        result = tool.execute()
+        assert "Git command failed" not in result
+        assert "Error running git command" not in result
+
+def test_textconv_driver_never_executes_via_show(tmp_path):
+    """A repo-local textconv diff driver must never run during git show.
+
+    Full exploit chain: a nested repo carries .gitattributes routing *.bin
+    through a diff driver and .git/config defines that driver's textconv as
+    an external script. Rendering the diff would execute the script; the
+    tool's --no-textconv flag prevents it.
+    """
+    workspace = tmp_path / "workspace"
+    nested = workspace / "nested"
+    nested.mkdir(parents=True)
+    _run_git_clean(nested, "init", "-q")
+    _run_git_clean(nested, "config", "user.name", "Test User")
+    _run_git_clean(nested, "config", "user.email", "test@example.com")
+
+    marker = workspace / "textconv_marker.txt"
+    evil = nested / "evil.sh"
+    evil.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    evil.chmod(0o755)
+    _run_git_clean(nested, "config", "diff.test.textconv", str(evil))
+    (nested / ".gitattributes").write_text("*.bin diff=test\n")
+
+    data = nested / "data.bin"
+    data.write_bytes(b"\x00\x01binary\xff\xfe\n")
+    _run_git_clean(nested, "add", ".")
+    commit = _run_git_clean(nested, "commit", "-q", "-m", "base")
+    assert commit.returncode == 0, commit.stderr
+
+    tool = GitInfoTool(
+        operation="show",
+        commit="HEAD",
+        working_dir=str(nested),
+        workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+    )
+    result = tool.execute()
+    assert "Git command failed" not in result
+    assert "Error running git command" not in result
+    assert not marker.exists(), (
+        "textconv executed during git show despite --no-textconv"
+    )
+
+
+def test_textconv_disabled_but_builtin_diff_works(tmp_path):
+    """With --no-textconv, normal diff output stays correct."""
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    _run_git_clean(repo, "init", "-q")
+    _run_git_clean(repo, "config", "user.name", "Test User")
+    _run_git_clean(repo, "config", "user.email", "test@example.com")
+
+    (repo / "hello.txt").write_text("line1\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    commit = _run_git_clean(repo, "commit", "-q", "-m", "base")
+    assert commit.returncode == 0, commit.stderr
+
+    (repo / "hello.txt").write_text("line1\nline2\n")
+    tool = GitInfoTool(
+        operation="diff",
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+        workspace_id=HOST_TEST_WS,
+        session_permissions={"git": "write"},  # explicit perms: the git gate fails closed when session_permissions is unresolved
+    )
+    result = tool.execute()
+    assert "Git command failed" not in result
+    assert "+line2" in result
+

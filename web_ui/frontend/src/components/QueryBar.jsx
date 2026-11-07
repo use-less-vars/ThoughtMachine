@@ -1,26 +1,31 @@
 /*
  * QueryBar.jsx
  *
- * Text input + contextual action buttons.
+ * Text input + a Run/Pause toggle plus separate Stop/Resume controls.
  *
  * Button logic:
- *   status     Run | Pause | Stop         Command sent
- *   ────────────────────────────────────────────────────
- *   IDLE       ✓   |       |              start_session (fresh) /
- *                                            continue_session (if isRunning)
- *   RUNNING        | ✓    | ✓            pause_session / stop_session
- *   PAUSING    ⛔  |      |              single disabled Pause button
- *   PAUSED     ✓   |       | ✓            continue_session(query) / stop_session
- *   WAITING... ✓   |       | ✓            continue_session(query)
+ *   status      Button                 Command sent
+ *   ─────────────────────────────────────────────────────────────
+ *   RUNNING     ⏸ Pause                pause_session
+ *   PAUSING     ⏸ Pausing… (disabled)  —
+ *   otherwise   ▶ Run                  start_session (fresh session) /
+ *                                      continue_session(query) (loaded session)
+ *   not IDLE /  ⏹ Stop                 stop_session
+ *   not connecting
+ *   PAUSED      ▶ Resume               resume_session
+ *
+ * The Run button is disabled while the session is connecting and, when IDLE,
+ * until the query is non-empty. Enter (without Shift) triggers the same toggle
+ * from IDLE / WAITING_FOR_USER / PAUSED.
  *
  * Props:
  *   sendCommand(command, payload)
- *   status, isRunning, config
+ *   status, isRunning, config, mode, sessionId, sessionReady
  */
 
 import React, { useState, useRef } from 'react'
 
-function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
+function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId, sessionReady }) {
   const [query, setQuery] = useState('')
   const textareaRef = useRef(null)
 
@@ -29,6 +34,7 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
   const isPaused = status === 'PAUSED'
   const isPausing = status === 'PAUSING'
   const isWaiting = status === 'WAITING_FOR_USER'
+  const isConnecting = !sessionReady && !sessionId // fresh tab waiting for session_loaded
 
   const handleRun = () => {
     if (!query.trim()) return
@@ -38,11 +44,11 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
       sendCommand('continue_session', {
         query: query.trim(),
         session_id: sessionId,
-        config: config ?? {}
+        config: { ...(config ?? {}), mode }
       })
     } else {
       // Fresh start — create new agent session
-      sendCommand('start_session', { query: query.trim(), config: config ?? {} })
+      sendCommand('start_session', { query: query.trim(), config: { ...(config ?? {}), mode } })
     }
     setQuery('')  // Clear input after sending
     if (textareaRef.current) {
@@ -62,6 +68,14 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
     } else {
       handleRun()
     }
+  }
+
+  const handleStop = () => {
+    sendCommand('stop_session', {})
+  }
+
+  const handleResume = () => {
+    sendCommand('resume_session', {})
   }
 
   const handleKeyDown = (e) => {
@@ -98,7 +112,7 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
         rows={1}
       />
       <div className="query-buttons">
-        {/* Toggle Run/Pause — always visible. No Resume button. */}
+        {/* Toggle Run/Pause — always visible. Stop/Resume are separate controls. */}
         {isBusy ? (
           <button className="btn btn-pause" onClick={handleToggle}>
             ⏸ Pause
@@ -111,11 +125,18 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
           <button
             className="btn btn-run"
             onClick={handleToggle}
-            disabled={!query.trim() && isIdle}
+            disabled={(isConnecting) || (!query.trim() && isIdle)}
           >
-            ▶ Run
+            {isConnecting ? 'Connecting…' : '▶ Run'}
           </button>
         )}
+        {/* Stop — disabled while idle/connecting. Resume — enabled only when PAUSED. */}
+        <button className="btn btn-stop" onClick={handleStop} disabled={isIdle || isConnecting}>
+          ⏹ Stop
+        </button>
+        <button className="btn btn-resume" onClick={handleResume} disabled={!isPaused}>
+          ▶ Resume
+        </button>
       </div>
     </div>
   )

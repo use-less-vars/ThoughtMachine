@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# Development-only dependencies (not shipped to end users).
+#
+# End-to-end browser tests (tests/e2e) run against the real UI via
+# Playwright + the pytest-playwright plugin.  They are skipped unless
+# pytest is invoked with --run-e2e; see tests/e2e/README.md.
+playwright>=1.40
+pytest-playwright>=0.4

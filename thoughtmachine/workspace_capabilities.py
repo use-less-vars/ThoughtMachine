@@ -16,11 +16,41 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from thoughtmachine.security import FRESH_WORKSPACE_DEFAULT_PERMISSIONS
+from thoughtmachine.vault import _copy_resource, vault_root
+from thoughtmachine.workspace_registry import (
+    RESERVED_WORKSPACE_IDS,
+    WorkspaceRegistry,
+    _normalize_path,
+)
+from thoughtmachine.validation import validate_single_path_segment
+
+# Minimal validation for template workers (avoids circular import via agent.__init__)
+_REQUIRED_WORKER_FIELDS = {"name", "description", "system_prompt", "tools", "permission_footprint"}
+
+
+def _validate_worker_dict(data: dict) -> dict | None:
+    """Validate a worker dict has all required fields.  Returns the dict or
+    ``None`` if validation fails."""
+    missing = _REQUIRED_WORKER_FIELDS - set(data.keys())
+    if missing:
+        return None
+    if not isinstance(data.get("tools"), list):
+        return None
+    if not isinstance(data.get("permission_footprint"), dict):
+        return None
+    return data
+
 # ── Default user data directory ───────────────────────────────────────────────
 
 def _user_dir() -> Path:
-    """Return the user data directory (lazily, so tests can patch ``Path.home``)."""
-    return Path.home() / ".thoughtmachine"
+    """Return the user data directory (lazily resolved, env-aware).
+
+    Uses ``vault_root()`` so ``THOUGHTMACHINE_VAULT_ROOT`` is honoured; falls
+    back to ``Path.home() / ".thoughtmachine"`` when the env var is unset
+    (tests patching ``Path.home`` continue to work).
+    """
+    return vault_root()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -133,9 +163,45 @@ class WorkspaceCapabilities:
 # ── Disk I/O ──────────────────────────────────────────────────────────────────
 
 
+# Zero-byte regular file seeded per workspace; bind-mounted read-only over
+# ``/workspace/.git`` when a workspace's ``.git`` is a FILE (git worktree /
+# submodule pointer), so the host git metadata is shielded without the docker
+# daemon silently materialising the bind source as a DIRECTORY.
+GIT_SHADOW_MASK_FILENAME = ".git-shadow-mask"
+
+
+def git_shadow_mask_path(workspace_id: str) -> Path:
+    """Return the host path of the per-workspace ``.git`` shadow mask file.
+
+    Seeded (idempotently) by :func:`ensure_workspace_dirs`.
+    """
+    return _workspace_dir(workspace_id) / GIT_SHADOW_MASK_FILENAME
+
+
+def _validate_workspace_id(workspace_id: str) -> str:
+    """Return *workspace_id* unchanged, or raise ``ValueError`` if unusable.
+
+    A workspace id becomes a single directory name under
+    ``<vault>/workspaces/``.  An id that is not one segment escapes that
+    namespace, and a reserved id (``global``) names a namespace the vault
+    owns for itself, so neither may be turned into a path.
+
+    The check lives here and nowhere else: every workspace path in the tree is
+    built from :func:`_workspace_dir`, so this is the one place that can
+    enforce it (Inv.6 -- one fact, one authority).  Call sites deliberately do
+    not repeat it.
+    """
+    error = validate_single_path_segment(workspace_id, kind="workspace id")
+    if error:
+        raise ValueError(error)
+    if workspace_id in RESERVED_WORKSPACE_IDS:
+        raise ValueError(f"workspace id {workspace_id!r} is reserved")
+    return workspace_id
+
+
 def _workspace_dir(workspace_id: str) -> Path:
     """Return the filesystem path for a given workspace ID."""
-    return _user_dir() / "workspaces" / workspace_id
+    return _user_dir() / "workspaces" / _validate_workspace_id(workspace_id)
 
 
 def _capabilities_path(workspace_id: str) -> Path:
@@ -183,14 +249,15 @@ def resolve_workspace_id(workspace_path: str) -> Optional[str]:
     Resolve a workspace filesystem path to its workspace ID.
 
     Iterates over ``~/.thoughtmachine/workspaces/<id>/config.json`` files,
-    compares the ``root`` field (normalised) to *workspace_path*, and returns
-    the matching ID.  Returns ``None`` if no match is found.
+    compares the ``root`` field (normalised, case-insensitive on Windows)
+    to *workspace_path*, and returns the matching ID.
+    Returns ``None`` if no match is found.
     """
     base = _user_dir() / "workspaces"
     if not base.is_dir():
         return None
 
-    normalised_input = os.path.abspath(workspace_path).replace("\\", "/").rstrip("/")
+    normalised_input = _normalize_path(workspace_path)
 
     for entry in sorted(base.iterdir()):
         if not entry.is_dir():
@@ -203,11 +270,21 @@ def resolve_workspace_id(workspace_path: str) -> Optional[str]:
             root = data.get("root", "")
             if not root:
                 continue
-            normalised_root = os.path.abspath(root).replace("\\", "/").rstrip("/")
+            normalised_root = _normalize_path(root)
             if normalised_root == normalised_input:
                 return entry.name
         except (json.JSONDecodeError, OSError):
             continue
+
+    # Fallback: check WorkspaceRegistry
+    try:
+        from thoughtmachine.workspace_registry import WorkspaceRegistry
+        registry = WorkspaceRegistry.get_default()
+        entry = registry.resolve_by_root(workspace_path)
+        if entry is not None:
+            return entry.id
+    except Exception:
+        pass
 
     return None
 
@@ -225,6 +302,29 @@ def _resources_dir() -> Path:
     return Path(str(pkg_path)).resolve().parent / "resources"
 
 
+def _registry_root_path(workspace_id: str) -> Optional[str]:
+    """Return the workspace's host directory from the registry, or ``None``.
+
+    The registry (``state/workspace_registry.json`` → ``root_path``) is the
+    single owner of "where this workspace lives on the host", and the same
+    value the UI and the container mount use.  ``config.json`` ``root`` is
+    seeded from it so the two stores agree: ``host_port._workspace_root``
+    reads ``root`` live and refuses to run ``host_bash`` without it.
+
+    Best-effort by contract: bootstrapping must never fail because the
+    registry is missing, corrupt or unavailable, so every fault collapses to
+    ``None`` and the caller omits the key (readers fail closed on absence).
+    """
+    try:
+        entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
+    except Exception:  # pragma: no cover - defensive (corrupt registry)
+        return None
+    root = getattr(entry, "root_path", None)
+    if not isinstance(root, str) or not root.strip():
+        return None
+    return root
+
+
 def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     """
     Bootstrap a workspace's default files.
@@ -235,9 +335,20 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
 
     * ``capabilities.json`` — fully permissive workspace capabilities
     * ``Dockerfile`` — copied from ``resources/default_dockerfile.txt``
+    * ``requirements.txt`` — copied from ``<repo_root>/requirements.txt``
     * ``domain_allowlist.json`` — empty JSON array ``[]``
-    * ``workers.json`` — empty JSON array ``[]``
+    * ``workers.json`` — default template worker from worker_templates/ (default)
     * ``mcp_servers.json`` — empty JSON array ``[]``
+    * ``config.json`` — framework-default permission ceiling under the
+      ``permissions`` key (the ``FRESH_WORKSPACE_DEFAULT_PERMISSIONS`` map:
+      filesystem/git ``read``, network/mcp/host_bash ``banned``, container
+      ``False``).  A missing file OR a present file with no ``permissions`` key
+      both make the security gate fail closed to deny-all.  When the workspace
+      is registered, the registry's ``root_path`` is seeded as the top-level
+      ``root`` key as well (the host directory ``host_bash`` anchors cwd in).
+      A blank ``git_identity: {"name": "", "email": ""}`` is always seeded so
+      the UI has a key to edit; blank/incomplete means "not configured" and
+      commits fall through to git's own identity resolution.
 
     No subdirectories (e.g. ``sessions/``, ``state/``, ``knowledge/``) are
     created inside the workspace config directory.
@@ -274,16 +385,32 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
             shutil.copy2(str(src_dockerfile), str(dockerfile_path))
             created.append(str(dockerfile_path))
 
+    # ── requirements.txt (copy from <repo_root>/requirements.txt) ─────────
+    requirements_path = base / "requirements.txt"
+    _copy_resource(
+        _resources_dir().parent / "requirements.txt",
+        requirements_path,
+        False,
+        created,
+    )
+
     # ── domain_allowlist.json (empty array) ───────────────────────────────
     domain_allowlist_path = base / "domain_allowlist.json"
     if not domain_allowlist_path.exists():
         domain_allowlist_path.write_text("[]", encoding="utf-8")
         created.append(str(domain_allowlist_path))
 
-    # ── workers.json (empty array) ────────────────────────────────────────
+    # ── .git shadow mask (zero-byte regular file) ──────────────────────────
+    git_shadow_mask = base / GIT_SHADOW_MASK_FILENAME
+    if not git_shadow_mask.exists():
+        git_shadow_mask.write_text("", encoding="utf-8")
+        created.append(str(git_shadow_mask))
+
+    # ── workers.json (template workers) ────────────────────────────
     workers_path = base / "workers.json"
     if not workers_path.exists():
-        workers_path.write_text("[]", encoding="utf-8")
+        workers_data = _build_default_workers()
+        _atomic_write_json(workers_path, workers_data)
         created.append(str(workers_path))
 
     # ── mcp_servers.json (empty array) ────────────────────────────────────
@@ -292,10 +419,147 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
         mcp_servers_path.write_text("[]", encoding="utf-8")
         created.append(str(mcp_servers_path))
 
+    # ── config.json (workspace ceiling source) ────────────────────────────
+    # The permission store reads ``workspaces/<id>/config.json`` as the
+    # workspace ceiling; a MISSING file raises in
+    # ``permission_store.workspace_ceiling`` and the security gate then fails
+    # CLOSED to deny-all.  A present file that carries no ``permissions`` key
+    # is treated the same way (fail closed): an empty ceiling is NO LONGER read
+    # as "no cap".  Seed the framework default EXPLICITLY
+    # (``FRESH_WORKSPACE_DEFAULT_PERMISSIONS``) so a fresh workspace is capped
+    # at the documented default instead of collapsing to deny-all, while still
+    # leaving the file present for PUT /workspace to merge into.  Idempotent:
+    # never overwrite an existing config.json.
+    config_path = base / "config.json"
+    if not config_path.exists():
+        seed: Dict[str, Any] = {
+            "permissions": dict(FRESH_WORKSPACE_DEFAULT_PERMISSIONS),
+            # Present-but-blank: the UI needs a key to edit, and "blank" means
+            # "no identity configured" (git's own resolution applies) -- never
+            # "commit with an empty ident" (``git_write_tool`` treats a blank
+            # or incomplete pair exactly like an absent key).
+            "git_identity": {"name": "", "email": ""},
+        }
+        # ``root`` is a hard requirement for host execution: ``host_port``
+        # reads it live and refuses a workspace without one.  Seeding it here
+        # means every creation path that registers and then bootstraps
+        # (POST /api/workspace, server auto-register, session creation)
+        # persists it, not just the ones that remember to write config.json.
+        registry_root = _registry_root_path(workspace_id)
+        if registry_root is not None:
+            seed["root"] = registry_root
+        _atomic_write_json(config_path, seed)
+        created.append(str(config_path))
+
     # ── Safeguard: warn about unexpected items ────────────────────────────
     _safeguard_workspace_dir(base)
 
     return created
+
+
+# ── Worker template helpers ───────────────────────────────────────────────────
+
+
+def _load_template_workers(include_bundled: bool = True) -> list[dict]:
+    """
+    Load template worker definitions from disk.
+
+    Checks ``~/.thoughtmachine/worker_templates/`` first, then falls back to
+    ``resources/worker_templates/``.  Each ``.json`` file is parsed, validated
+    with ``WorkerDefinition.model_validate()``, and converted to a dict.  Invalid
+    templates are logged as warnings and skipped.
+
+    Returns:
+        A list of dicts (valid template workers).
+    """
+    logger = logging.getLogger(__name__)
+
+    # Determine which directory to read templates from
+    user_template_dir = _user_dir() / "worker_templates"
+    if user_template_dir.is_dir() and any(user_template_dir.iterdir()):
+        template_dir = user_template_dir
+    elif include_bundled:
+        template_dir = _resources_dir() / "worker_templates"
+    else:
+        return []
+
+    if not template_dir.is_dir():
+        return []
+
+    workers: list[dict] = []
+
+    for fpath in sorted(template_dir.iterdir()):
+        if fpath.suffix != ".json":
+            continue
+        try:
+            raw = json.loads(fpath.read_text(encoding="utf-8"))
+            validated = _validate_worker_dict(raw)
+            if validated is None:
+                logger.warning(
+                    "Skipping invalid worker template %s (missing required fields)",
+                    fpath.name,
+                )
+                continue
+            workers.append(validated)
+        except Exception as exc:
+            logger.warning(
+                "Skipping invalid worker template %s: %s", fpath.name, exc
+            )
+
+    return workers
+
+
+def _build_default_workers() -> list[dict]:
+    """
+    Build the default workers list for a freshly bootstrapped workspace.
+
+    Loads the default template workers from worker_templates/ first.
+    If that produces nothing (e.g. package resources are not accessible),
+    falls back to a hardcoded default worker definition so the workspace
+    always has at least one usable worker.
+    """
+    result: list[dict] = []
+    existing_names: set[str] = set()
+
+    for template in _load_template_workers():
+        if template["name"] not in existing_names:
+            result.append(template)
+            existing_names.add(template["name"])
+
+    # Hardcoded fallback if template loading produced nothing.
+    # This ensures workers.json is never empty — every workspace
+    # always has at least a default worker.
+    if not result:
+        result.append({
+            "name": "default",
+            "description": "General-purpose worker sub-agent",
+            "system_prompt": (
+                "You are a capable autonomous sub-agent of ThoughtMachine. "
+                "Complete the task given to you thoroughly, using all available tools. "
+                "Think, research, write, edit, test, review. "
+                "When finished, use the Respond tool to return your final result. "
+                "Be concise but complete. "
+                "Do not ask the user for clarification — the main agent already understood the request."
+            ),
+            "tools": [],
+            "permission_footprint": {},
+        })
+
+    return result
+
+
+def _atomic_write_json(path: Path, data: list) -> None:
+    """
+    Write *data* as pretty-printed JSON to *path*, atomically.
+
+    Writes to a ``.tmp`` file first, then renames it over the target.
+    """
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(
+        json.dumps(data, indent=2, default=str),
+        encoding="utf-8",
+    )
+    os.replace(str(tmp_path), str(path))
 
 
 def _safeguard_workspace_dir(base: Path) -> None:
@@ -309,13 +573,17 @@ def _safeguard_workspace_dir(base: Path) -> None:
     This is a read-only check — no items are deleted or moved.
     """
     allowed = {
+        ".git-shadow-mask",
         "capabilities.json",
         "config.json",
         "Dockerfile",
         "domain_allowlist.json",
+        "requirements.txt",
         "workers.json",
         "workers",
         "mcp_servers.json",
+        "workspace_identity.json",
+        "sessions",
     }
     if not base.is_dir():
         return

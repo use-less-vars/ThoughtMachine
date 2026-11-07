@@ -1,0 +1,780 @@
+"""
+SessionManager — Dedicated session lifecycle component extracted from WebAgentBridge.
+
+Handles all session persistence and loading logic previously embedded in
+``bridge.py``, using ``FileSystemSessionStore`` for storage and ``ConfigManager``
+for config translation/enforcement.
+
+The bridge retains in-memory references (``_session``, ``_session_config``,
+``_session_id``) and delegates storage operations here.  This component
+does NOT know about event forwarding, agent controllers, or WebSockets.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+
+from agent.config.session_config import SessionConfig
+from agent.config.provider_profile import ProviderManager
+from agent.config.audit import log_config_audit
+from agent.core.message import is_system_notice_text
+from agent.logging import log
+from session.models import Session
+from session.store import FileSystemSessionStore
+from session.session_registry import SessionRegistry
+
+from web_ui.backend.config_manager import ConfigManager
+
+
+# ── Final / Respond tool names used in message normalisation ────────────────
+FINAL_TOOL_NAMES = {"Respond"}
+LEGACY_TO_RESPOND = {
+    "Final": {"response_type": "answer"},
+    "FinalReport": {"response_type": "answer"},
+    "RequestUserInteraction": {"response_type": "question"},
+}
+ALL_RESPOND_NAMES = FINAL_TOOL_NAMES | set(LEGACY_TO_RESPOND.keys())
+SUMMARY_TOOL_NAMES = {"SummarizeTool", "summarize", "Summarize"}
+
+# Hardcoded last-resort provider/model used when neither the caller, the saved
+# global defaults, nor an active provider profile supply a non-empty value.
+# Mirrors FALLBACK_FRONTEND_CONFIG in web_ui/backend/config_manager.py.
+_DEFAULT_PROVIDER_ID = "v4_flash"
+_DEFAULT_MODEL = "deepseek-v4-flash"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SessionManager
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SessionManager:
+    """
+    Manages session persistence, loading, and configuration merge.
+
+    Owns the ``FileSystemSessionStore`` and ``ConfigManager`` references so
+    that ``WebAgentBridge`` does not need to manage them directly.
+    """
+
+    def __init__(
+        self,
+        session_store: FileSystemSessionStore,
+        config_manager: ConfigManager,
+    ) -> None:
+        self._session_store = session_store
+        self._config_manager = config_manager
+
+    # ── Create ────────────────────────────────────────────────────────────────
+
+    def create_session(
+        self,
+        mode: str = "custom",
+        workspace_path: Optional[str] = None,
+        audit_source: str = 'user',
+        provider_id: Optional[str] = None,
+        model: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Create a new empty ``Session``, build a matching ``SessionConfig``,
+        persist to the store, and return ``(session_id, frontend_config_dict)``.
+
+        The caller (bridge) is responsible for setting ``_session``,
+        ``_session_config``, etc. from the returned values.
+        """
+        from session.models import Session
+
+        new_session = Session()
+        new_session.mode = mode
+        new_session.metadata["source"] = "web_ui"
+        # Main-agent sessions only: this flag gates session history bounding
+        # (session/size_bounding.py) and session_size_bytes exposure.
+        new_session.metadata["agent_type"] = "main"
+        new_session.ensure_name()
+
+        # Build a minimal SessionConfig for the requested mode
+        from agent.config.presets import get_tools_for_mode
+        tools = get_tools_for_mode(mode)
+        session_config = SessionConfig(
+            mode=mode,
+            max_turns=100,
+            enabled_tools=tools,
+            provider_id="",
+            model="",
+            base_url="",
+        )
+
+        # Apply saved global defaults (user/defaults.json) to new sessions.
+        # Only the GLOBAL_DEFAULT_KEYS allowlist may flow into a new session,
+        # sourced from the global-defaults layer — the factory/system layers do
+        # NOT seed new session configs; SessionConfig constructor defaults are
+        # the base (docs/architecture/config_ownership.md §"Session application
+        # of global defaults").
+        from web_ui.backend.config_manager import (
+            GLOBAL_DEFAULT_KEYS,
+            load_global_defaults,
+            translate_frontend_config,
+        )
+        defaults_be = translate_frontend_config(load_global_defaults())
+        for key in GLOBAL_DEFAULT_KEYS:
+            if key in defaults_be and defaults_be[key]:
+                setattr(session_config, key, defaults_be[key])
+
+        # A new session must carry a non-empty provider/model: resolve from the
+        # caller, the saved global defaults, the active provider profile, or the
+        # hardcoded fallback (last resort).
+        session_config.provider_id, session_config.model = (
+            self._resolve_provider_and_model(provider_id, model, defaults_be)
+        )
+
+        # Persist session + config metadata
+        new_session.metadata["session_config"] = session_config.model_dump(
+            exclude={"api_key"}, exclude_none=True
+        )
+        self._session_store.save_session(
+            new_session, workspace_id=new_session.workspace_id
+        )
+        self._session_store.add_open_session(new_session.session_id)
+
+        # Seed the session permission sidecar for the workspace.  The record
+        # above is written to the legacy sessions dir (workspace_id is layered
+        # onto the session only later by the caller), so a disk-mode permission
+        # read at the new-session handshake -- which runs before the first
+        # save_session -- would otherwise find no grants source in the
+        # workspace-scoped sessions dir and fail CLOSED.
+        if workspace_id:
+            self._seed_permissions_sidecar(
+                workspace_id,
+                new_session.session_id,
+                {},
+            )
+
+        frontend_config = self._config_manager.session_config_to_frontend(
+            session_config, workspace_path=workspace_path
+        )
+
+        log(
+            "INFO",
+            "session_manager",
+            f"Created session {new_session.session_id} (mode={mode})",
+        )
+
+        # Audit the session creation (redacted); never raises.
+        log_config_audit(
+            source=audit_source,
+            component='session.create',
+            old=None,
+            new=session_config,
+            injected=None,
+            extra={'session_id': new_session.session_id},
+        )
+
+        return new_session.session_id, frontend_config
+
+    # ── Load ──────────────────────────────────────────────────────────────────
+
+    def load_session(
+        self,
+        session_id: str,
+        workspace_id: Optional[str] = None,
+    ) -> Optional[Session]:
+        """
+        Load a ``Session`` from the store by ID.
+
+        Performs role repair (``tool_result`` → ``tool``) and config extraction
+        so the caller can update its in-memory state.
+
+        Returns ``None`` if the session is not found.
+        """
+        session = self._session_store.load_session(
+            session_id, workspace_id=workspace_id
+        )
+        if session is None:
+            return None
+
+        # Repair roles, migrate config, register in registry
+        self.repair_session(session)
+
+        return session
+
+    def extract_session_config(
+        self,
+        session: Session,
+    ) -> Optional[SessionConfig]:
+        """
+        Extract and construct a ``SessionConfig`` from session metadata.
+
+        Handles API-key resolution via ``ProviderManager``.
+        Returns ``None`` if no config metadata exists.
+        """
+        session_config_raw = session.metadata.get("session_config") or \
+            session.metadata.get("agent_config")
+        if not session_config_raw or not isinstance(session_config_raw, dict):
+            return None
+
+        # session_permissions is NOT a session-metadata grant source: the
+        # canonical store is the permission sidecar (P1).  Work on a copy and
+        # drop any legacy carrier key so the caller's metadata is never mutated
+        # and the retired grant source cannot resurface.
+        session_config_raw = dict(session_config_raw)
+        session_config_raw.pop("session_permissions", None)
+
+        from agent.config.session_config import SessionConfig
+
+        try:
+            if "mode" not in session_config_raw:
+                session_config_raw["mode"] = "agent"
+
+            sc = SessionConfig(**session_config_raw)
+
+            if not sc.mode:
+                sc.mode = "agent"
+
+            # Re-inject API key / provider details from the merged config chain
+            try:
+                merged = self._config_manager.resolve_full_config(
+                    workspace_id=session.workspace_id,
+                    session_id=session.session_id,
+                    provider_id=sc.provider_id,
+                )
+                if not sc.api_key and merged.get("api_key"):
+                    sc.api_key = merged["api_key"]
+                if not sc.base_url and merged.get("base_url"):
+                    sc.base_url = merged["base_url"]
+                resolved_pc = merged.get("provider_config") or {}
+                if resolved_pc:
+                    pc = dict(sc.provider_config or {})
+                    pc.update(resolved_pc)
+                    sc.provider_config = pc
+            except Exception as exc:
+                log(
+                    "WARNING",
+                    "session_manager",
+                    f"Could not resolve API key: {exc}",
+                )
+
+            return sc
+        except Exception as exc:
+            log(
+                "WARNING",
+                "session_manager",
+                f"extract_session_config failed: {exc}",
+            )
+            return None
+
+    def save_config_to_session(
+        self,
+        session: Session,
+        session_config: SessionConfig,
+        config_dump: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist session_config into session metadata and save.
+
+        ``config_dump`` (optional) overrides the serialised form written to
+        storage — e.g. the pre-ceiling dump captured by callers that apply an
+        in-memory workspace permission cap while loading, so the cap is never
+        persisted.  When omitted, ``session_config.model_dump(...)`` is used
+        as before.
+        """
+        if config_dump is not None:
+            dump = dict(config_dump)
+        else:
+            dump = session_config.model_dump(
+                exclude={"api_key"}, exclude_none=True
+            )
+        # session_permissions is NOT a persistence-layer grant source: the
+        # canonical, REST-owned store is the permission sidecar (P1).  Strip
+        # the key so a config dump can never act as a shadow grants writer.
+        dump.pop("session_permissions", None)
+        session.metadata["session_config"] = dump
+        if "agent_config" in session.metadata:
+            del session.metadata["agent_config"]
+        self._session_store.save_session(
+            session, workspace_id=session.workspace_id
+        )
+
+    # ── Permissions sidecar ───────────────────────────────────────────────────
+
+    def _seed_permissions_sidecar(
+        self,
+        workspace_id: str,
+        session_id: str,
+        permissions: Any,
+    ) -> None:
+        """Best-effort, ABSENT-ONLY write of a session's permission sidecar.
+
+        The sidecar (``<vault>/workspaces/<ws>/sessions/<sid>/permissions.json``)
+        is the first source ``read_session_permissions`` consults.  Seeding it at
+        session-create time keeps a disk-mode ``get_effective_permissions`` from
+        failing CLOSED when the session record still lives in the legacy sessions
+        dir.  ``permissions`` may be a raw dict or a ``SessionPermissions``
+        instance.  Never raises.
+
+        Delegates to ``permission_store.seed_session_permissions_if_absent`` so
+        the create path and the workspace-switch path share one mechanism and
+        agree: an EXISTING sidecar is never overwritten (switching back to a
+        workspace that already holds this session's grants preserves them).
+        """
+        try:
+            import thoughtmachine.vault as _vault_module
+            from thoughtmachine.permission_store import (
+                seed_session_permissions_if_absent,
+            )
+
+            seed_session_permissions_if_absent(
+                _vault_module.vault_root(),
+                workspace_id,
+                session_id,
+                permissions if permissions is not None else {},
+            )
+        except Exception as e:  # noqa: BLE001 - seeding must never break session lifecycle
+            log(
+                "WARNING",
+                "session_manager",
+                f"permissions sidecar seed failed for session {session_id}: {e}",
+            )
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+
+    def save_session(
+        self,
+        session: Session,
+        session_config: Optional[SessionConfig] = None,
+        name: Optional[str] = None,
+    ) -> Session:
+        """
+        Persist a session and its config to the store.
+
+        If ``session_config`` is given, its serialised form is written to
+        ``session.metadata["session_config"]``.
+        """
+        if session_config is not None:
+            dump = session_config.model_dump(
+                exclude={"api_key"}, exclude_none=True
+            )
+            # session_permissions is NOT a persistence-layer grant source: the
+            # canonical, REST-owned store is the permission sidecar (P1).  Strip
+            # the key so a config dump can never act as a shadow grants writer.
+            dump.pop("session_permissions", None)
+            session.metadata["session_config"] = dump
+        session.metadata.setdefault("source", "web_ui")
+        if name:
+            session.metadata["name"] = name
+        session.ensure_name()
+        self._session_store.save_session(
+            session, workspace_id=session.workspace_id
+        )
+        return session
+
+    # ── Delete ────────────────────────────────────────────────────────────────
+
+    def delete_session(
+        self,
+        session_id: str,
+        workspace_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Delete a session from the store, the global registry, and open-sessions
+        state.
+        """
+        try:
+            result = self._session_store.delete_session(
+                session_id, workspace_id=workspace_id
+            )
+            if result:
+                registry = SessionRegistry.get_default()
+                registry.remove(session_id)
+                self._session_store.remove_open_session(session_id)
+                log(
+                    "INFO",
+                    "session_manager",
+                    f"Session deleted: {session_id}",
+                )
+            else:
+                log(
+                    "WARNING",
+                    "session_manager",
+                    f"Session not found for deletion: {session_id}",
+                )
+            return result
+        except Exception as e:
+            log("ERROR", "session_manager", f"delete_session error: {e}")
+            return False
+
+    # ── List ──────────────────────────────────────────────────────────────────
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """List all saved sessions from the session store."""
+        try:
+            return self._session_store.list_sessions()
+        except Exception as e:
+            log("ERROR", "session_manager", f"list_sessions error: {e}")
+            return []
+
+    # ── Rename ────────────────────────────────────────────────────────────────
+
+    def rename_session(
+        self,
+        session_id: str,
+        new_name: str,
+        workspace_id: Optional[str] = None,
+    ) -> bool:
+        """Rename a session in the store."""
+        try:
+            session = self._session_store.load_session(
+                session_id, workspace_id=workspace_id
+            )
+            if session is None:
+                log(
+                    "WARNING",
+                    "session_manager",
+                    f"Session not found for rename: {session_id}",
+                )
+                return False
+            session.metadata["name"] = new_name
+            self._session_store.save_session(
+                session, workspace_id=session.workspace_id
+            )
+            log(
+                "INFO",
+                "session_manager",
+                f"Session renamed: {session_id} → {new_name}",
+            )
+            return True
+        except Exception as e:
+            log("ERROR", "session_manager", f"rename_session error: {e}")
+            return False
+
+    # ── Open sessions ─────────────────────────────────────────────────────────
+
+    def get_open_sessions(self) -> List[str]:
+        """Return the list of open session IDs from ``open_sessions.json``."""
+        try:
+            return self._session_store.get_open_sessions()
+        except Exception as e:
+            log("ERROR", "session_manager", f"get_open_sessions error: {e}")
+            return []
+
+    def save_open_session(self, session_id: str) -> None:
+        """Add a session ID to the open sessions list."""
+        try:
+            self._session_store.add_open_session(session_id)
+            log(
+                "INFO",
+                "session_manager",
+                f"Session {session_id} added to open sessions",
+            )
+        except Exception as e:
+            log(
+                "ERROR",
+                "session_manager",
+                f"save_open_session error: {e}",
+            )
+
+    def remove_open_session(self, session_id: str) -> None:
+        """Remove a session ID from the open sessions list."""
+        try:
+            self._session_store.remove_open_session(session_id)
+            log(
+                "INFO",
+                "session_manager",
+                f"Session {session_id} removed from open sessions",
+            )
+        except Exception as e:
+            log(
+                "ERROR",
+                "session_manager",
+                f"remove_open_session error: {e}",
+            )
+
+    # ── Close (persistence only — bridge handles agent shutdown) ──────────────
+
+    def close_session(
+        self,
+        session_id: str,
+    ) -> None:
+        """Clean up persistence state for a closed session."""
+        try:
+            self._session_store.remove_open_session(session_id)
+            registry = SessionRegistry.get_default()
+            registry.set_open(session_id, is_open=False)
+            log(
+                "INFO",
+                "session_manager",
+                f"Session closed (persistence cleanup): {session_id}",
+            )
+        except Exception as e:
+            log(
+                "ERROR",
+                "session_manager",
+                f"close_session error: {e}",
+            )
+
+    # ── Conversation helpers ──────────────────────────────────────────────────
+
+    def get_conversation(
+        self,
+        session: Optional[Session],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Return the normalized conversation for a session, or ``None`` if no
+        session is provided.  Normalizes API roles (``"tool"``) to frontend
+        roles (``"tool_result"``) without modifying the session data.
+        """
+        if session is None:
+            return None
+        return self._normalize_for_frontend(session.user_history or [])
+
+    def load_more_messages(
+        self,
+        session: Optional[Session],
+        offset: int,
+        limit: int = 50,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return a page of older messages from a session.
+
+        Args:
+            session: The session to page through.
+            offset:  Number of messages to skip from the end.
+            limit:   How many messages to return.
+
+        Returns:
+            A dict with ``messages``, ``total_count``, ``has_more``, or
+            ``None`` if session is ``None``.
+        """
+        if session is None:
+            return None
+
+        all_messages = session.user_history or []
+        total_count = len(all_messages)
+
+        end_idx = total_count - offset
+        start_idx = max(0, end_idx - limit)
+
+        page = self._normalize_for_frontend(all_messages[start_idx:end_idx])
+        has_more = start_idx > 0
+
+        return {
+            "type": "more_messages",
+            "messages": page,
+            "offset": offset,
+            "total_count": total_count,
+            "has_more": has_more,
+        }
+
+    # ── Session registry helpers ──────────────────────────────────────────────
+
+    def register_session(self, session_id: str) -> None:
+        """Register a session in the global ``SessionRegistry``."""
+        try:
+            registry = SessionRegistry.get_default()
+            registry.add(session_id)
+        except Exception as e:
+            log(
+                "WARNING",
+                "session_manager",
+                f"register_session failed: {e}",
+            )
+
+    def unregister_session(self, session_id: str) -> None:
+        """Remove a session from the global ``SessionRegistry``."""
+        try:
+            registry = SessionRegistry.get_default()
+            registry.remove(session_id)
+        except Exception as e:
+            log(
+                "WARNING",
+                "session_manager",
+                f"unregister_session failed: {e}",
+            )
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_for_frontend(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Normalize messages for frontend display without modifying the originals.
+
+        Copied from ``bridge._normalize_for_frontend`` — kept here so
+        ``SessionManager`` can produce frontend-friendly message lists
+        without importing the bridge module.
+        """
+        normalized: List[Dict[str, Any]] = []
+        last_tool_call_name: Optional[str] = None
+        pending_final_assistant = False
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # ── structured tool_calls array (current format) ──
+            if role == "assistant" and msg.get("tool_calls"):
+                assistant_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+                if assistant_msg.get("content") or msg.get("tool_calls"):
+                    normalized.append(assistant_msg)
+                for tc in msg["tool_calls"]:
+                    func = tc.get("function", {})
+                    tool_name = func.get("name", "?")
+                    args_str = func.get("arguments", "{}")
+                    try:
+                        args_obj = json.loads(args_str)
+                    except (json.JSONDecodeError, TypeError):
+                        args_obj = args_str
+                    normalized.append({
+                        "role": "tool_call",
+                        "content": json.dumps({
+                            "name": tool_name,
+                            "arguments": args_obj,
+                        }),
+                        "is_final": False,
+                        "is_system_notification": False,
+                    })
+                    last_tool_call_name = tool_name
+                continue
+
+            # ── old-format tool call fallback ──
+            if role == "assistant" and isinstance(content, str) and content.startswith("[Tool call:"):
+                match = re.match(r'^\[Tool call:\s*(\w+)\(([^)]*)\)\]$', content)
+                if match:
+                    tool_name = match.group(1)
+                    args_str = match.group(2)
+                    try:
+                        args_obj = json.loads(args_str.replace("'", '"'))
+                    except Exception:
+                        args_obj = {}
+                    normalized.append({
+                        "role": "tool_call",
+                        "content": json.dumps({"name": tool_name, "arguments": args_obj}),
+                        "is_final": False,
+                        "is_system_notification": False,
+                    })
+                    last_tool_call_name = tool_name
+                    continue
+
+            # ── tool result → tool_result + final detection ──
+            if role == "tool":
+                new_msg = dict(msg)
+                new_msg["role"] = "tool_result"
+                if last_tool_call_name in ALL_RESPOND_NAMES:
+                    new_msg["is_final"] = True
+                    pending_final_assistant = True
+                if last_tool_call_name in SUMMARY_TOOL_NAMES:
+                    new_msg["is_summary"] = True
+                normalized.append(new_msg)
+                continue
+
+            # ── assistant message (no tool_calls) ──
+            if role == "assistant":
+                if isinstance(content, str) and content.strip() == "":
+                    continue
+                new_msg = dict(msg)
+                if pending_final_assistant:
+                    new_msg["is_final"] = True
+                    pending_final_assistant = False
+                normalized.append(new_msg)
+                continue
+
+            # ── everything else (user, system notifications) ──
+            normalized.append(dict(msg))
+
+        # ── post-processing: inject is_system_notification for frontend ──
+        for m in normalized:
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                if is_system_notice_text(m["content"]):
+                    m["is_system_notification"] = True
+                else:
+                    m.setdefault("is_system_notification", False)
+            else:
+                m.setdefault("is_system_notification", False)
+            m.setdefault("is_final", False)
+            m.setdefault("response_type", None)
+
+        return normalized
+
+    @staticmethod
+    def _resolve_provider_and_model(
+        provider_id: Optional[str],
+        model: Optional[str],
+        defaults_be: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """Resolve a non-empty ``(provider_id, model)`` for a new session.
+
+        Precedence (first non-empty wins):
+
+        1. explicit caller arguments (``provider_id`` / ``model``)
+        2. saved global defaults (``user/defaults.json`` via ``defaults_be``)
+        3. the active provider profile (``ProviderManager``)
+        4. the hardcoded fallback pairs (last resort)
+        """
+        resolved_provider = provider_id or defaults_be.get("provider_id") or ""
+        resolved_model = model or defaults_be.get("model") or ""
+
+        if not resolved_provider or not resolved_model:
+            try:
+                profile = ProviderManager().get_active_profile()
+            except Exception:
+                profile = None
+            if profile is not None:
+                resolved_provider = resolved_provider or getattr(profile, "id", "") or ""
+                resolved_model = (
+                    resolved_model or getattr(profile, "default_model", "") or ""
+                )
+
+        resolved_provider = resolved_provider or _DEFAULT_PROVIDER_ID
+        resolved_model = resolved_model or _DEFAULT_MODEL
+        return str(resolved_provider), str(resolved_model)
+
+    def repair_session(self, session: Session) -> Session:
+        """
+    Apply role repair and config migration to an already-loaded session.
+
+    This is a stateless transformation — the session must have already been
+    loaded from a store by the caller.  The method:
+
+    * corrects ``tool_result`` roles back to ``tool``
+    * migrates legacy config metadata
+    * registers the session in the global ``SessionRegistry``
+
+    Returns the same ``Session`` object (mutated in place).
+    """
+        # ── Repair: restore corrupted roles ───────────────────────────────
+        repaired = False
+        for msg in session.user_history:
+            if msg.get("role") == "tool_result":
+                msg["role"] = "tool"
+                repaired = True
+        if repaired:
+            log(
+                "WARNING",
+                "session_manager",
+                f"Repaired {session.session_id}: corrected 'tool_result' roles back to 'tool'",
+            )
+
+        # ── Migrate config metadata ───────────────────────────────────────
+        session_config_raw = session.metadata.get("session_config") or \
+        session.metadata.get("agent_config")
+        if session_config_raw and isinstance(session_config_raw, dict):
+            if "mode" not in session_config_raw:
+                session_config_raw["mode"] = "agent"
+                log(
+                    "INFO",
+                    "session_manager",
+                    f"Migrated legacy session {session.session_id}: defaulted mode to 'agent'",
+                )
+
+        # Re-register in global registry
+        registry = SessionRegistry.get_default()
+        name = session.metadata.get("name", "") or ""
+        registry.register(
+            session_id=session.session_id,
+            workspace_id=session.workspace_id or "",
+            name=name,
+            mode=session.mode,
+        )
+
+        return session

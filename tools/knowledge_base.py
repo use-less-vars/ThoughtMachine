@@ -6,6 +6,7 @@ for architecture notes, development guides, roadmaps, bug tracking, lessons
 learned, and task management.
 """
 
+import json
 import logging
 import threading
 from datetime import datetime
@@ -127,12 +128,14 @@ class KnowledgeBaseTool(ToolBase):
 
     Use this tool to store and retrieve project information that persists
     across sessions. The knowledge base lives in `.thoughtmachine/knowledge/`
-    (workspace scope) or `~/.thoughtmachine/knowledge/` (global scope).
+    (workspace scope) or `~/.thoughtmachine/global/` (global scope).
     Use the ``scope`` parameter (``workspace`` or ``global``) to select which KB to use.
 
     **Workspace scope:** Local to the project, organized into domains:
     **Global scope:** User-wide, shared across all projects, with ``system/`` (read-only built-in reference)
-    and ``user/`` (writable personal notes) subdirectories.
+    and ``user/`` (read-only personal notes) subdirectories. The global KB is
+    read-only for agents: append/update/create_domain are refused there; use
+    scope=workspace for writable notes.
       - **system_architecture**: Architectural decisions and component relationships
       - **development_guides**: Coding conventions and workflows
       - **roadmap**: Milestones and future plans
@@ -153,9 +156,16 @@ class KnowledgeBaseTool(ToolBase):
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
-        """Return filesystem:write only for write modes (append, update, create_domain)."""
+        """Return the permission categories required for each KB operation.
+
+        Read-only operations (read, search, list) require ``filesystem:read``;
+        write operations (append, update, create_domain) require ``filesystem:write``.
+        Other modes (status, summary) require no special permissions.
+        """
         if params:
             mode = params.get("mode", "")
+            if mode in ("read", "search", "list"):
+                return ["filesystem:read"]
             if mode in ("append", "update", "create_domain"):
                 return ["filesystem:write"]
         return []
@@ -226,7 +236,8 @@ class KnowledgeBaseTool(ToolBase):
         description=(
             "Which knowledge base to use: workspace (project-local, "
             ".thoughtmachine/knowledge/) or global (user-wide, "
-            "~/.thoughtmachine/knowledge/)."
+            "~/.thoughtmachine/global/, read-only for agents: writes are "
+            "refused there, use workspace for writable notes)."
         ),
     )
 
@@ -236,15 +247,105 @@ class KnowledgeBaseTool(ToolBase):
         """
         self._log_debug(f"KnowledgeBaseTool.execute called with mode='{self.mode}', domain='{self.domain}'")
 
+        write_modes = ("append", "update", "create_domain")
+
         # Resolve the knowledge base root directory
+        kb_root: Optional[Path] = None
         if self.scope == "global":
-            kb_root = _get_global_kb_root()
+            # Read modes resolve the root WITHOUT initializing, so no
+            # directories or files are created on a read-only operation.
+            # Write modes resolve no root at all: the global KB is read-only
+            # for agents (refused right after the permission gate below), so
+            # nothing may be materialised there before that gate has run.
+            if self.mode not in write_modes:
+                from agent.knowledge.global_kb import GLOBAL_KB_DIR
+                kb_root = GLOBAL_KB_DIR
             init_result = None  # global KB is self-initialising
         else:
-            if self.workspace_path:
-                kb_root = Path(self.workspace_path) / ".thoughtmachine" / "knowledge"
+            # === Resolve workspace path from registries (primary) ===
+            ws_path = None
+            if self.session_id:
+                try:
+                    from session.session_registry import SessionRegistry
+                    from thoughtmachine.workspace_registry import WorkspaceRegistry
+                    session_info = SessionRegistry.get_default().get(self.session_id)
+                    ws_id = session_info.get("workspace_id") if session_info else None
+                    if ws_id:
+                        entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
+                        ws_path = entry.root_path if entry else None
+                except Exception:
+                    pass
+
+            # Fallback to deprecated AgentConfig.workspace_path
+            if not ws_path:
+                ws_path = getattr(self, 'workspace_path', None)
+                if ws_path:
+                    self._log_debug(
+                        "KnowledgeBaseTool falling back to deprecated AgentConfig.workspace_path")
+
+            if ws_path:
+                kb_root = Path(ws_path) / ".thoughtmachine" / "knowledge"
             else:
                 kb_root = Path.cwd() / ".thoughtmachine" / "knowledge"
+            # The skeleton is materialised only AFTER the permission gate below.
+            init_result = None
+
+        # Atomic permission re-check for write modes
+        mode = self.mode
+
+        # ── Workspace-scope filesystem grain gate ─────────────────────────
+        # Workspace-scoped KB reads AND writes obey the `filesystem` grain.
+        # This gate is ADDITIVE over the historical all-scope write check:
+        # non-workspace write modes (global included) still run the
+        # historical atomic `filesystem:write` check in the `elif` branch
+        # below, so NO scope loses its previous permission enforcement.
+        # Mirrors the shipped
+        # gate in tools/git_info_tool.py (_filesystem_read_allowed /
+        # _filesystem_read_gate_error): a missing `filesystem` key defers to
+        # the out-of-band session mirror (legacy/direct callers), preserving
+        # historical behaviour; read/search/list/summary/status need
+        # filesystem:read and append/update/create_domain need filesystem:write.
+        if self.scope == "workspace":
+            from security.gate_helpers import _value_satisfies
+            _kb_fs = (self.effective_permissions or {}).get("filesystem")
+            if _kb_fs is not None:
+                _kb_level = (
+                    "write" if mode in write_modes
+                    else ("read" if mode in ("read", "search", "list", "summary", "status") else None)
+                )
+                if _kb_level is not None:
+                    _kb_result = _value_satisfies(_kb_level, _kb_fs)
+                    if not (_kb_result is True or _kb_result == "ASK"):
+                        return json.dumps({
+                            "error": (
+                                f"Error: workspace KB requires filesystem:{_kb_level}; "
+                                f"this session has filesystem:{str(_kb_fs).lower()}"
+                            )
+                        })
+        elif mode in write_modes:
+            from security.security_gate import check_atomic_operation
+            effective = self.effective_permissions or {}
+            if not check_atomic_operation(
+                "filesystem:write",
+                effective,
+                "KnowledgeBaseTool",
+                f"{mode} in {getattr(self, 'domain', 'unknown')}"
+            ):
+                return json.dumps({"error": f"Atomic permission check failed: filesystem:write required for {mode}"})
+
+        # ── Global KB is READ-ONLY for agents ─────────────────────────────
+        # Checked AFTER the permission gate, so a genuinely unauthorised caller
+        # still receives the permission error, and BEFORE anything touches the
+        # filesystem: the refusal consults the non-initialising global root, so
+        # a refused write neither syncs nor creates `~/.thoughtmachine/global/`.
+        if self.scope == "global" and mode in write_modes:
+            return json.dumps({"error": self._global_write_refusal()})
+
+        # ── Materialise the workspace KB skeleton ─────────────────────────
+        # Only once the gate above has passed. This used to run during root
+        # resolution (i.e. BEFORE the gate), so a refused write still created
+        # the `_initialize_kb` skeleton and left fingerprints on disk.
+        if self.scope != "global" and mode in write_modes:
             init_result = self._initialize_kb(kb_root)
             if init_result:
                 self._log_debug(f"Knowledge base initialized: {init_result}")
@@ -273,6 +374,34 @@ class KnowledgeBaseTool(ToolBase):
             self._log_tool_error(f"Unexpected error in {self.mode} mode: {e}")
             return f"An unexpected error occurred: {e}. Please try again or check the knowledge base files."
 
+    def _global_write_refusal(self) -> str:
+        """Return the refusal message for a write against the GLOBAL knowledge base.
+
+        The global KB is read-only for agents: ``system/`` is built-in
+        reference material and ``user/`` is not an agent-writable area either
+        (personal notes belong to ``scope=workspace``). A domain that exists in
+        ``system/`` keeps its precise system-domain wording; every other write
+        target is refused by class, naming the ``user/`` area it would write to.
+
+        The root is read from ``GLOBAL_KB_DIR`` (imported at call time) rather
+        than ``get_global_kb_root()``, because the latter *initialises* the
+        global KB -- and a refused write must leave nothing on disk.
+        """
+        from agent.knowledge.global_kb import GLOBAL_KB_DIR
+
+        domain_name = (self.domain or "").lower().replace(" ", "_")
+        if domain_name and (GLOBAL_KB_DIR / "system" / f"{domain_name}.md").exists():
+            return (
+                f"Domain '{self.domain}' is a system domain and is read-only. "
+                f"The global knowledge base is read-only for agents; "
+                f"use scope=workspace for writable notes."
+            )
+        return (
+            f"Domain '{self.domain}' is in the global knowledge base's `user/` "
+            f"area, which is read-only for agents; '{self.mode}' is refused for "
+            f"scope=global. Use scope=workspace for writable notes."
+        )
+
     def _resolve_domain_path(self, kb_root: Path, domain_name: str, *, for_write: bool = False) -> tuple[Path, str]:
         """
         Resolve a domain name to its (file_path, rel_path).
@@ -283,29 +412,76 @@ class KnowledgeBaseTool(ToolBase):
 
         **Global scope:**
         Checks ``system/{domain}.md`` then ``user/{domain}.md``.
-        If ``for_write=True`` and the domain exists in ``system/``, raises
-        ``ValueError`` because system domains are read-only.
+        ``for_write=True`` always raises ``ValueError``: the global knowledge
+        base is read-only for agents, system domains included (a system domain
+        keeps its own precise wording).
 
-        Raises ValueError if the domain cannot be found.
+        Raises ValueError if the domain cannot be found, or if the domain name
+        could escape the knowledge base root (path traversal).
         """
+        # ── Path traversal guard (security remediation) ──────────────────
+        # Explicitly reject any domain containing parent-directory tokens or
+        # starting with an absolute ('/') or home ('~') path prefix.
+        if ".." in domain_name or domain_name.startswith(("/", "~")):
+            raise ValueError(
+                f"Domain path escapes knowledge base: invalid domain name '{domain_name}'"
+            )
+
+        # Resolve containment: every path returned from this method must stay
+        # inside kb_root even after symlink/`..` resolution.
+        kb_root_resolved = kb_root.resolve()
+
+        def _assert_inside_kb(candidate: Path) -> None:
+            """Raise ValueError if *candidate* resolves outside kb_root."""
+            if not candidate.resolve().is_relative_to(kb_root_resolved):
+                raise ValueError(
+                    f"Domain path escapes knowledge base: '{domain_name}' "
+                    "resolves outside the knowledge base"
+                )
+
         if self.scope == "global":
             # ── Global scope ────────────────────────────────────────────────
             system_path = kb_root / "system" / f"{domain_name}.md"
-            user_path = kb_root / "user" / f"{domain_name}.md"
 
             if for_write:
+                # Write-target hardening: the name must be a single path-free
+                # component, and the target is then built with the literal
+                # `user/` prefix -- so a write can never land anywhere else in
+                # the global KB (in particular never system/, which is
+                # read-only), regardless of what exists on disk.
+                if (
+                    not domain_name
+                    or "/" in domain_name
+                    or "\\" in domain_name
+                    or ".." in domain_name
+                ):
+                    raise ValueError(
+                        f"Invalid domain name '{domain_name}': the name must be "
+                        f"non-empty and must not contain '/', '\\' or '..'."
+                    )
                 if system_path.exists():
                     raise ValueError(
                         f"Domain '{domain_name}' is a system domain and is read-only. "
-                        f"Use a different domain name for personal notes, or use scope=workspace."
+                        f"The global knowledge base is read-only for agents; "
+                        f"use scope=workspace for writable notes."
                     )
-                # Always write to user/
-                return user_path, f"user/{domain_name}.md"
+                # The global KB is read-only for agents, `user/` included:
+                # personal notes belong to scope=workspace, so there is no
+                # global write target to hand out.
+                raise ValueError(
+                    f"The global knowledge base is read-only for agents: "
+                    f"refusing to write 'user/{domain_name}.md'. "
+                    f"Use scope=workspace for writable notes."
+                )
+
+            user_path = kb_root / "user" / f"{domain_name}.md"
 
             # Read: check system/ first, then user/
             if system_path.exists():
+                _assert_inside_kb(system_path)
                 return system_path, f"system/{domain_name}.md"
             if user_path.exists():
+                _assert_inside_kb(user_path)
                 return user_path, f"user/{domain_name}.md"
 
             raise ValueError(
@@ -318,6 +494,7 @@ class KnowledgeBaseTool(ToolBase):
         rel_path = DOMAINS.get(domain_name)
         if rel_path:
             file_path = kb_root / rel_path
+            _assert_inside_kb(file_path)
             if file_path.exists():
                 return file_path, rel_path
             return file_path, rel_path
@@ -325,6 +502,7 @@ class KnowledgeBaseTool(ToolBase):
         # Scan filesystem for custom domain files
         for subdir in ["project", "personal"]:
             candidate = kb_root / subdir / f"{domain_name}.md"
+            _assert_inside_kb(candidate)
             if candidate.exists():
                 rel = f"{subdir}/{domain_name}.md"
                 return candidate, rel
@@ -372,7 +550,7 @@ class KnowledgeBaseTool(ToolBase):
 
         For workspace scope: lists built-in domains plus custom files from
         project/ and personal/ directories.
-        For global scope: lists domains from system/ (read-only) and user/ (writable) directories.
+        For global scope: lists domains from system/ and user/ (both read-only).
         """
         if self.scope == "global":
             return self._mode_list_global(kb_root)
@@ -446,16 +624,17 @@ class KnowledgeBaseTool(ToolBase):
     def _mode_list_global(self, kb_root: Path) -> str:
         """List all domains in the global knowledge base.
 
-        Lists domains from system/ (read-only) and user/ (writable) directories.
+        Lists domains from system/ and user/ (both read-only for agents).
         """
         lines = ["## Global Knowledge Base - Available Domains\n"]
-        lines.append("> **Scope:** `global` — the knowledge base at `~/.thoughtmachine/knowledge/`")
+        lines.append("> **Scope:** `global` — the knowledge base at `~/.thoughtmachine/global/`")
         lines.append("> Domains in `system/` are read-only built-in reference materials.")
-        lines.append("> Domains in `user/` are writable personal notes.\n")
+        lines.append("> Domains in `user/` are read-only too: the global knowledge base is **read-only for agents**.")
+        lines.append("> Use `scope=workspace` for writable notes.\n")
 
         for section_label, subdir, icon in [
             ("### System Domains (read-only)", "system", "🔒"),
-            ("### User Domains (writable)", "user", "✏️"),
+            ("### User Domains (read-only)", "user", "📄"),
         ]:
             dir_path = kb_root / subdir
             if not dir_path.exists():
@@ -487,11 +666,9 @@ class KnowledgeBaseTool(ToolBase):
         lines.append("")
         lines.append("**Usage:**")
         lines.append("- `mode=read domain=<name> scope=global` — View a global domain")
-        lines.append("- `mode=append domain=<name> scope=global entry=\"...\"` — Add a timestamped entry to a user domain")
-        lines.append("- `mode=update domain=<name> scope=global section=\"...\" new_content=\"...\"` — Update a user domain section")
         lines.append("- `mode=search query=<term> scope=global` — Search across all global KB files")
         lines.append("- `mode=status scope=global` — Show current status and recent activity")
-        lines.append("- `mode=create_domain domain=<name> scope=global category=user` — Add a new user domain")
+        lines.append("- Writes (`append`, `update`, `create_domain`) are not available for `scope=global`; use `scope=workspace` instead")
         return "\n".join(lines)
 
     def _mode_search(self, kb_root: Path) -> str:
@@ -632,24 +809,11 @@ class KnowledgeBaseTool(ToolBase):
             )
 
         if self.scope == "global":
-            # Global scope: only user/ is writable
-            category = "user"
-            if self.category is not None and self.category.lower().strip() != "user":
-                return (
-                    f"Error: Invalid category '{self.category}' for global scope. "
-                    f"Only 'user' category is supported (system/ is read-only)."
-                )
-
-            # Check if domain already exists in system/ (read-only) or user/
-            system_path = kb_root / "system" / f"{domain_name}.md"
-            user_path = kb_root / "user" / f"{domain_name}.md"
-            if system_path.exists():
-                return f"Domain '{domain_name}' already exists in system/ (read-only). Choose a different name."
-            if user_path.exists():
-                return f"Domain '{domain_name}' already exists at `user/{domain_name}.md`."
-
-            rel_path = f"user/{domain_name}.md"
-            file_path = user_path
+            # Global scope: the global KB is read-only for agents, so there is
+            # no creatable category or write target at all. Defence in depth:
+            # `execute()` already refuses every global write mode before
+            # dispatch, so this is a second, unconditional refusal.
+            return self._global_write_refusal()
         else:
             # Workspace scope
             category = self.category
@@ -743,6 +907,39 @@ class KnowledgeBaseTool(ToolBase):
 
         return sections
 
+    def _find_section(self, content: str, rel_path: str) -> Optional[Tuple[str, int, int]]:
+        """Locate a ``##`` section by name using read-mode matching semantics.
+
+        Matching is case-insensitive and tolerates a leading ``#`` in the
+        requested section name. When several headings match, the one spanning
+        the most content wins (first such heading on ties).
+
+        Returns ``(heading_text, start_line, end_line)`` where ``start_line`` is
+        1-indexed and ``end_line`` is an exclusive slice index (as produced by
+        ``_build_section_index``), or ``None`` if no section matches.
+        """
+        if not self.section:
+            return None
+
+        clean_section = self.section.lstrip("#").strip()
+        match_heading = None
+        match_start = None
+        match_end = None
+        match_size = 0
+        for candidate_heading, sline, eline, _ in self._build_section_index(content, rel_path):
+            candidate_clean = candidate_heading.lstrip("#").strip()
+            if candidate_clean == clean_section or candidate_clean.lower() == clean_section.lower():
+                size = eline - sline
+                if size > match_size:
+                    match_heading = candidate_heading
+                    match_start = sline
+                    match_end = eline
+                    match_size = size
+
+        if match_heading is None or match_start is None or match_end is None:
+            return None
+        return (match_heading, match_start, match_end)
+
     def _mode_read(self, kb_root: Path) -> str:
         """Return content of the specified domain file.
 
@@ -756,7 +953,7 @@ class KnowledgeBaseTool(ToolBase):
 
         domain_name = self.domain.lower().replace(" ", "_")
         try:
-            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name, for_write=True)
+            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name)
         except ValueError as e:
             return str(e)
 
@@ -776,23 +973,8 @@ class KnowledgeBaseTool(ToolBase):
 
         # --- Step 1: Handle section extraction (if section is provided) ---
         if self.section:
-            clean_section = self.section.lstrip("#").strip()
-            # Try exact match first, then case-insensitive match
-            # Prefer the match with the most content (handles duplicate section headings)
-            match_heading = None
-            match_start = None
-            match_size = 0
-            for candidate_heading, sline, eline, _ in self._build_section_index(content, rel_path):
-                candidate_clean = candidate_heading.lstrip("#").strip()
-                if candidate_clean == clean_section or candidate_clean.lower() == clean_section.lower():
-                    size = eline - sline
-                    if size > match_size:
-                        match_heading = candidate_heading
-                        match_start = sline - 1  # convert to 0-indexed
-                        match_end = eline
-                        match_size = size
-
-            if match_heading is None or match_start is None:
+            found_section = self._find_section(content, rel_path)
+            if found_section is None:
                 # Section not found — build and show available sections
                 available = self._build_section_index(content, rel_path)
                 avail_lines = [f"Section \"{self.section}\" not found in **{domain_name}**. Available sections:\n"]
@@ -800,9 +982,11 @@ class KnowledgeBaseTool(ToolBase):
                     avail_lines.append(f"- {h} (lines {sl}–{el}, ~{tok} tokens)")
                 return "\n".join(avail_lines)
 
+            match_heading, match_start_line, match_end_line = found_section
+
             # Extract section content (heading line inclusive)
             lines = content.split("\n")
-            section_content = "\n".join(lines[match_start:match_end])
+            section_content = "\n".join(lines[match_start_line - 1:match_end_line])
 
             # If max_tokens is also set, apply truncation after section extraction
             if self.max_tokens is not None:
@@ -999,7 +1183,14 @@ class KnowledgeBaseTool(ToolBase):
         return result
 
     def _mode_update(self, kb_root: Path) -> str:
-        """Replace a section's content in a domain file."""
+        """Replace a section's content in a domain file.
+
+        Section lookup uses the same (case-insensitive) semantics as read mode,
+        so any section ``read`` can locate, ``update`` can also replace in place.
+        When the section cannot be found, no write is performed and the file is
+        left byte-identical — previously a missing match appended a duplicate
+        ``## <section>`` block (see bug/knowledgebase-tool-update-duplicates-section).
+        """
         if not self.domain:
             return "Error: `domain` parameter is required for update mode."
         if not self.section:
@@ -1009,7 +1200,10 @@ class KnowledgeBaseTool(ToolBase):
 
         domain_name = self.domain.lower().replace(" ", "_")
         try:
-            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name)
+            # for_write=True: resolve as a WRITE target so a system domain is
+            # refused (the read branch would hand back system/<domain>.md and
+            # the write below would overwrite a read-only system doc).
+            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name, for_write=True)
         except ValueError as e:
             return str(e)
 
@@ -1027,31 +1221,45 @@ class KnowledgeBaseTool(ToolBase):
                 self._log_tool_error(f"Error reading {file_path} for update: {e}")
                 return f"Error reading '{rel_path}': {e}"
 
-            # Normalize section name: strip leading '#' and whitespace
+            # Locate the section with the SAME matcher used by read mode, so a
+            # section that read() resolves is never silently missed by update().
+            found_section = self._find_section(content, rel_path)
+
+            if found_section is None:
+                # Genuinely not found — DO NOT write. (Previously this appended a
+                # duplicate "## <section>" block and corrupted the file.)
+                available = self._build_section_index(content, rel_path)
+                avail_lines = [
+                    f"Section \"{self.section}\" not found in **{domain_name}**. "
+                    f"No changes were made. Available sections:\n"
+                ]
+                for h, sl, el, tok in available:
+                    avail_lines.append(f"- {h} (lines {sl}–{el}, ~{tok} tokens)")
+                self._log_debug(f"Section '{self.section}' not found in {rel_path}; no write performed")
+                return "\n".join(avail_lines)
+
+            match_heading, match_start_line, match_end_line = found_section
+            # Normalize the replacement header the same way as before.
             clean_section = self.section.lstrip('#').strip()
 
-            # Locate the section header using regex anchored to line start
-            section_header_re = _re.compile(rf"^## {_re.escape(clean_section)}\s*$", _re.MULTILINE)
-            match = section_header_re.search(content)
+            # Replace the section in place: keep everything before the heading,
+            # write the new heading + content, then keep everything from the next
+            # section heading (or EOF) onward.
+            lines = content.split("\n")
 
-            if not match:
-                # Section not found — append it at the end
-                section_header = f"## {clean_section}"
-                updated_content = content.rstrip() + f"\n\n{section_header}\n{self.new_content}\n"
-                self._log_debug(f"Section '{clean_section}' not found, appending to end of {rel_path}")
-                found = False
+            def _line_start(idx: int) -> int:
+                return sum(len(line) + 1 for line in lines[:idx])
+
+            section_start = _line_start(match_start_line - 1)
+            if match_end_line < len(lines):
+                next_section = _line_start(match_end_line) - 1
+                updated_content = (
+                    content[:section_start]
+                    + f"## {clean_section}\n{self.new_content}\n"
+                    + content[next_section:]
+                )
             else:
-                # Section found — delete from header to next "## " or EOF, then insert new header + content
-                section_start = match.start()
-                # Find the next "## " header after the current one
-                next_section = content.find("\n## ", match.end())
-                if next_section == -1:
-                    # No next section, delete until EOF
-                    updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n"
-                else:
-                    # Delete until next section
-                    updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n" + content[next_section:]
-                found = True
+                updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n"
 
             try:
                 file_path.write_text(updated_content, encoding="utf-8")
@@ -1062,12 +1270,8 @@ class KnowledgeBaseTool(ToolBase):
                 self._log_tool_error(f"Error writing {file_path} for update: {e}")
                 return f"Error writing to '{rel_path}': {e}"
 
-        if found:
-            self._log_debug(f"Updated section '{self.section}' in {rel_path}")
-            return f"✅ Section **{self.section}** updated in **{domain_name}** (`{rel_path}`)."
-        else:
-            self._log_debug(f"Created new section '{self.section}' in {rel_path}")
-            return f"✅ Section **{self.section}** created (appended to end) in **{domain_name}** (`{rel_path}`)."
+        self._log_debug(f"Updated section '{self.section}' in {rel_path}")
+        return f"✅ Section **{self.section}** updated in **{domain_name}** (`{rel_path}`)."
 
     def _mode_status(self, kb_root: Path) -> str:
         """Return the 'Current Status' section from task_tracker plus the 5 most recent

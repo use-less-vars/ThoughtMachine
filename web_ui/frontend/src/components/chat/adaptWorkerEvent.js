@@ -1,0 +1,631 @@
+/*
+ * adaptWorkerEvent.js
+ *
+ * Pure function that transforms a worker event object (from events.jsonl)
+ * into a msg object suitable for MessageBubble (or any of the shared
+ * message components: MessageContent, CopyButton, etc.).
+ *
+ * Exported as default: adaptWorkerEvent(evt)
+ *
+ * Returns a msg object with at minimum { _id, role, content } plus
+ * optional flags (is_final, is_system_notification, reasoning_content,
+ * is_summary, response_type) — or null if the event should be suppressed
+ * (user_message / query are already shown in the main ChatPanel).
+ */
+
+const WORKER_STARTED_TEXT = '⬤ Worker started'
+const WORKER_COMPLETED_TEXT = '■ Worker completed'
+const WORKER_STOPPED_TEXT = '⏹ Worker stopped'
+const WORKER_PAUSED_TEXT = '⏸ Worker paused'
+const WORKER_RESUMED_TEXT = '▶ Worker resumed'
+const UNKNOWN_EVENT_TEXT = 'Unknown event: '
+
+/**
+ * Ordered identity parts shared by eventId() and toolCallEventId().
+ *
+ * Kept as a separate builder so both ids are built from the SAME conditions
+ * and labels — the eventId() output must stay byte-identical to what it was
+ * when these checks lived inline.
+ */
+function identityParts(evt) {
+  const parts = []
+  if (evt.session_id) parts.push(evt.session_id)
+  if (evt.worker_name) parts.push(evt.worker_name)
+  // Include instance identity so per-instance events from the same worker
+  // (multi-instance spawns) don't collide in dedup keys
+  if (evt.instance_id != null) parts.push(`i${evt.instance_id}`)
+  if (evt.instance_label) parts.push(`l${evt.instance_label}`)
+  return parts
+}
+
+/**
+ * Build a unique ID for deduplication.
+ * Includes session_id and worker_name when available so events from
+ * different spawns / workers don't collide.
+ */
+function eventId(evt) {
+  const parts = identityParts(evt)
+  if (evt.timestamp) parts.push(evt.timestamp)
+  parts.push(evt.event || '')
+  return parts.join('_')
+}
+
+/**
+ * Build the identity shared by all three phases (start / call / result) of a
+ * single backend tool call.
+ *
+ * Same identity parts as eventId() but WITHOUT the timestamp and WITHOUT the
+ * event name — those are exactly the two components that differ between the
+ * phases — plus the backend `tool_call_id`.  Returns null when the event
+ * carries no usable id, which keeps the old "three separate rows" behaviour
+ * for replayed/legacy events and providers that omit ids.
+ */
+export function toolCallEventId(evt) {
+  const req = (evt && evt.request) || {}
+  const tcId = req.tool_call_id
+  if (typeof tcId !== 'string' || !tcId) return null
+  const parts = identityParts(evt)
+  parts.push(`tc${tcId}`)
+  return parts.join('_')
+}
+
+/**
+ * PURE upsert for tool messages (call-start / call / result phases).
+ *
+ * `seq` is a monotonically increasing number supplied by the caller; it is
+ * stamped onto appended entries only, so a merged entry keeps the sequence
+ * number of the FIRST time it appeared (call order == bubble order).
+ *
+ * - no usable `tool_call_id` -> append (nothing to pair with).
+ * - id present, no match     -> append.
+ * - id present, match found  -> replace IN PLACE (position preserved), keep
+ *   the first entry's `_seq` and `_id`, and overlay only the fields the
+ *   incoming message actually defines, so a later, thinner phase never erases
+ *   a richer earlier field with `undefined`.
+ *
+ * Never mutates `prev` (or any of its entries); always returns a new array.
+ */
+export function mergeToolMessages(prev, incoming, seq) {
+  const list = Array.isArray(prev) ? prev : []
+  const msg = incoming || {}
+  const tcId = msg.tool_call_id
+  const hasId = typeof tcId === 'string' && tcId.length > 0
+  if (hasId) {
+    const idx = list.findIndex(m => m && m.tool_call_id === tcId)
+    if (idx !== -1) {
+      const base = list[idx]
+      const merged = { ...base }
+      for (const key of Object.keys(msg)) {
+        if (msg[key] !== undefined) merged[key] = msg[key]
+      }
+      // Position, first-insert identity AND content are authoritative.
+      // `content` must never be overwritten: for tool calls it is the
+      // name/args JSON that MessageBubble parses, while the outcome travels in
+      // `result`.  A later phase overwriting content would break the bubble.
+      merged._seq = base._seq
+      merged._id = base._id
+      merged.content = base.content
+      const next = list.slice()
+      next[idx] = merged
+      return next
+    }
+  }
+  return [...list, { ...msg, _seq: seq }]
+}
+
+/**
+ * Build display content for a system notification:
+ *   "<message> (<detail>)"
+ * Message and detail are optional.
+ */
+function notificationContent(message, detail) {
+  const parts = []
+  const msg = (message || '').trim()
+  if (msg) parts.push(msg)
+  if (detail) parts.push(detail)
+  return parts.join(' ')
+}
+
+/**
+ * Adapt a token-warning system_notification into a msg object.
+ */
+function tokenWarningMsg(evt) {
+  const resp = evt.response || {}
+  const detail = typeof resp.token_count === 'number'
+    ? `(Tokens: ${resp.token_count})`
+    : undefined
+  return {
+    _id: eventId(evt),
+    role: 'user',
+    content: notificationContent(resp.message || resp.warning_message, detail),
+    is_system_notification: true,
+  }
+}
+
+/**
+ * Adapt a turn-warning system_notification into a msg object.
+ */
+function turnWarningMsg(evt) {
+  const resp = evt.response || {}
+  const detail = typeof resp.turn_count === 'number'
+    ? `(Turns: ${resp.turn_count})`
+    : undefined
+  return {
+    _id: eventId(evt),
+    role: 'user',
+    content: notificationContent(resp.message, detail),
+    is_system_notification: true,
+  }
+}
+
+/**
+ * Adapt a time-warning system_notification into a msg object.
+ */
+function timeWarningMsg(evt) {
+  const resp = evt.response || {}
+  const detail = typeof resp.elapsed_seconds === 'number'
+    ? `(Elapsed: ${resp.elapsed_seconds}s)`
+    : undefined
+  return {
+    _id: eventId(evt),
+    role: 'user',
+    content: notificationContent(resp.message, detail),
+    is_system_notification: true,
+  }
+}
+
+/**
+ * Main adapter function.
+ *
+ * @param {object} evt — A worker event object from events.jsonl
+ * @returns {object|null} — A msg object for MessageBubble, or null to suppress
+ */
+export default function adaptWorkerEvent(evt) {
+  // Guard against null/undefined
+  if (!evt || !evt.event) return null
+
+  switch (evt.event) {
+    // ── Query (user's request to the worker) ─────────────────────
+    case 'user_message': {
+      const req = evt.request || {}
+      // The query may arrive JSON-wrapped if the delegation system
+      // serializes the full context (e.g. '{"query":"Verify..."}').
+      // Detect and unwrap so the user sees plain text.
+      let query = req.query || '(empty query)'
+      if (typeof query === 'string' && query.trim().startsWith('{')) {
+        try {
+          const parsed = JSON.parse(query)
+          if (parsed && typeof parsed.query === 'string') {
+            query = parsed.query
+          }
+        } catch (_) {
+          // Not valid JSON — use raw value as-is
+        }
+      }
+      return {
+        _id: eventId(evt),
+        role: 'user',
+        content: query,
+        is_worker_query: true,
+      }
+    }
+    // Legacy query event (same format)
+    case 'query':
+      return null
+
+    // ── Final response (assistant answer) ──────────────────────────
+    case 'final_response':
+    // Worker message (sent via WS as worker:worker_message) — same format
+    case 'worker_message':
+    // Assistant message (from per-worker EventBus via WebSocket)
+    case 'assistant_message': {
+      const resp = evt.response || {}
+      const hasResponseType = resp.response_type != null
+      return {
+        _id: eventId(evt),
+        role: 'assistant',
+        content: resp.content || '',
+        reasoning_content: resp.reasoning_content || undefined,
+        is_final: hasResponseType,
+        response_type: resp.response_type || 'answer',
+      }
+    }
+
+    // ── Tool call ─────────────────────────────────────────────────
+    case 'tool_call': {
+      const req = evt.request || {}
+      const jsonContent = JSON.stringify({
+        name: req.tool || 'unknown',
+        arguments: req.args || {},
+      })
+      // One identity for every phase of a call when the backend supplied an id;
+      // otherwise the historical per-event id (three separate rows).
+      const msg = {
+        _id: toolCallEventId(evt) || eventId(evt),
+        role: 'tool_call',
+        content: jsonContent,
+        tool_name: req.tool || 'unknown',
+        arguments: req.args || {},
+      }
+      if (typeof req.tool_call_id === 'string' && req.tool_call_id) {
+        msg.tool_call_id = req.tool_call_id
+      }
+      if (req.success !== undefined) msg.success = req.success
+      if (req.error !== undefined) msg.error = req.error
+      return msg
+    }
+
+    // ── Tool call (pending / started) ───────────────────────
+    case 'tool_call_start': {
+      const req = evt.request || {}
+      const jsonContent = JSON.stringify({
+        name: req.tool || 'unknown',
+        arguments: req.args || {},
+      })
+      const msg = {
+        _id: toolCallEventId(evt) || eventId(evt),
+        role: 'tool_call',
+        content: jsonContent,
+        tool_name: req.tool || 'unknown',
+        arguments: req.args || {},
+      }
+      if (typeof req.tool_call_id === 'string' && req.tool_call_id) {
+        msg.tool_call_id = req.tool_call_id
+      }
+      return msg
+    }
+
+    // ── Tool result ───────────────────────────────────────────────
+    case 'tool_result': {
+      const req = evt.request || {}
+      const resp = evt.response || {}
+      const success = req.success !== false
+      const content = success
+        ? (resp.result || '(empty)')
+        : (req.error || resp.result || 'Unknown error')
+      const isSummary = (req.tool === 'SummarizeTool')
+      // Paired result (backend supplied tool_call_id): adopt the call bubble's
+      // identity AND its 'tool_call' role so mergeToolMessages folds the result
+      // into the row the call already created.
+      //
+      // UNPAIRED results deliberately stay standalone (role 'tool_result',
+      // unchanged content): there is nothing to pair them with, which is the
+      // case for replayed/legacy events and for providers that omit ids.  They
+      // must keep rendering exactly as they do today.
+      const pairedId = toolCallEventId(evt)
+      const msg = {
+        _id: pairedId || eventId(evt),
+        role: pairedId ? 'tool_call' : 'tool_result',
+        content: String(content),
+        is_summary: isSummary,
+        tool_name: req.tool || 'unknown',
+        arguments: req.args || {},
+        success,
+        result: String(content),
+      }
+      if (typeof req.tool_call_id === 'string' && req.tool_call_id) {
+        msg.tool_call_id = req.tool_call_id
+      }
+      return msg
+    }
+
+    // ── System notifications (warnings) ──────────────────────────
+    case 'system_notification': {
+      const resp = evt.response || {}
+      const type = resp.type || ''
+      if (type === 'token_warning') return tokenWarningMsg(evt)
+      if (type === 'turn_warning') return turnWarningMsg(evt)
+      if (type === 'time_warning') return timeWarningMsg(evt)
+      if (type === 'context_summarized') {
+        const detail = typeof resp.context_length === 'number'
+          ? `(Tokens: ${resp.context_length})`
+          : undefined
+        return {
+          _id: eventId(evt),
+          role: 'user',
+          content: notificationContent(
+            resp.message || 'Context has been summarized. You now have a fresh context window and full access to tools.',
+            detail
+          ),
+          is_system_notification: true,
+        }
+      }
+      // Fallback for system_notification without a recognized type
+      return {
+        _id: eventId(evt),
+        role: 'user',
+        content: notificationContent(resp.message || 'System notification'),
+        is_system_notification: true,
+      }
+    }
+
+    // ── Context updated (live context token display) ────────────────────────
+    // Suppressed — token count is already shown in the header via context_updated/tokens_updated
+    case 'context_updated':
+      return null
+
+
+
+    // ── Tokens updated (live token count updates for the header only) ────
+    // Return null (no bubble) since context_updated already shows the context display.
+    // Token count changes are propagated via the header ctx: display, not as bubbles.
+    case 'tokens_updated':
+      return null
+
+
+    // ── Token recovery (warning cleared) ───────────────────────
+    case 'token_recovery': {
+      const resp = evt.response || {}
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: resp.message || 'Token usage has returned to safe levels after summarization.',
+        is_system_notification: true,
+      }
+    }
+
+    // ── Lifecycle events ──────────────────────────────────────────
+    case 'started':
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: WORKER_STARTED_TEXT,
+        is_system_notification: true,
+      }
+
+    case 'completed':
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: WORKER_COMPLETED_TEXT,
+        is_system_notification: true,
+      }
+
+    // stopped / paused / resumed describe a TRANSIENT state change, not
+    // conversation content: they are flagged `client_only` so the transcript
+    // can render them as the ephemeral bubble family (muted, dashed) instead
+    // of the enclosed, persisted system-notice family. Worker events never
+    // reach receiveConversationChanged(), so the flag has no store effect.
+    case 'stopped':
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: WORKER_STOPPED_TEXT,
+        is_system_notification: true,
+        client_only: true,
+      }
+
+    case 'paused':
+    case 'worker_paused':
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: WORKER_PAUSED_TEXT,
+        is_system_notification: true,
+        client_only: true,
+      }
+
+    case 'resumed':
+    case 'worker_resumed':
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: WORKER_RESUMED_TEXT,
+        is_system_notification: true,
+        client_only: true,
+      }
+
+    // ── Error ─────────────────────────────────────────────────────
+    case 'error': {
+      const resp = evt.response || {}
+      const req = evt.request || {}
+      const message = resp.error || req.error || 'Unknown error'
+      return {
+        _id: eventId(evt),
+        role: 'user',
+        content: `❌ ${message}`,
+        is_system_notification: true,
+      }
+    }
+
+    // ── Worker lifecycle events (from WebSocket bridge ONLY) ────────────
+    // These events are published to the global_event_bus by worker.py and
+    // forwarded to the frontend via the bridge WebSocket. They are NOT
+    // fetched from events.jsonl filesystem polling — WorkerOutputPanel
+    // filters them out (msg.is_worker_event === true) from file fetches.
+    // All lifecycle handlers must set is_worker_event: true for this to work.
+    case 'worker_spawned': {
+      const sReq = evt.request || {}
+      const sResp = evt.response || {}
+      const workerName = sResp.worker_name || sReq.worker_name || 'default'
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: `🟢 Worker spawned: ${workerName}`,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
+
+    case 'worker_status': {
+      const stReq = evt.request || {}
+      const stResp = evt.response || {}
+      const status = stResp.status || stReq.status || 'running'
+      const message = stResp.message || stReq.message || ''
+      const content = message
+        ? `⏳ Worker status: ${status} — ${message}`
+        : `⏳ Worker status: ${status}`
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
+
+    case 'worker_completed': {
+      const cReq = evt.request || {}
+      const cResp = evt.response || {}
+      const workerName2 = cResp.worker_name || cReq.worker_name || 'default'
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: `✅ Worker completed: ${workerName2}`,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
+
+    case 'worker_error': {
+      const eReq = evt.request || {}
+      const eResp = evt.response || {}
+      const errMsg = eResp.error || eReq.error || 'Unknown worker error'
+      const workerName3 = eResp.worker_name || eReq.worker_name || 'default'
+      return {
+        _id: eventId(evt),
+        role: 'user',
+        content: `🔴 Worker error (${workerName3}): ${errMsg}`,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
+
+    case 'worker_partial_result': {
+      const pResp = evt.response || {}
+      const partialText = pResp.content || pResp.partial_text || pResp.result || ''
+      const status = pResp.status || ''
+      const suffix = status ? ` (${status})` : ''
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: partialText
+          ? `📝 Worker partial result${suffix}: ${partialText}`
+          : `📝 Worker partial result${suffix}`,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
+
+    // ── Fallback: unknown event type ──────────────────────────────
+    default:
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: `${UNKNOWN_EVENT_TEXT}${evt.event}`,
+        is_system_notification: true,
+      }
+  }
+}
+
+/**
+ * Determine whether a worker event will render a visible bubble.
+ *
+ * Handles BOTH shapes used across the frontend:
+ *   (1) raw WS shape   : { type: 'worker:worker_message', data: {...}, timestamp }
+ *   (2) internal panel : { event: 'worker_message', request, response, timestamp }
+ *
+ * An event is renderable when adaptWorkerEvent() produces a msg with content,
+ * reasoning_content, or is_system_notification — mirroring the EMPTY EVENT
+ * FILTER in WorkerOutputPanel. Header-only events (context_updated /
+ * tokens_updated) and suppressed queries ('query') are NOT renderable.
+ *
+ * @param {object} evt
+ * @returns {boolean} true if the event renders a visible bubble
+ */
+export function isWorkerEventRenderable(evt) {
+  if (!evt) return false
+
+  // ── Raw WebSocket shape: { type: 'worker:xxx', data: {...} } ──
+  if (evt.type) {
+    const rawType = evt.type.replace('worker:', '') || ''
+    const data = evt.data || {}
+    // Header-only / suppressed events never render a bubble
+    if (rawType === 'context_updated') return false
+    if (rawType === 'tokens_updated') return false
+    if (rawType === 'query') return false
+    // Assistant-message variants are visible only with actual content
+    if (rawType === 'worker_message' || rawType === 'assistant_message' || rawType === 'final_response') {
+      return !!(data.content || data.reasoning_content)
+    }
+    if (rawType === 'user_message') {
+      return !!(data.content || data.query || (evt.request && evt.request.query))
+    }
+    // Lifecycle, warnings, errors, tool events — always render
+    return true
+  }
+
+  // ── Internal panel shape: { event: 'xxx', request, response } ──
+  const msg = adaptWorkerEvent(evt)
+  return !!(msg && (msg.content || msg.reasoning_content || msg.is_system_notification))
+}
+
+
+/* ===================================================================
+ * Example mappings (for reference / testing):
+ *
+ * const event1 = {
+ *   event: 'tool_call',
+ *   timestamp: '2026-07-01T12:00:00.000Z',
+ *   request: { tool: 'read_file', args: { path: '/tmp/test.txt' } },
+ *   response: {},
+ * };
+ * // adaptWorkerEvent(event1)
+ * // → {
+ * //     _id: '2026-07-01T12:00:00.000Ztool_call',
+ * //     role: 'tool_call',
+ * //     content: '{"name":"read_file","arguments":{"path":"/tmp/test.txt"}}',
+ * //   }
+ *
+ * const event2 = {
+ *   event: 'final_response',
+ *   timestamp: '2026-07-01T12:01:00.000Z',
+ *   response: {
+ *     content: 'The answer is 42.',
+ *     reasoning_content: 'Let me think about this...\n\n1 + 1 = 2...\nSo the answer is 42.',
+ *     response_type: 'answer',
+ *   },
+ * };
+ * // adaptWorkerEvent(event2)
+ * // → {
+ * //     _id: '2026-07-01T12:01:00.000Zfinal_response',
+ * //     role: 'assistant',
+ * //     content: 'The answer is 42.',
+ * //     reasoning_content: 'Let me think about this...\n\n1 + 1 = 2...\nSo the answer is 42.',
+ * //     is_final: true,
+ * //     response_type: 'answer',
+ * //   }
+ *
+ * const event3 = {
+ *   event: 'system_notification',
+ *   timestamp: '2026-07-01T12:02:00.000Z',
+ *   response: {
+ *     type: 'token_warning',
+ *     message: 'Approaching context limit',
+ *     token_count: 120000,
+ *   },
+ * };
+ * // adaptWorkerEvent(event3)
+ * // → {
+ * //     _id: '2026-07-01T12:02:00.000Zsystem_notification',
+ * //     role: 'user',
+ * //     content: 'Approaching context limit',
+ * //     is_system_notification: true,
+ * //   }
+ *
+ * const event4 = {
+ *   event: 'tool_result',
+ *   timestamp: '2026-07-01T12:03:00.000Z',
+ *   request: { tool: 'glob', success: true },
+ *   response: { result: 'Found 3 files: a.txt, b.txt, c.txt' },
+ * };
+ * // adaptWorkerEvent(event4)
+ * // → {
+ * //     _id: '2026-07-01T12:03:00.000Ztool_result',
+ * //     role: 'tool_result',
+ * //     content: 'Found 3 files: a.txt, b.txt, c.txt',
+ * //   }
+ *
+ * const event5 = { event: 'user_message', timestamp: '...' };
+ * // adaptWorkerEvent(event5) → null  (suppressed)
+ * =================================================================== */

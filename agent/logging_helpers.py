@@ -10,7 +10,6 @@ from agent.logging import log
 def dump_messages(messages: List[Dict[str, Any]], label: str, max_items: int = 50):
     """Log a compact representation of a message list."""
     if not messages:
-        log("DEBUG", "debug.dump", f"{label}: empty list")
         return
     
     sample = []
@@ -38,9 +37,3 @@ def dump_messages(messages: List[Dict[str, Any]], label: str, max_items: int = 5
             "is_summary": "Summary of previous conversation:" in content,
         })
     
-    log("DEBUG", "debug.dump", label, {
-        "count": len(messages),
-        "sample": sample,
-        "has_more": len(messages) > max_items,
-        "truncated_at": max_items if len(messages) > max_items else None
-    })

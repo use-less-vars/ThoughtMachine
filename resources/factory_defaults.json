@@ -1,0 +1,11 @@
+{
+  "version": "1",
+  "description": "System factory defaults — immutable base configuration for ThoughtMachine vault.",
+  "config": {
+    "max_turns": 50,
+    "temperature": 0.7,
+    "provider_id": "",
+    "model": "",
+    "system_prompt": ""
+  }
+}

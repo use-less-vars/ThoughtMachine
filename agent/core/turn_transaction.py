@@ -13,7 +13,6 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from agent.logging import log
-from session.models import ObservableList
 
 
 class TurnTransaction:
@@ -110,6 +109,8 @@ class TurnTransaction:
         Returns:
             List of committed messages in order of addition
         """
+        # Local import: session.models <-> agent.core circular import (PASS 1e)
+        from session.models import ObservableList
         if self._committed:
             raise RuntimeError('Transaction already committed')
         if self._assistant_committed:
@@ -168,8 +169,36 @@ class TurnTransaction:
         return self._assistant_message is None and len(self._tool_calls_buffer) == 0
 
     def has_assistant_message(self) -> bool:
-        """Check if assistant message has been added."""
-        return self._assistant_message is not None
+        """Check if the assistant message carries anything worth committing.
+
+        Presence alone is NOT enough. A turn that was stopped before the first
+        token still calls add_assistant_message() with content='', and a
+        presence-only check let that empty assistant message reach
+        user_history - which then broke the next request (an assistant turn
+        with no content and no tool_calls is not a valid message for the
+        provider). So require real content, or at least one tool call.
+        """
+        if self._assistant_message is None:
+            return False
+        if self._assistant_message.get('tool_calls'):
+            return True
+        content = self._assistant_message.get('content')
+        if not content:
+            return False
+        if isinstance(content, str):
+            return bool(content.strip())
+        if isinstance(content, (list, tuple)):
+            # Multi-part content: a text part that is non-empty is real content.
+            for part in content:
+                if isinstance(part, str):
+                    if part.strip():
+                        return True
+                elif isinstance(part, dict):
+                    text = part.get('text')
+                    if isinstance(text, str) and text.strip():
+                        return True
+            return False
+        return True
 
     def count_messages(self) -> Tuple[int, int]:
         """

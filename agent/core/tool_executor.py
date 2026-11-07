@@ -4,19 +4,24 @@ Tool execution and dispatch logic.
 Extracted from agent.py to separate tool execution concerns.
 """
 import json
+import logging
 import threading
 from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
 from pydantic import ValidationError
 from agent.logging import log
+from agent.logging.lifecycle import log_tool_call_raw
 from fast_json_repair import loads as repair_loads
 from agent.core.turn_transaction import TurnTransaction
 from tools.respond import Respond
 from tools.summarize_tool import SummarizeTool
 
+# Module logger used for the fail-closed id-less entry observation below.
+logger = logging.getLogger(__name__)
+
 # Try to import event system for security prompts
 try:
-    from agent.events import global_event_bus
+    from agent.events import create_event, global_event_bus, EventType
     _EVENT_SYSTEM_AVAILABLE = True
 except ImportError:
     _EVENT_SYSTEM_AVAILABLE = False
@@ -25,12 +30,35 @@ except ImportError:
 # Try to import security module
 from thoughtmachine.security import SessionPermissions
 
+# Audit emitter for the permission-widening observation below.  A missing
+# audit logger must never stop a tool call, but it is expected to be present.
+try:
+    from thoughtmachine.audit_logger import audit_event
+except ImportError:  # pragma: no cover - defensive only
+
+    def audit_event(event_type: str, details: str) -> None:  # type: ignore
+        return None
+
+
+# Worker-name context var (stdlib-only leaf module — no circular import):
+# carries the name of the worker sub-agent whose query is executing on this
+# thread, so tools can stamp ownership labels (e.g. ``thoughtmachine.worker``
+# on containers they create).
+try:
+    from agent.core.worker_context import current_worker_name
+except ImportError:
+
+    def current_worker_name():  # type: ignore
+        return None
+
 # Import unified security gate (always available)
 try:
     from security.security_gate import (
         get_workspace_capabilities,
         get_effective_permissions,
         check_required_categories,
+        check_requires_resource,
+        _DISK_FAIL_CLOSED_SESSION,
     )
     from thoughtmachine.workspace_capabilities import (
         WorkspaceCapabilities,
@@ -42,26 +70,100 @@ except ImportError:
     get_workspace_capabilities = None
     get_effective_permissions = None
     check_required_categories = None
+    check_requires_resource = None
     WorkspaceCapabilities = None
     resolve_workspace_id = None
+    _DISK_FAIL_CLOSED_SESSION = None
 
-# ---------------------------------------------------------------------------
-# Default session permissions profile (six categories)
-# ---------------------------------------------------------------------------
-# Fallback used when no live SessionPermissions model is available on config.
-DEFAULT_SESSION_PERMISSIONS = {
-    "container": False,
-    "network": "banned",
-    "filesystem": "read",
-    "system": "read",
-    "git": "read",
-    "execution": "banned",
-}
+
+def _permission_rank(value: Any) -> Optional[float]:
+    """Rank one permission value on the shared grant-level scale.
+
+    Ranks come from ``security.resource_catalog.GRANT_LEVEL_RANKS`` (the single
+    flat order used by the gate: ``banned(0) < read(1) == connect(1) < ask(2)
+    < write(3) == write_on_feature_branch(3) < outbound(3.5) < full(4)``).
+    Booleans are ranked on the same scale (``True`` = write level, ``False`` =
+    ban) because the gate may hand back boolean values for non-container
+    categories.
+
+    Returns ``None`` for any value that cannot be placed on the scale; callers
+    must treat an unrankable pair as "not comparable" and never report it.
+    """
+    if isinstance(value, bool):
+        return 3.0 if value else 0.0
+    if value is None:
+        return None
+    try:
+        from security.resource_catalog import GRANT_LEVEL_RANKS
+    except Exception:  # noqa: BLE001 - leaf module; keep the caller alive
+        return None
+    return GRANT_LEVEL_RANKS.get(str(value).strip().lower())
+
+
+def _ensure_gate_imported() -> bool:
+    """Rebind gate functions after a circular-import interruption.
+
+    The module-level import above can execute while ``security.security_gate``
+    is still mid-initialisation (its first import triggered from inside a
+    circular chain), which makes the ``from``-import fail and latches
+    ``GATE_AVAILABLE`` to False even though the gate is perfectly importable
+    once module import has settled.  This helper re-attempts the binding at
+    first gate entry; if the gate genuinely cannot be imported, the caller
+    denies (fail closed) -- the gate is never silently skipped.
+
+    Bindings are written as module globals so gate calls below keep reading
+    them at call time (late binding): a monkeypatched
+    ``tool_executor_module.get_workspace_capabilities`` (e.g. test fixtures)
+    is preserved instead of being clobbered by the rebind.
+    """
+    global GATE_AVAILABLE  # noqa: PLW0603
+    global get_workspace_capabilities  # noqa: PLW0603
+    global get_effective_permissions  # noqa: PLW0603
+    global check_required_categories  # noqa: PLW0603
+    global check_requires_resource  # noqa: PLW0603
+    global WorkspaceCapabilities  # noqa: PLW0603
+    global resolve_workspace_id  # noqa: PLW0603
+    global _DISK_FAIL_CLOSED_SESSION  # noqa: PLW0603
+    try:
+        from security.security_gate import (
+            get_workspace_capabilities as _new_get_workspace_capabilities,
+            get_effective_permissions as _new_get_effective_permissions,
+            check_required_categories as _new_check_required_categories,
+            check_requires_resource as _new_check_requires_resource,
+            _DISK_FAIL_CLOSED_SESSION as _new_DISK_FAIL_CLOSED_SESSION,
+        )
+        from thoughtmachine.workspace_capabilities import (
+            WorkspaceCapabilities as _new_WorkspaceCapabilities,
+            resolve_workspace_id as _new_resolve_workspace_id,
+        )
+        if get_workspace_capabilities is None:
+            get_workspace_capabilities = _new_get_workspace_capabilities
+        if get_effective_permissions is None:
+            get_effective_permissions = _new_get_effective_permissions
+        if check_required_categories is None:
+            check_required_categories = _new_check_required_categories
+        if check_requires_resource is None:
+            check_requires_resource = _new_check_requires_resource
+        if WorkspaceCapabilities is None:
+            WorkspaceCapabilities = _new_WorkspaceCapabilities
+        if resolve_workspace_id is None:
+            resolve_workspace_id = _new_resolve_workspace_id
+        if _DISK_FAIL_CLOSED_SESSION is None:
+            _DISK_FAIL_CLOSED_SESSION = _new_DISK_FAIL_CLOSED_SESSION
+        GATE_AVAILABLE = True
+        return True
+    except ImportError:
+        return False
+
+
+# Fallback session-permissions profile (re-exported from
+# agent/config/defaults.py so existing importers keep seeing it here).
+from agent.config.defaults import DEFAULT_SESSION_PERMISSIONS
 
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
 
-    def __init__(self, tool_classes, config, state, logger=None, security_available=False, agent=None):
+    def __init__(self, tool_classes, config, state, logger=None, security_available=False, agent=None, event_bus=None, is_worker_context=False):
         """
         Initialize tool executor.
         
@@ -72,6 +174,7 @@ class ToolExecutor:
             logger: Optional logger instance.
             security_available: Whether security module is available.
             agent: Optional Agent instance for token update callbacks.
+            is_worker_context: Whether this executor runs inside a worker (no interactive user).
         """
         self.tool_classes = tool_classes
         self.config = config
@@ -79,8 +182,15 @@ class ToolExecutor:
         self.logger = logger
         self.security_available = security_available
         self.agent = agent
+        self._event_bus = event_bus
+        self._is_worker_context = is_worker_context
+        self._session_workspace_id_cache = {}
+        # Last observed effective permissions (worker context only), used to
+        # detect and audit per-category widening between tool calls -- i.e. an
+        # on-disk grant that took effect without respawning the worker.
+        self._last_effective_permissions: Dict[str, Any] = {}
 
-    def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, session_id: str = "", turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
+    def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, session_id: str = "", workspace_id: str = "", turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
         """
         Execute multiple tool calls from an assistant message.
         
@@ -95,10 +205,25 @@ class ToolExecutor:
             Tuple of:
             - executed_tools: List of executed tool information
             - final_detected: Whether a terminal tool was executed (Respond, Final, etc.)
-            - respond_result: Dict with 'response_type' and 'content' if Respond was executed, else None
+            - respond_result: Dict with 'response_type', 'content', 'status', 'confidence', 'meta' if Respond was executed, else None
             - summary_text: Summary text if SummarizeTool was called
             - summary_keep_recent_turns: Number of turns to keep for summarization
         """
+        # Fail-closed entry observation: entering with neither a session id
+        # nor a workspace id means the permission gate has NO on-disk
+        # authority to read, so its effective profile is the deny-all
+        # _DISK_FAIL_CLOSED_SESSION and any category-gated tool call is
+        # DENIED.  Warn (do NOT raise / change behaviour) so the missing
+        # identity is observable.
+        if not session_id and not workspace_id:
+            logger.warning(
+                "execute_tool_calls entered with NO session identity "
+                "(session_id=%r) and NO workspace identity (workspace_id=%r); "
+                "permission checks are fail-closed and category-gated tool "
+                "calls will be DENIED (deny-all _DISK_FAIL_CLOSED_SESSION).",
+                session_id,
+                workspace_id,
+            )
         # Resolve update_token_func: if not provided, use agent._update_tokens_after_tool
         if update_token_func is None:
             if self.agent is not None:
@@ -117,21 +242,50 @@ class ToolExecutor:
                 turn_transaction.add_tool_result(message)
             else:
                 add_to_conversation_func(message)
-        for tool_call in tool_calls:
+        for _tc_index, tool_call in enumerate(tool_calls):
+            # Cooperative cancellation: if a stop was requested between tool
+            # calls, skip execution and record a clean 'stopped' tool result
+            # for every pending call. The agent's turn_start stop_check
+            # checkpoint then terminates the turn with a 'stopped' event.
+            # stop_check is only consulted when callable (None by default,
+            # so main-agent paths are unaffected).
+            stop_check = getattr(self.config, "stop_check", None)
+            if callable(stop_check) and stop_check():
+                stopped_content = json.dumps({
+                    "status": "stopped",
+                    "message": "Worker stopped before tool execution",
+                })
+                for tc in tool_calls[_tc_index:]:
+                    add_tool_result({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": stopped_content,
+                    })
+                    executed_tools.append({
+                        "name": tc["function"]["name"],
+                        "arguments": {},
+                        "result": stopped_content,
+                        "tool_call_id": tc.get("id", ""),
+                    })
+                return (executed_tools, False, None, None, None)
             tool_name = tool_call['function']['name']
             if not self.state.is_tool_allowed(tool_name):
                 tool_result = self._create_tool_rejection_message(tool_name)
                 add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
                 tool_tokens = self.agent.token_counter.estimate_tokens(tool_result) if self.agent is not None else self._estimate_tokens_fallback(tool_result)
                 update_token_func(tool_tokens)
-                executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result})
+                # A state-level rejection is a refusal: record it structurally so the
+                # caller does not have to sniff the prose (which carries no marker).
+                executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result, 'success': False, 'tool_call_id': tool_call.get('id', '')})
                 continue
             arguments_str = tool_call['function']['arguments']
+            json_repair_needed = False
             try:
                 arguments = json.loads(arguments_str)
             except json.JSONDecodeError:
                 try:
                     arguments = repair_loads(arguments_str)
+                    json_repair_needed = True
                     if self.logger:
                         log('INFO', 'core.tool_executor', f'JSON repaired for {tool_name}')
                 except Exception as e:
@@ -139,25 +293,39 @@ class ToolExecutor:
                     if self.logger:
                         self.logger.log_error('JSON_DECODE_ERROR', f'Failed to parse JSON for {tool_name}: {e}')
                     add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
-                    executed_tools.append({'name': tool_name, 'arguments': {'error': 'Invalid JSON', 'raw': arguments_str}, 'result': tool_result})
+                    executed_tools.append({'name': tool_name, 'arguments': {'error': 'Invalid JSON', 'raw': arguments_str}, 'result': tool_result, 'success': False, 'tool_call_id': tool_call.get('id', '')})
+                    log_tool_call_raw(tool_name=tool_name, tool_call_id=tool_call['id'], arguments_raw=arguments_str, json_repair_needed=True, session_id=session_id)
                     continue
+            log_tool_call_raw(tool_name=tool_name, tool_call_id=tool_call['id'], arguments_raw=arguments_str, json_repair_needed=json_repair_needed, session_id=session_id)
             if self.logger:
                 self.logger.log_tool_call(tool_name, arguments, tool_call['id'])
-            tool_class = next((cls for cls in self.tool_classes if cls.__name__ == tool_name), None)
+            # Resolve by stable tool name first (tool_name()); fall back to the
+            # class name so legacy/worker-internal callers keep working.
+            tool_class = next(
+                (
+                    cls
+                    for cls in self.tool_classes
+                    if cls.tool_name() == tool_name or cls.__name__ == tool_name
+                ),
+                None,
+            )
             if not tool_class:
                 error_msg = f'Unknown tool: {tool_name}'
                 tool_result = error_msg
-                tool_execution_result = {'result': tool_result, 'tool_type': 'normal'}
+                tool_execution_result = {'result': tool_result, 'tool_type': 'normal', 'success': False}
                 tool_type = 'normal'
             else:
-                tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns, session_id=session_id)
+                tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns, session_id=session_id, workspace_id=workspace_id)
                 tool_result = tool_execution_result['result']
                 tool_type = tool_execution_result.get('tool_type', 'normal')
                 if tool_type == 'respond':
                     final_detected = True
                     respond_result = {
                         'response_type': tool_execution_result.get('response_type'),
-                        'content': tool_execution_result.get('content')
+                        'content': tool_execution_result.get('content'),
+                        'status': tool_execution_result.get('status'),
+                        'confidence': tool_execution_result.get('confidence'),
+                        'meta': tool_execution_result.get('meta'),
                     }
                 elif tool_type == 'summary':
                     summary_requested = True
@@ -174,10 +342,17 @@ class ToolExecutor:
             update_token_func(tool_tokens)
             if self.logger:
                 pass
-            executed_tools.append({'name': tool_name, 'arguments': arguments, 'result': tool_result})
+            tool_entry = {'name': tool_name, 'arguments': arguments, 'result': tool_result, 'tool_call_id': tool_call.get('id', '')}
+            # Forward the executor's structural verdict when it has one, so a
+            # refusal stays distinguishable from a success without prose
+            # sniffing upstream.  Success paths stay key-less (no invented
+            # 'success': True), so an absent key keeps meaning "no verdict".
+            if 'success' in tool_execution_result:
+                tool_entry['success'] = tool_execution_result['success']
+            executed_tools.append(tool_entry)
         return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
 
-    def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns, session_id: str = "") -> Dict[str, Any]:
+    def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns, session_id: str = "", workspace_id: str = "") -> Dict[str, Any]:
         """
         Execute a single tool instance.
 
@@ -187,8 +362,13 @@ class ToolExecutor:
             - tool_type: 'normal', 'respond', or 'summary'
             - response_type: if tool_type == 'respond'
             - content: if tool_type == 'respond'
+            - status: if tool_type == 'respond'
+            - confidence: if tool_type == 'respond'
+            - meta: if tool_type == 'respond'
             - summary_text: if tool_type == 'summary'
             - summary_keep_recent_turns: if tool_type == 'summary'
+            - success: False on every refusal / failure path.  Absent when the
+              tool actually executed, so an absent key means "no verdict".
         """
         try:
             tool_args = arguments.copy()
@@ -212,15 +392,16 @@ class ToolExecutor:
             except ValidationError as e:
                 # Provide LLM-friendly error with valid field names
                 try:
-                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions"}
+                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions", "session_id", "is_worker_context"}
                     valid_fields = [f for f in valid_field_names if f not in infra_fields]
                     valid_fields_str = ', '.join(valid_fields)
-                    return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal'}
+                    return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal', 'success': False}
                 except Exception:
-                    return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
+                    return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal', 'success': False}
             # Now inject infrastructure fields (safe because validation passed)
-            if self.config.workspace_path:
-                tool_args['workspace_path'] = self.config.workspace_path
+            # workspace_path is ALWAYS taken from the executor config: it is an
+            # infrastructure field, so a caller-supplied value must never win.
+            tool_args['workspace_path'] = self.config.workspace_path
             if self.config.tool_output_token_limit is not None:
                 tool_args['token_limit'] = self.config.tool_output_token_limit
             # Check permission categories using the unified security gate
@@ -228,32 +409,170 @@ class ToolExecutor:
             if session_perms_obj is None:
                 session_perms_obj = SessionPermissions() if SessionPermissions else None
 
+            # A circular import can interrupt the module-level gate import
+            # above (security.security_gate caught mid-initialisation), leaving
+            # GATE_AVAILABLE False even though the gate is importable now that
+            # module import has settled.  Re-attempt the binding at first gate
+            # entry -- and if the gate genuinely cannot be resolved, deny
+            # (fail closed) rather than silently executing the tool ungated.
+            if session_perms_obj is not None and not GATE_AVAILABLE:
+                if not _ensure_gate_imported():
+                    return {'result': 'Permission denied: security gate unavailable; tool execution denied (fail-closed).', 'tool_type': 'normal', 'success': False}
+
+            # Assigned by the gate branch below; pre-declared so the
+            # worker-context injection further down can tell whether a live
+            # resolution happened (instead of relying on ``locals()``).
+            effective: Optional[Dict[str, Any]] = None
+
             if GATE_AVAILABLE and session_perms_obj is not None:
                 # Resolve workspace ID to load workspace capabilities
                 workspace_path = getattr(self.config, 'workspace_path', None)
                 ws_id = resolve_workspace_id(workspace_path) if (workspace_path and resolve_workspace_id) else None
+                required_categories = tool_class.get_required_categories(arguments)
+                # Fail-closed: when a workspace_path is configured but its
+                # workspace ID cannot be resolved, deny execution instead of
+                # silently falling back to (potentially permissive) default
+                # capabilities. Only tools that actually declare required
+                # capability categories are gated -- tools with no required
+                # categories have nothing to be permissive about and keep
+                # executing (e.g. introspection probes in tests).
+                if workspace_path and not ws_id and required_categories:
+                    return {'result': f"DENIED: could not resolve workspace_id for workspace_path={workspace_path}; tool execution denied (fail-closed).", 'tool_type': 'normal', 'success': False}
+                # Fallback workspace-id resolution when no workspace_path is
+                # configured: prefer the explicitly passed workspace_id (agent
+                # session context), then a cached best-effort lookup of the
+                # persisted session record's top-level 'workspace_id'.
+                if not ws_id:
+                    ws_id = workspace_id or self._resolve_workspace_id_from_session(session_id)
                 caps = get_workspace_capabilities(ws_id) if ws_id else WorkspaceCapabilities()
-                effective = get_effective_permissions(session_perms_obj, caps)
+                # Disk-authoritative permissions mode: when BOTH a session id
+                # and a workspace id are available, ask the gate to read the
+                # session's on-disk permissions record (vault sidecar,
+                # fail-closed on any store error) instead of trusting the
+                # in-memory mirror.  Workers now carry the REAL parent
+                # session/workspace ids (propagated at spawn through
+                # WorkerContext), so their vault sidecar record exists and
+                # disk-pure mode applies uniformly to main agents AND worker
+                # sub-agents: grants/revocations made to the parent session
+                # are re-read on every tool call, so stale in-memory mirrors
+                # no longer outlive the vault.  The legacy 2-arg merge below
+                # is kept only for genuinely id-less executors (direct
+                # construction, legacy paths, empty session_id).
+                if session_id and ws_id:
+                    effective = get_effective_permissions(
+                        session_perms_obj,
+                        caps,
+                        session_id=session_id,
+                        workspace_id=ws_id,
+                    )
+                else:
+                    # Fail-closed: an id-less executor (no session_id and/or
+                    # no resolvable workspace_id) has no on-disk authority to
+                    # read, so it must NOT inherit the in-memory mirror
+                    # (self.config.session_permissions), which can be
+                    # over-broad relative to the workspace ceiling / stored
+                    # record.  Merge against the deny-all profile so the
+                    # result can only ever restrict, never grant.
+                    effective = get_effective_permissions(
+                        _DISK_FAIL_CLOSED_SESSION, caps
+                    )
 
                 ok, error_msg = check_required_categories(
-                    tool_class.get_required_categories(arguments),
+                    required_categories,
                     effective,
                     tool_name=tool_name,
                     tool_args=arguments,
                     description=getattr(tool_class, 'describe_action', lambda a: '')(arguments),
-                    event_bus=global_event_bus,
+                    event_bus=self._event_bus or global_event_bus,
                     agent_id=str(agent_id),
                     session_id=session_id,
+                    # Worker context: cap the disk-effective permissions with
+                    # the DECLARED worker footprint from the worker definition
+                    # (agent_config.permission_footprint) -- never with the
+                    # spawn-time snapshot of the session's permissions
+                    # (session_perms_obj), which would pin the worker to the
+                    # permissions the session happened to hold at spawn and
+                    # make a later grant ineffective until respawn.
+                    #
+                    # Authority model:
+                    #   * the session's live on-disk record (minus the
+                    #     workspace ceiling) is the ONLY grant authority;
+                    #   * the declared footprint is the ONLY worker cap.
+                    # Composition is therefore
+                    #   effective = min(declared_footprint,
+                    #                   live_session_minus_ceiling),
+                    # so a revocation on disk still narrows the worker
+                    # immediately and a grant on disk widens it immediately,
+                    # up to whatever the worker definition declared.
+                    # An empty/absent footprint means "no declared cap": the
+                    # gate iterates ``(permission_footprint or {}).items()``,
+                    # so None/{} caps nothing and the live resolution stands.
+                    permission_footprint=(
+                        (getattr(self.config, 'permission_footprint', None) or None)
+                        if self._is_worker_context
+                        else None
+                    ),
+                    is_worker_context=self._is_worker_context,
                 )
+
+                # ── Widening observability (worker context only) ──────────
+                # Compare this call's resolution against the one observed on a
+                # previous call by this executor and audit every category that
+                # became MORE permissive.  This is the visible signature of a
+                # post-spawn GRANT: the resolution above is re-read from disk,
+                # so a grant written between two tool calls shows up here as a
+                # rank increase even though the worker was never respawned.
+                # Observe the POST-cap dict: ``check_required_categories``
+                # applies the declared footprint in place, so what comes back is
+                # what this worker can actually do.  The event reports a change
+                # in EFFECTIVE authority, therefore a grant that the declared
+                # footprint swallows is deliberately silent -- a capped grant is
+                # not a widening.  Storing the baseline from the same post-cap
+                # point keeps consecutive observations comparable.  Runs before
+                # the ``if not ok`` early return so a denied call also refreshes
+                # the baseline.
+                if self._is_worker_context:
+                    self._record_permission_widening(effective, session_id)
+
                 if not ok:
-                    return {'result': error_msg, 'tool_type': 'normal'}
+                    return {'result': error_msg, 'tool_type': 'normal', 'success': False}
+
+                # Resource binding check: tools bound to a hidden resource
+                # (requires_resource, e.g. git) may only run when the session
+                # holds the resource's read grain.
+                requires_resource = getattr(tool_class, 'requires_resource', None)
+                if requires_resource:
+                    ok2, err2 = check_requires_resource(
+                        requires_resource,
+                        effective,
+                        tool_name=tool_name,
+                        description=getattr(tool_class, 'describe_action', lambda a: '')(arguments),
+                    )
+                    if not ok2:
+                        return {'result': err2, 'tool_type': 'normal', 'success': False}
             # Inject session permissions dict so the tool can apply
             # fine-grained security (e.g., DockerCodeRunner uses it
             # to decide container network/filesystem modes).
-            if session_perms_obj is not None:
+            if self._is_worker_context and effective is not None:
+                # Worker context: hand the tool the SAME live resolution the
+                # gate just authorised (on-disk session permissions, capped by
+                # the workspace ceiling and the declared worker footprint --
+                # the gate applies that cap in place), not the spawn-time
+                # ``self.config.session_permissions`` snapshot.  A plain dict
+                # copy is injected so no gate-private dict attributes leak
+                # into tool code.
+                tool_args['session_permissions'] = dict(effective)
+            elif session_perms_obj is not None:
                 tool_args['session_permissions'] = session_perms_obj.to_dict()
             else:
                 tool_args['session_permissions'] = DEFAULT_SESSION_PERMISSIONS
+
+            # Inject effective permissions for in-tool atomic re-checks
+            if GATE_AVAILABLE and session_perms_obj is not None:
+                tool_args['effective_permissions'] = effective
+                tool_args['workspace_id'] = ws_id
+            else:
+                tool_args['effective_permissions'] = {}
 
             # Inject agent config for introspection tools
             if hasattr(self, 'config') and self.config is not None:
@@ -265,11 +584,98 @@ class ToolExecutor:
                     'base_url': getattr(self.config, 'base_url', None),
                     'model': getattr(self.config, 'model', None),
                     'tool_output_token_limit': getattr(self.config, 'tool_output_token_limit', None),
+                    'token_monitor_warning_threshold': getattr(self.config, 'token_monitor_warning_threshold', None),
+                    'token_monitor_critical_threshold': getattr(self.config, 'token_monitor_critical_threshold', None),
+                    'use_workspace_lifecycle_manager': getattr(self.config, 'use_workspace_lifecycle_manager', False),
+                    'log_dir': getattr(self.config, 'log_dir', None),
+                    'max_workers_per_session': getattr(self.config, 'max_workers_per_session', None),
+                    'worker_timeout_seconds': getattr(self.config, 'worker_timeout_seconds', None),
+                    'worker_max_retries': getattr(self.config, 'worker_max_retries', None),
                 }
             else:
                 tool_args['agent_config'] = None
 
-            tool_instance = tool_class(**tool_args)
+            # Inject session_id only for tools that support it (e.g. Worker)
+            if 'session_id' in valid_field_names:
+                tool_args['session_id'] = session_id
+
+            # Inject the calling worker's name (if any) for tools that declare
+            # the field (e.g. ContainerStartTool / DockerCodeRunner), so
+            # containers they create carry the ``thoughtmachine.worker``
+            # ownership label and worker teardown can reclaim them.
+            if 'worker_name' in valid_field_names:
+                _worker_name = current_worker_name()
+                if _worker_name:
+                    tool_args['worker_name'] = _worker_name
+
+            # Inject the worker-context flag unconditionally: tools that
+            # self-gate on the 'ask' grain (e.g. host_bash) must deny from a
+            # worker context instead of reaching an interactive approval
+            # prompt.  Worker executors pass is_worker_context=True; main-agent
+            # executors default to False and keep the interactive ask flow.
+            tool_args['is_worker_context'] = self._is_worker_context
+
+            # Credential injection: resolve {{credential:...}} placeholders in tool args
+            if tool_args:
+                credential_names: List[str] = []
+                try:
+                    from agent.credentials import CredentialInjector
+                    from agent.credentials.injector import _PLACEHOLDER_RE
+                    # Get workspace_id from the session context already available
+                    ws_id = None
+                    if 'session_permissions' in tool_args and isinstance(tool_args['session_permissions'], dict):
+                        ws_id = tool_args['session_permissions'].get('workspace_id')
+                    if not ws_id and 'workspace_id' in tool_args:
+                        ws_id = tool_args['workspace_id']
+                    if ws_id:
+                        # Collect the credential NAMES before injection: inject()
+                        # replaces every placeholder with its secret value, so
+                        # the names are unrecoverable afterwards.
+                        for value in tool_args.values():
+                            if isinstance(value, str):
+                                match = _PLACEHOLDER_RE.fullmatch(value)
+                                if match:
+                                    credential_names.append(match.group(1))
+                        injector = CredentialInjector(ws_id)
+                        tool_args = injector.inject(tool_args)
+                except Exception as exc:
+                    log('ERROR', 'core.credentials', "Credential injection failed for tool '%s': %s", tool_name, exc)
+                    return {'result': f"Credential injection failed: {exc}", 'tool_type': 'normal', 'success': False}
+
+                # Audit trail: one CREDENTIAL_USE event per injected credential
+                # name.  Names only -- values are never placed on the bus.
+                if _EVENT_SYSTEM_AVAILABLE:
+                    for credential_name in dict.fromkeys(credential_names):
+                        try:
+                            event_bus = self._event_bus or global_event_bus
+                            if event_bus is None:
+                                continue
+                            event_bus.publish(
+                                create_event(
+                                    EventType.CREDENTIAL_USE,
+                                    {
+                                        'credential_name': credential_name,
+                                        'tool_name': tool_name,
+                                        'session_id': session_id,
+                                    },
+                                    source='tool_executor',
+                                    session_id=session_id or None,
+                                )
+                            )
+                        except Exception as exc:
+                            log('ERROR', 'core.credentials', "Credential audit event failed for tool '%s': %s", tool_name, exc)
+
+            try:
+                tool_instance = tool_class(**tool_args)
+            except ValidationError:
+                # Safety net: if an injected infra field isn't accepted by this
+                # tool (e.g. a field was added unconditionally instead of gated),
+                # strip any key not in the model and retry once.
+                valid = set(tool_class.model_fields.keys())
+                for key in list(tool_args.keys()):
+                    if key not in valid:
+                        tool_args.pop(key)
+                tool_instance = tool_class(**tool_args)
             if self.logger:
                 if hasattr(self.logger, 'py_logger'):
                     tool_instance._set_logger(self.logger.py_logger)
@@ -286,15 +692,108 @@ class ToolExecutor:
             if not tool_instance.skip_output_truncation:
                 tool_result = tool_instance._truncate_output(tool_result)
             if isinstance(tool_instance, Respond):
-                return {'result': tool_result, 'tool_type': 'respond', 'response_type': tool_instance.response_type, 'content': tool_result}
+                return {
+                    'result': tool_result,
+                    'tool_type': 'respond',
+                    'response_type': tool_instance.response_type,
+                    'content': tool_result,
+                    'status': tool_instance.status,
+                    'confidence': tool_instance.confidence,
+                    'meta': tool_instance.meta,
+                }
             elif isinstance(tool_instance, SummarizeTool):
                 return {'result': tool_result, 'tool_type': 'summary', 'summary_text': tool_instance.summary, 'summary_keep_recent_turns': tool_instance.keep_recent_turns}
             else:
                 return {'result': tool_result, 'tool_type': 'normal'}
         except ValidationError as e:
-            return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
+            return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal', 'success': False}
         except Exception as e:
-            return {'result': f'Error executing tool: {e}', 'tool_type': 'normal'}
+            return {'result': f'Error executing tool: {e}', 'tool_type': 'normal', 'success': False}
+
+    def _record_permission_widening(self, effective: Any, session_id: str) -> None:
+        """Audit per-category permission WIDENING between tool calls (worker).
+
+        A worker's effective permissions are resolved from the session's live
+        on-disk record on every tool call, so a grant written after the worker
+        was spawned now takes effect immediately (no respawn).  That is the
+        intended behaviour, but a silent widening is exactly the kind of event
+        an operator must be able to see afterwards, so every category whose
+        rank increased since this executor's previous observation is emitted as
+        a ``worker_permission_widened`` audit record.
+
+        Rules:
+          * only categories present in BOTH observations are compared (a
+            category seen for the first time is a baseline, not a widening);
+          * a pair is skipped when either side cannot be ranked;
+          * an equal or lower rank is never reported (narrowing is already
+            recorded by the store that performed it).
+
+        ``actor`` is reported as ``"unknown"``: this executor only observes the
+        widening post-hoc and has no identity for whoever wrote the grant.  The
+        authority that knows the actor is the permission-store write path, which
+        is out of scope here; the record therefore carries the observation
+        context (``worker_id`` from the worker-name context var, ``session_id``
+        from the tool call) instead of guessing an actor.
+
+        Never raises: audit failures must not affect tool execution.
+        """
+        try:
+            previous = self._last_effective_permissions or {}
+            current = dict(effective or {})
+            for category, new_value in current.items():
+                if category not in previous:
+                    continue
+                old_value = previous[category]
+                old_rank = _permission_rank(old_value)
+                new_rank = _permission_rank(new_value)
+                if old_rank is None or new_rank is None:
+                    continue
+                if new_rank <= old_rank:
+                    continue
+                audit_event(
+                    "worker_permission_widened",
+                    json.dumps(
+                        {
+                            "worker_id": current_worker_name(),
+                            "session_id": session_id,
+                            "category": category,
+                            "old_value": old_value,
+                            "new_value": new_value,
+                            "actor": "unknown",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ),
+                )
+            if current:
+                self._last_effective_permissions = current
+        except Exception:  # noqa: BLE001 - observability only, never blocking
+            pass
+
+    def _resolve_workspace_id_from_session(self, session_id: str) -> Optional[str]:
+        """Best-effort resolve a session's workspace_id from its persisted
+        session record (top-level 'workspace_id' field).  Never raises and
+        never fails closed: any lookup error simply yields None, letting the
+        caller fall back to legacy mirror behaviour."""
+        if not session_id:
+            return None
+        cached = self._session_workspace_id_cache.get(session_id)
+        if cached:
+            return cached
+        try:
+            from session.store import FileSystemSessionStore
+            store = FileSystemSessionStore()
+            path = store._find_session_path(session_id)
+            if path is None:
+                return None
+            raw = json.loads(path.read_text(encoding='utf-8'))
+            ws_id = raw.get('workspace_id') if isinstance(raw, dict) else None
+            if ws_id:
+                self._session_workspace_id_cache[session_id] = ws_id
+                return ws_id
+        except Exception:
+            pass
+        return None
 
     def close(self):
         """Close and release any resources held by this executor."""
@@ -312,18 +811,18 @@ class ToolExecutor:
             return len(str(text)) // 4
 
     def _create_tool_rejection_message(self, tool_name: str) -> str:
-        """Create rejection message for disallowed tool calls."""
+        """Create concise rejection message for disallowed tool calls.
+        
+        Includes the restriction reason so the LLM understands why the tool
+        was blocked (e.g., 'timeout', 'token', 'turn') rather than retrying
+        the same call blindly.
+        """
         allowed_tools = self.state.get_allowed_tools()
+        restriction_reason = getattr(self.state, 'restriction_reason', None)
         if allowed_tools:
-            # Dynamically list all allowed tools
-            allowed_list = '\n'.join(f'- {t}' for t in allowed_tools)
-            return (
-                f"❌ TOOL CALL REJECTED ❌"
-                f"\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN."
-                f"\n\nCurrent state: restrictions_active (limit exceeded)"
-                f"\nWhy: Token or turn limits exceeded."
-                f"\n\nYou may call:\n{allowed_list}"
-                f"\n\nPlease use one of the allowed tools now."
-            )
+            allowed_list = ', '.join(allowed_tools)
+            if restriction_reason:
+                return f"Tool '{tool_name}' not allowed. Reason: {restriction_reason}. Available tools: {allowed_list}"
+            return f"Tool not allowed. Available tools: {allowed_list}"
         else:
-            return f"❌ TOOL CALL REJECTED ❌\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN.\n\nCurrent state: token_state={self.state.token_state.value}, turn_state={self.state.turn_state.value}\nPossible reasons: Token or turn limits exceeded with active restrictions.\n\nCheck system warnings for required actions."
+            return f"Tool not allowed. Available tools: none"

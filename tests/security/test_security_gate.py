@@ -36,6 +36,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from security.security_gate import (
+    apply_workspace_ceiling,
     check_required_categories,
     get_effective_permissions,
     get_workspace_capabilities,
@@ -81,12 +82,15 @@ class TestWorkspaceCapabilitiesModel:
 
 class TestGetWorkspaceCapabilities:
     def test_default_when_file_missing(self):
-        """When the capabilities file does not exist, return fully-permissive defaults."""
+        """When the capabilities file does not exist, fail closed (all denied)."""
+        # NOTE: get_workspace_capabilities is fail-closed — a missing
+        # capabilities file yields all-False capabilities, never permissive
+        # defaults, so an unregistered workspace gets no capabilities.
         caps = get_workspace_capabilities("nonexistent_workspace")
-        assert caps.allow_network is True  # canonical default
-        assert caps.allow_docker is True
-        assert caps.filesystem_write is True
-        assert caps.git_available is True
+        assert caps.allow_network is False
+        assert caps.allow_docker is False
+        assert caps.filesystem_write is False
+        assert caps.git_available is False
 
     def test_loads_real_values(self):
         """Read values from a well-formed capabilities JSON."""
@@ -130,13 +134,19 @@ class TestGetWorkspaceCapabilities:
 
 class TestEffectivePermissionsMerge:
     def test_all_max(self):
-        """All-session-max with all-workspace-true yields maximum effective permissions."""
+        """All-session-max with all-workspace-true yields maximum effective permissions.
+
+        The effective dict carries exactly the canonical category keys
+        (filesystem | network | container | git | mcp | host_bash | ci |
+        credential | visual); the
+        legacy ``system`` grain was removed in the permission-schema
+        unification and is never emitted.
+        """
         session = SessionPermissions(
             filesystem="write",
             network="write",
             container=True,
             git="write",
-            system="full",
         )
         workspace = WorkspaceCapabilities(
             allow_network=True,
@@ -149,7 +159,12 @@ class TestEffectivePermissionsMerge:
         assert eff["network"] == "write"  # "write" + workspace=True → "write" (pass-through)
         assert eff["container"] is True
         assert eff["git"] == "write"
-        assert eff["system"] == "full"
+        assert eff["mcp"] == "banned"  # session default
+        assert eff["host_bash"] == "banned"  # session default
+        assert set(eff) == {
+            "filesystem", "network", "container", "git", "mcp", "host_bash",
+            "ci", "credential", "visual",
+        }
 
     def test_network_workspace_denied(self):
         """Workspace allow_network=False → effective network=False."""
@@ -214,12 +229,23 @@ class TestEffectivePermissionsMerge:
         eff = get_effective_permissions(session, workspace)
         assert eff["container"] is True
 
-    def test_system_passthrough(self):
-        """System permission passes through unchanged (no workspace cap)."""
-        session = SessionPermissions(system="read")
+    def test_system_grain_not_emitted(self):
+        """Legacy system/execution grains never reach the effective dict.
+
+        SessionPermissions no longer declares ``system``/``execution``
+        fields (permission-schema unification); the effective dict exposes
+        only the seven canonical category keys, so no ``system``-keyed gate
+        look-up can ever succeed.
+        """
+        session = SessionPermissions()
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(session, workspace)
-        assert eff["system"] == "read"
+        assert "system" not in eff
+        assert "execution" not in eff
+        assert set(eff) == {
+            "filesystem", "network", "container", "git", "mcp", "host_bash",
+            "ci", "credential", "visual",
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -469,3 +495,93 @@ class TestResolvePrompt:
         # check_required_categories owns the cleanup.
         # But we can test that the value was placed on the queue.
         assert not q.empty()
+
+
+# ===========================================================================
+#  apply_workspace_ceiling -- host_bash seam
+# ===========================================================================
+
+
+class TestApplyWorkspaceCeilingHostBash:
+    """The host_bash ceiling branch caps allow/ask/banned on its own scale.
+
+    host_bash ranks ``banned < ask < allow``, which is NOT the shared
+    ``WORKSPACE_CEILING_LEVELS`` table, so ``apply_workspace_ceiling``
+    intercepts it before the generic rank normalisation (else an 'allow'
+    ceiling would hit the unknown-level fail-open path).  The rule under
+    test: whenever the ceiling ranks strictly below the session grant the
+    result is forced to the below-ask tier ``banned`` -- an 'ask' ceiling
+    over an 'allow' grant must never emit 'ask' (prompts come only from
+    genuine session-level 'ask' grants).
+    """
+
+    def test_ask_ceiling_caps_allow_to_banned(self):
+        result = apply_workspace_ceiling(
+            {"host_bash": "ask"}, {"host_bash": "allow"}
+        )
+        assert result == {"host_bash": "banned"}
+
+    def test_banned_ceiling_caps_allow_to_banned(self):
+        result = apply_workspace_ceiling(
+            {"host_bash": "banned"}, {"host_bash": "allow"}
+        )
+        assert result == {"host_bash": "banned"}
+
+    def test_bool_false_ceiling_caps_allow_to_banned(self):
+        result = apply_workspace_ceiling(
+            {"host_bash": False}, {"host_bash": "allow"}
+        )
+        assert result == {"host_bash": "banned"}
+
+    def test_allow_ceiling_keeps_allow_grant(self):
+        result = apply_workspace_ceiling(
+            {"host_bash": "allow"}, {"host_bash": "allow"}
+        )
+        assert result == {"host_bash": "allow"}
+
+
+# ===========================================================================
+#  check_required_categories -- host_bash category gate
+# ===========================================================================
+
+
+class TestCheckRequiredCategoriesHostBash:
+    """The outer gate resolves a ``host_bash:allow`` requirement against the
+    effective host_bash grain.
+
+    The tool declares the VALUE form ``["host_bash:allow"]``
+    (tools/host_bash_tool.py) precisely because the gate's requirement loop
+    SKIPS any entry lacking ``":"`` (security_gate.py:1483-1485): a bare
+    ``["host_bash"]`` would gate nothing.  These pins exercise the value form
+    the gate actually evaluates, i.e. the value-satisfaction table for the
+    host_bash category.
+    """
+
+    def test_allow_grain_satisfies_allow_requirement(self):
+        eff = {"host_bash": "allow"}
+        ok, msg = check_required_categories(
+            ["host_bash:allow"], eff, "TestTool", {}, "", None
+        )
+        assert ok is True
+
+    def test_banned_grain_denies_allow_requirement(self):
+        eff = {"host_bash": "banned"}
+        ok, msg = check_required_categories(
+            ["host_bash:allow"], eff, "TestTool", {}, "", None
+        )
+        assert ok is False
+
+    def test_ask_grain_without_event_bus_denies_with_approval_hint(self):
+        eff = {"host_bash": "ask"}
+        ok, msg = check_required_categories(
+            ["host_bash:allow"], eff, "TestTool", {}, "", None
+        )
+        assert ok is False
+        assert "interactive approval" in msg
+
+    def test_bare_category_without_value_is_silently_skipped(self):
+        """A colon-less requirement entry is SKIPPED (no footprint): a bare ``["host_bash"]`` gates nothing."""
+        ok, msg = check_required_categories(["host_bash"], {"host_bash": "banned"}, "TestTool", {}, "", None)
+        assert ok is True
+        assert msg == ""
+

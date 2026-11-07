@@ -171,7 +171,7 @@ class TestAgentConfigSystemPromptValidator:
 
     def test_custom_file_takes_precedence(self, _patch_loader_paths, monkeypatch):
         """When custom_system_prompt.txt exists and a non-empty value is passed,
-        the custom file wins."""
+        the custom file wins (model-level API contract for mode='custom')."""
         fake_home = _patch_loader_paths
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
@@ -180,16 +180,22 @@ class TestAgentConfigSystemPromptValidator:
         custom_path.parent.mkdir(parents=True, exist_ok=True)
         custom_path.write_text("Custom file prompt", encoding="utf-8")
 
-        cfg = AgentConfig(system_prompt="Explicit prompt")
+        # NOTE legacy GUI gap: the PyQt GUI Session.mode is never 'custom'
+        # (GUI users always get the factory default prompt), so these tests
+        # assert the model-level API contract for custom-mode precedence.
+        cfg = AgentConfig(mode="custom", system_prompt="Explicit prompt")
         # Custom file should win over explicit value
         assert cfg.system_prompt == "Custom file prompt"
 
     def test_explicit_value_when_no_custom_file(self, _patch_loader_paths, monkeypatch):
-        """When no custom file, the explicit value passed to the constructor is used."""
+        """When no custom file, the explicit value passed to the constructor is used
+        (model-level API contract for mode='custom')."""
         fake_home = _patch_loader_paths
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
-        cfg = AgentConfig(system_prompt="My explicit prompt")
+        # mode='custom' keeps the explicit value intact (see GUI-gap note in
+        # test_custom_file_takes_precedence).
+        cfg = AgentConfig(mode="custom", system_prompt="My explicit prompt")
         assert cfg.system_prompt == "My explicit prompt"
 
     def test_empty_string_falls_to_factory(self, _patch_loader_paths, monkeypatch):

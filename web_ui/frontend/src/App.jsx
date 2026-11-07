@@ -1,64 +1,253 @@
 /*
  * App.jsx
  *
- * Root component — hub WebSocket for sessions list + tab management.
+ * Root component — hub WebSocket for sessions list + per-workspace tab strip.
  *
- * Architecture (multi-tab):
- *   ┌──────────────────────────────────────────────────┐
- *   │                   TabBar                          │
- *   ├──────────────────────────────────────────────────┤
- *   │  ┌─ Tab 1 ──┐  ┌─ Tab 2 ──┐  ┌─ Tab 3 ──┐      │
- *   │  │ SessionTab │  │ SessionTab │  │ SessionTab │  │
- *   │  │ (own WS)  │  │ (own WS)  │  │ (own WS)  │  │
- *   │  └───────────┘  └───────────┘  └───────────┘      │
- *   ├──────────────────────────────────────────────────┤
- *   │              SessionList (sidebar)                │
- *   └──────────────────────────────────────────────────┘
+ * Architecture (workspace panel shell, Phase 4 + R7):
+ *   ┌──────────────────────────────────────────────────────────────────────┐
+ *   │  [WorkspaceDetailPage | WorkspaceSelector]   route                   │
+ *   │  [TabBar strip]  — per-workspace session tabs (frontend-only state)  │
+ *   │  ┌─ SessionTab ─┐ (tabs visited on the session layer stay mounted   │
+ *   │  │ (own WS)     │  as a hidden deck, so tab switches preserve state  │
+ *   │  └──────────────┘  (no remount); leaving the layer unmounts all)     │
+ *   ├──────────────────────────────────────────────────────────────────────┤
+ *   │           WorkerOutputPanel (sidebar)                                │
+ *   └──────────────────────────────────────────────────────────────────────┘
  *
  * App maintains one "hub" WebSocket that only handles:
- *   - list_sessions → sessions_list
- *   - session_saved
- *   - session_deleted
- *   - session_renamed
+ *   - list_sessions        → sessions_list
+ *   - get_open_sessions    → open_sessions (R7 restore/merge)
+ *   - session_saved / session_deleted / session_renamed / session_closed
  *
  * Each SessionTab creates its OWN WebSocket for session interaction.
- * App manages a tabs array: [ { tabId, sessionId }, ... ]
+ *
+ * Tab state lives in src/sessionTabsStore.js, keyed by workspace id and
+ * persisted to localStorage (`tm.sessionTabs.<workspaceId>`). Closing a tab
+ * is frontend-only — the session stays open server-side.
+ *
+ * Routing (see src/router.js):
+ *   #/workspaces          → WorkspaceSelector (no strip)
+ *   #/workspace/:id       → WorkspaceDetailPage (+ session tab strip)
+ *   #/session/:sessionId  → tabbed session view (tab ensured + activated)
  */
 
 import React, { useEffect, useRef, useCallback, useState, useMemo } from 'react'
 import useStore from './store/useStore'
+import useWorkspaceStore from './store/workspaceStore'
+import useSessionTabsStore from './sessionTabsStore'
 import SessionTab from './components/SessionTab'
-import SessionList from './components/SessionList'
 import TabBar from './components/TabBar'
-import SessionActionsPanel from './components/SessionActionsPanel'
+import WorkerPanelArea from './components/WorkerPanelArea'
+import { isWorkerEventRenderable } from './components/chat/adaptWorkerEvent'
+import { routeEventsToPanels } from './components/chat/workerEventRouting'
+import LoggingPanel from './components/LoggingPanel'
+import OnboardingWizard from './components/OnboardingWizard'
+import WorkspaceSelector from './components/WorkspaceSelector'
+import WorkspaceDetailPage from './components/workspace/WorkspaceDetailPage'
+import LayerNav from './components/LayerNav'
+import { useRoute, useNavigate } from './router'
+import { apiUrl, wsUrl } from './apiBase'
+import { isSessionInWorkspace } from './sessionLookup'
 import './styles.css'
 
-const WS_URL = `ws://${window.location.hostname}:8000/ws`
-
-let nextTabId = 1
+const TABS_PREFIX = 'tm.sessionTabs.'
+const WORKER_PANELS_PREFIX = 'tm.workerPanels.'
+const PANEL_SIZE_MIN = 250
+const PANEL_SIZE_MAX = 600
+const PANEL_SIZE_DEFAULT = 350
+// Instance key uniquely identifying a worker panel within a session
+// (worker name + instance id; missing instance id treated as '0').
+const workerPanelInstanceKey = (panel) => `${panel.worker_name}#${panel.instance_id ?? '0'}`
+// Session ids that already have tabs in the tab store. Used at boot to
+// decide which per-session worker-panel state to restore from localStorage.
+function bootSessionIds() {
+  try {
+    const tabState = useSessionTabsStore.getState()
+    const sessions = new Set()
+    Object.values(tabState.byWorkspace || {}).forEach(we => {
+      (we?.tabs || []).forEach(t => {
+        if (t?.sessionId) sessions.add(t.sessionId)
+      })
+    })
+    return sessions
+  } catch {
+    return new Set()
+  }
+}
 
 export default function App() {
-  const [tabs, setTabs] = useState([])           // { tabId, sessionId }
-  const [activeTabId, setActiveTabId] = useState(null)
-  const [showSessions, setShowSessions] = useState(false)
-  const [tabRunningStates, setTabRunningStates] = useState({})
+  const route = useRoute()
+  const navigate = useNavigate()
+
+  // ── Workspace context (sessionId → workspaceId mapping) ──────────────
+  const sessionWorkspacesRef = useRef({})   // sessionId → workspaceId (learned from server)
+  const lastKnownWorkspaceRef = useRef(null)
+  const currentWsRef = useRef(null)
+  const routeRef = useRef(route)
+  routeRef.current = route
+
+  // The workspace that owns the current tab strip. For workspace routes it is
+  // the route id; for session routes it is whatever workspace we know the
+  // session belongs to (learned from sessions_list / open_sessions /
+  // session_loaded via onWorkspaceKnown); otherwise the last known workspace.
+  const currentWs = route?.view === 'workspace'
+    ? route.id
+    : route?.view === 'session'
+      ? (route.workspaceId || sessionWorkspacesRef.current[route.id] || lastKnownWorkspaceRef.current || null)
+      : (lastKnownWorkspaceRef.current || null)
+  currentWsRef.current = currentWs
+
   const wsRef = useRef(null)
   const [hubWs, setHubWs] = useState(null)
   const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
   const [hubReady, setHubReady] = useState(false)
-  const [sessionPanelOpen, setSessionPanelOpen] = useState(false)
+  const hydratedRef = useRef(false)              // boot-time restore ran once
+  const tabsSeenOnceRef = useRef(new Set())      // session ids ever seen in tabs (guards the LS sweep)
+  const panelsRestoredRef = useRef(false)        // worker-panel LS restore ran once
+  const bootWsRef = useRef(null)                 // workspace hydrated at boot
+  const [workspaceKnownTick, setWorkspaceKnownTick] = useState(0)  // bump when a session→workspace mapping appears
+  // Deep-link admission: `${workspaceId}:${sessionId}` → true | false |
+  // 'pending' | null (null = the probe could not answer → fail open). See the
+  // deep-link membership validation effect below.
+  const deepLinkVerdictsRef = useRef({})
+  const [deepLinkTick, setDeepLinkTick] = useState(0)  // bump when a verdict lands
 
-  const tabActionsRef = useRef({})
-  const tabLoadTriggeredRef = useRef({})   // track which deferred tabs have had load triggered
-  const deferredLoadSentRef = useRef({})   // track whether load_session was actually sent via sendCommand
-  const tabsRef = useRef(tabs)
-  tabsRef.current = tabs
+  // ── Worker panels state per session ───────────────────────────────────
+  // workerPanelsBySession: { [sessionId]: [panel, ...] } — panel = { instance_id,
+  //   instance_label, worker_name, workspaceId, size, maximized, pinned, order }
+  // focusedPanelBySession: { [sessionId]: instanceKey | null } — focused panel
+  //   per session (null → fall back to the most recently opened panel).
+  // Persisted per-session in localStorage (tm.workerPanels.<sid> and .focused).
+  const [workerPanelsBySession, setWorkerPanelsBySession] = useState(() => {
+    try {
+      const sessions = bootSessionIds()
+      const result = {}
+      sessions.forEach(sid => {
+        const saved = localStorage.getItem(WORKER_PANELS_PREFIX + sid)
+        if (!saved) return
+        const parsed = JSON.parse(saved)
+        if (!Array.isArray(parsed)) return
+        const panels = parsed.filter(p => p && typeof p === 'object' && p.worker_name)
+        if (panels.length > 0) result[sid] = panels
+      })
+      return result
+    } catch {
+      return {}
+    }
+  })
+  const [focusedPanelBySession, setFocusedPanelBySession] = useState(() => {
+    try {
+      const sessions = bootSessionIds()
+      const result = {}
+      sessions.forEach(sid => {
+        const saved = localStorage.getItem(WORKER_PANELS_PREFIX + sid + '.focused')
+        if (saved != null) result[sid] = saved
+      })
+      return result
+    } catch {
+      return {}
+    }
+  })
 
-  // Snapshot which session ID was active at startup (from localStorage),
-  // so we know which tabs should load on WS connect vs defer.
-  const startupActiveSessionId = useMemo(() => {
-    return localStorage.getItem('activeSessionId')
-  }, [])   // tabId -> { sendCommand, getSessionId }
+  // ── Keep-mounted session deck (per workspace, in-memory only) ─────────
+  // mountedSessions[ws] = session ids whose SessionTab is currently mounted
+  // (visible or hidden) on the session layer. A tab is mounted on its first
+  // activation on this layer and STAYS mounted while the layer is active, so
+  // switching tabs preserves each session's in-memory state (query drafts,
+  // loaded conversation) instead of unmount/remount churn. Leaving the
+  // session layer (workspace/selector route) clears the deck — panes unmount
+  // and the next session entry mounts lazily again (workspace-panel model).
+  const [mountedSessions, setMountedSessions] = useState({})
+
+  const [showLoggingPanel, setShowLoggingPanel] = useState(false)
+  const [loggingConfig, setLoggingConfig] = useState(null)
+  const [loggingConfigError, setLoggingConfigError] = useState(null)
+  const [workerEvents, setWorkerEvents] = useState({})  // { [sessionId]: [event, ...] } live WS worker events
+  const [dockerHealth, setDockerHealth] = useState(null)  // /api/health/containers payload (null while loading or backend down)
+  const [backendDown, setBackendDown] = useState(false)   // health fetch failed or non-200 → backend unreachable
+  const [backendBannerDismissed, setBackendBannerDismissed] = useState(false)
+  const [onboardingDone, setOnboardingDone] = useState(null)  // null = unknown / fetch failed (wizard hidden); false → show wizard
+
+  const pendingWorkerSelectionRef = useRef(null)  // { workerName, workspaceId, instanceId, instanceLabel } queued before activeSessionId is set
+  const tabActionsRef = useRef({})                // tabId -> { sendCommand, getSessionId }
+  const healthInFlightRef = useRef(false)         // guards overlapping health polls
+
+  // ── Per-workspace tab strip selectors (currentWs-scoped) ─────────────
+  const storeEntry = useSessionTabsStore(s => (currentWs ? s.byWorkspace[currentWs] : null))
+  const tabs = storeEntry?.tabs || []
+  const activeSessionId = storeEntry?.activeSessionId || null
+  const activeTab = tabs.find(t => t.sessionId === activeSessionId) || null
+  // Focused worker panel per session: explicit focus wins, else the most
+  // recently opened (last) panel. selectedWorker exposes the consumer
+  // contract: name, workspaceId, instance_id, instance_label.
+  const focusedPanelInstanceKeyFor = (sid) => {
+    const panels = workerPanelsBySession[sid] || []
+    if (panels.length === 0) return null
+    const focused = focusedPanelBySession[sid]
+    if (focused != null && panels.some(p => workerPanelInstanceKey(p) === focused)) return focused
+    return workerPanelInstanceKey(panels[panels.length - 1])
+  }
+  // Per-session selected worker — the keep-mounted deck renders several
+  // SessionTabs, each of which needs the worker selection of ITS session.
+  const selectedWorkerFor = (sid) => {
+    if (!sid) return null
+    const key = focusedPanelInstanceKeyFor(sid)
+    if (!key) return null
+    const panels = workerPanelsBySession[sid] || []
+    const entry = panels.find(p => workerPanelInstanceKey(p) === key) || null
+    return entry ? { ...entry, name: entry.worker_name, workspaceId: entry.workspaceId } : null
+  }
+  const selectedWorker = activeSessionId ? selectedWorkerFor(activeSessionId) : null
+  // Worker events pre-routed to per-panel buckets ({ [instanceKey]: [event, ...] }).
+  // Routing is pure — every event goes to EVERY panel it matches.
+  const routedEvents = useMemo(
+    () => routeEventsToPanels(workerEvents[activeSessionId] || [], workerPanelsBySession[activeSessionId] || []),
+    [workerEvents, activeSessionId, workerPanelsBySession]
+  )
+
+  const tabRunningStates = useStore(s => s.tabRunningStates)
+  const routeSessionConfig = useStore(s => (route?.view === 'session' && route.id ? s.sessionConfigs[route.id] : undefined))
+  const workspaceList = useWorkspaceStore(s => s.workspaceList)
+
+  // Human-readable session name from the shared store (sessions_list data).
+  const nameFromStore = (sessionId) => {
+    if (!sessionId) return ''
+    const s = useStore.getState().sessions.find(x => x.session_id === sessionId)
+    return s?.name || ''
+  }
+
+  // --- Shared top-left breadcrumb (LayerNav) labels -------------------
+  // Workspace label comes from workspaceStore.workspaceList ({ id, name }).
+  const layerNavWorkspaceLabel =
+    route?.view === 'workspace'
+      ? (workspaceList.find(w => w.id === route.id)?.name ?? null)
+      : route?.view === 'session' && route.workspaceId
+        ? (workspaceList.find(w => w.id === route.workspaceId)?.name ?? null)
+        : null
+  // Session label: current-strip tab title first, else the shared sessions store.
+  const layerNavSessionLabel =
+    route?.view === 'session' && route.id
+      ? (tabs.find(t => t.sessionId === route.id)?.title || nameFromStore(route.id) || null)
+      : null
+
+  // Central rename application. Session renames reach this component through
+  // two paths — the inline rename UI and WS session_renamed events (the tab
+  // WS via SessionTab's onSessionRenamed callback, or the hub when relayed).
+  // Both must update the persisted tab-strip title IMMEDIATELY (no reload),
+  // not just the shared sessions name store. updateSessionName is idempotent,
+  // so a rename applied twice (optimistic UI + echoed WS event) is harmless.
+  const applySessionRename = useCallback((sessionId, newName) => {
+    if (!sessionId || !newName) return
+    useStore.getState().updateSessionName(sessionId, newName)
+    const st = useSessionTabsStore.getState()
+    // Resolve the owning workspace: the learned mapping wins; otherwise look
+    // for any strip entry that already holds this session's tab; fall back to
+    // the last-known / current workspace.
+    const byWs = st.byWorkspace || {}
+    const foundWs = Object.keys(byWs).find(ws => (byWs[ws]?.tabs || []).some(t => t.sessionId === sessionId))
+    const ws = sessionWorkspacesRef.current[sessionId] || foundWs || lastKnownWorkspaceRef.current || currentWsRef.current
+    if (ws) st.setTabTitle(ws, sessionId, newName)
+  }, [])
 
   // ── Hub WebSocket (sessions list only) with auto-reconnect ────────────
   const reconnectTimeoutRef = useRef(null)
@@ -79,14 +268,12 @@ export default function App() {
       reconnectTimeoutRef.current = null
     }
 
-    const ws = new WebSocket(WS_URL)
+    const ws = new WebSocket(wsUrl())
     wsRef.current = ws
 
     ws.onopen = () => {
       console.log("[Hub WS] onopen")
-      // Already set at connectHub entry; this is just a sanity double-set
       hubHasConnectedOnceRef.current = true
-      // Reset reconnect counter on successful connection
       reconnectAttemptsRef.current = 0
       setHubWs(ws)
       ws.send(JSON.stringify({ command: 'list_sessions' }))
@@ -95,7 +282,7 @@ export default function App() {
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
-        handleHubEvent(msg)
+        handleHubEventRef.current(msg)
         // Tabs may connect only after hub has received open_sessions
         if (msg.type === 'open_sessions') {
           console.log('[Hub WS] open_sessions processed, tabs may connect now')
@@ -107,6 +294,11 @@ export default function App() {
     }
 
     ws.onclose = (e) => {
+      // Guard: only act if this WS is still the "current" one.
+      if (wsRef.current !== ws) {
+        console.log('[Hub WS] ignoring stale onclose (not the current WS)')
+        return
+      }
       setHubWs(null)
       setHubReady(false)
       // 1001 = normal close (component unmounting / page unload), keep flag, don't reconnect
@@ -117,7 +309,10 @@ export default function App() {
           return
         }
         hubHasConnectedOnceRef.current = false  // allow reconnection on real errors
-        const delay = 1000 + Math.random() * 3000  // 1–4s jitter
+        // First retry is faster (0.5–1s), subsequent attempts use wider jitter (1–4s)
+        const delay = reconnectAttemptsRef.current <= 1
+          ? 500 + Math.random() * 500
+          : 1000 + Math.random() * 3000
         console.log(`[Hub WS] disconnected (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS}), reconnecting in ${Math.round(delay)}ms...`)
         reconnectTimeoutRef.current = setTimeout(connectHub, delay)
       }
@@ -130,7 +325,7 @@ export default function App() {
     return ws
   }, [])
 
-  // ── WebSocket lifecycle + clean close on page unload ──────────────
+  // ── WebSocket lifecycle + clean close on page unload ─────────────────
   useEffect(() => {
     const ws = connectHub()
 
@@ -139,8 +334,6 @@ export default function App() {
         clearTimeout(reconnectTimeoutRef.current)
         reconnectTimeoutRef.current = null
       }
-      // Close with code 1001 (going away) — the reconnect logic skips 1001,
-      // so stale/old pages won't keep reconnecting on refresh/close.
       try {
         const current = wsRef.current
         if (current && (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)) {
@@ -158,11 +351,13 @@ export default function App() {
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current)
       }
+      wsRef.current = null
+      hubHasConnectedOnceRef.current = false
       ws?.close()  // may be null if connectHub guard skipped duplicate
     }
   }, [connectHub])
 
-  // ── Request open sessions when hub WS connects ──────────────────────────
+  // ── Request open sessions when hub WS connects ───────────────────────
   useEffect(() => {
     if (hubWs && hubWs.readyState === WebSocket.OPEN) {
       hubWs.send(JSON.stringify({ command: 'get_open_sessions' }))
@@ -170,169 +365,471 @@ export default function App() {
     }
   }, [hubWs])
 
-  // ── Hub event router ────────────────────────────────────────────────────
+  // ── Hub event router ─────────────────────────────────────────────────
   function handleHubEvent(msg) {
     const store = useStore.getState()
     switch (msg.type) {
-      case 'sessions_list':
-        store.setSessions(msg.sessions ?? [])
+      case 'sessions_list': {
+        const list = msg.sessions ?? []
+        store.setSessions(list)
+        // sessions_list entries carry workspace_id (session registry) — use
+        // them to learn which workspace owns each session.
+        let changed = false
+        list.forEach(s => {
+          if (s.workspace_id && sessionWorkspacesRef.current[s.session_id] !== s.workspace_id) {
+            sessionWorkspacesRef.current[s.session_id] = s.workspace_id
+            lastKnownWorkspaceRef.current = s.workspace_id
+            changed = true
+          }
+        })
+        if (changed) setWorkspaceKnownTick(t => t + 1)
         break
+      }
       case 'session_saved':
         // session_saved is never sent to the hub WS (only to tab WSes).
         // Tab WS triggers refresh via onSessionSaved callback → hubSend('list_sessions').
         break
-      case 'session_deleted':
+      case 'session_deleted': {
+        const deletedId = msg.session_id
+        if (deletedId) {
+          useStore.getState().removeSession(deletedId)
+          const ws = sessionWorkspacesRef.current[deletedId] || currentWsRef.current
+          if (ws) {
+            useSessionTabsStore.getState().closeTab(ws, deletedId)
+            removeMounted(ws, deletedId)
+          }
+          delete sessionWorkspacesRef.current[deletedId]
+          // If the user is viewing the deleted session, drop back to the
+          // workspace list (the tab is gone, so there is nothing left to show).
+          if (route?.view === 'session' && route.id === deletedId) {
+            navigate('/workspaces')
+          }
+        }
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
+      }
       case 'session_renamed':
+        // Apply the new name immediately (tab strip + persisted tab state +
+        // shared name store) — no page reload — then re-fetch the full
+        // session list to keep the sidebar and mappings in sync.
+        if (msg.new_name) applySessionRename(msg.session_id, msg.new_name)
+        wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
+        break
+      case 'session_closed':
+        // re-fetch the full session list to keep sidebar + mappings in sync
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
       case 'open_sessions':
         console.log('[Hub WS] open_sessions received:', msg.sessions)
-        // Restore previously active tab (by session ID) instead of defaulting
-        // to the last-loaded tab.  Tab IDs are ephemeral (regenerated on every
-        // page load), so we persist the session ID instead.
-        const savedSessionId = localStorage.getItem('activeSessionId')
-        if (msg.sessions && msg.sessions.length > 0) {
-          msg.sessions.forEach(s => {
-            loadTab(s.session_id, savedSessionId)
+        // R7 restore/merge: add server-open sessions that are not yet in the
+        // persisted strip (LAZY — strip entries only; the active tab is the
+        // persisted activeSessionId, restored by hydrate at boot).
+        {
+          const sessions = Array.isArray(msg.sessions) ? msg.sessions : []
+          const openIds = new Set(sessions.map(s => s.session_id))
+          let changed = false
+          let removedStrayTabs = false
+          // Candidate strips for the repair pass below: everything currently in
+          // memory plus every strip persisted in localStorage (hydrated on
+          // demand so a strip we have never visited can still be cleaned).
+          const stripWs = (() => {
+            const keys = new Set(Object.keys(useSessionTabsStore.getState().byWorkspace))
+            try {
+              for (let i = 0; i < localStorage.length; i += 1) {
+                const k = localStorage.key(i)
+                if (k && k.startsWith(TABS_PREFIX)) keys.add(k.slice(TABS_PREFIX.length))
+              }
+            } catch { /* ignore */ }
+            keys.forEach(w => { if (w) useSessionTabsStore.getState().hydrate(w) })
+            return [...keys]
+          })()
+          sessions.forEach(s => {
+            // ``open_sessions`` is GLOBAL — it lists every open session from
+            // EVERY workspace. Resolve the owning workspace from authoritative
+            // sources only: the workspace_id the server sends, the
+            // sessions_list mapping held in the store, or the mapping learned
+            // from earlier session events.
+            const knownWs = useStore.getState().sessions.find(x => x.session_id === s.session_id)?.workspace_id
+            const ws = s.workspace_id || knownWs || sessionWorkspacesRef.current[s.session_id]
+            // FAIL CLOSED. Guessing "whatever workspace is on screen" (the old
+            // lastKnownWorkspaceRef || currentWsRef tail) is exactly what piled
+            // every workspace's open sessions into a single strip.
+            if (!ws) return
+            if (sessionWorkspacesRef.current[s.session_id] !== ws) {
+              sessionWorkspacesRef.current[s.session_id] = ws
+              changed = true
+            }
+            // Repair: a session belongs to exactly one workspace, so drop any
+            // tab for it that an earlier (guessing) build filed under another
+            // strip — including strips restored from localStorage.
+            stripWs.forEach(other => {
+              if (other === ws) return
+              const stray = useSessionTabsStore.getState().byWorkspace[other]
+              if (stray?.tabs.some(t => t.sessionId === s.session_id)) {
+                useSessionTabsStore.getState().closeTab(other, s.session_id)
+                removedStrayTabs = true
+              }
+            })
+            const st = useSessionTabsStore.getState()
+            const entry = st.byWorkspace[ws]
+            if (!entry?.tabs.some(t => t.sessionId === s.session_id)) {
+              st.openTab(ws, { sessionId: s.session_id, title: s.name || '' })
+            } else if (s.name) {
+              // Tab already exists (e.g. opened early by route-driven
+              // activation before the hub knew its name) — fill an EMPTY
+              // title, and correct a STALE one: the server-side name is
+              // authoritative, so a persisted title that no longer matches it
+              // is repaired here (an out-of-band rename never reaches this
+              // strip otherwise).
+              const existing = entry.tabs.find(t => t.sessionId === s.session_id)
+              if (existing && existing.title !== s.name) st.setTabTitle(ws, s.session_id, s.name)
+            }
           })
+          // Legacy migration: no persisted tm.sessionTabs.<ws> state, but a
+          // legacy 'activeSessionId' key points at a session that is still
+          // open server-side → restore it as the active tab (and persist).
+          const ws = currentWsRef.current
+          if (ws) {
+            const st = useSessionTabsStore.getState()
+            const entry = st.byWorkspace[ws]
+            if (entry) {
+              let persisted = null
+              try { persisted = localStorage.getItem(TABS_PREFIX + ws) } catch { /* ignore */ }
+              const legacy = (() => { try { return localStorage.getItem('activeSessionId') } catch { return null } })()
+              if (!persisted && legacy && openIds.has(legacy) && entry.tabs.some(t => t.sessionId === legacy)) {
+                st.setActiveTab(ws, legacy)
+              }
+              // st is a pre-mutation snapshot — re-fetch before reading post-mutation state.
+              const fresh = useSessionTabsStore.getState().byWorkspace[ws]
+              if (!fresh.activeSessionId && fresh.tabs.length > 0) {
+                useSessionTabsStore.getState().setActiveTab(ws, fresh.tabs[0].sessionId)
+              }
+            }
+          }
+          if (changed || removedStrayTabs) setWorkspaceKnownTick(t => t + 1)
         }
-        // hubReady is set to true in onmessage after handleHubEvent returns
         break
       case 'session_loaded':
         // New session created via hub WS — open a tab with the real sessionId
         if (msg.session_id) {
-          console.log('[Hub WS] session_loaded, opening tab for', msg.session_id)
-          loadTab(msg.session_id)
+          loadTab(msg.session_id, undefined, msg.workspace_id)
           // Refresh sessions list so the new session appears in the sidebar
           wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         }
         break
 
+      case 'state_changed': {
+        // Hub-relayed session runtime state (IDLE/RUNNING/PAUSING/PAUSED/
+        // WAITING_FOR_USER). The hub broadcasts state_changed for sessions, so
+        // the tab strip shows live status even while no SessionTab is mounted
+        // (e.g. on the workspace route). SessionTab's own WebSocket also
+        // delivers state_changed — store writes are idempotent, so a duplicate
+        // is harmless.
+        const sid = msg.session_id
+        if (!sid) break
+        const rawState = typeof msg.state === 'string' ? msg.state.trim() : ''
+        if (!rawState) break
+        const state = rawState.toUpperCase()
+        const ws = sessionWorkspacesRef.current[sid] || currentWsRef.current || lastKnownWorkspaceRef.current
+        // Never paint a status for a session that belongs to another workspace
+        // (only tabs of the current strip should reflect live state).
+        if (currentWs && ws && ws !== currentWs) break
+        const st = useStore.getState()
+        st.receiveStateChanged(sid, state)
+        st.setTabRunningState(sid, state)
+        break
+      }
+
       default:
-        // Other events (state_changed, conversation_changed, etc.)
+        // Other events (conversation_changed, tokens_updated, etc.)
         // are handled by individual SessionTab WebSockets.
         break
     }
   }
 
-  // ── Hub sendCommand (only for sessions-list operations) ─────────────────
+  // Ref to capture the latest handleHubEvent (avoids stale closure in ws.onmessage)
+  const handleHubEventRef = useRef(handleHubEvent)
+  handleHubEventRef.current = handleHubEvent
+
+  // ── Hub sendCommand (only for sessions-list operations) ───────────────
   const hubSend = useCallback((command, payload = {}) => {
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify({ command, ...payload }))
   }, [])
 
-  // ── Handle session renamed (triggered by SessionTab via callback) ───────
+  // ── Wizard sendCommand (used ONLY for save_provider) ───────────────────
+  // Returns false when the hub WS is not open so the wizard can surface a
+  // "backend not ready" message instead of silently dropping the provider.
+  const wizardSend = useCallback((command, payload = {}) => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false
+    ws.send(JSON.stringify({ command, ...payload }))
+    return true
+  }, [])
+
+  // ── Handle session renamed (triggered by SessionTab via callback) ─────
+  // Both the inline rename UI and the tab-WS session_renamed event funnel
+  // here: update the tab title (persisted strip) + shared name store
+  // immediately, then re-fetch the session list for sidebar consistency.
   const handleSessionRenamed = useCallback((sessionId, newName) => {
+    applySessionRename(sessionId, newName)
     hubSend('list_sessions')
-  }, [hubSend])
+  }, [applySessionRename, hubSend])
 
-  // ── Tab management ──────────────────────────────────────────────────────
-  const addTab = useCallback((sessionId = null) => {
-    const tabId = `tab-${nextTabId++}`
-    setTabs((prev) => [...prev, { tabId, sessionId }])
-    setActiveTabId(tabId)
+  // ── SessionTab reports the workspace it loaded into (session_loaded) ──
+  const handleWorkspaceKnown = useCallback((sessionId, workspaceId) => {
+    if (!sessionId || !workspaceId) return
+    sessionWorkspacesRef.current[sessionId] = workspaceId
+    lastKnownWorkspaceRef.current = workspaceId
+    setWorkspaceKnownTick(t => t + 1)
   }, [])
 
-  // Open a tab for an existing session (auto-load from hub WS or sidebar)
-  // preferredSessionId — if set, only make this tab active if its sessionId matches.
-  const loadTab = useCallback((sessionId, preferredSessionId) => {
-      console.log(`[DEBUG App.loadTab] sessionId=${sessionId}, preferredSessionId=${preferredSessionId}`)
-    // Don't create duplicate tabs for the same session.
-    // Use functional updater to avoid stale closure on `tabs`.
-    setTabs((prev) => {
-      const existing = prev.find((t) => t.sessionId === sessionId)
-      if (existing) {
-        console.log(`[DEBUG App.loadTab] FOUND existing tab ${existing.tabId} for session ${sessionId}`)
-        // Only switch to this tab if it's the preferred one (or no preference)
-        if (!preferredSessionId || existing.sessionId === preferredSessionId) {
-          setActiveTabId(existing.tabId)
-          // Mark for deferred load — this tab may not have been loaded yet
-          tabLoadTriggeredRef.current[existing.tabId] = true
-          console.log(`[DEBUG App.loadTab] Set active + triggered for existing tab ${existing.tabId}`)
-        } else {
-          console.log(`[DEBUG App.loadTab] NOT preferred — skipping setActive for existing tab ${existing.tabId}`)
-        }
-        return prev
+  // ── Tab management (per-workspace strip) ──────────────────────────────
+  // Open a tab for a session that exists server-side. With a workspaceIdHint
+  // (session_loaded) the workspace is known; otherwise fall back to learned
+  // mappings / last known workspace. Only a preferred session becomes active.
+  const loadTab = useCallback((sessionId, preferredSessionId, workspaceIdHint) => {
+    if (!sessionId) return
+    const st = useSessionTabsStore.getState()
+    const ws = workspaceIdHint || sessionWorkspacesRef.current[sessionId] || lastKnownWorkspaceRef.current || currentWsRef.current
+    if (!ws) return
+    if (workspaceIdHint) {
+      sessionWorkspacesRef.current[sessionId] = workspaceIdHint
+      lastKnownWorkspaceRef.current = workspaceIdHint
+    }
+    const entry = st.byWorkspace[ws]
+    if (entry?.tabs.some(t => t.sessionId === sessionId)) {
+      // Tab already exists — only activate when nothing is active yet.
+      if ((!preferredSessionId || sessionId === preferredSessionId) && !st.byWorkspace[ws].activeSessionId) {
+        st.setActiveTab(ws, sessionId)
+        navigate(`/workspace/${ws}/session/${encodeURIComponent(sessionId)}`)
       }
-      const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      console.log(`[DEBUG App.loadTab] CREATING new tab ${tabId} for session ${sessionId}, preferred=${preferredSessionId}, match=${!preferredSessionId || sessionId === preferredSessionId}`)
-      // Only switch to this tab if it's the preferred one (or no preference)
-      if (!preferredSessionId || sessionId === preferredSessionId) {
-        setActiveTabId(tabId)
-        // Mark this tab so handleRegisterTab will trigger deferred load
-        // once the SessionTab WS connects. Without this, new tabs created
-        // via "+" would get stuck in deferred mode (empty placeholder).
-        tabLoadTriggeredRef.current[tabId] = true
-        console.log(`[DEBUG App.loadTab] Set active + triggered for new tab ${tabId}`)
-      } else {
-        console.log(`[DEBUG App.loadTab] NOT preferred — skipping setActive/trigger for new tab ${tabId}`)
-      }
-      return [...prev, { tabId, sessionId }]
+      return
+    }
+    st.openTab(ws, { sessionId, title: nameFromStore(sessionId) })
+    if (!preferredSessionId || sessionId === preferredSessionId) {
+      st.setActiveTab(ws, sessionId)
+      navigate(`/workspace/${ws}/session/${encodeURIComponent(sessionId)}`)
+    }
+  }, [navigate])
+
+  // Drop a session id from the mounted deck (tab closed / adopted /
+  // deleted). The pane unmounts; if the tab is later reopened it mounts
+  // fresh (lazy) instead of resurrecting a hidden pane.
+  const removeMounted = useCallback((ws, sessionId) => {
+    if (!ws || !sessionId) return
+    setMountedSessions(prev => {
+      const cur = prev[ws]
+      if (!cur || !cur.includes(sessionId)) return prev
+      const next = cur.filter(id => id !== sessionId)
+      const rest = { ...prev }
+      if (next.length === 0) delete rest[ws]
+      else rest[ws] = next
+      return rest
     })
   }, [])
 
-  // Initiate close: send close_session over the tab's own WS.
-  // Do NOT remove from DOM yet — wait for server acknowledgement.
-  const initiateCloseTab = useCallback((tabId) => {
-    const tab = tabsRef.current.find(t => t.tabId === tabId)
-    const actions = tabActionsRef.current[tabId]
-    if (actions?.sendCommand) {
-      actions.sendCommand('close_session', { session_id: tab?.sessionId })
-    } else {
-      // No WS connected — remove immediately
-      removeTab(tabId)
+  // Close a tab — FRONTEND ONLY: the session stays open server-side.
+  // If the active tab is closed, activate the neighbor (store picks it) and
+  // follow it; with no tabs left, leave the session view (or stay on the
+  // workspace view, which simply shows no strip).
+  const handleCloseTab = useCallback((ws, sessionId) => {
+    if (!ws || !sessionId) return
+    const st = useSessionTabsStore.getState()
+    const wasActive = st.byWorkspace[ws]?.activeSessionId === sessionId
+    st.closeTab(ws, sessionId)
+    // The closed tab leaves the mounted deck too — reopening it later mounts
+    // a fresh SessionTab instead of resurrecting the hidden pane.
+    removeMounted(ws, sessionId)
+    if (wasActive) {
+      // Re-fetch: st is a pre-mutation snapshot (zustand set() replaces the
+      // state object), so reading st.byWorkspace here would return the OLD
+      // active tab (the one just closed).
+      const newActive = useSessionTabsStore.getState().byWorkspace[ws]?.activeSessionId
+      if (newActive) {
+        navigate(`/workspace/${ws}/session/${encodeURIComponent(newActive)}`)
+      } else if (routeRef.current?.view === 'session') {
+        navigate('/workspaces')
+      }
     }
+  }, [navigate, removeMounted])
+
+  const openPanel = useCallback((sessionId, { name, workspaceId, instance_id, instance_label }) => {
+    if (!sessionId || !name) return
+    const newKey = `${name}#${instance_id ?? '0'}`
+    setWorkerPanelsBySession(prev => {
+      const panels = prev[sessionId] || []
+      if (panels.some(p => workerPanelInstanceKey(p) === newKey)) return prev
+      return {
+        ...prev,
+        [sessionId]: [
+          ...panels,
+          {
+            instance_id,
+            instance_label,
+            worker_name: name,
+            workspaceId,
+            size: PANEL_SIZE_DEFAULT,
+            maximized: false,
+            pinned: false,
+            order: panels.length,
+          },
+        ],
+      }
+    })
+    setFocusedPanelBySession(prev => ({ ...prev, [sessionId]: newKey }))
   }, [])
 
-  // Actually remove the tab from DOM (called when server acknowledges close
-  // via session_closed event, or on unexpected WS close).
-  const removeTab = useCallback((tabId) => {
-    setTabs((prev) => {
-      const idx = prev.findIndex((t) => t.tabId === tabId)
-      if (idx === -1) return prev  // already removed
-      const next = prev.filter((t) => t.tabId !== tabId)
-      if (tabId === activeTabId) {
-        const newIdx = Math.min(idx, next.length - 1)
-        setActiveTabId(next.length > 0 ? next[newIdx >= 0 ? newIdx : 0].tabId : null)
-      }
-      return next
+  const closePanel = useCallback((sessionId, instanceKey) => {
+    if (!sessionId || !instanceKey) return
+    const panels = workerPanelsBySession[sessionId] || []
+    const idx = panels.findIndex(p => workerPanelInstanceKey(p) === instanceKey)
+    if (idx === -1) return
+    const nextPanels = panels.filter((_, i) => i !== idx).map((p, i) => ({ ...p, order: i }))
+    setWorkerPanelsBySession(prev => ({ ...prev, [sessionId]: nextPanels }))
+    setFocusedPanelBySession(prev => {
+      if (prev[sessionId] !== instanceKey) return prev
+      const nextKey = nextPanels.length > 0
+        ? workerPanelInstanceKey(nextPanels[Math.min(idx, nextPanels.length - 1)])
+        : null
+      return { ...prev, [sessionId]: nextKey }
     })
-    delete tabActionsRef.current[tabId]
-  }, [activeTabId])
+  }, [workerPanelsBySession])
 
-  const handleNewTab = useCallback(() => {
-    // Send new_session via hub WS — the hub WS handler will respond
-    // with session_loaded, which creates the tab with a real sessionId.
-    hubSend('new_session')
-  }, [hubSend])
+  const reorderPanel = useCallback((sessionId, instanceKey, direction) => {
+    if (!sessionId || !instanceKey) return
+    const panels = workerPanelsBySession[sessionId] || []
+    const idx = panels.findIndex(p => workerPanelInstanceKey(p) === instanceKey)
+    if (idx === -1) return
+    const to = direction === 'left' ? idx - 1 : idx + 1
+    if (to < 0 || to >= panels.length) return
+    const next = panels.slice()
+    const [moved] = next.splice(idx, 1)
+    next.splice(to, 0, moved)
+    setWorkerPanelsBySession(prev => ({
+      ...prev,
+      [sessionId]: next.map((p, i) => ({ ...p, order: i })),
+    }))
+  }, [workerPanelsBySession])
 
-  // Open an existing session in a tab (called from SessionList sidebar)
-  const handleOpenTab = useCallback((sessionId) => {
-    loadTab(sessionId)
-  }, [loadTab])
+  const resizePanel = useCallback((sessionId, instanceKey, width) => {
+    if (!sessionId || !instanceKey) return
+    const clamped = Math.max(PANEL_SIZE_MIN, Math.min(PANEL_SIZE_MAX, width))
+    setWorkerPanelsBySession(prev => {
+      const panels = prev[sessionId] || []
+      if (!panels.some(p => workerPanelInstanceKey(p) === instanceKey)) return prev
+      return {
+        ...prev,
+        [sessionId]: panels.map(p => (workerPanelInstanceKey(p) === instanceKey ? { ...p, size: clamped } : p)),
+      }
+    })
+  }, [])
 
-  // ── Session actions panel toggle (shown/hidden via ⚙️ cogwheel) ────────
-  // When a tab is active, opens the slide-in SessionActionsPanel with
-  // Save As… (to name the current session) and Delete Session.
-  // When no tabs are open, toggles the SessionList sidebar instead.
-  const handleCogwheelClick = useCallback(() => {
-    if (tabs.length > 0 && activeTabId) {
-      setSessionPanelOpen((prev) => !prev)
-    } else {
-      setShowSessions((prev) => !prev)
+  const toggleMaximize = useCallback((sessionId, instanceKey) => {
+    if (!sessionId || !instanceKey) return
+    setWorkerPanelsBySession(prev => {
+      const panels = prev[sessionId] || []
+      if (!panels.some(p => workerPanelInstanceKey(p) === instanceKey)) return prev
+      return {
+        ...prev,
+        [sessionId]: panels.map(p => (workerPanelInstanceKey(p) === instanceKey ? { ...p, maximized: !p.maximized } : p)),
+      }
+    })
+  }, [])
+
+  const togglePin = useCallback((sessionId, instanceKey) => {
+    if (!sessionId || !instanceKey) return
+    setWorkerPanelsBySession(prev => {
+      const panels = prev[sessionId] || []
+      if (!panels.some(p => workerPanelInstanceKey(p) === instanceKey)) return prev
+      return {
+        ...prev,
+        [sessionId]: panels.map(p => (workerPanelInstanceKey(p) === instanceKey ? { ...p, pinned: !p.pinned } : p)),
+      }
+    })
+  }, [])
+
+  const focusPanel = useCallback((sessionId, instanceKey) => {
+    if (!sessionId || !instanceKey) return
+    setFocusedPanelBySession(prev => ({ ...prev, [sessionId]: instanceKey }))
+  }, [])
+
+  const handleSelectWorker = useCallback((workerName, workspaceId, instanceId, instanceLabel) => {
+    if (!activeSessionId) {
+      // Queue the selection — activeSessionId may not be available yet
+      pendingWorkerSelectionRef.current = { workerName, workspaceId, instanceId, instanceLabel }
+      return
     }
-  }, [tabs.length, activeTabId])
+    pendingWorkerSelectionRef.current = null
+    openPanel(activeSessionId, { name: workerName, workspaceId, instance_id: instanceId, instance_label: instanceLabel })
+  }, [activeSessionId, openPanel])
 
-  const handleOpenSessionFromPanel = useCallback((sessionId) => {
-    loadTab(sessionId)
-    setSessionPanelOpen(false)
-  }, [loadTab])
+  const handleCloseWorkerPanel = useCallback(() => {
+    if (!activeSessionId) return
+    const panels = workerPanelsBySession[activeSessionId] || []
+    if (panels.length === 0) return
+    const focused = focusedPanelBySession[activeSessionId]
+    const key = (focused != null && panels.some(p => workerPanelInstanceKey(p) === focused))
+      ? focused
+      : workerPanelInstanceKey(panels[panels.length - 1])
+    closePanel(activeSessionId, key)
+  }, [activeSessionId, workerPanelsBySession, focusedPanelBySession, closePanel])
 
-  const handleRunningChange = useCallback((tabId, status) => {
-    setTabRunningStates((prev) => ({ ...prev, [tabId]: status }))
+  // ── Handle worker lifecycle events from SessionTab WS ─────────────────
+  const handleWorkerEvent = useCallback((sessionId, event) => {
+    console.log('[PIPELINE:HOPS] App.handleWorkerEvent: called', { type: event.type, sessionId, context_length: event.context_length, source: event.source })
+    console.log('[TOKEN_PIPELINE] App.handleWorkerEvent: called', { type: event.type, sessionId, context_length: event.context_length, source: event.source })
+    if (!sessionId) {
+      console.warn('[TOKEN_PIPELINE] App.handleWorkerEvent: DROPPED — sessionId is falsy')
+      return
+    }
+    setWorkerEvents(prev => {
+      const events = prev[sessionId] || []
+      // Use canonical dedup key: normalize worker_message/assistant_message/final_response
+      // variants to 'final_response' so the same logical event arriving with different
+      // WS type values (e.g. worker:assistant_message vs worker:worker_message) is caught.
+      // Dedup key helper: canonical type + timestamp + instance identity (when present)
+      const evtKey = (e) => {
+        const eRawType = e.type?.replace('worker:', '') || ''
+        const eCanonicalType = (
+          eRawType === 'worker_message' ||
+          eRawType === 'final_response' ||
+          eRawType === 'assistant_message'
+        ) ? 'final_response' : eRawType
+        const instancePart =
+          (e.instance_id != null ? `|i${e.instance_id}` : '') +
+          (e.instance_label ? `|l${e.instance_label}` : '')
+        // Backend tool_call_id (when present) distinguishes sibling tool events
+        // that share a type AND a timestamp; absent → key is unchanged.
+        const eToolCallId = e.data?.tool_call_id
+        const toolCallPart =
+          (typeof eToolCallId === 'string' && eToolCallId) ? '|tc' + eToolCallId : ''
+        return eCanonicalType + '|' + (e.timestamp || '') + instancePart + toolCallPart
+      }
+      const key = evtKey(event)
+      const incomingVisible = isWorkerEventRenderable(event)
+      // Only renderable stored events can block a duplicate — an earlier empty
+      // placeholder must not consume the dedup key, otherwise the full-content
+      // message for the same logical event is wrongly dropped. Non-renderable
+      // incoming events are always stored (the panel needs them for the live
+      // ctx counter and token updates), never blocked.
+      if (incomingVisible && events.some(e => {
+        if (!isWorkerEventRenderable(e)) return false
+        return evtKey(e) === key
+      })) {
+        console.log('[TOKEN_PIPELINE] App.handleWorkerEvent: DEDUPED event', { type: event.type, key })
+        return prev  // dedup
+      }
+      // Cap at 500 events per session (trim oldest)
+      const updated = [...events, event]
+      if (updated.length > 500) {
+        return { ...prev, [sessionId]: updated.slice(-500) }
+      }
+      console.log('[PIPELINE:HOPS] App.handleWorkerEvent: stored event', { type: event.type, sessionId, count: updated.length })
+      console.log('[TOKEN_PIPELINE] App.handleWorkerEvent: stored event', { type: event.type, sessionId, count: updated.length })
+      return { ...prev, [sessionId]: updated }
+    })
   }, [])
 
   const handleSessionSaved = useCallback((sessionId) => {
@@ -341,128 +838,462 @@ export default function App() {
   }, [hubSend])
 
   const handleNewSessionCreated = useCallback((sessionId, sessionName) => {
-    // Update the tab that created this session with its new sessionId
-    setTabs((prev) =>
-      prev.map((t) => (t.sessionId === null ? { ...t, sessionId } : t))
-    )
-    // If we got a session name, immediately add/update it in the sessions store
-    // so the tab label shows a human-readable name instead of a UUID truncation.
+    // SessionTab created a brand-new session (tab WS session_loaded).
+    if (!sessionId) return
+    const ws = currentWsRef.current
+    if (!ws) return
+    const st = useSessionTabsStore.getState()
+    if (!st.byWorkspace[ws]?.tabs.some(t => t.sessionId === sessionId)) {
+      st.openTab(ws, { sessionId, title: sessionName || nameFromStore(sessionId) })
+    }
+    st.setActiveTab(ws, sessionId)
     if (sessionName) {
-      const store = useStore.getState()
-      const existing = store.sessions.find((s) => s.session_id === sessionId)
-      if (!existing) {
-        store.setSessions([
-          ...store.sessions,
-          { session_id: sessionId, name: sessionName },
-        ])
-      }
+      useStore.getState().updateSessionName(sessionId, sessionName)
     }
-  }, [])
-
-  // ── Tab selection handler with deferred-load trigger ─────────────────
-  const handleSelectTab = useCallback((tabId) => {
-    console.log(`[DEBUG App.handleSelectTab] tabId=${tabId}, tabs=`, tabsRef.current.map(t => t.tabId),
-      'loadTriggered=', tabLoadTriggeredRef.current[tabId],
-      'sessionId=', tabsRef.current.find(t => t.tabId === tabId)?.sessionId,
-      'actionsExist=', !!tabActionsRef.current[tabId])
-    setActiveTabId(tabId)
-    // If this tab was deferred (didn't load on WS connect), trigger its load now
-    if (!tabLoadTriggeredRef.current[tabId]) {
-      tabLoadTriggeredRef.current[tabId] = true
-      const tab = tabsRef.current.find((t) => t.tabId === tabId)
-      if (tab?.sessionId) {
-        const actions = tabActionsRef.current[tabId]
-        if (actions?.sendCommand) {
-          actions.sendCommand('load_session', { session_id: tab.sessionId })
-          deferredLoadSentRef.current[tabId] = true
-          console.log(`[App] Triggered deferred load for tab ${tabId}, session ${tab.sessionId}`)
-        } else {
-          console.log(`[DEBUG App.handleSelectTab] actions MISSING for tab ${tabId} — deferred won't fire yet`)
-        }
-      } else {
-        console.log(`[DEBUG App.handleSelectTab] tab ${tabId} has no sessionId — skipping deferred load`)
-      }
-    } else {
-      console.log(`[DEBUG App.handleSelectTab] tab ${tabId} already triggered — no deferred action`)
-    }
-  }, [])
-
-  // ── Tab action registry (for save from SessionList) ───────────────────
-  const handleRegisterTab = useCallback((tabId, actions) => {
-    console.log(`[DEBUG App.handleRegisterTab] tabId=${tabId}, triggered=${!!tabLoadTriggeredRef.current[tabId]}, sent=${!!deferredLoadSentRef.current[tabId]}, sessionId=`, tabsRef.current.find(t => t.tabId === tabId)?.sessionId)
-    tabActionsRef.current[tabId] = actions
-    // If this tab was selected before its actions were registered, trigger deferred load now
-    if (tabLoadTriggeredRef.current[tabId] && !deferredLoadSentRef.current[tabId]) {
-      const tab = tabsRef.current.find((t) => t.tabId === tabId)
-      if (tab?.sessionId) {
-        console.log(`[DEBUG App.handleRegisterTab] FIRE! sending load_session for tab ${tabId}`)
-        actions.sendCommand('load_session', { session_id: tab.sessionId })
-        deferredLoadSentRef.current[tabId] = true
-        console.log(`[App] Triggered deferred load for tab ${tabId} (via delayed registration)`)
-      } else {
-        console.log(`[DEBUG App.handleRegisterTab] tab ${tabId} has no sessionId — cannot send load_session`)
-      }
-    }
-  }, [])
-
-  // ── Reliable rename via per-tab WS (Task 2) ──────────────────────────
-  const handleRename = useCallback((sessionId, newName) => {
-    // Find a tab that owns this session
-    const tabEntry = tabs.find((t) => t.sessionId === sessionId)
-    if (tabEntry) {
-      const actions = tabActionsRef.current[tabEntry.tabId]
-      if (actions?.sendCommand) {
-        actions.sendCommand('rename_session', { session_id: sessionId, new_name: newName })
-        return
-      }
-    }
-    // Fallback: use hub WS if no tab is open for this session
-    hubSend('rename_session', { session_id: sessionId, new_name: newName })
-  }, [tabs, hubSend])
-
-  // ── Reliable delete via per-tab WS (Task 3) ──────────────────────────
-  const handleDelete = useCallback((sessionId) => {
-    // Find a tab that owns this session
-    const tabEntry = tabs.find((t) => t.sessionId === sessionId)
-    if (tabEntry) {
-      const actions = tabActionsRef.current[tabEntry.tabId]
-      if (actions?.sendCommand) {
-        // Close the tab first, then delete
-        initiateCloseTab(tabEntry.tabId)
-        actions.sendCommand('delete_session', { session_id: sessionId })
-        // Refresh sessions list immediately so the sidebar updates
-        hubSend('list_sessions')
-        return
-      }
-    }
-    // Fallback: use hub WS if no tab is open for this session
-    hubSend('delete_session', { session_id: sessionId })
+    // Refresh the sidebar so the new session appears in the list.
     hubSend('list_sessions')
-  }, [tabs, hubSend, initiateCloseTab])
+    navigate(`/workspace/${ws}/session/${encodeURIComponent(sessionId)}`)
+  }, [hubSend, navigate])
 
-  // After delete from panel, close the panel
-  const handleDeleteFromPanel = useCallback((sessionId) => {
-    handleDelete(sessionId)
-    setSessionPanelOpen(false)
-  }, [handleDelete])
+  // ── Handle tab session adoption (intentional replacement) ─────────────
+  // Called by SessionTab when a session_loaded flagged `replacement: true`
+  // rebinds the ACTIVE tab to a NEW session id (workspace switch via
+  // apply_config). Replace the old tab entry and follow the new session.
+  const handleSessionAdopted = useCallback((oldSessionId, newSessionId) => {
+    if (!newSessionId || newSessionId === oldSessionId) return
+    const ws = sessionWorkspacesRef.current[newSessionId] || currentWsRef.current
+    if (!ws) return
+    const st = useSessionTabsStore.getState()
+    if (oldSessionId) {
+      st.closeTab(ws, oldSessionId)
+      removeMounted(ws, oldSessionId)
+    }
+    if (!st.byWorkspace[ws]?.tabs.some(t => t.sessionId === newSessionId)) {
+      st.openTab(ws, { sessionId: newSessionId, title: nameFromStore(newSessionId) })
+    }
+    st.setActiveTab(ws, newSessionId)
+    hubSend('list_sessions')
+    navigate(`/workspace/${ws}/session/${encodeURIComponent(newSessionId)}`)
+  }, [hubSend, navigate, removeMounted])
 
-  // ── Derive tab names from sessions list ─────────────────────────────────
-  const sessions = useStore((s) => s.sessions)
-  const sessionMap = {}
-  for (const s of sessions) {
-    sessionMap[s.session_id] = s.name || 'Untitled'
-  }
+  const handleOpenNewTab = useCallback((sessionId, sessionName) => {
+    // Called by SessionTab when a workspace switch creates a NEW session
+    // while the active tab keeps the old session. Opens a fresh tab.
+    if (!sessionId) return
+    const ws = currentWsRef.current
+    if (!ws) return
+    const st = useSessionTabsStore.getState()
+    if (!st.byWorkspace[ws]?.tabs.some(t => t.sessionId === sessionId)) {
+      st.openTab(ws, { sessionId, title: sessionName || nameFromStore(sessionId) })
+    }
+    st.setActiveTab(ws, sessionId)
+    // Initialize store slices for the new session (keyed by sessionId)
+    useStore.getState().setSessionMode(sessionId, localStorage.getItem('lastSessionMode') || 'engineer')
+    useStore.getState().setTabRunningState(sessionId, false)
+    if (sessionName) {
+      useStore.getState().updateSessionName(sessionId, sessionName)
+    }
+    hubSend('list_sessions')
+    navigate(`/workspace/${ws}/session/${encodeURIComponent(sessionId)}`)
+  }, [hubSend, navigate])
 
-  const tabItems = tabs.map((t) => ({
-    id: t.tabId,
-    name: t.sessionId ? (sessionMap[t.sessionId] || t.sessionId.slice(0, 8)) : 'New Session',
-  }))
+  // ── Tab action registry (for save from SessionTab) ────────────────────
+  const handleRegisterTab = useCallback((tabId, actions) => {
+    tabActionsRef.current[tabId] = actions
+    // load_session is sent by the tab's own onopen (deduped); do not send here.
+  }, [])
 
-  const activeTab = tabs.find((t) => t.tabId === activeTabId)
-  const activeSessionId = activeTab?.sessionId
-  const activeSessionName = activeSessionId ? (sessionMap[activeSessionId] || 'Untitled') : 'New Session'
+  // ── R7 BOOT restore: hydrate the persisted strip for the boot workspace ──
+  useEffect(() => {
+    if (hydratedRef.current) return
+    const initialRoute = routeRef.current
+    let bootWs = null
+    if (initialRoute?.view === 'workspace') {
+      bootWs = initialRoute.id
+    } else if (initialRoute?.view === 'session') {
+      const target = initialRoute.id
+      // Nested route (#/workspace/:wsId/session/:sid) carries the workspace
+      // explicitly — use it directly instead of searching persisted strips.
+      if (initialRoute.workspaceId) {
+        bootWs = initialRoute.workspaceId
+      } else {
+        try {
+          const keys = Object.keys(localStorage)
+          const findWs = (sid) => {
+            for (const key of keys) {
+              if (!key.startsWith(TABS_PREFIX)) continue
+              const parsed = JSON.parse(localStorage.getItem(key) || 'null')
+              if (parsed?.tabs?.some(t => t.sessionId === sid)) return key.slice(TABS_PREFIX.length)
+            }
+            return null
+          }
+          bootWs = findWs(target)
+          if (!bootWs) {
+            // Legacy migration source: old global activeSessionId key
+            const legacy = localStorage.getItem('activeSessionId')
+            if (legacy === target) bootWs = findWs(legacy)
+          }
+        } catch {
+          // malformed localStorage — fall through to open_sessions flow
+        }
+      }
+    }
+    if (bootWs) {
+      const entry = useSessionTabsStore.getState().hydrate(bootWs)
+      bootWsRef.current = bootWs
+      if (entry.activeSessionId && initialRoute?.view !== 'session') {
+        // Re-persist (no-op when already hydrated); keeps legacy key in sync.
+        useSessionTabsStore.getState().setActiveTab(bootWs, entry.activeSessionId)
+      }
+    }
+    hydratedRef.current = true
+  }, [])
 
-  // ── Persist active session ID in localStorage (stable across page loads) ─
+  // ── Restore per-session worker panels from localStorage ───────────────
+  // Runs once, AFTER the R7 boot hydration (the tab store is still empty when
+  // the useState initializers above run, so boot-time restore cannot happen
+  // there). Merges saved panels/focused keys for every session that already
+  // has a tab, only ADDING sessions that are not yet in memory (no clobber).
+  useEffect(() => {
+    if (panelsRestoredRef.current) return
+    panelsRestoredRef.current = true
+    try {
+      const tabState = useSessionTabsStore.getState()
+      const sessionIds = new Set()
+      Object.values(tabState.byWorkspace || {}).forEach(we => {
+        (we?.tabs || []).forEach(t => {
+          if (t?.sessionId) sessionIds.add(t.sessionId)
+        })
+      })
+      sessionIds.forEach(sid => {
+        const saved = localStorage.getItem(WORKER_PANELS_PREFIX + sid)
+        if (saved) {
+          try {
+            const parsed = JSON.parse(saved)
+            if (Array.isArray(parsed)) {
+              const panels = parsed.filter(p => p && typeof p === 'object' && p.worker_name)
+              if (panels.length > 0) {
+                setWorkerPanelsBySession(prev => (prev[sid] ? prev : { ...prev, [sid]: panels }))
+              }
+            }
+          } catch {
+            // malformed entry — ignore
+          }
+        }
+        const focused = localStorage.getItem(WORKER_PANELS_PREFIX + sid + '.focused')
+        if (focused != null) {
+          setFocusedPanelBySession(prev => (prev[sid] != null ? prev : { ...prev, [sid]: focused }))
+        }
+      })
+    } catch {
+      // localStorage unavailable — memory state still works this session
+    }
+  }, [])
+
+  // ── Hydrate the strip whenever we land on a workspace route ───────────
+  useEffect(() => {
+    if (route?.view === 'workspace' && route.id) {
+      useSessionTabsStore.getState().hydrate(route.id)
+      lastKnownWorkspaceRef.current = route.id
+    }
+  }, [route])
+
+  // ── Deep-link membership validation ───────────────────────────────────
+  // A bare session deep link (#/session/<id>) carries no workspace, so the
+  // activation effect below would otherwise open a tab for ANY id — including
+  // one that does not belong to the workspace we resolved. Probe
+  // /api/session/list for that workspace first (tri-state, see sessionLookup).
+  // A refusal redirects to the workspace SELECTOR, never to a workspace route:
+  // the workspace id in such a URL is itself client-supplied, so adopting it
+  // would only move the same trust problem one hop downstream.
+  useEffect(() => {
+    if (route?.view !== 'session' || !route.id) return
+    const sid = route.id
+    const ws = currentWs || bootWsRef.current || null
+    if (!ws) return   // no workspace resolved yet — nothing to validate against
+    const key = `${ws}:${sid}`
+    if (deepLinkVerdictsRef.current[key] !== undefined) return
+    // A tab already open for this session is proof of membership from an
+    // authoritative source (sessions_list / session_loaded): never re-probe it
+    // and never retract a tab the user is already looking at.
+    const openTabs = useSessionTabsStore.getState().byWorkspace?.[ws]?.tabs || []
+    if (openTabs.some(t => t.sessionId === sid)) {
+      deepLinkVerdictsRef.current[key] = true
+      return
+    }
+    deepLinkVerdictsRef.current[key] = 'pending'
+    let cancelled = false
+    isSessionInWorkspace(ws, sid).then(verdict => {
+      if (cancelled) return
+      const resolved = verdict === true ? true : verdict === false ? false : null
+      deepLinkVerdictsRef.current[key] = resolved
+      if (resolved === false) {
+        console.warn(`[App] deep link refused: session ${sid} is not in workspace ${ws}`)
+        navigate('/workspaces')
+      }
+      setDeepLinkTick(t => t + 1)
+    })
+    return () => {
+      cancelled = true
+      // Still undecided (StrictMode double-mount / deps changed): drop the
+      // marker so the next run re-probes instead of deadlocking the gate.
+      if (deepLinkVerdictsRef.current[key] === 'pending') delete deepLinkVerdictsRef.current[key]
+    }
+  }, [route, currentWs, navigate])
+
+  // ── Route-driven tab activation ───────────────────────────────────────
+  // The session route (#/session/<id>) is the single entry point for opening
+  // a session: if a tab for that session already exists, activate it;
+  // otherwise create one (lazily — strip entry only until it becomes active).
+  useEffect(() => {
+    if (route?.view === 'session' && route.id) {
+      // (b) Learn the workspace from the loaded session config when we don't
+      // know it yet (deep link where the tab's own session_loaded hasn't come).
+      const cfg = routeSessionConfig
+      if (cfg?.config?.workspace_path && !sessionWorkspacesRef.current[route.id]) {
+        const wsPath = cfg.config.workspace_path
+        const match = workspaceList.find(w => w.root === wsPath || w.path === wsPath)
+        if (match) {
+          sessionWorkspacesRef.current[route.id] = match.id
+          lastKnownWorkspaceRef.current = match.id
+        }
+      }
+      // (a) Ensure the tab exists and is active in the owning workspace.
+      const ws = currentWs || bootWsRef.current || null
+      if (ws) {
+        // Re-read after hydrate: zustand's set() produces a NEW state object,
+        // so a snapshot taken before hydrate cannot see the newly added workspace.
+        const st0 = useSessionTabsStore.getState()
+        if (!st0.byWorkspace[ws]) st0.hydrate(ws)
+        const st = useSessionTabsStore.getState()
+        if (!st.byWorkspace[ws].tabs.some(t => t.sessionId === route.id)) {
+          // (c) Deep-link admission: only CREATE a tab once the membership probe
+          // has confirmed the session belongs to this workspace. Undecidable
+          // probes (null) fail OPEN = historical behaviour; an already-open tab
+          // is never refused here (the probe is skipped for it).
+          const verdict = deepLinkVerdictsRef.current[`${ws}:${route.id}`]
+          if (verdict !== true && verdict !== null) return
+          st.openTab(ws, { sessionId: route.id, title: nameFromStore(route.id) })
+        }
+        st.setActiveTab(ws, route.id)
+      }
+    } else if (route?.view === 'workspace') {
+      lastKnownWorkspaceRef.current = route.id
+    }
+  }, [route, workspaceKnownTick, routeSessionConfig, currentWs, deepLinkTick])
+
+  // ── Keep-mounted session deck lifecycle ───────────────────────────────
+  // Sessions activated on the session layer stay mounted (hidden when not
+  // active) so tab switches preserve their state instead of remounting.
+  // Leaving the session layer clears the deck — every pane unmounts and the
+  // next session entry mounts fresh/lazy again. Entries are pruned whenever
+  // the underlying tab disappears (closed/adopted/deleted).
+  useEffect(() => {
+    if (route?.view !== 'session') {
+      setMountedSessions({})
+      return
+    }
+    if (!route.id || !currentWs) return
+    setMountedSessions(prev => {
+      const live = new Set(
+        (useSessionTabsStore.getState().byWorkspace[currentWs]?.tabs || []).map(t => t.sessionId)
+      )
+      const pruned = (prev[currentWs] || []).filter(id => live.has(id))
+      const next = pruned.includes(route.id) ? pruned : [...pruned, route.id]
+      const prevWs = prev[currentWs]
+      if (
+        prevWs &&
+        prevWs.length === next.length &&
+        prevWs.every((id, i) => id === next[i])
+      ) {
+        return prev
+      }
+      if (next.length === 0) {
+        if (prevWs === undefined) return prev
+        const rest = { ...prev }
+        delete rest[currentWs]
+        return rest
+      }
+      return { ...prev, [currentWs]: next }
+    })
+  }, [route?.view, route?.id, currentWs])
+
+  // ── Persist worker panels state to localStorage (per session) ───────────
+  useEffect(() => {
+    Object.entries(workerPanelsBySession).forEach(([sid, panels]) => {
+      try {
+        localStorage.setItem(WORKER_PANELS_PREFIX + sid, JSON.stringify(panels))
+      } catch {
+        // ignore quota / security errors — memory state still works this session
+      }
+    })
+  }, [workerPanelsBySession])
+
+  // Focused key per session: null → remove the focused key entirely.
+  useEffect(() => {
+    Object.entries(focusedPanelBySession).forEach(([sid, key]) => {
+      try {
+        if (key == null) {
+          localStorage.removeItem(WORKER_PANELS_PREFIX + sid + '.focused')
+        } else {
+          localStorage.setItem(WORKER_PANELS_PREFIX + sid + '.focused', key)
+        }
+      } catch {
+        // ignore
+      }
+    })
+  }, [focusedPanelBySession])
+
+  // One-time migration: drop the legacy global 'workerPanelState' key.
+  useEffect(() => {
+    try {
+      localStorage.removeItem('workerPanelState')
+    } catch {
+      // ignore
+    }
+  }, [])
+
+  // ── Clean up stale keys when sessions are removed from tabs ───────────
+  useEffect(() => {
+    const activeSessionIds = new Set(tabs.map(t => t.sessionId).filter(Boolean))
+    // Remember every session id ever seen in tabs. The LS sweep below only
+    // removes keys for sessions that were seen at least once and are gone
+    // now, so a mount-time run with empty/stale tabs can never wipe other
+    // (not yet hydrated) workspaces' panel state.
+    activeSessionIds.forEach(sid => tabsSeenOnceRef.current.add(sid))
+    setWorkerPanelsBySession(prev => {
+      const stale = Object.keys(prev).filter(id => !activeSessionIds.has(id))
+      if (stale.length === 0) return prev
+      const next = { ...prev }
+      stale.forEach(id => delete next[id])
+      return next
+    })
+    setFocusedPanelBySession(prev => {
+      const stale = Object.keys(prev).filter(id => !activeSessionIds.has(id))
+      if (stale.length === 0) return prev
+      const next = { ...prev }
+      stale.forEach(id => delete next[id])
+      return next
+    })
+    // Remove persisted per-session keys for sessions that no longer have tabs.
+    // Skipped until at least one tab has been observed (mount runs with empty
+    // tabs must not wipe freshly-restored localStorage).
+    if (tabsSeenOnceRef.current.size > 0) {
+      Object.keys(localStorage).forEach(key => {
+        if (!key.startsWith(WORKER_PANELS_PREFIX)) return
+        const sid = key.slice(WORKER_PANELS_PREFIX.length).replace(/\.focused$/, '')
+        if (tabsSeenOnceRef.current.has(sid) && !activeSessionIds.has(sid)) {
+          localStorage.removeItem(key)
+        }
+      })
+    }
+  }, [tabs])
+
+  // ── Flush any pending worker selection once activeSessionId becomes available ──
+  useEffect(() => {
+    const pending = pendingWorkerSelectionRef.current
+    if (pending && activeSessionId) {
+      pendingWorkerSelectionRef.current = null
+      openPanel(activeSessionId, {
+        name: pending.workerName,
+        workspaceId: pending.workspaceId,
+        instance_id: pending.instanceId,
+        instance_label: pending.instanceLabel,
+      })
+    }
+  }, [activeSessionId, openPanel])
+
+  // ── Fetch logging config (callable for retry) ─────────────────────────
+  const fetchLoggingConfig = useCallback(() => {
+    setLoggingConfigError(null)
+    fetch(apiUrl('/api/logging/config'))
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
+      .then(data => setLoggingConfig(data))
+      .catch(err => {
+        console.error('Failed to fetch logging config:', err)
+        setLoggingConfigError(err.message || 'Failed to load')
+      })
+  }, [])
+
+  // ── Poll backend health (drives the backend-down + degraded-Docker banners) ─
+  // Two-step probe, run on mount then every 10s:
+  //   Step 1  GET /api/health           — liveness only. A fetch failure or
+  //             non-200 means the backend itself is down → the
+  //             "Backend not running" banner.
+  //   Step 2  GET /api/health/containers — only when Step 1 succeeded. A 200
+  //             renders the structured docker payload (available/reason/hint);
+  //             a failure here leaves Docker "unverified" (no banner, no raw
+  //             error text) — the backend is up, so the backend-down banner
+  //             would be wrong.
+  // The ref guard skips a poll tick while the previous request is still in
+  // flight, so polls never overlap.
+  const checkBackendHealth = useCallback(async () => {
+    if (healthInFlightRef.current) return
+    healthInFlightRef.current = true
+    try {
+      // Step 1: backend liveness
+      const healthRes = await fetch(apiUrl('/api/health'))
+      if (!healthRes.ok) throw new Error(`HTTP ${healthRes.status}`)
+      try {
+        // Step 2: structured Docker availability (only when the backend is up)
+        const res = await fetch(apiUrl('/api/health/containers'))
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        setDockerHealth(await res.json())
+      } catch (err) {
+        // Backend is up but the containers probe failed → Docker unverified.
+        // Deliberately NOT backendDown: no banner, no raw error text.
+        console.error('Failed to fetch Docker health:', err)
+        setDockerHealth(null)
+      }
+      setBackendDown(false)
+      // Recovery re-arms the "Backend not running" banner for a future outage.
+      setBackendBannerDismissed(false)
+    } catch (err) {
+      console.error('Failed to fetch backend health:', err)
+      setDockerHealth(null)
+      setBackendDown(true)
+    } finally {
+      healthInFlightRef.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    checkBackendHealth()
+    const interval = setInterval(checkBackendHealth, 10000)
+    return () => clearInterval(interval)
+  }, [checkBackendHealth])
+
+  // ── First-run wizard: fetch onboarding status once on mount ────────────
+  // null (fetch failed / non-OK) keeps the wizard hidden — the backend-down
+  // banner already covers an unreachable backend.
+  useEffect(() => {
+    let cancelled = false
+    fetch(apiUrl('/api/onboarding/status'))
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
+      .then((data) => {
+        if (!cancelled) setOnboardingDone(data.onboarding_complete === true)
+      })
+      .catch((err) => {
+        console.error('Failed to fetch onboarding status:', err)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // ── Fetch initial logging config on mount ─────────────────────────────
+  useEffect(() => {
+    fetchLoggingConfig()
+  }, [fetchLoggingConfig])
+
+  // ── Persist active session ID in localStorage (legacy key, still written;
+  //    the new tm.sessionTabs.<ws> entry is the source of truth) ─────────
   useEffect(() => {
     if (activeSessionId) {
       localStorage.setItem('activeSessionId', activeSessionId)
@@ -471,84 +1302,173 @@ export default function App() {
     // so the open_sessions handler can read it before any tab is active.
   }, [activeSessionId])
 
-  // ── Render ──────────────────────────────────────────────────────────────
+  // ── Docker availability (tri-state, mirrors workspaceStore) ──────────
+  // null while loading; true/false from the health payload. Tolerates both
+  // the legacy flat string ("reachable"/other) and the structured dispatch
+  // shape ({"available": bool, "reason": ..., "hint": ...}).
+  const dockerInfo = dockerHealth?.docker
+  const dockerAvailable =
+    dockerHealth === null
+      ? null
+      : typeof dockerInfo === 'string'
+        ? dockerInfo === 'reachable'
+        : dockerInfo
+          ? dockerInfo.available === true
+          : false
+  const dockerHint =
+    dockerInfo && typeof dockerInfo === 'object' ? dockerInfo.hint : null
+  // Only the actionable hint is shown — never raw error text. Fall back to a
+  // still-actionable generic line when the hint is missing/empty (the banner
+  // already prefixes "⚠ Docker unavailable — ").
+  const degradedText =
+    dockerHint && typeof dockerHint === 'string' && dockerHint.trim()
+      ? dockerHint
+      : 'see the backend startup log for details'
+
+  // Keep-mounted session deck: every tab activated on the session layer
+  // stays mounted (hidden unless it is the active one), so switching tabs
+  // preserves per-session state without unmount/remount churn. The active
+  // session is always in the deck (first activation mounts immediately).
+  const deckSessions = tabs
+    .filter(t => t.sessionId === activeSessionId || (mountedSessions[currentWs] || []).includes(t.sessionId))
+    .map(t => t.sessionId)
+
+  // ── Render ────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
-      <TabBar
-        tabs={tabItems}
-        activeTabId={activeTabId}
-        onSelectTab={handleSelectTab}
-        onCloseTab={initiateCloseTab}
-        onNewTab={handleNewTab}
-        runningStates={tabRunningStates}
-        onCogwheelClick={handleCogwheelClick}
-      />
-
+      {backendDown && !backendBannerDismissed && (
+        <div className="docker-health-banner" role="alert">
+          <span className="docker-health-banner-text">Backend not running — check logs/backend_startup.log</span>
+          <button
+            className="docker-health-banner-dismiss"
+            onClick={() => setBackendBannerDismissed(true)}
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      {!backendDown && dockerAvailable === false && (
+        <div className="docker-health-banner" role="alert">
+          ⚠ Docker unavailable — {degradedText}
+        </div>
+      )}
       <div className="app-main">
-        {/* All tabs stay mounted; inactive ones hidden with display:none */}
         <div className="app-center tab-content-area">
-          {tabs.length === 0 ? (
-            <div className="empty-state">
-              <p>Open a session or create a new one to get started.</p>
+          <LayerNav route={route} workspaceLabel={layerNavWorkspaceLabel} sessionLabel={layerNavSessionLabel} />
+          {/* Per-workspace session tab strip (frontend-only state).
+              Only shown on workspace/session views — never on the selector. */}
+          {route?.view !== 'selector' && currentWs && tabs.length > 0 && (
+            <TabBar
+              tabs={tabs.map(t => ({ id: t.sessionId, name: t.title }))}
+              activeTabId={activeSessionId}
+              onSelectTab={(id) => {
+                useSessionTabsStore.getState().setActiveTab(currentWs, id)
+                navigate(`/workspace/${currentWs}/session/${encodeURIComponent(id)}`)
+              }}
+              onCloseTab={(id) => handleCloseTab(currentWs, id)}
+              onNewTab={() => navigate(`/workspace/${encodeURIComponent(currentWs)}`)}
+              onLoggingClick={() => setShowLoggingPanel(true)}
+              runningStates={tabRunningStates}
+            />
+          )}
+
+          {/* Keep-mounted session deck (own WebSocket per pane). Rendered
+              only while actually ON a session route — on the workspace route
+              the strip is visible but no session body mounts. Tabs activated
+              on this layer stay mounted (hidden via .session-tab-pane-hidden)
+              so switching tabs preserves each session's in-memory state;
+              leaving the session layer unmounts the whole deck. */}
+          {route?.view === 'session' && currentWs && activeTab && tabs.length > 0 && (
+            <div className="tab-wrapper">
+              {deckSessions.map(sid => (
+                <div
+                  key={sid}
+                  className={
+                    sid === activeSessionId
+                      ? 'session-tab-pane'
+                      : 'session-tab-pane session-tab-pane-hidden'
+                  }
+                >
+                  <SessionTab
+                    sessionId={sid}
+                    tabId={`tab-${sid}`}
+                    hubReady={hubReady}
+                    isActive={sid === activeSessionId}
+                    staggerMs={0}
+                    loadOnConnect={true}
+                    onClose={() => handleCloseTab(currentWs, sid)}
+                    onNewSession={handleNewSessionCreated}
+                    onSessionAdopted={(newId) => handleSessionAdopted(sid, newId)}
+                    onOpenNewTab={handleOpenNewTab}
+                    onSessionSaved={handleSessionSaved}
+                    onRegister={handleRegisterTab}
+                    onSessionRenamed={handleSessionRenamed}
+                    selectedWorker={selectedWorkerFor(sid)}
+                    onSelectWorker={handleSelectWorker}
+                    onClearWorker={handleCloseWorkerPanel}
+                    onWorkerEvent={handleWorkerEvent}
+                    onLoggingConfigChanged={(config) => setLoggingConfig(config)}
+                    onWorkspaceKnown={handleWorkspaceKnown}
+                    routeWorkspaceId={route?.workspaceId || null}
+                  />
+                </div>
+              ))}
             </div>
-          ) : (
-            tabs.map((tab, index) => (
-              <div
-                key={tab.tabId}
-                className="tab-wrapper"
-                style={{ display: tab.tabId === activeTabId ? '' : 'none' }}
-              >
-                <SessionTab
-                  sessionId={tab.sessionId}
-                  tabId={tab.tabId}
-                  hubReady={hubReady}
-                  isActive={tab.tabId === activeTabId}
-                  staggerMs={index * 200}
-                  loadOnConnect={tab.sessionId === startupActiveSessionId || tab.tabId === activeTabId}
-                  onClose={() => removeTab(tab.tabId)}
-                  onNewSession={handleNewSessionCreated}
-                  onSessionSaved={handleSessionSaved}
-                  onRegister={(actions) => handleRegisterTab(tab.tabId, actions)}
-                  onRunningChange={handleRunningChange}
-                  onSessionRenamed={handleSessionRenamed}
-                />
-              </div>
-            ))
+          )}
+
+          {/* Route views */}
+          {route?.view === 'workspace' && <WorkspaceDetailPage workspaceId={route.id} />}
+          {route?.view === 'selector' && <WorkspaceSelector />}
+          {route?.view === 'session' && !tabs.some((t) => t.sessionId === route.id) && (
+            <div className="session-loading-placeholder">Loading session…</div>
           )}
         </div>
 
-        {/* Sessions sidebar — always visible when no tabs are open, toggle via ⚙️ cogwheel */}
-        <div className={`session-sidebar ${(showSessions || tabs.length === 0) ? 'open' : ''}`}>
-          <SessionList
-            sessions={sessions}
-            onNew={handleNewTab}
-            onOpenTab={handleOpenTab}
-            onDelete={handleDelete}
-            onRename={handleRename}
+        {/* Logging Panel — toggle via button above */}
+        {showLoggingPanel && (
+          <LoggingPanel
+            config={loggingConfig}
+            configError={loggingConfigError}
+            onRetry={fetchLoggingConfig}
+            onSaveConfig={async (configPayload) => {
+              const res = await fetch(apiUrl('/api/logging/config'), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(configPayload),
+              })
+              if (!res.ok) throw new Error(`HTTP ${res.status}`)
+              const data = await res.json()
+              setLoggingConfig(data.config || data)
+              return data.config || data
+            }}
+            onClose={() => setShowLoggingPanel(false)}
           />
-        </div>
+        )}
+
+        {/* Worker Panel Area — multi-panel sidebar for worker event logs */}
+        <WorkerPanelArea
+          sessionId={activeSessionId}
+          workspaceId={currentWs}
+          panels={workerPanelsBySession[activeSessionId] || []}
+          focusedKey={focusedPanelBySession[activeSessionId] || null}
+          eventsByKey={routedEvents}
+          onClose={(key) => closePanel(activeSessionId, key)}
+          onFocus={(key) => focusPanel(activeSessionId, key)}
+          onResize={(key, w) => resizePanel(activeSessionId, key, w)}
+          onToggleMaximize={(key) => toggleMaximize(activeSessionId, key)}
+          onTogglePin={(key) => togglePin(activeSessionId, key)}
+          onMoveLeft={(key) => reorderPanel(activeSessionId, key, 'left')}
+          onMoveRight={(key) => reorderPanel(activeSessionId, key, 'right')}
+        />
 
       </div>
 
-      {/* Session Actions Panel */}
-      {sessionPanelOpen && activeTab && (
-        <SessionActionsPanel
-          sessionId={activeSessionId}
-          sessionName={activeSessionName}
-          onClose={() => setSessionPanelOpen(false)}
-          onRename={(id, name) => {
-            handleRename(id, name)
-            // Also send save_session to persist name immediately
-            const tabEntry = tabs.find((t) => t.sessionId === id)
-            if (tabEntry) {
-              const actions = tabActionsRef.current[tabEntry.tabId]
-              actions?.sendCommand?.('save_session')
-            }
-            setSessionPanelOpen(false)
-          }}
-          onDelete={handleDeleteFromPanel}
-          sessionsList={sessions}
-          onOpenSession={handleOpenSessionFromPanel}
+      {/* First-run setup wizard — last child of .app-container */}
+      {onboardingDone === false && (
+        <OnboardingWizard
+          onFinished={() => setOnboardingDone(true)}
+          sendCommand={wizardSend}
         />
       )}
     </div>

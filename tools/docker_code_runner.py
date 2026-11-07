@@ -8,12 +8,35 @@ from typing import ClassVar, List, Literal, Optional, Dict, Any
 from pydantic import Field, field_validator, model_validator
 from .base import ToolBase
 
+from thoughtmachine.audit_logger import audit_event
+from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
+
+# Worker-name context var (stdlib-only leaf module — no circular import).
+# Falls back to None so the runner keeps working outside a worker turn.
+try:
+    from agent.core.worker_context import current_worker_name
+except ImportError:
+
+    def current_worker_name():  # type: ignore
+        return None
+
 # Import centralized security
 try:
-    from thoughtmachine.security import setup_docker_sandbox as security_setup_docker, set_logger as security_set_logger
+    from thoughtmachine.security import (
+        setup_docker_sandbox as security_setup_docker,
+        set_logger as security_set_logger,
+        DockerSetupError,
+    )
     SECURITY_AVAILABLE = True
-except ImportError:
-    SECURITY_AVAILABLE = False
+except ImportError as _security_import_error:
+    # thoughtmachine.security is REQUIRED: DockerSetupError must always be
+    # the security layer's class (tests enforce that contract), so no local
+    # fallback class is ever defined here. Fail the import loudly instead of
+    # silently degrading.
+    raise ImportError(
+        "thoughtmachine.security is required by tools.docker_code_runner: "
+        "DockerSetupError must come from thoughtmachine.security"
+    ) from _security_import_error
 
 try:
     import docker
@@ -25,6 +48,13 @@ except ImportError:
     DockerException = Exception
     NotFound = Exception
     APIError = Exception
+
+try:
+    from infra.container_manager import ContainerManager
+except ImportError:
+    ContainerManager = None
+
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL
 
 
 class DockerCodeRunner(ToolBase):
@@ -86,7 +116,9 @@ class DockerCodeRunner(ToolBase):
     - This reduces Docker container overhead while maintaining security isolation.
 
     Dockerfile:
-    The Docker image is built from the project's Dockerfile at `docker/executor.Dockerfile`.
+    The executor image is built from the vault-managed workspace Dockerfile
+    via `ContainerManager`/`docker_executor` (no repo `docker/` directory is
+    involved).
     Set `build=True` to force a rebuild before execution (useful when adding packages).
 
     Security policy:
@@ -151,8 +183,18 @@ class DockerCodeRunner(ToolBase):
         description="Interpreter to use for executing script (e.g., 'bash', 'python3', 'sh'). Default: 'bash'"
     )
     idle_timeout: int = Field(
-        default=600,
+        default=IDLE_TIMEOUT_SECONDS,
         description="Idle timeout in seconds for container pooling. Container will be closed after this period of inactivity. Default: 600 seconds (10 minutes)."
+    )
+    worker_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "[internal] Owner identity of the worker sub-agent that created this "
+            "container (injected by ToolExecutor from the worker context var as "
+            "'<session_id or unknown>:<worker_name>'; stamped VERBATIM as the "
+            "``thoughtmachine.worker`` docker label on fresh creates so worker "
+            "teardown can reclaim it by exact label match)."
+        ),
     )
 
     @model_validator(mode='after')
@@ -204,8 +246,10 @@ class DockerCodeRunner(ToolBase):
             delimiter = 'SCRIPT_EOF'
 
         # Write script using heredoc, make executable, run with interpreter
-        # Use /workspace/tmp directory with random name (writable location)
-        script_dir = "/workspace/tmp"
+        # Use the exec-capable /home/agent/tmp tmpfs (writable, mode 700, on a
+        # mount that is NOT the workspace bind) so scratch scripts never litter
+        # the repository. The path is still unique per invocation via the uuid.
+        script_dir = "/home/agent/tmp"
         script_path = f"{script_dir}/script_{uuid.uuid4().hex[:8]}.sh"
 
         # Build command:
@@ -262,10 +306,14 @@ chmod +x "{script_path}"
             ))
 
         # Validate workspace path
-        if self.workspace_path is None:
-            workspace = os.getcwd()
-        else:
-            workspace = self.workspace_path
+        ws_path = self._resolve_registry_workspace()
+        if ws_path is None:
+            # Never fall back to cwd: the current directory may be outside the
+            # workspace, and mounting it would leak host files into the container.
+            raise DockerSetupError(
+                "workspace path could not be resolved; refusing to mount cwd"
+            )
+        workspace = ws_path
 
         # Build absolute path for working directory
         workdir = "/workspace"
@@ -295,20 +343,12 @@ chmod +x "{script_path}"
             else:
                 workdir = os.path.join("/workspace", rel_path)
 
-        try:
-            # Import DockerExecutor from the existing module
-            # Add parent directory to sys.path
-            import sys
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/..')
-            import importlib
-            import docker_executor
-            DockerExecutor = importlib.reload(docker_executor).DockerExecutor
-        except ImportError as e:
+        if ContainerManager is None:
             duration = time.time() - start_time
             return self._truncate_output(self._build_json_response(
                 success=False,
                 exit_code=-1,
-                error=f"Could not import DockerExecutor: {e}. Make sure docker package is installed and docker_executor.py exists.",
+                error="Could not import ContainerManager. Make sure docker package is installed and infra.container_manager.py exists.",
                 duration=duration
             ))
 
@@ -344,43 +384,108 @@ chmod +x "{script_path}"
         session_permissions = getattr(self, 'session_permissions', None)
 
         try:
-            if SECURITY_AVAILABLE:
-                executor = security_setup_docker(
-                    workspace_path=workspace,
-                    image=self.image,
-                    network="none",     # Harmless default; the security gate in docker_executor.py makes the final decision
-                    mem_limit=self.mem_limit,
-                    cpu_quota=self.cpu_quota,
-                    force_rebuild=self.build,
-                    idle_timeout=self.idle_timeout
-                )
-                # Pass session permissions and workspace ID to the executor
-                # so the unified security gate can make real decisions.
-                executor.session_permissions = session_permissions
-                executor.workspace_id = workspace_id
-            else:
-                # Fallback to direct DockerExecutor instantiation
-                executor = DockerExecutor(
-                    workspace_path=workspace,
-                    image=self.image,
-                    network="none",     # Harmless default; the security gate in docker_executor.py makes the final decision
-                    mem_limit=self.mem_limit,
-                    cpu_quota=self.cpu_quota,
-                    force_rebuild=self.build,
-                    idle_timeout=self.idle_timeout,
-                    session_permissions=session_permissions,
-                    workspace_id=workspace_id,
-                )
-
-            with open("/tmp/container_audit.log", "a") as _f:
-                _f.write(f"{time.time()} | CODERUNNER_EXECUTE | workspace={workspace} via_security={SECURITY_AVAILABLE}\n")
-            # Execute command with optional environment and working directory
-            stdout, stderr, exit_code = executor.execute(
-                command=actual_command,
-                timeout=self.timeout,
-                workdir=workdir,
-                environment=self.environment
+            # Re-route through the per-session ContainerManager:
+            # start(manager) -> exec -> stop. Network/mount decisions still
+            # come from docker_executor._resolve_container_config_via_gate
+            # (single source of truth), and named volumes are populated from
+            # the host workspace on first use. No per-execute reload of
+            # docker_executor (the old importlib.reload pattern) — the
+            # MODULE_LOAD audit fires once per process instead.
+            manager = ContainerManager(
+                workspace_path=workspace,
+                session_id=getattr(self, 'session_id', None),
+                workspace_id=workspace_id,
+                session_permissions=session_permissions,
+                image=self.image,
+                mem_limit=self.mem_limit,
+                cpu_quota=self.cpu_quota,
             )
+            if self.build:
+                # Preserve build=True semantics: explicitly run the image
+                # build-drift gate before starting. The executor image is built
+                # from the vault-managed workspace Dockerfile (vault-gated
+                # ContainerManager.build_image -> docker_executor machinery);
+                # the legacy docker/executor.Dockerfile no longer exists.
+                manager.build_image(tag=self.image)
+            audit_event("CODERUNNER_EXECUTE", f"workspace={workspace} via_security={SECURITY_AVAILABLE}")
+            info = manager.start(
+                image=self.image,
+                worker_name=getattr(self, "worker_name", None) or current_worker_name(),
+                lifecycle_class=LIFECYCLE_EPHEMERAL,
+                heal_missing=True,
+            )
+            # start() returns {"error": ...} (no "id") when the per-workspace
+            # container limit is reached or any pre-create check fails -
+            # surface that as a clear RuntimeError instead of a KeyError('id').
+            #
+            # Drift refusal is the one error start() does NOT resolve on its own:
+            # it refuses to hand back a reused container whose live isolation is
+            # MORE PERMISSIVE than the resolved policy, WITHOUT mutating it. This
+            # ephemeral caller owns the container lifecycle, so it removes the
+            # drifted container explicitly and creates a fresh one under the
+            # resolved policy (start() never removes on the drift path).
+            _drift = info.get("drift")
+            if "error" in info and _drift and _drift.get("decision") == "deny":
+                # The drifted container id rides INSIDE ``drift`` (the deny
+                # payload mirrors exec's exactly: no top-level ``container_id``).
+                # A drift deny with no recoverable id is unrecoverable - fail
+                # loudly instead of silently skipping the remove/restart.
+                _drift_cid = _drift.get("container_id")
+                if not _drift_cid:
+                    raise RuntimeError(
+                        "Container start was denied for isolation drift but the "
+                        "drift payload carried no container_id; cannot remove or "
+                        "recreate the drifted container."
+                    )
+                manager.remove(_drift_cid)
+                info = manager.start(
+                    image=self.image,
+                    worker_name=getattr(self, "worker_name", None) or current_worker_name(),
+                    lifecycle_class=LIFECYCLE_EPHEMERAL,
+                    heal_missing=True,
+                )
+            if "error" in info:
+                raise RuntimeError(info["error"])
+            try:
+                result = manager.exec(
+                    info["id"],
+                    command=actual_command,
+                    timeout=self.timeout,
+                    workdir=workdir,
+                    environment=self.environment,
+                )
+            finally:
+                manager.stop(info["id"])
+
+            # A cancelled turn comes back from exec as an INTERRUPTED payload:
+            # the wait was abandoned, the in-container process was NOT killed.
+            # Surface it verbatim instead of reading it as a normal exit (the
+            # exit code is None on that path, so the checks below would mistake
+            # it for a clean run).
+            if isinstance(result, dict) and result.get("status") == "interrupted":
+                _interrupted_payload = {
+                    "success": False,
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "exit_code": -3,
+                    "reason": result.get("reason"),
+                    "stdout": result.get("stdout", "") or "",
+                    "stderr": result.get("stderr", "") or "",
+                    "command": actual_command,
+                    "duration": time.time() - start_time,
+                    "timed_out": False,
+                    "error": (
+                        "Turn was cancelled while waiting for the command. The "
+                        "process inside the container was NOT killed and may "
+                        "still be running."
+                    ),
+                    "note": result.get("note"),
+                }
+                return self._truncate_output(json.dumps(_interrupted_payload, indent=2))
+
+            stdout = result["stdout"]
+            stderr = result["stderr"]
+            exit_code = result["exit_code"]
 
             duration = time.time() - start_time
 
@@ -427,27 +532,16 @@ chmod +x "{script_path}"
             ))
 
     def _build_image(self, client, image_name):
-        """Build Docker image from docker/executor.Dockerfile"""
-        dockerfile_path = os.path.join(os.path.dirname(__file__), "..", "docker", "executor.Dockerfile")
-        if not os.path.exists(dockerfile_path):
-            dockerfile_path = "docker/executor.Dockerfile"
+        """Legacy build helper — no longer supported.
 
-        try:
-            # Build the image
-            image, build_logs = client.images.build(
-                path=os.path.dirname(dockerfile_path),
-                dockerfile=os.path.basename(dockerfile_path),
-                tag=image_name,
-                rm=True,
-                pull=True
-            )
-            # Log build output (optional)
-            for chunk in build_logs:
-                if "stream" in chunk:
-                    line = chunk["stream"].strip()
-                    if line:
-                        self._log_debug(f"Build: {line}")
-            return image
-        except DockerException as e:
-            raise RuntimeError(f"Failed to build Docker image: {e}")
+        The old ``docker/executor.Dockerfile`` does not exist; the executor
+        image is built by ``ContainerManager.build_image`` / ``docker_executor``
+        from the vault-managed workspace Dockerfile (vault-authoritative).
+        """
+        raise RuntimeError(
+            "Direct image builds from docker/executor.Dockerfile are no longer "
+            "supported: the executor image is built from the vault-managed "
+            "workspace Dockerfile via ContainerManager/docker_executor "
+            "(use build_image(tag=...) or DockerCodeRunner(build=True))."
+        )
 

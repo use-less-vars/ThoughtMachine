@@ -6,239 +6,165 @@
  * Each role gets a distinct CSS class and alignment.
  *
  * Props: messages — array of { role, content, reasoning_content? } objects
- */
-
-import React, { useState, useEffect, useRef, useCallback } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-
-/* ── Copy-to-clipboard button ──
  *
- * Uses onMouseDown + preventDefault so clicking never steals focus
- * from wherever the user is (the query bar, another field, etc.).
+ * Auto-scroll logic:
+ *   - Tracks whether the user is "at the bottom" of the scroll container.
+ *   - On message APPEND (count increases), if user was at bottom, scroll to
+ *     new bottom via useLayoutEffect + double requestAnimationFrame.
+ *   - Uses a programmaticScrollRef to suppress the onScroll handler during
+ *     programmatic scroll events, preventing false "not at bottom" detection
+ *     when async content (syntax highlighting, markdown) expands scrollHeight
+ *     between the scroll assignment and the scroll event delivery.
+ *   - A ResizeObserver on the container handles async content expansion
+ *     while the user is at bottom, keeping the view anchored to the latest
+ *     content even as images / code blocks load asynchronously.
  */
-function CopyButton({ text, label }) {
-  const [copied, setCopied] = useState(false)
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch (e) {
-      console.warn('Copy failed:', e)
-    }
-  }
-  return (
-    <button className="copy-btn" onMouseDown={(e) => e.preventDefault()} onClick={handleCopy} title="Copy to clipboard">
-      {copied ? '✅' : label || '📋'}
-    </button>
-  )
-}
 
-const TRUNCATE_LENGTH = 500
+import React, { useEffect, useLayoutEffect, useRef, useCallback } from 'react'
+import { MessageBubble } from './chat/MessageBubble'
 
-const ROLE_STYLE = {
-  user:        { className: 'message-user',             label: 'You' },
-  assistant:   { className: 'message-assistant',       label: 'Assistant' },
-  tool_call:   { className: 'message-tool-call',       label: 'Tool Call' },
-  tool_result: { className: 'message-tool-result',     label: 'Tool Result' },
-  summary:     { className: 'message-summary',           label: '📝 Summary' },
-  final:       { className: 'message-final',            label: '🎯 Final' },
-  question:    { className: 'message-question',          label: '❓ Question' },
-  system:      { className: 'message-system-as-user',  label: 'System' },
-}
-
-/* ── Truncatable text for long tool results ── */
-function TruncatableContent({ text }) {
-  const [expanded, setExpanded] = useState(false)
-  if (!text || text.length <= TRUNCATE_LENGTH) {
-    return <pre className="truncatable-content">{text}</pre>
-  }
-  return (
-    <div>
-      <pre className="truncatable-content">
-        {expanded ? text : text.slice(0, TRUNCATE_LENGTH) + '…'}
-      </pre>
-      <button className="truncate-toggle" onClick={() => setExpanded(!expanded)}>
-        {expanded ? '▲ Show less' : '▼ Show more'}
-      </button>
-    </div>
-  )
-}
-
-/* ── Tool call display ── */
-/* ── Summary tool result (dark golden, full markdown, no truncation) ── */
-function SummaryContent({ content }) {
-  return (
-    <div className="summary-markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-        {content}
-      </ReactMarkdown>
-    </div>
-  )
-}
-
-function ToolCallContent({ content }) {
-  const MAX_LINES = 5
-  let parsed = null
-  try {
-    parsed = JSON.parse(content)
-  } catch (e) {
-    return <pre className="tool-call-raw">{content}</pre>
-  }
-  const { name, arguments: args } = parsed
-
-  /* Pretty-print args and limit to MAX_LINES lines */
-  let argsText = ''
-  let truncated = false
-  if (args) {
-    const full = JSON.stringify(args, null, 2)
-    const lines = full.split('\n')
-    if (lines.length > MAX_LINES) {
-      argsText = lines.slice(0, MAX_LINES).join('\n') + '\n...'
-      truncated = true
-    } else {
-      argsText = full
-    }
-  }
-
-  return (
-    <details className="tool-call-details" open>
-      <summary className="tool-call-summary">
-        🛠️ Tool Call: <strong>{name}</strong>
-      </summary>
-      <div className="tool-call-body">
-        {args ? (
-          <pre className="tool-call-args">{argsText}</pre>
-        ) : (
-          <em>No arguments</em>
-        )}
-      </div>
-    </details>
-  )
-}
-
-/* ── Assistant message with optional reasoning block ── */
-function AssistantContent({ msg }) {
-  return (
-    <>
-      {msg.reasoning_content && (
-        <details className="reasoning-block" open>
-          <summary className="reasoning-summary">
-            💭 Thinking
-            <CopyButton text={msg.reasoning_content} label="📋" />
-          </summary>
-          <div className="reasoning-content">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {msg.reasoning_content}
-            </ReactMarkdown>
-          </div>
-        </details>
-      )}
-      <div className="assistant-markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-          {msg.content}
-        </ReactMarkdown>
-      </div>
-    </>
-  )
-}
-
-/* ── Route content based on role ── */
-function MessageContent({ msg }) {
-  /* Summary results: dark golden, full markdown, no truncation */
-  if (msg.is_summary) {
-    return <SummaryContent content={msg.content} />
-  }
-
-  /* Final results render as full markdown (blueish, no truncation) */
-  if (msg.is_final) {
-    return (
-      <div className="final-markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-          {msg.content}
-        </ReactMarkdown>
-      </div>
-    )
-  }
-  switch (msg.role) {
-    case 'assistant':
-      return <AssistantContent msg={msg} />
-    case 'tool_call':
-      return <ToolCallContent content={msg.content} />
-    case 'tool_result':
-      return <TruncatableContent text={msg.content} />
-    case 'system':
-      return <p className="system-text">{msg.content}</p>
-    default:
-      /* System notification messages with role 'user' render as system style */
-      if (msg.is_system_notification) {
-        return <p className="system-text">{msg.content}</p>
-      }
-      return <p className="message-text">{msg.content}</p>
-  }
-}
-
-/* ── Single bubble ── */
-const MessageBubble = React.memo(
-  function MessageBubble({ msg, index }) {
-  /* ── System notifications are stored as 'user' role with is_system_notification flag ── */
-  const effectiveRole = msg.is_final
-    ? (msg.response_type === 'question' ? 'question' : 'final')
-    : (msg.is_summary ? 'summary' : (msg.is_system_notification ? 'system' : msg.role))
-  const style = ROLE_STYLE[effectiveRole] || ROLE_STYLE.system
-  const copyText = msg.reasoning_content
-    ? `${msg.reasoning_content}\n\n---\n\n${msg.content}`
-    : msg.content
-  return (
-    <div className={`message ${style.className}`} key={index}>
-      <div className="message-sender">
-        {style.label}
-        <CopyButton text={copyText} label="📋" />
-      </div>
-      <MessageContent msg={msg} />
-    </div>
-  )
-  },
-  (prev, next) =>
-    prev.index === next.index &&
-    prev.msg.content === next.msg.content &&
-    prev.msg.role === next.msg.role &&
-    prev.msg.reasoning_content === next.msg.reasoning_content &&
-    prev.msg.is_system_notification === next.msg.is_system_notification &&
-    prev.msg.is_final === next.msg.is_final &&
-    prev.msg.is_summary === next.msg.is_summary &&
-    prev.msg.response_type === next.msg.response_type
-)
+// Fix 3a: "at bottom" window (~50px). Wider than the old 20px so a user
+// reading near the bottom edge isn't considered "scrolled up" by every small
+// append, while still auto-scrolling for the common reading-at-bottom case.
+const AT_BOTTOM_THRESHOLD = 50
 
 /* ── Main panel ── */
-function ChatPanel({ messages, loadMore, hasMore }) {
+function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
   const chatRef = useRef(null)
-  const [shouldAutoScroll, setShouldAutoScroll] = useState(true)
+  const isAtBottomRef = useRef(true)
+  const programmaticScrollRef = useRef(false)
+  const prevCountRef = useRef(0)
+  // Fix 3a: last known scrollTop — used to preserve the user's reading
+  // position when the messages list is replaced while scrolled up.
+  const prevScrollTopRef = useRef(0)
+  // Streaming deltas grow the LAST message in place (count unchanged), so the
+  // last rendered content is tracked to detect "appended below the fold".
+  const prevLastContentRef = useRef(null)
 
-  // On scroll, determine if user is at bottom
+  // ── Scroll handler — suppress updates during programmatic scroll ──
   const handleScroll = useCallback(() => {
+    if (programmaticScrollRef.current) {
+      // This scroll event was triggered by our own programmatic scroll;
+      // reset the guard for the next user-initiated scroll.
+      programmaticScrollRef.current = false
+      // Update isAtBottomRef so it reflects the user's actual scroll position
+      // even when this scroll event was triggered programmatically.
+      const el = chatRef.current
+      if (el) {
+        isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_THRESHOLD
+        prevScrollTopRef.current = el.scrollTop
+      }
+      return
+    }
     const el = chatRef.current
     if (!el) return
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20
-    setShouldAutoScroll(atBottom)
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_THRESHOLD
+    isAtBottomRef.current = atBottom
+    prevScrollTopRef.current = el.scrollTop
   }, [])
 
-  // After messages update, scroll if we were at bottom
-  useEffect(() => {
-    if (shouldAutoScroll && chatRef.current) {
-      chatRef.current.scrollTop = chatRef.current.scrollHeight
-    }
-  }, [messages, shouldAutoScroll])
-
-  const scrollToBottom = () => {
-    if (chatRef.current) {
-      chatRef.current.scrollTop = chatRef.current.scrollHeight
-      setShouldAutoScroll(true)
+  // ── Centralized programmatic scroll helper ──
+  // All direct scroll-to-bottom calls route through this function.
+  // Pass force=true to scroll regardless of isAtBottomRef state.
+  const scrollToBottomFn = (force = false) => {
+    if (!force && !isAtBottomRef.current) return
+    const el = chatRef.current
+    if (el) {
+      programmaticScrollRef.current = true
+      el.scrollTop = el.scrollHeight
+      isAtBottomRef.current = true
     }
   }
 
-  // Scroll to the previous user query above the current viewport
+  // ── Auto-scroll on message append ──
+  // Runs synchronously after DOM mutations (useLayoutEffect) but double-rAF
+  // ensures async rendering (syntax highlighting, markdown) has settled.
+  useLayoutEffect(() => {
+    const currentCount = messages ? messages.length : 0
+    const prevCount = prevCountRef.current
+    prevCountRef.current = currentCount
+    // A streaming delta keeps the count constant and only grows the last
+    // message's text; treat that as an append so the view follows the stream.
+    // The THINKING phase grows `reasoning_content` only (the answer body is
+    // still empty), so the signature must cover both fields -- keyed on
+    // `content` alone a reasoning-only delta looked like "no change" and the
+    // view fell into the restore-scrollTop branch below, freezing the panel
+    // while the model was thinking. The signature is private to this ref, so
+    // the two-field shape is not observable anywhere else.
+    const lastMsg = currentCount > 0 ? messages[currentCount - 1] : null
+    const currentLastContent = currentCount > 0
+      ? `${lastMsg?.content ?? ''}\u0000${lastMsg?.reasoning_content ?? ''}`
+      : ''
+    const prevLastContent = prevLastContentRef.current
+    prevLastContentRef.current = currentLastContent
+    const grewInPlace = currentCount === prevCount && currentCount > 0 &&
+      currentLastContent !== prevLastContent
+
+    // No container — nothing to do.
+    if (!chatRef.current || currentCount === 0) return
+
+    // Fix 3a: content changed while the user is scrolled UP — preserve their
+    // exact reading position. Browsers keep scrollTop when content is appended
+    // below the fold, but conversation_changed REPLACES the whole list, so we
+    // defensively restore the last known scrollTop from prevScrollTopRef.
+    // This replaces the previous hard early-return and prevents scroll fights
+    // between this effect and the ResizeObserver.
+    if (!isAtBottomRef.current || (currentCount <= prevCount && !grewInPlace)) {
+      chatRef.current.scrollTop = prevScrollTopRef.current
+      return
+    }
+
+    // Content was APPENDED and user is at bottom — scroll to the new bottom.
+    // Runs synchronously after DOM mutations (useLayoutEffect) but double-rAF
+    // ensures async rendering (syntax highlighting, markdown) has settled.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        scrollToBottomFn()
+      })
+    })
+  }, [messages])
+
+  // ── ResizeObserver — keep anchored at bottom during async expansion ──
+  useEffect(() => {
+    const el = chatRef.current
+    if (!el) return
+
+    const observer = new ResizeObserver(() => {
+      // Only intervene if user is at bottom and we're not already
+      // in the middle of a programmatic scroll.
+      if (isAtBottomRef.current && !programmaticScrollRef.current) {
+        if (el.scrollHeight - el.scrollTop - el.clientHeight > 1) {
+          // Content expanded below the fold while user was at bottom.
+          scrollToBottomFn()
+        }
+      }
+    })
+
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  // ── Force scroll to bottom when scrollToBottomKey changes ──
+  // Fix 3a: the key is bumped on (a) context compaction/summary recovery
+  // (R3, pre-existing wiring in SessionTab.handleEvent) and (b) user query
+  // send (start_session / continue_session, wired in SessionTab.sendCommand).
+  // Both are explicit user/system actions where force-scrolling is desired
+  // EVEN IF the user is scrolled up — hence the removed isAtBottomRef guard
+  // (previously it made this key a no-op whenever the user had scrolled up,
+  // defeating the compaction intent).
+  useEffect(() => {
+    const el = chatRef.current
+    if (!el) return
+    if (scrollToBottomKey === 0) return  // initial value, no action
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        scrollToBottomFn(true)
+      })
+    })
+  }, [scrollToBottomKey])
+
+  // ── Scroll to previous user query (jump up) ──
   const jumpToPrevQuery = () => {
     const el = chatRef.current
     if (!el) return
@@ -249,14 +175,14 @@ function ChatPanel({ messages, loadMore, hasMore }) {
       if (msgEl.offsetTop + msgEl.offsetHeight < el.scrollTop + 10) {
         // This user message is above the current viewport — scroll to it
         el.scrollTop = msgEl.offsetTop - 20
-        setShouldAutoScroll(false)
+        isAtBottomRef.current = false
         return
       }
     }
     // No user message above viewport, go to the first one (top of chat)
     if (userMessages.length > 0) {
       el.scrollTop = userMessages[0].offsetTop - 20
-      setShouldAutoScroll(false)
+      isAtBottomRef.current = false
     }
   }
 
@@ -277,16 +203,14 @@ function ChatPanel({ messages, loadMore, hasMore }) {
           <MessageBubble key={i} msg={msg} index={i} />
         ))}
       </div>
-      {!shouldAutoScroll && (
-        <div className="scroll-nav-group">
-          <button className="scroll-prev-btn" onClick={jumpToPrevQuery} title="Jump to previous query">
-            ↑
-          </button>
-          <button className="scroll-bottom-btn" onClick={scrollToBottom} title="Scroll to bottom">
-            ↓
-          </button>
-        </div>
-      )}
+      <div className="scroll-nav-group">
+        <button className="scroll-prev-btn" onClick={jumpToPrevQuery} title="Jump to previous query">
+          ↑
+        </button>
+        <button className="scroll-bottom-btn" onClick={() => scrollToBottomFn(true)} title="Scroll to bottom">
+          ↓
+        </button>
+      </div>
     </div>
   )
 }

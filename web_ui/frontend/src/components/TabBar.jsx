@@ -4,8 +4,6 @@
  * Top tab bar that displays open session tabs (like browser tabs).
  * Each tab shows the session name and a close (✕) button.
  * A "+" button creates a new tab.
- * A ⚙️ cogwheel opens the Session Actions slide-in panel (name + delete)
- * when a tab is active, or toggles the sessions sidebar when no tabs are open.
  *
  * Props:
  *   tabs            — array of { id, name }
@@ -13,7 +11,6 @@
  *   onSelectTab     — called with (tabId)
  *   onCloseTab      — called with (tabId)
  *   onNewTab        — called with ()
- *   onCogwheelClick — called with () when cogwheel is clicked
  *   runningStates   — { [tabId]: status }
  */
 
@@ -24,6 +21,8 @@ function _tabStatusClass(status) {
     case 'RUNNING':
       return 'running'
     case 'PAUSED':
+      return 'paused'
+    case 'PAUSING':
       return 'pausing'
     case 'WAITING_FOR_USER':
       return 'running'
@@ -32,7 +31,7 @@ function _tabStatusClass(status) {
   }
 }
 
-export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, onCogwheelClick, runningStates = {} }) {
+export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, onLoggingClick, runningStates = {} }) {
   if (tabs.length === 0) {
     return null
   }
@@ -47,7 +46,7 @@ export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onN
             onClick={() => onSelectTab(tab.id)}
             title={tab.name}
           >
-            <span className="tab-label">{tab.name}</span>
+            <span className="tab-label">{tab.name || 'Untitled'}</span>
             <button
               className="tab-close-btn"
               onClick={(e) => {
@@ -64,9 +63,11 @@ export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onN
           +
         </button>
       </div>
-      <button className="tab-cogwheel-btn" onClick={onCogwheelClick} title="Session actions">
-        ⚙️
-      </button>
+      <div className="tab-actions">
+        <button className="tab-action-btn" onClick={onLoggingClick} title="Toggle logging panel">
+          Logging
+        </button>
+      </div>
     </div>
   )
 }

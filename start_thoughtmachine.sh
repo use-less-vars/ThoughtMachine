@@ -2,156 +2,526 @@
 #===============================================================================
 # start_thoughtmachine.sh
 #
-#  ⚠ SYNCED with start_thoughtmachine.bat — keep in agreement.
-#  ⚠ If you edit this file, mirror the same change in the batch file.
-#===============================================================================
-# Single-command launcher for ThoughtMachine Web UI.
-# Pre-requisite: run install_thoughtmachine.sh first.
+#  Preflight doctor + launcher for ThoughtMachine.
+#  Runs all checks first; when they pass it starts the app:
+#    * default (prod): production mode, single process -- backend serves the
+#                      built frontend from web_ui/frontend/dist on
+#                      TM_BACKEND_PORT (default 8000). Fast. For daily use.
+#                      Auto-builds dist/ on first run if missing.
+#    * --dev / -d:     development mode -- vite dev server on TM_FRONTEND_PORT
+#                      (default 5173) in the background, plus the backend.
+#                      Slow (unbundled modules, HMR, dev React). For editing
+#                      frontend code only.
+#    * --doctor:       preflight (tolerates a missing/unusable Docker daemon) +
+#                      start the backend, verify /api/health, print
+#                      BACKEND-HEALTHY and keep running.
+#    * --check-only:   run ONLY the preflight checks, then exit 0 without
+#                      starting anything (also honors TM_CHECK_ONLY=1).
 #
-# Usage:
-#   ./start_thoughtmachine.sh           # Development mode (hot-reload)
-#   ./start_thoughtmachine.sh --prod    # Production mode (serves from dist/)
+#  The backend is always started in the background; its stdout+stderr are
+#  mirrored to the console AND to logs/backend_startup.log (via tee). The
+#  script polls http://127.0.0.1:<TM_BACKEND_PORT>/api/health for up to 30 s before
+#  considering the backend up. The frontend is only started after the
+#  backend is healthy.
 #===============================================================================
-
-# Ensure clean startup by killing any leftover processes
-"$(dirname "$0")/kill_thoughtmachine.sh"
-set -euo pipefail
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$SCRIPT_DIR"
+cd "$SCRIPT_DIR"
 
-# ── Parse flags ────────────────────────────────────────────────────────────
-PROD_MODE=false
+# Make sure standard system paths are on PATH for docker detection even in
+# minimal environments (cron/systemd, non-login shells).
+case ":$PATH:" in *:/usr/bin:*) ;; *) export PATH="/usr/bin:$PATH" ;; esac
+case ":$PATH:" in *:/usr/sbin:*) ;; *) export PATH="/usr/sbin:$PATH" ;; esac
+mkdir -p "$SCRIPT_DIR/logs"
+
+DOCTOR="$SCRIPT_DIR/scripts/doctor_checks.py"
+DEV_MODE=false
+CHECK_ONLY=false
+DOCTOR_MODE=false
+
 for arg in "$@"; do
     case "$arg" in
-        --prod|-p)
-            PROD_MODE=true
-            ;;
+        --dev|-d)           DEV_MODE=true ;;
+        --prod|-p)          DEV_MODE=false ;;   # legacy alias; prod is now default
+        --check-only)       CHECK_ONLY=true ;;
+        --doctor)           DOCTOR_MODE=true ;;
         --help|-h)
-            echo "Usage: $0 [--prod]"
-            echo ""
-            echo "  --prod    Production mode (serves pre-built dist/ files)"
-            echo "            Default is development mode with hot-reload."
-            echo "  --help    Show this help"
+            echo "Usage: $0 [--dev] [--check-only] [--doctor]"
+            echo "  (default)     production: backend serves the built frontend on one port"
+            echo "  --dev / -d    development: vite dev server on TM_FRONTEND_PORT (slow, HMR)"
+            echo "  --check-only  run preflight checks only, then exit 0"
+            echo "  --doctor      preflight (Docker problems only warn) + start the backend,"
+            echo "                verify /api/health, print BACKEND-HEALTHY and keep running"
             exit 0
             ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: $0 [--prod]"
+            echo "Usage: $0 [--dev] [--check-only] [--doctor]"
             exit 1
             ;;
     esac
 done
-
-# ── Ensure virtual environment exists ─────────────────────────────────────────
-VENV_DIR="$PROJECT_DIR/.venv"
-if [[ ! -d "$VENV_DIR" ]]; then
-    echo "✗ Virtual environment not found at $VENV_DIR"
-    echo ""
-    echo "  Run the install script first:"
-    echo "    ./install_thoughtmachine.sh"
-    exit 1
+if [ "${TM_CHECK_ONLY:-}" = "1" ]; then
+    CHECK_ONLY=true
 fi
 
-source "$VENV_DIR/bin/activate"
+# TM_REQUIRE_DOCKER: strict opt-in for failing the boot on a Docker problem.
+# Value "1" ONLY (mirrors install.sh's DOCKER_NONFATAL idiom); unset/empty/any
+# other value keeps Docker optional, so a Docker problem degrades the boot
+# (warn + continue) instead of refusing to start.
+TM_REQUIRE_DOCKER="${TM_REQUIRE_DOCKER:-}"
+if [ "$TM_REQUIRE_DOCKER" = "1" ]; then
+    DOCKER_REQUIRED=1
+else
+    DOCKER_REQUIRED=0
+fi
 
-# ── Start ─────────────────────────────────────────────────────────────────────
+# TM_REQUIRE_FRONTEND: strict opt-in for failing the boot on a frontend problem.
+# Value "1" ONLY (mirrors TM_REQUIRE_DOCKER above); unset/empty/any other value
+# keeps the frontend optional, so a frontend dev-server failure degrades the
+# boot (warn + continue with the backend only) instead of refusing to start.
+TM_REQUIRE_FRONTEND="${TM_REQUIRE_FRONTEND:-}"
+if [ "$TM_REQUIRE_FRONTEND" = "1" ]; then
+    FRONTEND_REQUIRED=1
+else
+    FRONTEND_REQUIRED=0
+fi
+
+# TM_BACKEND_PORT / TM_FRONTEND_PORT: ports the launcher binds and probes.
+# Defaults preserve the historical values exactly (backend 8000, frontend 5173)
+# so an unset environment behaves the same as before.
+TM_BACKEND_PORT="${TM_BACKEND_PORT:-8000}"
+TM_FRONTEND_PORT="${TM_FRONTEND_PORT:-5173}"
+
+doctor() {
+    python3 "$DOCTOR" "$@"
+}
+
+# Extract a field from a JSON document passed on stdin. Prints "" on any error.
+json_get() {
+    python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print(d.get(sys.argv[1], "") if isinstance(d, dict) else "")' "$1" 2>/dev/null || true
+}
+
+BACKEND_PID=""
+VITE_PID=""
+BACKEND_LOG="$SCRIPT_DIR/logs/backend_startup.log"
+
+cleanup() {
+    if [ -n "${VITE_PID:-}" ]; then
+        kill "$VITE_PID" 2>/dev/null || true
+        wait "$VITE_PID" 2>/dev/null || true
+    fi
+    if [ -n "${BACKEND_PID:-}" ]; then
+        kill "$BACKEND_PID" 2>/dev/null || true
+        wait "$BACKEND_PID" 2>/dev/null || true
+    fi
+}
+trap 'cleanup; exit 130' INT TERM
+
+# Poll GET http://127.0.0.1:<TM_BACKEND_PORT>/api/health for up to 30 s (30 x 1 s).
+# Returns 0 when the backend answers 200; 1 on timeout or early exit.
+# Fallback: when /api/health returns 404 (route not registered in this build),
+# probe /api/health/containers (the real readiness endpoint) instead.
+wait_for_backend() {
+    # $1 = backend PID; $2 = backend port to probe.
+    python3 - "$1" "$2" <<'PY'
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+pid = sys.argv[1]
+port = sys.argv[2]
+have_proc = os.path.isdir("/proc")
+deadline = time.time() + 30
+while time.time() < deadline:
+    if have_proc and not os.path.isdir("/proc/%s" % pid):
+        break
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%s/api/health" % port, timeout=2) as resp:
+            if resp.status == 200:
+                sys.exit(0)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%s/api/health/containers" % port, timeout=2) as resp2:
+                    if resp2.status == 200:
+                        sys.exit(0)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    time.sleep(1)
+sys.exit(1)
+PY
+    return $?
+}
+
+# Start the backend in the background with stdout+stderr mirrored to the
+# console and logs/backend_startup.log, then wait for it to become healthy.
+# Exits 1 (with the log tail) on failure.
+start_backend() {
+    # $1 = backend command line (kept word-split on purpose)
+    mkdir -p "$SCRIPT_DIR/logs"
+    echo "  Starting backend; console output mirrored to logs/backend_startup.log ..."
+    # shellcheck disable=SC2086
+    # The subshell execs the backend, so $! is the backend's own PID (tee's
+    # PID is not captured); tee truncates the log on start.
+    ( exec $1 ) > >(tee "$BACKEND_LOG") 2>&1 &
+    BACKEND_PID=$!
+    echo "  Backend PID: $BACKEND_PID"
+    if ! wait_for_backend "$BACKEND_PID" "$TM_BACKEND_PORT"; then
+        kill "$BACKEND_PID" 2>/dev/null || true
+        wait "$BACKEND_PID" 2>/dev/null || true
+        echo ""
+        echo "Backend failed to start. See logs/backend_startup.log. Last lines:"
+        tail -50 "$BACKEND_LOG" 2>/dev/null | sed 's/^/  /'
+        exit 1
+    fi
+    echo "  Backend is healthy (/api/health)."
+}
+
 echo "============================================"
-echo "  ThoughtMachine — Starting Web UI"
+echo "  ThoughtMachine - preflight check"
 echo "============================================"
 echo ""
 
-if $PROD_MODE; then
-    # ── Production mode (auto-build fresh, then serve) ────────────────
-    echo "  Mode:    PRODUCTION (fresh build from source)"
-    echo "  Server:  http://127.0.0.1:8000"
-    echo "  Stop:    Ctrl+C"
-    echo ""
-    export TM_NPM_CMD="$(command -v npm)"
-    python -m web_ui.backend.server --serve-frontend
+# ------------------------------------------- required tools (before all checks)
+echo "Required tools ..."
+TOOLS_OUT="$(doctor --check-tools 2>&1)"
+TOOLS_RC=$?
+if [ "$TOOLS_RC" -ne 0 ]; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "      macOS detected - skipping Linux-only tool requirements."
+    else
+        echo "      FAILED: required tools are missing:"
+        printf '%s' "$TOOLS_OUT" | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+for name in d.get("critical_missing", []):
+    print("    - %s: %s" % (name, d["tools"][name].get("hint", "")))' 2>/dev/null | sed 's/^/      /'
+        echo "      Install the missing tools, then re-run this script."
+        exit 1
+    fi
+fi
+DOCKER_PRESENT="$(printf '%s' "$TOOLS_OUT" | json_get docker_present)"
+if [ "$DOCKER_PRESENT" = "False" ]; then
+    echo "      NOTE: docker not found - continuing without Docker (degraded mode)."
+    echo "      Install it with:  $(printf '%s' "$TOOLS_OUT" | json_get docker_hint)"
+fi
+echo "      ok."
+
+# system health table (informational; failures do not block startup)
+python3 -m thoughtmachine.doctor || true
+echo ""
+
+# --------------------------------------------------------- [1/8] venv (critical)
+echo "[1/8] Python virtual environment ..."
+VENV_OUT="$(doctor --ensure-venv 2>&1)"
+VENV_RC=$?
+if [ "$VENV_RC" -ne 0 ]; then
+    echo "      FAILED: virtual environment (.venv) could not be set up."
+    printf '%s\n' "$VENV_OUT" | sed 's/^/      /'
+    echo "      Run ./install.sh first"
+    exit 1
+fi
+VENV_BROKEN="$(printf '%s' "$VENV_OUT" | json_get broken_reason)"
+if [ -n "$VENV_BROKEN" ]; then
+    echo "Venv is broken. Recreating automatically..."
+fi
+echo "      ok."
+
+# ------------------------------------------------------------ [2/8] Docker access
+echo "[2/8] Docker ..."
+DOCKER_OUT="$(doctor --check-docker 2>&1)"
+DOCKER_RC=$?
+if [ "$DOCKER_RC" -ne 0 ]; then
+    DOCKER_REASON="$(printf '%s' "$DOCKER_OUT" | json_get reason)"
+    DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
+    case "$DOCKER_REASON" in
+        permission_denied)
+            if $CHECK_ONLY; then
+                echo "      WARNING: Docker permission problem (reason: permission_denied) - continuing in --check-only mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif [ "${TM_REEXEC:-}" = "1" ]; then
+                if $DOCTOR_MODE; then
+                    echo "      WARNING: Docker permission problem persists even inside the 'docker' group (continuing in --doctor mode)."
+                else
+                    echo "      FAILED: Docker permission problem persists even inside the 'docker' group."
+                    echo "      Re-login or run: newgrp docker"
+                    exit 1
+                fi
+            elif ! command -v sg >/dev/null 2>&1; then
+                echo "      FAILED: 'sg' command not found - cannot re-run inside the docker group."
+                echo "      Re-login or run: newgrp docker"
+                exit 1
+            else
+                echo "      Re-running inside the 'docker' group ..."
+                export TM_REEXEC=1
+                exec sg docker -c "cd '$SCRIPT_DIR' && '$SCRIPT_DIR/$(basename "$0")' $*"
+            fi
+            ;;
+        daemon_down|lib_missing)
+            if $CHECK_ONLY; then
+                echo "      WARNING: Docker is not usable (reason: $DOCKER_REASON) - continuing in --check-only mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif $DOCTOR_MODE; then
+                echo "      WARNING: Docker is not usable (reason: $DOCKER_REASON) - continuing in --doctor mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif [ "$DOCKER_REQUIRED" -eq 1 ]; then
+                echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                if [ "$DOCKER_REASON" = "daemon_down" ]; then
+                    echo "      Start it with:  sudo systemctl enable --now docker"
+                fi
+                exit 1
+            else
+                echo "      WARNING: Docker is not usable (reason: ${DOCKER_REASON:-unknown}) - the boot continues degraded without Docker."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                if [ "$DOCKER_REASON" = "daemon_down" ]; then
+                    echo "      Start Docker and re-run to enable container features (sudo systemctl enable --now docker)."
+                fi
+            fi
+            ;;
+        *)
+            if $CHECK_ONLY; then
+                echo "      WARNING: Docker check failed (reason: ${DOCKER_REASON:-unknown}) - continuing in --check-only mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif $DOCTOR_MODE; then
+                echo "      WARNING: Docker check failed (reason: ${DOCKER_REASON:-unknown}) - continuing in --doctor mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif [ "$DOCKER_REQUIRED" -eq 1 ]; then
+                echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                exit 1
+            else
+                echo "      WARNING: Docker is not usable (reason: ${DOCKER_REASON:-unknown}) - the boot continues degraded without Docker."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+            fi
+            ;;
+    esac
 else
-    # ── Development mode (hot-reload via Vite) ─────────────────────────
-    echo "  Mode:    DEVELOPMENT (hot-reload enabled)"
-    echo ""
-    echo "  Frontend: http://127.0.0.1:5173  <-- USE THIS URL"
-    echo "  Backend:  http://127.0.0.1:8000   (API only, not the app)"
-    echo "  Stop:    Ctrl+C"
-    echo ""
+    echo "      ok."
+fi
 
-    FRONTEND_DIR="$PROJECT_DIR/web_ui/frontend"
+# ---------------------------------------------- [3/8] Stale containers cleanup
+echo "[3/8] Stale ThoughtMachine containers ..."
+STALE_OUT="$(doctor --check-stale-containers 2>&1)"
+STALE_RC=$?
+STALE_COUNT="$(printf '%s' "$STALE_OUT" | json_get count)"
+if [ "$STALE_RC" -eq 0 ]; then
+    echo "      ok (no stale containers)."
+elif [ -z "$STALE_COUNT" ]; then
+    echo "      (stale-container check skipped)"
+else
+    STALE_DETAIL="$(printf '%s' "$STALE_OUT" | json_get detail)"
+    echo "      found ${STALE_COUNT} stale container(s)."
+    [ -n "$STALE_DETAIL" ] && printf '%s\n' "$STALE_DETAIL" | sed 's/^/      /'
+    if $CHECK_ONLY; then
+        echo "      (--check-only: stale containers reported, not removed)"
+    else
+        CLEAN_OUT="$(doctor --clean-stale-containers 2>&1)" || true
+        CLEAN_DETAIL="$(printf '%s' "$CLEAN_OUT" | json_get detail)"
+        if [ -n "$CLEAN_DETAIL" ]; then
+            echo "      $CLEAN_DETAIL."
+        else
+            echo "      (cleanup output unavailable - ignoring)"
+        fi
+    fi
+fi
+echo ""
 
-    # ── Pre-flight checks for Vite ──────────────────────────────────────
-    if [ ! -d "$FRONTEND_DIR" ]; then
-        echo "[ERROR] Frontend directory not found at:"
-        echo "  $FRONTEND_DIR"
-        echo ""
-        echo "  Make sure you ran install_thoughtmachine.sh first."
+# ---------------------------------------------- [4/8] Ports (backend API) / (Vite frontend)
+echo "[4/8] Ports $TM_BACKEND_PORT (backend) and $TM_FRONTEND_PORT (frontend) ..."
+for port in "$TM_BACKEND_PORT" "$TM_FRONTEND_PORT"; do
+    PORT_OUT="$(doctor --check-port "$port" 2>&1)"
+    PORT_RC=$?
+    if [ "$PORT_RC" -ne 0 ]; then
+        PORT_DETAIL="$(printf '%s' "$PORT_OUT" | json_get detail)"
+        echo "      FAILED: ${PORT_DETAIL:-port $port is in use}."
+        echo "      Stop the other process, then re-run this script."
         exit 1
     fi
-    if [ ! -f "$FRONTEND_DIR/package.json" ]; then
-        echo "[ERROR] package.json not found in frontend directory:"
-        echo "  $FRONTEND_DIR"
-        echo ""
-        echo "  The installation appears incomplete. Run install_thoughtmachine.sh again."
-        exit 1
+done
+echo "      ok."
+
+# -------------------------------------------------------------- [5/8] Node.js
+echo "[5/8] Node.js >= 18 ..."
+NODE_OUT="$(doctor --check-node 2>&1)"
+NODE_RC=$?
+if [ "$NODE_RC" -ne 0 ]; then
+    NODE_REASON="$(printf '%s' "$NODE_OUT" | json_get reason)"
+    NODE_DETAIL="$(printf '%s' "$NODE_OUT" | json_get detail)"
+    echo "      FAILED: Node.js >= 18 is required but not available (reason: ${NODE_REASON:-unknown})."
+    [ -n "$NODE_DETAIL" ] && echo "      $NODE_DETAIL"
+    echo "      Install Node.js 18+ (e.g. https://nodejs.org)"
+    exit 1
+fi
+echo "      ok."
+
+# ------------------------------------------------ [6/8] ~/.thoughtmachine writable
+echo "[6/8] ~/.thoughtmachine writable ..."
+# Ensure the vault exists with factory defaults BEFORE we check writability,
+# so a fresh machine (no ~/.thoughtmachine) can start. Idempotent; the
+# read-only doctor check below then verifies the vault as a post-condition.
+BOOTSTRAP_OUT="$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -m thoughtmachine.bootstrap 2>&1)"
+BOOTSTRAP_RC=$?
+if [ "$BOOTSTRAP_RC" -ne 0 ]; then
+    echo "      WARNING: vault bootstrap failed; continuing to the read-only vault check below."
+    printf '%s\n' "$BOOTSTRAP_OUT" | sed 's/^/      /'
+fi
+TM_OUT="$(doctor --check-dotthoughtmachine 2>&1)"
+TM_RC=$?
+if [ "$TM_RC" -ne 0 ]; then
+    if sudo -n true 2>/dev/null; then
+        sudo chown -R "$USER" ~/.thoughtmachine 2>/dev/null || true
+        TM_OUT="$(doctor --check-dotthoughtmachine 2>&1)"
+        TM_RC=$?
     fi
-    if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
-        echo "[WARNING] node_modules not found — installing dependencies..."
+fi
+if [ "$TM_RC" -ne 0 ]; then
+    echo "Vault not writable. Fix with: sudo chown -R $USER ~/.thoughtmachine"
+    exit 1
+fi
+echo "      ok."
+
+# ------------------------------------------------------------------ [7/8] Locale
+echo "[7/8] Locale ..."
+export LANG=C.UTF-8
+echo "      LANG set to C.UTF-8 (avoids locale-related errors)."
+
+# ------------------------------------------------------------ [8/8] Ready message
+echo "[8/8] All checks passed."
+echo ""
+
+if $CHECK_ONLY; then
+    echo "  (--check-only: preflight done, nothing was started)"
+    exit 0
+fi
+
+# ------------------------------------------------------------------- launch
+if $DOCTOR_MODE; then
+    echo "============================================"
+    echo "  ThoughtMachine - doctor mode"
+    echo "============================================"
+    echo ""
+    start_backend ".venv/bin/python -m web_ui.backend.server --port $TM_BACKEND_PORT"
+    echo ""
+    echo "BACKEND-HEALTHY"
+    echo "  (--doctor: backend verified healthy; press Ctrl-C to stop)"
+    wait "$BACKEND_PID"
+    BACKEND_RC=$?
+    echo "  Backend exited (rc=$BACKEND_RC)."
+    exit "$BACKEND_RC"
+fi
+
+if ! $DEV_MODE; then
+    FRONTEND_DIR="$SCRIPT_DIR/web_ui/frontend"
+    DIST_DIR="$FRONTEND_DIR/dist"
+    VITE_BIN="$FRONTEND_DIR/node_modules/.bin/vite"
+    if [ ! -f "$DIST_DIR/index.html" ]; then
+        echo "============================================"
+        echo "  ThoughtMachine - first-run setup"
+        echo "  Building the production frontend bundle ..."
+        echo "============================================"
         echo ""
-        (cd "$FRONTEND_DIR" && npm install)
-        if [ $? -ne 0 ]; then
-            echo ""
-            echo "[FAIL] npm install failed. Try running manually:"
-            echo "  cd $FRONTEND_DIR"
-            echo "  npm install"
+        if [ -x "$VITE_BIN" ]; then
+            (cd "$FRONTEND_DIR" && "$VITE_BIN" build) || {
+                echo ""; echo "  FAILED: production build failed."; exit 1; }
+        else
+            (cd "$FRONTEND_DIR" && npm run build) || {
+                echo ""; echo "  FAILED: production build failed."; exit 1; }
+        fi
+        echo ""
+    fi
+    echo "============================================"
+    echo "  ThoughtMachine - production mode (default)"
+    echo "  MODE:      production (single process, no vite dev server)"
+    echo "  Open:      http://localhost:$TM_BACKEND_PORT"
+    echo "  (backend serves the built frontend from web_ui/frontend/dist)"
+    echo "============================================"
+    echo ""
+    export TM_NPM_CMD="$(command -v npm 2>/dev/null || true)"
+    start_backend ".venv/bin/python -m web_ui.backend.server --serve-frontend --port $TM_BACKEND_PORT"
+    echo ""
+    echo "  Backend is running (PID $BACKEND_PID); serving the frontend on http://localhost:$TM_BACKEND_PORT."
+    echo "  Stop it with Ctrl-C."
+    wait "$BACKEND_PID"
+    BACKEND_RC=$?
+    exit "$BACKEND_RC"
+fi
+
+echo "============================================"
+echo "  ThoughtMachine - development mode (--dev)"
+echo "  MODE:      development (vite dev server, HMR, slow -- for editing code only)"
+echo "  Backend:   http://localhost:$TM_BACKEND_PORT"
+echo "  Frontend:  http://localhost:$TM_FRONTEND_PORT  <-- open this"
+echo "============================================"
+echo ""
+
+start_backend ".venv/bin/python -m web_ui.backend.server --port $TM_BACKEND_PORT"
+
+FRONTEND_DIR="$SCRIPT_DIR/web_ui/frontend"
+VITE_BIN="$FRONTEND_DIR/node_modules/.bin/vite"
+
+# vite.config.js reads VITE_PORT (dev-server bind port) and VITE_BACKEND_PORT
+# (API/WS proxy target); export both so the dev server follows TM_*_PORT.
+export VITE_PORT="$TM_FRONTEND_PORT"
+export VITE_BACKEND_PORT="$TM_BACKEND_PORT"
+
+if [ -x "$VITE_BIN" ]; then
+    echo "  Starting vite ($VITE_BIN --host 127.0.0.1, port $TM_FRONTEND_PORT) ..."
+    (cd "$FRONTEND_DIR" && "$VITE_BIN" --host 127.0.0.1) &
+    VITE_PID=$!
+else
+    echo "  vite binary not found - using 'npm run dev' ..."
+    (cd "$FRONTEND_DIR" && npm run dev) &
+    VITE_PID=$!
+fi
+
+# Wait briefly (max ~10s) until the frontend answers on its port.
+FRONTEND_DIED=0
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if ! kill -0 "$VITE_PID" 2>/dev/null; then
+        if [ "$FRONTEND_REQUIRED" = "1" ]; then
+            echo "  FAILED: the frontend dev server exited during startup."
+            cleanup
             exit 1
         fi
-        echo "  [+] npm packages installed"
         echo ""
-    fi
-
-    # Verify Vite binary exists
-    if [ ! -f "$FRONTEND_DIR/node_modules/.bin/vite" ]; then
-        echo "[ERROR] Vite binary not found in node_modules."
-        echo "  The npm install may have failed or was interrupted."
-        echo "  Try: cd $FRONTEND_DIR && npm install"
-        exit 1
-    fi
-
-    VITE_BIN="$FRONTEND_DIR/node_modules/.bin/vite"
-
-    # Start Vite FIRST in background
-    echo "  → Starting Vite dev server (port 5173)..."
-    cd "$FRONTEND_DIR"
-    $VITE_BIN --host 127.0.0.1 &
-    VITE_PID=$!
-    cd "$PROJECT_DIR"
-
-    # Wait for Vite to start (up to 15 seconds)
-    echo "  → Waiting for Vite to start..."
-    VITE_READY=false
-    for i in $(seq 1 15); do
-        sleep 1
-        if ss -tlnp 2>/dev/null | grep -q :5173 || \
-           lsof -i :5173 2>/dev/null | grep -q LISTEN; then
-            VITE_READY=true
-            break
-        fi
-    done
-    if [ "$VITE_READY" = false ]; then
+        echo "  WARNING: the frontend dev server exited during startup."
+        echo "    The web UI at http://localhost:$TM_FRONTEND_PORT will NOT be available."
+        echo "    The backend API/WebSocket server is unaffected: http://localhost:$TM_BACKEND_PORT"
+        echo "    To fix, re-run ./install.sh to install the frontend dependencies."
+        echo "    To restore strict behaviour (fail the boot instead): TM_REQUIRE_FRONTEND=1 ./start_thoughtmachine.sh"
         echo ""
-        echo "  [WARNING] Vite may not have started in time."
-        echo ""
-    else
-        echo "  → Vite is ready on http://127.0.0.1:5173"
+        VITE_PID=""
+        FRONTEND_DIED=1
+        break
     fi
+    if (command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ":$TM_FRONTEND_PORT ") || \
+       (command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$TM_FRONTEND_PORT" -sTCP:LISTEN >/dev/null 2>&1); then
+        break
+    fi
+    sleep 1
+done
 
-    # Start backend in foreground (blocking)
-    echo "  → Starting backend server (port 8000)..."
-    python -m web_ui.backend.server
-
-    # When backend exits, kill Vite
-    echo ""
-    echo "  → Shutting down Vite dev server..."
-    kill $VITE_PID 2>/dev/null || true
+echo ""
+if [ "$FRONTEND_DIED" = "1" ]; then
+    echo "  Backend is running (PID $BACKEND_PID) at http://localhost:$TM_BACKEND_PORT; the frontend dev server is NOT running."
+    echo "  Stop it with Ctrl-C."
+else
+    echo "  Backend is running (PID $BACKEND_PID) with the frontend dev server on http://localhost:$TM_FRONTEND_PORT."
+    echo "  Stop it with Ctrl-C; the frontend dev server is stopped automatically."
 fi
+echo ""
+wait "$BACKEND_PID"
+BACKEND_RC=$?
+
+echo "  Backend exited (rc=$BACKEND_RC) - stopping the frontend dev server ..."
+cleanup
+
+exit "$BACKEND_RC"

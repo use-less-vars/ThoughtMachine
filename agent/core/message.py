@@ -10,10 +10,16 @@ used anywhere a plain message dict is expected.
 """
 
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_NOTIFICATION_PREFIX: str = '[SYSTEM NOTIFICATION]'
+
+# Second, distinctly-prefixed system family: notices tell the model what just
+# happened to its own turn (paused, stopped).  Rendered as
+# ``[System Notice: <text>]`` -- note the closing bracket the helper adds.
+SYSTEM_NOTICE_PREFIX: str = '[System Notice:'
 
 
 class Message(dict):
@@ -37,3 +43,26 @@ class Message(dict):
     def to_dict(self) -> dict:
         """Return a plain ``dict`` (not a ``Message``) with all keys."""
         return dict(self)
+
+
+def make_system_notice(text: str, *, kind: str, **metadata) -> Message:
+    """Build a ``[System Notice: <text>]`` message (role ``user``).
+
+    ``kind`` names what happened to the turn (``'pause_nudge'``,
+    ``'stop_notice'``); any extra keyword becomes an extra metadata key
+    alongside the generated ``warning_id``, the ``system_notice`` marker and
+    the ``kind``.  Like every system message it carries
+    ``is_system_notification=True``, so it stays out of the model-facing
+    history pruning and renders as a system bubble.
+    """
+    return Message(
+        role='user',
+        content=f'{SYSTEM_NOTICE_PREFIX} {text}]',
+        is_system_notification=True,
+        metadata={'warning_id': str(uuid.uuid4()), 'system_notice': True, 'kind': kind, **metadata},
+    )
+
+
+def is_system_notice_text(text: str) -> bool:
+    """True when ``text`` opens a system message of EITHER family."""
+    return text.startswith(SYSTEM_NOTIFICATION_PREFIX) or text.startswith(SYSTEM_NOTICE_PREFIX)

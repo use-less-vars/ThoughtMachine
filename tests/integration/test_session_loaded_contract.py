@@ -1,0 +1,742 @@
+"""Contract test — the `load_session` WS response shape (frontend Test A).
+
+This test is a SINGLE, PASSING response-shape contract: it drives the real
+server via REST + WebSocket and pins down the shape of the events the
+frontend receives when a session is loaded — NOT the persisted SessionConfig
+internals (those belong to the session-creation contract tests).
+
+Event-order facts this test relies on (verified against current code):
+
+  * ``conversation_changed`` is always sent BEFORE ``session_loaded`` when a
+    session is loaded — never assume ``session_loaded`` is the first event:
+      - fresh-bridge path: ``bridge.load_session`` broadcasts
+        ``conversation_changed`` (web_ui/backend/bridge.py:1653) and only then
+        ``session_loaded`` (web_ui/backend/bridge.py:1665);
+      - cached-bridge reconnect path: the server sends ``conversation_changed``
+        directly to the new websocket (web_ui/backend/server.py:1244) before
+        the fallback ``session_loaded`` block (web_ui/backend/server.py:1344).
+    Note that ``conversation_changed`` is NOT necessarily the very first event
+    in the fresh-bridge path: the server's own post-load ``tokens_updated``
+    send (web_ui/backend/server.py:1356-1360) runs directly inside the
+    load_session handler and reaches the client ahead of the loop-scheduled
+    bridge broadcasts (the bridge's broadcasts go through
+    ``asyncio.run_coroutine_threadsafe``, server.py:521-533, so they are
+    deferred until the handler yields).  The ordering contract asserted below
+    is therefore: ``conversation_changed`` precedes ``session_loaded`` and
+    carries the ``messages`` list — not that it is ``events[0]``.
+    The helper below therefore DRAINS events until ``session_loaded`` arrives
+    and returns everything it saw, so ordering assertions stay explicit.
+
+  * There is NO ``state_changed`` event after ``session_loaded`` (Fix 2a
+    removed it): live running-state is embedded in the ``session_loaded``
+    payload itself as ``is_running``, which mirrors the old state_changed
+    semantics (web_ui/backend/bridge.py:1671-1674).
+
+  * ``session_name`` is never empty: the bridge defaults to
+    ``'Untitled Session'`` when the session has no name
+    (web_ui/backend/bridge.py:1667) — this guards the S3-2 regression.
+
+Config key names asserted inside ``session_loaded.config`` (the frontend
+config dict produced by ``frontend_config_from_bridge`` /
+``get_frontend_config``, web_ui/backend/config_manager.py:183-221, 401-409):
+
+  * ``mode``            — session mode ("custom" here; config_manager.py:214-215)
+  * ``provider``        — mapped from the backend ``provider_type`` via
+                          {"openai": "openai", "anthropic": "anthropic",
+                           "openai_compatible": "local"}.get(provider_type, "local")
+                          (config_manager.py:233-239) — ALWAYS present
+  * ``model``           — model name (may legitimately be "" under a hermetic
+                          vault with no global defaults)
+  * ``session_permissions`` — the permission matrix (NOT "permissions", which
+                          only exists at the config_changed EVENT level,
+                          web_ui/backend/server.py:1369-1375)
+
+The contract asserts KEY PRESENCE only — these keys always exist, even when
+their values are empty under a hermetic vault.
+
+Run (from repo root):
+    python -m pytest tests/integration/test_session_loaded_contract.py -v
+
+Hermetic: temp HOME + patched ``Path.home()`` + purged/re-imported server
+modules, exactly like tests/web_ui/backend/test_websocket_integration.py.
+No network, no LLM, no Docker daemon involved.
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import pathlib
+import queue
+import shutil
+import sys as sys_mod
+import tempfile
+import threading
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from starlette.testclient import TestClient
+
+pytestmark = pytest.mark.integration
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Hermetic full-server harness
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ABSENT = object()
+
+
+@pytest.fixture(scope="module")
+def contract_server():
+    """Temp HOME + purged modules + fresh import of web_ui.backend.server.
+
+    Module-scoped so the test shares one hermetic vault/store, mirroring the
+    `pathed_server` fixture in tests/web_ui/backend/test_websocket_integration.py.
+    """
+    tmp_home = tempfile.mkdtemp(prefix="test_session_loaded_contract_")
+    fake_home_path = Path(tmp_home)
+
+    old_home_env = os.environ.get("HOME")
+    os.environ["HOME"] = tmp_home
+
+    saved_env = {}
+    for key in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_COMPATIBLE_API_KEY"):
+        saved_env[key] = os.environ.pop(key, None)
+
+    patcher = patch.object(pathlib.Path, "home", return_value=fake_home_path)
+    patcher.start()
+
+    # Re-import server so module-level singletons (_session_store, registries)
+    # are built against the temp HOME, not the real one. "session" is purged too:
+    # FileSystemSessionStore._instance is a process-global class singleton that an
+    # earlier test module may have created under ITS temp HOME (which is deleted at
+    # teardown); a stale singleton would make REST create write to the old HOME while
+    # the WS load_session path scans the current one, so the lookup would miss.
+    mod_prefixes = ("web_ui.backend", "agent.config.provider_profile", "thoughtmachine.bootstrap", "session")
+
+    def _matched_modules():
+        return [
+            n for n in list(sys_mod.modules)
+            if any(n.startswith(p) for p in mod_prefixes)
+        ]
+
+    # Snapshot the exact pre-fixture sys.modules state (plus the parent-package
+    # attributes that re-importing these submodules rebinds) so teardown can put
+    # the ORIGINAL singletons back, exactly as the bb608a5 harness does.
+    saved_modules = {n: sys_mod.modules[n] for n in _matched_modules()}
+    saved_attrs: dict = {}
+    for n in saved_modules:
+        parent_name, _, child = n.rpartition(".")
+        if not parent_name or parent_name in saved_modules:
+            continue
+        parent_mod = sys_mod.modules.get(parent_name)
+        if parent_mod is not None:
+            saved_attrs.setdefault(parent_name, {})[child] = parent_mod.__dict__.get(
+                child, _ABSENT
+            )
+
+    for mod_name in list(sys_mod.modules.keys()):
+        if any(mod_name.startswith(p) for p in mod_prefixes):
+            del sys_mod.modules[mod_name]
+
+    server_mod = importlib.import_module("web_ui.backend.server")
+    app = server_mod.app
+
+    yield app, tmp_home
+
+    patcher.stop()
+    if old_home_env is not None:
+        os.environ["HOME"] = old_home_env
+    else:
+        os.environ.pop("HOME", None)
+    for key, val in saved_env.items():
+        if val is not None:
+            os.environ[key] = val
+    shutil.rmtree(tmp_home, ignore_errors=True)
+
+    # Restore the exact pre-fixture module state: drop the modules this fixture
+    # imported, reinstate the originals, then re-point the parent-package
+    # attributes that the re-imports had rebound to the fresh duplicates.
+    # (The fixture never mutates sys.path, so there is nothing to restore there.)
+    for name in _matched_modules():
+        del sys_mod.modules[name]
+    sys_mod.modules.update(saved_modules)
+    for parent_name, attrs in saved_attrs.items():
+        parent_mod = sys_mod.modules[parent_name]
+        for child, value in attrs.items():
+            if value is _ABSENT:
+                parent_mod.__dict__.pop(child, None)
+            else:
+                parent_mod.__dict__[child] = value
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _receive_until_session_loaded(ws, path_label: str, max_events: int = 25, timeout: float = 15.0):
+    """Drain WS events until ``session_loaded`` arrives — hang-proof.
+
+    ``conversation_changed`` is always broadcast/sent BEFORE ``session_loaded``
+    (bridge.py:1653/1665; server.py:1244/1344), but it is not necessarily the
+    FIRST event: the fresh-bridge path can emit ``tokens_updated`` first
+    (server.py:1356-1360 — the server's direct post-load send races ahead of
+    the loop-scheduled bridge broadcasts).  Never assume ``session_loaded`` is
+    the first event.  Returns ``(session_loaded, events)`` where ``events`` is
+    every event drained (including the session_loaded one).
+
+    Hang-proofing: ``ws.receive_json()`` has NO built-in timeout (it blocks
+    forever on a silent server), so each read runs in a short-lived daemon
+    thread that posts into a ``queue.Queue``; the main thread waits at most
+    ``timeout`` seconds.  On timeout the test FAILS with what it saw so far
+    — it can never hang the suite.  Leftover daemon threads are harmless.
+
+    Fail-fast: server-side failure paths never emit the expected
+    ``conversation_changed``/``session_loaded`` pair — the generic command
+    handler (server.py:1957-1963) replies with a ``status_message`` containing
+    "⚠ Internal error", and the silent store-miss path (bridge.py:1582-1584
+    + server.py:1270, which sets ``_bridge_loaded_session = True`` regardless)
+    emits only the success-looking ``status_message`` "Session ... loaded. Click
+    Run to continue." with no ``session_loaded`` at all.  Both are detected
+    below and failed immediately instead of waiting out the timeout.
+    """
+    events = []
+    for _ in range(max_events):
+        _box = queue.Queue(maxsize=1)
+
+        def _receive_one(_box=_box):
+            try:
+                _box.put(("ok", ws.receive_json()))
+            except Exception as exc:  # pragma: no cover — defensive
+                _box.put(("exc", exc))
+
+        _thread = threading.Thread(target=_receive_one, daemon=True)
+        _thread.start()
+        try:
+            _kind, _val = _box.get(timeout=timeout)
+        except queue.Empty:
+            pytest.fail(
+                f"{path_label}: timed out after {timeout}s waiting for events; "
+                f"received so far: {[e.get('type') for e in events]}"
+            )
+        if _kind == "exc":
+            raise _val
+        evt = _val
+        events.append(evt)
+        if evt.get("type") == "error":
+            pytest.fail(f"{path_label}: received error event: {evt}")
+        if evt.get("type") == "status_message":
+            _text = str(evt.get("text", ""))
+            if any(m in _text.lower() for m in ("⚠", "failed", "internal error", "not found", "loaded")):
+                pytest.fail(
+                    f"{path_label}: server reported failure before session_loaded: {_text!r}"
+                )
+        if evt.get("type") == "session_loaded":
+            return evt, events
+    pytest.fail(
+        f"{path_label}: no session_loaded within {max_events} events "
+        f"(got types: {[e.get('type') for e in events]})"
+    )
+
+
+def _receive_until(ws, path_label: str, predicate, max_events: int = 25, timeout: float = 15.0):
+    """Drain WS events until ``predicate(evt)`` is satisfied — hang-proof.
+
+    Same thread/queue drain pattern as ``_receive_until_session_loaded`` but
+    with NO status fail-fast: this variant is for FAILURE paths, where the
+    server legitimately emits ``⚠ ... could not be loaded`` status messages
+    (the load_error contract below). Only a ``type == "error"`` event aborts
+    early. Returns ``(evt, events)`` when ``predicate(evt)`` is True.
+    """
+    events = []
+    for _ in range(max_events):
+        _box = queue.Queue(maxsize=1)
+
+        def _receive_one(_box=_box):
+            try:
+                _box.put(("ok", ws.receive_json()))
+            except Exception as exc:  # pragma: no cover — defensive
+                _box.put(("exc", exc))
+
+        _thread = threading.Thread(target=_receive_one, daemon=True)
+        _thread.start()
+        try:
+            _kind, _val = _box.get(timeout=timeout)
+        except queue.Empty:
+            pytest.fail(
+                f"{path_label}: timed out after {timeout}s waiting for events; "
+                f"received so far: {[e.get('type') for e in events]}"
+            )
+        if _kind == "exc":
+            raise _val
+        evt = _val
+        events.append(evt)
+        if evt.get("type") == "error":
+            pytest.fail(f"{path_label}: received error event: {evt}")
+        if predicate(evt):
+            return evt, events
+    pytest.fail(
+        f"{path_label}: predicate never satisfied within {max_events} events "
+        f"(got types: {[e.get('type') for e in events]})"
+    )
+
+
+def _drain_more(ws, events, n: int = 3, timeout: float = 5.0):
+    """Receive up to ``n`` more events, appending them to ``events``.
+
+    Best-effort: the server may be done sending (failure paths send only the
+    ⚠ status after session_loaded), so ``queue.Empty`` is tolerated and
+    returns early instead of failing. Hang-proof via the same thread/queue
+    pattern as the other helpers.
+    """
+    for _ in range(n):
+        _box = queue.Queue(maxsize=1)
+
+        def _receive_one(_box=_box):
+            try:
+                _box.put(("ok", ws.receive_json()))
+            except Exception as exc:  # pragma: no cover — defensive
+                _box.put(("exc", exc))
+
+        _thread = threading.Thread(target=_receive_one, daemon=True)
+        _thread.start()
+        try:
+            _kind, _val = _box.get(timeout=timeout)
+        except queue.Empty:
+            return events  # server done sending — fine
+        if _kind == "exc":
+            raise _val
+        events.append(_val)
+    return events
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test A: load_session response shape contract (single, PASSING)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_load_session_response_shape_contract(contract_server):
+    """REST-created session, loaded via WS: frontend response-shape contract."""
+    app, _ = contract_server
+
+    with TestClient(app) as client:
+        # Create the session over REST so the WS path is a pure load.
+        resp = client.post("/api/session/create", json={"mode": "custom"})
+        assert resp.status_code == 200, f"create failed: {resp.status_code} {resp.text}"
+        body = resp.json()
+        session_id = body["session_id"]
+        assert body["mode"] == "custom"
+
+        # Load it over WS and drain until session_loaded arrives.
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"command": "load_session", "session_id": session_id})
+            evt, events = _receive_until_session_loaded(ws, "REST create → WS load_session")
+
+    # --- Event order: conversation_changed precedes session_loaded (never
+    #     assume session_loaded is first). The fresh-bridge path may emit
+    #     tokens_updated first (server.py:1356-1360 — the server's direct
+    #     post-load send races ahead of the loop-scheduled bridge broadcasts),
+    #     so we locate conversation_changed among the drained events instead
+    #     of asserting it is events[0]. ---
+    assert events, "expected at least one event before session_loaded"
+    conv_events = [e for e in events if e.get("type") == "conversation_changed"]
+    assert conv_events, (
+        f"expected a conversation_changed event before session_loaded "
+        f"(got types: {[e.get('type') for e in events]})"
+    )
+    conv = conv_events[0]
+    # Fresh-bridge path may emit tokens_updated (server.py:1356-1360 — the
+    # server's direct post-load send, which can reach the client before the
+    # loop-scheduled bridge broadcasts) ahead of conversation_changed; the
+    # contract is conversation_changed precedes session_loaded and carries
+    # the messages list.
+    assert events.index(conv) < events.index(evt), (
+        f"conversation_changed must precede session_loaded "
+        f"(got types: {[e.get('type') for e in events]})"
+    )
+    assert isinstance(conv.get("messages"), list), (
+        f"conversation_changed.messages must be a list "
+        f"(got {type(conv.get('messages')).__name__})"
+    )
+
+    # --- session_loaded payload shape. ---
+    assert evt.get("type") == "session_loaded", (
+        f"expected session_loaded, got {evt.get('type')!r}"
+    )
+    assert evt.get("session_id") == session_id, (
+        f"session_loaded.session_id {evt.get('session_id')!r} != {session_id!r}"
+    )
+
+    # S3-2 guard: session_name is never empty (bridge defaults 'Untitled Session').
+    session_name = evt.get("session_name")
+    assert isinstance(session_name, str) and session_name, (
+        f"session_loaded.session_name must be a non-empty string (got {session_name!r})"
+    )
+
+    # Fix 2a: no separate state_changed after load — live running-state is
+    # embedded as is_running in the session_loaded payload itself.
+    assert isinstance(evt.get("is_running"), bool), (
+        f"session_loaded.is_running must be a bool (got {evt.get('is_running')!r})"
+    )
+
+    # The frontend config dict must carry the four semantic keys (presence
+    # contract only — values may be empty under a hermetic vault).
+    fe_config = evt.get("config")
+    assert isinstance(fe_config, dict), (
+        f"session_loaded.config must be a dict (got {type(fe_config).__name__}: {fe_config!r})"
+    )
+    required_keys = ("mode", "provider", "model", "session_permissions")
+    missing = [key for key in required_keys if key not in fe_config]
+    assert not missing, (
+        f"session_loaded.config missing required key(s) {missing}; "
+        f"present keys: {sorted(fe_config.keys())}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test B: load_session on a MISSING (dead) session id reports load_error
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_load_session_missing_session_reports_load_error(contract_server):
+    """Regression for the S3 truthfulness bug: a dead session id must produce a
+    load_error session_loaded, not a success-looking status.
+
+    The pre-fix server's silent store-miss path (bridge.load_session returning
+    False) emitted only the success-looking status_message (the one-shot
+    "Session ... loaded" banner, since removed in PR #55) with NO session_loaded
+    at all — the frontend then rendered a phantom loaded session. The fallback
+    now sends session_loaded with load_error: True (same session_id the tab
+    requested) plus a ⚠ status.
+    """
+    app, _ = contract_server
+    missing_id = str(uuid.uuid4())
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"command": "load_session", "session_id": missing_id})
+            evt, events = _receive_until(
+                ws,
+                "load_session on missing id",
+                predicate=lambda e: e.get("type") == "session_loaded",
+            )
+            events = _drain_more(ws, events, n=3)
+
+    # --- session_loaded reports the failure truthfully. ---
+    assert evt.get("type") == "session_loaded", (
+        f"expected session_loaded, got {evt.get('type')!r}"
+    )
+    assert evt.get("load_error") is True, (
+        f"expected load_error True for missing session (got {evt.get('load_error')!r})"
+    )
+    assert evt.get("session_id") == missing_id, (
+        f"session_loaded.session_id {evt.get('session_id')!r} != {missing_id!r}"
+    )
+    assert evt.get("is_running") is False, (
+        "failed load must not claim the session is running"
+    )
+
+    # --- Every status message admits the failure (no success-looking text). ---
+    statuses = [str(e.get("text", "")) for e in events if e.get("type") == "status_message"]
+    assert statuses, (
+        f"expected at least one status_message after failed load "
+        f"(got event types: {[e.get('type') for e in events]})"
+    )
+    for t in statuses:
+        assert "could not be loaded" in t, (
+            f"unexpected status after failed load: {t!r}"
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test C (Fix 6): apply_config echoing the session's OWN workspace_path must NOT
+# trigger a workspace switch / session replacement
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_apply_config_same_workspace_path_does_not_switch_session(contract_server):
+    """Fix 6 regression: apply_config must baseline its workspace_changed
+    comparison on the SESSION's own workspace, not on _project_path.
+
+    The tab frontend never sends ?project=, so _project_path is always the
+    server root, while the frontend echoes the session's workspace_path in
+    EVERY apply_config payload (ConfigPanel getSafeDraft). The pre-Fix-6 code
+    compared against _project_path, so every apply on a non-default-workspace
+    session looked like a workspace switch: the session was saved/re-stopped
+    and the server emitted the "✅ Switched to project" status (and, for a
+    session with a conversation, a replacement session_loaded with a NEW
+    session id — discarding the tab's session).
+
+    Contract asserted here (after apply_config with workspace_path EQUAL to
+    the session's own workspace):
+      * a config_changed event is received (the apply is applied normally), and
+      * NO session_loaded event is emitted (no replacement, no new session id),
+      * NO "Switched to project" status is emitted (no switch happened).
+
+    NOTE the discriminator subtlety: for an EMPTY session the switch branch
+    (server.py:874-883) re-uses the existing session and sends NO session_loaded
+    even under the old code — so "no session_loaded" alone would not catch the
+    regression. The "Switched to project" status is the real discriminator: it
+    is emitted unconditionally at the end of the switch branch (server.py:974-977).
+    """
+    app, tmp_home = contract_server
+    proj_a = os.path.join(tmp_home, "proj_a")
+    os.makedirs(proj_a, exist_ok=True)
+
+    with TestClient(app) as client:
+        # REST-create the session bound to proj_a (workspace_path branch).
+        resp = client.post("/api/session/create", json={"mode": "custom", "workspace_path": proj_a})
+        assert resp.status_code == 200, f"create failed: {resp.status_code} {resp.text}"
+        session_id = resp.json()["session_id"]
+
+        with client.websocket_connect("/ws") as ws:
+            # Load it: bridge._workspace_path gets backfilled from the registry
+            # (bridge.py:1621-1626) and is echoed in session_loaded.workspace_path.
+            ws.send_json({"command": "load_session", "session_id": session_id})
+            evt, events = _receive_until_session_loaded(ws, "REST create → WS load_session")
+            session_ws = evt.get("workspace_path") or ""
+            assert isinstance(session_ws, str) and session_ws, (
+                f"session_loaded.workspace_path must be a non-empty string "
+                f"(got {session_ws!r}) — bridge._workspace_path backfill failed; "
+                "Fix 6 baseline cannot be verified"
+            )
+
+            # Apply the SAME workspace_path the session already lives in —
+            # exactly what the real frontend does on every Apply click.
+            ws.send_json({
+                "command": "apply_config",
+                "config": {
+                    "workspace_path": session_ws,
+                    "mode": "custom",
+                    "provider": "openai",
+                    "model": "",
+                    "session_permissions": {},
+                    "temperature": 0.2,
+                    "max_turns": 100,
+                    "enabled_tools": [],
+                },
+            })
+            cfg_evt, cfg_events = _receive_until(
+                ws,
+                "apply_config with same workspace_path",
+                predicate=lambda e: e.get("type") == "config_changed",
+            )
+            cfg_events = _drain_more(ws, cfg_events, n=4)
+
+    # --- The apply went through normally. ---
+    assert cfg_evt.get("type") == "config_changed", (
+        f"expected config_changed, got {cfg_evt.get('type')!r}"
+    )
+
+    # --- And NO workspace switch happened. ---
+    switched_statuses = [
+        str(e.get("text", "")) for e in cfg_events
+        if e.get("type") == "status_message" and "Switched to project" in str(e.get("text", ""))
+    ]
+    assert not switched_statuses, (
+        f"apply_config with the session's own workspace_path must NOT switch "
+        f"workspace, but got status: {switched_statuses!r}"
+    )
+    loaded_evts = [e for e in cfg_events if e.get("type") == "session_loaded"]
+    assert not loaded_evts, (
+        f"apply_config with the session's own workspace_path must NOT emit "
+        f"session_loaded (replacement), but got: {loaded_evts!r}"
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Test D (Fix 6): apply_config with a DIFFERENT workspace_path still switches
+# (replacement session_loaded with a new session id)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_apply_config_different_workspace_path_still_switches_session(contract_server):
+    """Fix 6 must not break the genuine workspace-switch path: apply_config
+    with a workspace_path DIFFERENT from the session's own workspace still
+    triggers the full switch — a replacement session_loaded carrying the NEW
+    session id, the new workspace_path, and the "Switched to project" status.
+
+    To hit the replacement branch (server.py:829-873) the existing session must
+    have a conversation (_session_has_conversation), so a user message is
+    injected hermetically into the store singleton BEFORE the WS load_session
+    (the bridge loads it into memory with the conversation intact).
+    """
+    app, tmp_home = contract_server
+    proj_a = os.path.join(tmp_home, "proj_a")
+    proj_b = os.path.join(tmp_home, "proj_b")
+    os.makedirs(proj_a, exist_ok=True)
+    os.makedirs(proj_b, exist_ok=True)
+
+    with TestClient(app) as client:
+        resp = client.post("/api/session/create", json={"mode": "custom", "workspace_path": proj_a})
+        assert resp.status_code == 200, f"create failed: {resp.status_code} {resp.text}"
+        original_session_id = resp.json()["session_id"]
+
+        # Inject a conversation into the persisted session so the switch branch
+        # (server.py:829-873 — _session_has_conversation) fires with a
+        # replacement session_loaded. Must happen BEFORE the WS load_session.
+        import importlib
+        server_mod = importlib.import_module("web_ui.backend.server")
+        session_store = server_mod._get_session_store()
+        session = session_store.load_session(original_session_id, workspace_id=None)
+        assert session is not None, "injected session must load from the store"
+        session.add_message("user", "hello")
+        session_store.save_session(session, workspace_id=session.workspace_id)
+
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"command": "load_session", "session_id": original_session_id})
+            evt, events = _receive_until_session_loaded(ws, "REST create → WS load_session")
+            # Sanity: the injected conversation actually reached the bridge.
+            assert evt.get("message_count", 0) >= 1, (
+                f"expected the injected conversation in session_loaded.message_count "
+                f"(got {evt.get('message_count')!r})"
+            )
+
+            # Genuine switch: workspace_path differs from the session's own.
+            ws.send_json({
+                "command": "apply_config",
+                "config": {
+                    "workspace_path": proj_b,
+                    "mode": "custom",
+                    "provider": "openai",
+                    "model": "",
+                    "session_permissions": {},
+                    "temperature": 0.2,
+                    "max_turns": 100,
+                    "enabled_tools": [],
+                },
+            })
+            sw_evt, sw_events = _receive_until(
+                ws,
+                "apply_config with different workspace_path",
+                predicate=lambda e: e.get("type") == "session_loaded",
+            )
+            sw_events = _drain_more(ws, sw_events, n=4)
+
+    # --- Replacement session_loaded contract. ---
+    assert sw_evt.get("type") == "session_loaded", (
+        f"expected session_loaded after workspace switch, got {sw_evt.get('type')!r}"
+    )
+    assert sw_evt.get("replacement") is True, (
+        f"workspace switch must send session_loaded with replacement True "
+        f"(got {sw_evt.get('replacement')!r})"
+    )
+    assert sw_evt.get("session_id") != original_session_id, (
+        f"workspace switch must create a NEW session id "
+        f"(got {sw_evt.get('session_id')!r} == original {original_session_id!r})"
+    )
+    assert Path(sw_evt.get("workspace_path") or "").resolve() == Path(proj_b).resolve(), (
+        f"session_loaded.workspace_path {sw_evt.get('workspace_path')!r} != "
+        f"{os.path.normpath(proj_b)!r}"
+    )
+
+    # --- The switch status is emitted. ---
+    switched_statuses = [
+        str(e.get("text", "")) for e in sw_events
+        if e.get("type") == "status_message" and "Switched to project" in str(e.get("text", ""))
+    ]
+    assert switched_statuses, (
+        f"expected a 'Switched to project' status after the workspace switch "
+        f"(got event types: {[e.get('type') for e in sw_events]})"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Regression: the "Session … loaded" banner must not accumulate
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _drain_events(ws, quiet_timeout: float = 3.0, max_events: int = 60):
+    """Receive every frame the server sends until it goes quiet.
+
+    Order-agnostic, unlike the drain-until-target helpers above: it simply
+    collects frames until no frame arrives for ``quiet_timeout`` seconds (the
+    ``load_session`` tail — tokens_updated / context_updated / config_changed /
+    the status banner — is sent after ``session_loaded``, and the bridge's own
+    broadcasts are loop-scheduled via ``run_coroutine_threadsafe``, so event
+    order is NOT a stable contract).  Hang-proof via the same thread + queue
+    pattern as the other helpers.
+    """
+    events = []
+    while len(events) < max_events:
+        _box = queue.Queue(maxsize=1)
+
+        def _receive_one(_box=_box):
+            try:
+                _box.put(("ok", ws.receive_json()))
+            except Exception as exc:  # pragma: no cover — defensive
+                _box.put(("exc", exc))
+
+        threading.Thread(target=_receive_one, daemon=True).start()
+        try:
+            _kind, _val = _box.get(timeout=quiet_timeout)
+        except queue.Empty:
+            break  # server done sending — quiet
+        if _kind == "exc":
+            raise _val
+        events.append(_val)
+    return events
+
+
+def _loaded_banners(events, session_id: str):
+    """Return the status_message frames carrying the 'Session … loaded' banner."""
+    banner_text = f"Session {session_id} loaded. Click Run to continue."
+    return [
+        e for e in events
+        if e.get("type") == "status_message" and e.get("text") == banner_text
+    ]
+
+
+def test_reload_does_not_reemit_session_loaded_banner(contract_server):
+    """A load must NOT emit the (now-removed) session-loaded banner at all.
+
+    The banner was a one-shot cold-load notification rendered in the
+    system-notification color; the operator ruled it retired because it misled
+    the operator into reading a UI confirmation as a core internal message.
+    The backend's ``load_session`` handler no longer emits it on either path —
+    neither the cold load (no cached bridge) nor the re-attach to a cached
+    bridge.  Behaviour under test:
+      * 1st ``load_session`` on a WS -> cold load -> NO banner;
+      * 2nd ``load_session`` on the SAME ws (== tab switch / WS reconnect /
+        repeat load command, all of which reuse the cached bridge) -> NO banner
+        either.
+
+    Regression guard: this assertion used to require the banner exactly once
+    across a cold load + re-attach.  If the emission is ever re-introduced on
+    the cached-bridge path (the pre-``_cold_load``-gate behaviour) the frontend
+    store appended a second client-only system bubble on every re-attach ->
+    unbounded accumulation.
+    """
+    app, _ = contract_server
+
+    with TestClient(app) as client:
+        resp = client.post("/api/session/create", json={"mode": "custom"})
+        assert resp.status_code == 200, f"create failed: {resp.status_code} {resp.text}"
+        session_id = resp.json()["session_id"]
+
+        with client.websocket_connect("/ws") as ws:
+            # 1st load — cold path (fresh bridge): no banner is emitted.
+            ws.send_json({"command": "load_session", "session_id": session_id})
+            cold_events = _drain_events(ws)
+
+            # 2nd load — same ws, same session: cached-bridge re-attach path.
+            ws.send_json({"command": "load_session", "session_id": session_id})
+            reattach_events = _drain_events(ws)
+
+    # Sanity: both loads completed (session_loaded on each), so the second one
+    # really did exercise the re-attach path rather than a fresh cold load.
+    assert any(e.get("type") == "session_loaded" for e in cold_events), (
+        f"cold load should emit session_loaded; got "
+        f"{[e.get('type') for e in cold_events]}"
+    )
+    assert any(e.get("type") == "session_loaded" for e in reattach_events), (
+        f"re-attach should still emit session_loaded; got "
+        f"{[e.get('type') for e in reattach_events]}"
+    )
+
+    banners = _loaded_banners(cold_events, session_id) + _loaded_banners(
+        reattach_events, session_id
+    )
+    assert len(banners) == 0, (
+        f"the 'loaded' banner was removed entirely - it must NOT appear on a "
+        f"cold load nor on a re-attach; got {len(banners)}: {banners}"
+    )
+

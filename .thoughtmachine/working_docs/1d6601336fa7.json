@@ -1,0 +1,15 @@
+{
+  "doc_id": "1d6601336fa7",
+  "title": "Docker Pipeline Trace",
+  "sections": {
+    "dockerfiles": "[2026-07-27 17:22:13] ## Phase 1 Discovery Results\n\n### Dockerfiles\n- Only one: `docker/executor.Dockerfile` (550 bytes)\n- Based on `python:3.11-slim`\n- Copies and installs `docker/requirements-docker.txt`\n- Non-root user `agent` (UID 1000)\n- No docker-compose, no dockerignore, no devcontainer\n\n### Requirements Files\n1. `docker/requirements-docker.txt` (258 bytes, 20 lines) - for container\n2. `requirements.txt` (21 lines) - for host dev environment\n3. `requirements-rag.txt` - RAG-specific\n\n### GUI References\n- `web_ui/backend/server.py:1875` - WebSocket command \"rebuild_container\" -> docker_executor.rebuild_container()\n\n### Container Management\n- `docker_executor.py` (root, 1050 lines) - main Docker engine: DockerExecutor class, _ensure_container(), _ensure_image(), _build_image(), rebuild_container(), verify_container_integrity()\n- `tools/docker_code_runner.py` - agent tool wrapper for running code in container\n- `tools/workspace/edit_dockerfile.py` - tool to modify workspace Dockerfile\n- `tests/docker_integration/test_container_integrity.py` - 24 tests\n\n### Vault\n- `~/.thoughtmachine/` - extensive vault infrastructure across codebase",
+    "requirements": "",
+    "gui_references": "",
+    "vault_provisioning": "",
+    "container_management": "",
+    "commit_status": "",
+    "discrepancies": ""
+  },
+  "created_at": "2026-07-27T17:21:05.842225",
+  "updated_at": "2026-07-27T17:22:13.971444"
+}

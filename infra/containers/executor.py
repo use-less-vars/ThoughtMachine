@@ -1,0 +1,1726 @@
+"""
+docker_executor.py — Docker container lifecycle and integrity verification.
+
+Call chain for container integrity checks
+══════════════════════════════════════════
+
+When a session is loaded or configuration is changed, the container is
+checked to ensure it still matches the current session permissions:
+
+    WebAgentBridge.load_session() / WebAgentBridge.apply_config()
+        → _maybe_re_sync_container()
+            → verify_container_integrity()
+                → resolve_container_config()
+                    → get_workspace_capabilities() + get_effective_permissions()
+                        (security/security_gate.py)
+
+The single source of truth for computing desired (network_mode, workspace_mode)
+from session permissions is ``security.security_gate.resolve_container_config``
+(a pure, total, fail-closed resolver). Both ``verify_container_integrity`` and
+``DockerExecutor._compute_container_config`` route through the shared
+``_resolve_container_config_via_gate`` adapter, ensuring consistency between
+integrity checks and container creation/recreation.
+
+"""
+
+from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL, LIFECYCLE_PERSISTENT
+from agent.logging import log
+from agent.config.defaults import (
+    CONTAINER_TYPE_FREE_USE,
+    CONTAINER_TYPE_LABEL,
+    DEFAULT_MEM_LIMIT,
+    EXEC_TMPFS_OPTIONS,
+    host_user,
+    _host_ids,
+)
+from infra.container_create import (
+    ContainerCreateSpec,
+    HardeningRecipe,
+    MountSpec,
+    create_hardened_container,
+    git_shadow_for_workspace,
+)
+from thoughtmachine.workspace_capabilities import git_shadow_mask_path
+import docker
+import docker.types
+import hashlib
+import os
+import re
+import time
+import threading
+import queue
+import sys
+
+# ── Audit log for network_mode debugging ───────────────────────────────────
+from thoughtmachine.audit_logger import audit_event
+from infra.container_destroy_audit import CONTAINER_DESTROY, emit_destroy_audit
+
+_audit = lambda e, d: audit_event(e, d)  # module-level convenience
+_audit("MODULE_LOAD", f"file={__file__} pid={os.getpid()}")
+
+# ── Destroy-audit telemetry ─────────────────────────────────────────────
+# Every site that actually DESTROYS a container emits ONE `CONTAINER_DESTROY`
+# audit event through the shared formatter, so the destroy trail is
+# reconstructible independently of the `CONTAINER_LIFECYCLE` DECISION event.
+# The event name is re-exported here (`_DESTROY_AUDIT`) for callers/tests that
+# import it from this module.
+_DESTROY_AUDIT = CONTAINER_DESTROY
+
+
+# ── Build log cache (thread-safe) ────────────────────────────────────────────
+# Populated by _build_image() during Docker image builds; consumed by
+# get_container_status() to return build logs to the frontend.
+_build_log_cache: dict[str, str] = {}
+_build_log_cache_lock = threading.Lock()
+_build_in_progress: bool = False
+
+# ── Executor build-drift tracking ─────────────────────────────────────
+# Every executor image is labeled with a content hash of its build
+# sources (repo requirements.txt + resources/default_dockerfile.txt) so an
+# existing image is reused unless those sources actually changed. The
+# algorithm is identical to infra/resource_container_manager.py so the two
+# systems' hashes are comparable.
+EXECUTOR_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EXECUTOR_REQUIREMENTS = os.path.join(_REPO_ROOT, "requirements.txt")
+EXECUTOR_RUNTIME_DOCKERFILE = os.path.join(_REPO_ROOT, "resources", "default_dockerfile.txt")
+
+
+def _hash_executor_build_bytes(req_b: bytes, df_b: bytes) -> str:
+    """Hash executor build sources (same algorithm as resource_container_manager)."""
+    return hashlib.sha256(req_b + b"\n" + df_b).hexdigest()
+
+
+def _fold_extra_build_inputs(digest: str, extra_paths) -> str:
+    """Fold additional build-input files into an existing build hash.
+
+    Used when the build actually copies extra, caller-supplied files into the
+    build context (e.g. a vault ``Dockerfile``/``requirements.txt``): those
+    files are real build inputs, so their content must affect the hash or a
+    changed-but-still-matching label would skip the rebuild.
+
+    A missing/unreadable extra file is itself a distinct build state and is
+    folded as a marker rather than raising, so callers keep their own
+    missing-file error messages.
+    """
+    h = hashlib.sha256(digest.encode("utf-8"))
+    for path in extra_paths:
+        h.update(b"\x00")
+        try:
+            with open(path, "rb") as f:
+                h.update(f.read())
+        except OSError:
+            h.update(b"<missing>")
+    return h.hexdigest()
+
+
+def compute_executor_build_hash(requirements_path=None, dockerfile_path=None,
+                               extra_paths=None) -> str:
+    """Compute the content hash of the executor image build sources.
+
+    Args:
+        requirements_path: path to requirements.txt (defaults to the repo one).
+        dockerfile_path: path to the runtime Dockerfile (defaults to the repo one).
+        extra_paths: optional additional build-input files that are copied into
+            the build context by the caller (e.g. the vault Dockerfile). When
+            omitted the digest is byte-identical to the historical two-source
+            hash, so unrelated callers are unaffected.
+
+    Returns:
+        sha256 hex digest of ``requirements_bytes + b"\n" + dockerfile_bytes``,
+        folded together with ``extra_paths`` contents when any are supplied.
+
+    Raises:
+        OSError: If either base source file is missing or unreadable.
+    """
+    req_path = requirements_path or EXECUTOR_REQUIREMENTS
+    df_path = dockerfile_path or EXECUTOR_RUNTIME_DOCKERFILE
+    with open(req_path, "rb") as f:
+        req_b = f.read()
+    with open(df_path, "rb") as f:
+        df_b = f.read()
+    digest = _hash_executor_build_bytes(req_b, df_b)
+    if extra_paths:
+        digest = _fold_extra_build_inputs(digest, list(extra_paths))
+    return digest
+
+
+def _compute_image_tag(workspace_path: str) -> str:
+    """Derive a deterministic Docker image tag from the workspace path.
+
+    Different workspaces (e.g., worktrees) get different tags so they
+    never share or conflict on one tag like `agent-executor:latest`.
+    """
+    path_hash = hashlib.sha256(workspace_path.encode()).hexdigest()[:16]
+    return f"agent-executor-{path_hash}"
+
+
+def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line=None, labels=None, networkmode=None):
+    """Run ``client.api.build`` over a host directory, streaming log lines.
+
+    Shared by :meth:`DockerExecutor._build_image` and
+    ``ContainerManager.build_image`` so the build-stream handling (and its
+    BuildError wrapping) lives in exactly one place.
+
+    Args:
+        client: docker client whose ``api.build`` performs the build.
+        build_path: host path used as the build context.
+        dockerfile: Dockerfile name within the build context.
+        tag: image tag for the built image.
+        nocache: if True, bypass the Docker layer cache.
+        on_line: optional callback invoked with each non-empty log line.
+        labels: optional dict of labels applied to the built image (e.g.
+            ``{EXECUTOR_BUILD_HASH_LABEL: hash}``); only passed to the
+            daemon when not None.
+
+    Returns:
+        (image_id, log_lines) where log_lines is the list of non-empty
+        ``stream`` chunks (plus BuildError lines on failure).
+
+    Raises:
+        RuntimeError: If the build fails (BuildError wrapped with its logs) or
+            the daemon returns no image ID.
+    """
+    log_lines: list[str] = []
+    image_id = None
+    try:
+        build_kwargs = dict(
+            path=build_path,
+            dockerfile=dockerfile,
+            tag=tag,
+            rm=True,
+            pull=True,
+            nocache=nocache,
+            decode=True,
+        )
+        if labels is not None:
+            build_kwargs["labels"] = labels
+        if networkmode is not None:
+            # docker-py's kwarg is `network_mode` (underscore); it is translated
+            # internally to the `networkmode` query param. There is deliberately NO
+            # try/except fallback here: if this kwarg is ever unsupported the build
+            # MUST fail rather than silently degrade to a networked build.
+            build_kwargs["network_mode"] = networkmode
+        build_logs = client.api.build(**build_kwargs)
+        for chunk in build_logs:
+            if "stream" in chunk:
+                line = chunk["stream"].strip()
+                if line:
+                    log_lines.append(line)
+                    if on_line:
+                        on_line(line)
+            elif "aux" in chunk and "ID" in chunk["aux"]:
+                image_id = chunk["aux"]["ID"]
+    except docker.errors.BuildError as e:
+        error_lines = [str(line) for line in (e.build_log or [])]
+        log_lines.extend(error_lines)
+        for line in error_lines:
+            if on_line:
+                on_line(line)
+        raise RuntimeError(
+            f"Docker build failed: {e}\n"
+            f"Build logs:\n" + "\n".join(error_lines)
+        ) from e
+
+    if image_id is None:
+        raise RuntimeError("Docker build completed but no image ID was returned")
+    return image_id, log_lines
+
+
+def _resolve_workspace_id(workspace_path: str):
+    """Resolve workspace ID from a workspace path, returning None on failure."""
+    try:
+        from thoughtmachine.workspace_capabilities import resolve_workspace_id
+        return resolve_workspace_id(workspace_path)
+    except Exception:
+        return None
+
+
+def normalize_workspace_path(workspace_path: str) -> str:
+    """Canonical workspace-path normalisation for container naming.
+
+    Absolute path with any trailing slash removed, so two spellings of the
+    same workspace always hash to the same container name. This is the single
+    normalisation used by :func:`build_container_name`.
+    """
+    return os.path.abspath(workspace_path).rstrip("/")
+
+
+def _safe_session_tag(session_id):
+    """Return a docker-safe short tag for a session id (container names).
+
+    Strips unsafe characters (keeps [a-zA-Z0-9_.-], max 16 chars); falls back
+    to a sha256 prefix when nothing safe remains; 'anon' for None.
+    """
+    if session_id is None:
+        return "anon"
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "", str(session_id))[:16]
+    if cleaned:
+        return cleaned
+    return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:8]
+
+
+def build_container_name(
+    workspace_path,
+    lifecycle_class,
+    session_id=None,
+    network_mode="none",
+    workspace_mode="ro",
+):
+    """Return the canonical Docker container name (the pool key) for a container.
+
+    The name encodes the lifecycle class, the normalised workspace, and the
+    isolation envelope ``(network_mode, workspace_mode)`` (via ``env_hash``), so
+    a container built under one grant is never reused under another. Ephemeral
+    containers additionally key on ``session_id``.
+
+    ``persistent`` -> ``agent-exec-persistent-{ws_hash}-{env_hash}``
+    ``ephemeral``  -> ``agent-exec-ephemeral-{ws_hash}-{session_tag}-{env_hash}``
+    """
+    ws_hash = hashlib.sha256(
+        normalize_workspace_path(workspace_path).encode()
+    ).hexdigest()[:12]
+    env_hash = hashlib.sha256(
+        f"{network_mode}:{workspace_mode}".encode()
+    ).hexdigest()[:8]
+    if lifecycle_class == LIFECYCLE_EPHEMERAL:
+        tag = _safe_session_tag(session_id)
+        return f"agent-exec-ephemeral-{ws_hash}-{tag}-{env_hash}"
+    return f"agent-exec-persistent-{ws_hash}-{env_hash}"
+
+
+def _resolve_container_config_via_gate(
+    workspace_id, session_permissions, session_id=None
+):
+    """Resolve ``(network_mode, workspace_mode)`` via the security-gate SSOT.
+
+    The single shared adapter over ``security.security_gate``: it normalises
+    ``workspace_id`` to ``str`` (callers may pass a ``uuid.UUID`` or ``None``),
+    loads capabilities with the canonical ``get_workspace_capabilities`` loader,
+    and resolves the ``(network_mode, workspace_mode)`` pair with the persistent
+    lifecycle class.
+
+    The gate is invoked in DISK-AUTHORITATIVE mode (``use_disk=True``): the
+    on-disk workspace ceiling is the source of truth and the in-memory
+    ``session_permissions`` is not trusted as a fallback.  ``session_id`` is
+    threaded through so a workspace-only envelope (``session_id=None``) uses the
+    designed-default session grants capped by the on-disk ceiling; a set
+    ``session_id`` reads that session's sidecar.
+
+    Pure, total, fail-closed: a falsy workspace id, a ``ContainerConfigError``
+    (including the ``workspace_id_required`` refusal), or any exception returns
+    the locked-down ``("none", "ro")``.
+    """
+    network_mode = "none"
+    workspace_mode = "ro"
+    wsid = str(workspace_id) if workspace_id is not None else None
+    if wsid:
+        try:
+            from security.security_gate import (
+                ContainerConfig,
+                get_workspace_capabilities,
+                resolve_container_config,
+            )
+            from thoughtmachine.container_record import LIFECYCLE_PERSISTENT
+
+            capabilities = get_workspace_capabilities(wsid)
+            cfg = resolve_container_config(
+                session_permissions if session_permissions is not None else {},
+                capabilities,
+                LIFECYCLE_PERSISTENT,
+                session_id=session_id,
+                workspace_id=wsid,
+                use_disk=True,
+            )
+            if isinstance(cfg, ContainerConfig):
+                network_mode = cfg.network_mode
+                workspace_mode = cfg.workspace_mode
+        except Exception as e:
+            log("WARN", "docker.security_gate",
+                f"Gate lookup failed, using safe defaults: {e}")
+            network_mode = "none"
+            workspace_mode = "ro"
+    return network_mode, workspace_mode
+
+
+def _integrity_container_name(obj):
+    """Return *obj*'s container name when it is a real string, else empty.
+
+    Mocked / partially-populated container objects expose a non-string
+    ``name``; such objects are treated as "no name" rather than misclassified.
+    """
+    name = getattr(obj, "name", None)
+    return name if isinstance(name, str) else ""
+
+
+def _is_resource_container(obj):
+    """True when *obj* is a hidden resource container that must be left alone.
+
+    Resource containers (``tm-res-*`` names / the ``thoughtmachine.resource``
+    label) are shared workspace infrastructure owned by the resource container
+    manager.  ``verify_container_integrity`` must never inspect them for
+    integrity drift nor stop/remove them.
+    """
+    if _integrity_container_name(obj).startswith("tm-res-"):
+        return True
+    labels = getattr(obj, "labels", None)
+    if isinstance(labels, dict) and labels.get("thoughtmachine.resource"):
+        return True
+    return False
+
+
+def _find_container_via_record(client, workspace_id):
+    """Return the workspace's integrity-managed container via the record store.
+
+    Primary lookup path.  Each persistent record owns exactly one Docker label
+    (``thoughtmachine.container_id`` → record id, §7).  We enumerate the
+    workspace's records, resolve each persistent record's live container by
+    that label, and return the first candidate that survives the integrity
+    guards (persistent lifecycle + non-resource name).  Returns ``None`` when no
+    record-owned container is found (the caller then falls back to name math).
+    """
+    if not workspace_id:
+        return None
+    try:
+        from thoughtmachine.container_record import (
+            LIFECYCLE_PERSISTENT,
+            RECORD_LABEL_KEY,
+            list_records,
+        )
+    except Exception:
+        return None
+    try:
+        records = list_records(workspace_id)
+    except Exception as exc:
+        log("WARNING", "docker.verify_integrity",
+            f"record store lookup failed for workspace {workspace_id}: {exc}")
+        return None
+    for record in records:
+        # Resource / ephemeral / service records are never integrity-managed,
+        # even when a live container carries the record label.
+        if getattr(record, "lifecycle_class", None) != LIFECYCLE_PERSISTENT:
+            continue
+        try:
+            live = client.containers.list(
+                all=True,
+                filters={"label": f"{RECORD_LABEL_KEY}={record.id}"},
+            )
+        except Exception as exc:
+            log("WARNING", "docker.verify_integrity",
+                f"label lookup failed for record {record.id}: {exc}")
+            continue
+        for candidate in live or []:
+            if _is_resource_container(candidate):
+                continue
+            return candidate
+    return None
+
+
+def _resolve_integrity_container(client, workspace_id, container_name):
+    """Resolve the live container to verify for *workspace_id*.
+
+    Primary: the record-store label lookup (:func:`_find_container_via_record`).
+    Fallback: the legacy ``agent-exec-<hash>`` name lookup, kept for containers
+    that predate the record store (or workspaces with no resolvable id).
+    Raises ``docker.errors.NotFound`` when the fallback name lookup misses.
+    """
+    container = _find_container_via_record(client, workspace_id)
+    if container is not None:
+        return container
+    return client.containers.get(container_name)
+
+
+def verify_container_integrity(
+    workspace_path: str,
+    session_permissions: dict = None,
+) -> dict:
+    """Check an existing container against the expected security config.
+
+    If permissions have been tightened since the container was created, the
+    container is stopped and removed so it will be recreated with the new
+    settings on next use.
+
+    This is called during:
+      - Server startup (lifespan) to catch stale containers from previous runs
+      - Session load to catch containers whose permissions have changed
+        since the session was last active
+
+    Args:
+        workspace_path: Absolute path to the workspace.
+        session_permissions: The session permissions dict (e.g. from a loaded
+            session's config).  If None, the most restrictive defaults are used.
+
+    Returns:
+        dict with keys:
+            - container_exists (bool | None): None if Docker unavailable
+            - container_name (str | None)
+            - matches_config (bool | None): None if no container
+            - desired (dict): {"network": ..., "mode": ...}
+            - actual (dict | None): {"network": ..., "mode": ...}
+            - action_taken (str): "none", "removed", "refused", or "error"
+            - mismatch_reason (str | None)
+    """
+    workspace_path = normalize_workspace_path(workspace_path)
+
+    # Resolve workspace_id for config computation
+    workspace_id = _resolve_workspace_id(workspace_path)
+
+    # Compute desired config via the shared security-gate SSOT adapter
+    # (``_resolve_container_config_via_gate``) — the pure, fail-closed path
+    # shared with ``DockerExecutor._compute_container_config``.
+    desired_network, desired_mode = _resolve_container_config_via_gate(
+        workspace_id, session_permissions, None
+    )
+
+    # Canonical, envelope-keyed persistent name — the LEGACY fallback lookup
+    # used only when the record store has no matching container.
+    container_name = build_container_name(
+        workspace_path,
+        LIFECYCLE_PERSISTENT,
+        network_mode=desired_network,
+        workspace_mode=desired_mode,
+    )
+    audit_event(
+        "NETWORK_DECISION",
+        f"workspace={workspace_path} network_mode={desired_network}",
+    )
+
+    # Connect to Docker
+    try:
+        import docker
+        client = docker.from_env()
+    except Exception as exc:
+        log("WARNING", "docker.verify_integrity",
+            f"Cannot connect to Docker: {exc}")
+        return {
+            "container_exists": None,
+            "container_name": container_name,
+            "matches_config": None,
+            "desired": {"network": desired_network, "mode": desired_mode},
+            "actual": None,
+            "action_taken": "error",
+            "mismatch_reason": f"Docker unavailable: {exc}",
+        }
+
+    # Look up container.
+    #
+    # Primary: resolve via the container-record store (durable, label-driven
+    # identity) so lookup is robust to the container name drifting from the
+    # path-derived ``agent-exec-<hash>`` convention.  Fallback: the legacy
+    # name-based lookup, kept for containers that predate the record store.
+    try:
+        container = _resolve_integrity_container(
+            client, workspace_id, container_name
+        )
+        if container is not None:
+            container.reload()
+    except docker.errors.NotFound:
+        container = None
+    if container is None:
+        log("DEBUG", "docker.verify_integrity",
+            f"No existing container for {workspace_path}",
+            {"container_name": container_name})
+        return {
+            "container_exists": False,
+            "container_name": container_name,
+            "matches_config": None,
+            "desired": {"network": desired_network, "mode": desired_mode},
+            "actual": None,
+            "action_taken": "none",
+            "mismatch_reason": None,
+        }
+
+    # Get actual config from running container
+    actual_network = container.attrs["HostConfig"]["NetworkMode"]
+    actual_mounts = container.attrs.get("Mounts", [])
+    actual_mode = "ro"
+    for m in actual_mounts:
+        if m.get("Destination") == "/workspace":
+            actual_mode = m.get("Mode", "ro")
+            break
+
+    # Compare
+    if actual_network == desired_network and actual_mode == desired_mode:
+        audit_event("INTEGRITY_CHECK",
+                   f"workspace={workspace_path} container={container.id[:12]} "
+                   f"network={actual_network} mode={actual_mode} status=match")
+        log("INFO", "docker.verify_integrity",
+            f"Container {container.id[:12]} matches expected config",
+            {"container_name": container_name,
+             "network": actual_network, "mode": actual_mode})
+        return {
+            "container_exists": True,
+            "container_name": container_name,
+            "matches_config": True,
+            "desired": {"network": desired_network, "mode": desired_mode},
+            "actual": {"network": actual_network, "mode": actual_mode},
+            "action_taken": "none",
+            "mismatch_reason": None,
+        }
+
+    # Mismatch — the lifecycle funnel is the single arbiter of whether the
+    # container may be destroyed.  ``reconcile`` is READ-ONLY (it never stops
+    # or removes anything); it may return "refuse" (the safe default for a
+    # permissions-tightening drift) or "reap" (an explicit destroy is allowed).
+    mismatch_reason = (
+        f"network={actual_network}->{desired_network}, "
+        f"mode={actual_mode}->{desired_mode}"
+    )
+
+    from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+    decision = ContainerLifecycle.reconcile(
+        container,
+        session_permissions,
+        ContainerIntent(
+            kind="use",
+            desired_network=desired_network,
+            desired_workspace_mode=desired_mode,
+            workspace_owned=True,
+            reason="verify_integrity_mismatch",
+            workspace_id=workspace_id,
+        ),
+    )
+
+    action_taken = "none"
+    if decision.destroys:
+        log("WARNING", "docker.verify_integrity",
+            f"Container {container.id[:12]} config mismatch — removing",
+            {"container_name": container_name,
+             "actual_network": actual_network, "desired_network": desired_network,
+             "actual_mode": actual_mode, "desired_mode": desired_mode})
+
+        audit_event("VERIFY_RECREATE",
+                   f"workspace={workspace_path} container={container.id[:12]} "
+                   f"network={actual_network}->{desired_network} "
+                   f"mode={actual_mode}->{desired_mode}")
+
+        try:
+            container.stop(timeout=5)
+            container.remove()
+        except Exception as exc:
+            log("ERROR", "docker.verify_integrity",
+                f"Failed to remove mismatched container: {exc}")
+            return {
+                "container_exists": True,
+                "container_name": container_name,
+                "matches_config": False,
+                "desired": {"network": desired_network, "mode": desired_mode},
+                "actual": {"network": actual_network, "mode": actual_mode},
+                "action_taken": "error",
+                "mismatch_reason": mismatch_reason,
+            }
+
+        try:
+            from infra.container_manager import (
+                _reap_bound_record as _cm_reap_bound_record,
+                _emit_container_removed as _cm_emit_container_removed,
+            )
+            _cm_reap_bound_record(workspace_id, container)
+            _cm_emit_container_removed(workspace_id, None, container, reason="removed")
+        except Exception:
+            pass
+
+        action_taken = "removed"
+    elif decision.action == "refuse":
+        log("WARNING", "docker.verify_integrity",
+            f"Container {container.id[:12]} config mismatch — refused "
+            f"(container left intact): {decision.reason}",
+            {"container_name": container_name,
+             "actual_network": actual_network, "desired_network": desired_network,
+             "actual_mode": actual_mode, "desired_mode": desired_mode})
+        action_taken = "refused"
+
+    return {
+        "container_exists": True,
+        "container_name": container_name,
+        "matches_config": False,
+        "desired": {"network": desired_network, "mode": desired_mode},
+        "actual": {"network": actual_network, "mode": actual_mode},
+        "action_taken": action_taken,
+        "mismatch_reason": mismatch_reason,
+    }
+
+
+class DockerExecutor:
+    def __init__(
+        self,
+        workspace_path: str,
+        image: str = "agent-executor",
+        network: str = "none",
+        mem_limit: str = DEFAULT_MEM_LIMIT,
+        cpu_quota: int = 100000,
+        force_rebuild: bool = False,
+        idle_timeout: int = IDLE_TIMEOUT_SECONDS,
+        session_permissions=None,
+        workspace_id: str = None,
+    ):
+        # Normalize path: absolute, no trailing slash — ensures deterministic container naming
+        self.workspace_path = os.path.abspath(workspace_path).rstrip('/')
+        self.image = image or _compute_image_tag(self.workspace_path)
+        self.network = network
+        self.mem_limit = mem_limit
+        self.cpu_quota = cpu_quota
+        self.force_rebuild = force_rebuild
+        self.idle_timeout = idle_timeout
+        self.session_permissions = session_permissions
+        self.workspace_id = workspace_id
+        self.client = docker.from_env()
+        self.container = None
+        self.last_used = time.time()
+        self._timeout_warning_printed = False
+
+        if self.workspace_id is None:
+            try:
+                from thoughtmachine.workspace_capabilities import resolve_workspace_id
+                self.workspace_id = resolve_workspace_id(self.workspace_path)
+            except Exception:
+                self.workspace_id = None
+
+    def _compute_container_config(self):
+        """Compute desired network_mode and workspace mount mode from session permissions.
+
+        Thin, patchable wrapper over the shared SSOT adapter
+        ``_resolve_container_config_via_gate`` (which delegates to the
+        fail-closed ``security.security_gate.resolve_container_config``).
+
+        Returns:
+            Tuple of (network_mode: str, workspace_mode: str)
+            where network_mode is "bridge" or "none"
+            and workspace_mode is "rw" or "ro".
+        """
+        network_mode, workspace_mode = _resolve_container_config_via_gate(
+            self.workspace_id, self.session_permissions,
+            getattr(self, "session_id", None),
+        )
+        audit_event(
+            "NETWORK_DECISION",
+            f"workspace={self.workspace_path} network_mode={network_mode}",
+        )
+        return network_mode, workspace_mode
+
+    def _reap_container(self, container):
+        """Destroy ``container`` through the container lifecycle funnel.
+
+        The ``_ensure_container`` recreate paths are explicitly destructive, so
+        this routes an explicit reap intent (``kind="reap", explicit=True``)
+        through :meth:`ContainerLifecycle.reconcile`: an explicit reap ALWAYS
+        wins, emitting exactly one CONTAINER_LIFECYCLE decision event and
+        returning ``destroys=True`` — there is deliberately no refusal path
+        here.  The original ``stop()``/``remove()`` calls are preserved (swallow
+        ``NotFound``: the container is already gone).
+        """
+        from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+        decision = ContainerLifecycle.reconcile(
+            container,
+            self.session_permissions,
+            ContainerIntent(
+                kind="reap",
+                explicit=True,
+                reason="ensure_container_recreate",
+                workspace_id=self.workspace_id,
+                session_id=getattr(self, "session_id", None),
+            ),
+        )
+        if not decision.destroys:
+            # A refused reap must still be audited: the container survives, so
+            # there is no destroy to claim -- the reason records the refusal.
+            emit_destroy_audit(
+                _audit, "executor.reap", container, reason="refused",
+                detail=f"action={getattr(decision, 'action', 'unknown')} "
+                       f"decision_reason={getattr(decision, 'reason', 'unknown')}")
+            return
+        # Destroy proceeds: audit BEFORE the stop so the pre-stop state is real.
+        emit_destroy_audit(_audit, "executor.reap", container,
+                           reason="ensure_container_recreate")
+        try:
+            container.stop()
+            container.remove()
+        except docker.errors.NotFound:
+            pass
+
+    def _ensure_container(self):
+        from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+        # Ensure the Docker image exists
+        self._ensure_image()
+
+        log("DEBUG", "tools.docker_executor.container",
+            "_ensure_container called",
+            {"workspace_path": self.workspace_path, "image": self.image,
+             "has_container": self.container is not None,
+             "force_rebuild": self.force_rebuild})
+
+        # ── Fast path: self.container already exists and is running ──
+        if self.container:
+            try:
+                self.container.reload()
+                if self.container.status == "running":
+                    # ── Compute desired config via unified gate ──
+                    desired_network, desired_workspace_mode = self._compute_container_config()
+
+                    # ── Read actual config from container ──
+                    actual_network = self.container.attrs['HostConfig']['NetworkMode']
+                    actual_mounts = self.container.attrs.get('Mounts', [])
+                    actual_workspace_mode = "ro"
+                    for m in actual_mounts:
+                        if m.get('Destination') == '/workspace':
+                            actual_workspace_mode = m.get('Mode', 'ro')
+                            break
+
+                    # ── Compare desired vs actual ──
+                    if actual_network != desired_network or actual_workspace_mode != desired_workspace_mode:
+                        log("INFO", "tools.docker_executor.container",
+                            "Cached container config mismatch, recreating",
+                            {"container_id": self.container.id[:12],
+                             "actual_network": actual_network, "desired_network": desired_network,
+                             "actual_mode": actual_workspace_mode, "desired_mode": desired_workspace_mode})
+                        audit_event("CONTAINER_RECREATE_MISMATCH",
+                                   f"workspace={self.workspace_path} container={self.container.id[:12]} "
+                                   f"network={actual_network}->{desired_network} "
+                                   f"mode={actual_workspace_mode}->{desired_workspace_mode} source=live_object")
+                        self._reap_container(self.container)
+                        self.container = None
+                    else:
+                        log("DEBUG", "tools.docker_executor.container",
+                            "Reusing running container (fast path — config match)",
+                            {"container_id": self.container.id, "name": self.container.name})
+                        audit_event("CONTAINER_REUSE_OK",
+                                   f"workspace={self.workspace_path} container={self.container.id[:12]} source=live_object")
+                        return
+            except docker.errors.NotFound:
+                self.container = None
+
+        # ── Always compute desired config via unified gate ──
+        network_mode, workspace_mode = self._compute_container_config()
+
+        # ── Canonical envelope-keyed container name (the pool key) ──
+        container_name = build_container_name(
+            self.workspace_path,
+            LIFECYCLE_PERSISTENT,
+            network_mode=network_mode,
+            workspace_mode=workspace_mode,
+        )
+
+        # ── Try to find existing container by name ──
+        existing = None
+        try:
+            existing = self.client.containers.get(container_name)
+            existing.reload()
+        except docker.errors.NotFound:
+            pass
+
+        # ── Force rebuild: always remove existing ──
+        if self.force_rebuild and existing:
+            self._reap_container(existing)
+            existing = None
+            audit_event("CONTAINER_RECREATE",
+                       f"workspace={self.workspace_path} reason=force_rebuild")
+
+        # ── Check if existing container matches desired config ──
+        if existing is not None:
+            current_network = existing.attrs['HostConfig']['NetworkMode']
+            current_mounts = existing.attrs.get('Mounts', [])
+            current_workspace_mode = "ro"
+            for m in current_mounts:
+                if m.get('Destination') == '/workspace':
+                    current_workspace_mode = m.get('Mode', 'ro')
+                    break
+
+            config_mismatch = (
+                current_network != network_mode or
+                current_workspace_mode != workspace_mode
+            )
+
+            if config_mismatch:
+                # ── Name-matched drift is routed through the lifecycle funnel.
+                # A workspace-owned container is only replaced when the funnel
+                # says the intent destroys it; otherwise it is kept and used.
+                intent = ContainerIntent(
+                    kind="use",
+                    explicit=False,
+                    workspace_owned=True,
+                    reason="ensure_drift_config",
+                    desired_network=network_mode,
+                    desired_workspace_mode=workspace_mode,
+                    workspace_id=self.workspace_id,
+                    session_id=getattr(self, "session_id", None),
+                )
+                decision = ContainerLifecycle.reconcile(
+                    existing, self.session_permissions, intent
+                )
+                if not decision.destroys:
+                    log("WARNING", "tools.docker_executor.container",
+                        "Drifted container config refused (not recreating)",
+                        {"container_id": existing.id[:12],
+                         "current_network": current_network, "desired_network": network_mode,
+                         "current_mode": current_workspace_mode, "desired_mode": workspace_mode})
+                    audit_event("CONTAINER_DRIFT_REFUSED",
+                               f"workspace={self.workspace_path} container={existing.id[:12]} "
+                               f"network={current_network}->{network_mode} "
+                               f"mode={current_workspace_mode}->{workspace_mode} "
+                               f"reason={decision.reason}")
+                    self.container = existing
+                    self.last_used = time.time()
+                    return {"status": "refused", "reason": decision.reason,
+                            "container": existing.id}
+                log("INFO", "tools.docker_executor.container",
+                    "Container config mismatch, recreating",
+                    {"container_id": existing.id[:12],
+                     "current_network": current_network, "desired_network": network_mode,
+                     "current_mode": current_workspace_mode, "desired_mode": workspace_mode})
+                audit_event("CONTAINER_RECREATE_MISMATCH",
+                           f"workspace={self.workspace_path} container={existing.id[:12]} "
+                           f"network={current_network}->{network_mode} "
+                           f"mode={current_workspace_mode}->{workspace_mode}")
+                self._reap_container(existing)
+                existing = None
+            else:
+                try:
+                    container_image_id = existing.attrs.get('Image', '')
+                    current_image = self.client.images.get(self.image)
+                    current_image_id = current_image.id
+                    if container_image_id and current_image_id and container_image_id != current_image_id:
+                        log("INFO", "tools.docker_executor.container",
+                            "Container built from stale image, recreating",
+                            {"container_id": existing.id[:12],
+                             "container_image": container_image_id[:19] + "...",
+                             "current_image": current_image_id[:19] + "..."})
+                        audit_event("CONTAINER_RECREATE_MISMATCH",
+                                   f"workspace={self.workspace_path} container={existing.id[:12]} reason=stale_image")
+                        self._reap_container(existing)
+                        existing = None
+                    else:
+                        log("DEBUG", "tools.docker_executor.container",
+                            "Reusing existing container (config + image match)",
+                            {"container_id": existing.id[:12], "name": container_name})
+                        audit_event("CONTAINER_REUSE_OK",
+                                   f"workspace={self.workspace_path} container={existing.id[:12]} source=name_match")
+                except docker.errors.ImageNotFound:
+                    log("WARNING", "tools.docker_executor.container",
+                        "Could not compare image IDs (image not found), recreating container",
+                        {"container_id": existing.id[:12]})
+                    self._reap_container(existing)
+                    existing = None
+
+        # ── Reuse existing if still valid ──
+        if existing is not None:
+            self.container = existing
+            if self.container.status == "dead":
+                self._reap_container(self.container)
+                self.container = None
+                raise docker.errors.NotFound(f"Container {container_name} was dead and removed")
+            elif self.container.status != "running":
+                try:
+                    self.container.start()
+                except docker.errors.APIError:
+                    self._reap_container(self.container)
+                    self.container = None
+                    raise docker.errors.NotFound(f"Container {container_name} failed to start and was removed")
+            self.last_used = time.time()
+            return
+
+        # ── Create new container ──
+        # Route through the single host-id source of truth: on Windows
+        # _host_ids() returns None (no uid concept); omit the tmpfs uid/gid.
+        ids = _host_ids()
+        _home_tmpfs = "rw,exec,size=256M"
+        if ids is not None:
+            _home_tmpfs += f",uid={ids[0]},gid={ids[1]}"
+        tmpfs = {
+            "/tmp": EXEC_TMPFS_OPTIONS,
+            "/home/agent": _home_tmpfs,
+        }
+        shadow = git_shadow_for_workspace(
+            self.workspace_path,
+            git_shadow_mask_path(self.workspace_id) if self.workspace_id else None,
+        )
+        tmpfs.update(shadow.tmpfs)
+
+        log('INFO', 'tools.docker_executor.container',
+            f"AUDIT: Creating container with network={network_mode}, mode={workspace_mode}, tmpfs={tmpfs}")
+
+        audit_event("CONTAINER_CREATE",
+                   f"image={self.image} network={network_mode} name={container_name}")
+        # Workspace bind mount via docker.types.Mount so it can be combined
+        # with a named volume for the persistent package cache.
+        host_workspace = self.workspace_path
+        read_only = workspace_mode == "ro"
+        workspace_mount = docker.types.Mount(
+            target="/workspace", source=host_workspace, type="bind", read_only=read_only
+        )
+        pkg_mount = None
+        try:
+            pkg_volume_name = f"tm-packages-{self.workspace_id or 'default'}"
+            try:
+                self.client.volumes.get_or_create(name=pkg_volume_name)
+            except (docker.errors.APIError, docker.errors.NotFound):
+                self.client.volumes.create(name=pkg_volume_name)
+            pkg_mount = docker.types.Mount(
+                target="/home/agent/.local", source=pkg_volume_name, type="volume"
+            )
+        except Exception as e:
+            log("WARNING", "tools.docker_executor.container",
+                f"Package volume setup failed; continuing without persistent package cache: {e}")
+        mounts = [workspace_mount]
+        if pkg_mount is not None:
+            mounts.append(pkg_mount)
+        for _shadow_mount in shadow.mounts:
+            mounts.append(
+                docker.types.Mount(
+                    target=_shadow_mount.target,
+                    source=_shadow_mount.source,
+                    type=_shadow_mount.type,
+                    read_only=_shadow_mount.read_only,
+                )
+            )
+        container_env = {"PYTHONUSERBASE": "/home/agent/.local"}
+
+        # ── Admission control (phase 2 gate) ─────────────────────────────
+        # Route this terminal create through the pure admission gate so the
+        # container is created with the gate-approved (possibly narrowed)
+        # network mode.  A Deny raises AdmissionDenied; a Transform only ever
+        # narrows, so we adopt the gate's network mode.
+        from security.admission_gate import (
+            AdmissionDenied,
+            AdmissionRequest,
+            ClientProbes,
+            ContainerSpec,
+            Deny,
+            Transform,
+            admit,
+        )
+        from thoughtmachine.container_record import docker_restart_policy
+
+        _admission_wsid = str(self.workspace_id) if self.workspace_id is not None else "default"
+        _admission = admit(
+            AdmissionRequest(
+                spec=ContainerSpec(
+                    container_type="user",
+                    lifecycle_class=LIFECYCLE_PERSISTENT,
+                    workspace_id=_admission_wsid,
+                    image=None,
+                    name=container_name,
+                    mem_limit=self.mem_limit,
+                    cpu_quota=self.cpu_quota,
+                    network_mode=network_mode,
+                    read_only=True,
+                ),
+                permissions=self.session_permissions or {},
+                capabilities=_load_admission_capabilities(_admission_wsid),
+                session_config=getattr(self, "_session_config", None),
+            ),
+            probes=ClientProbes(self.client),
+        )
+        if isinstance(_admission, Deny):
+            raise AdmissionDenied(_admission.code, _admission.message)
+        if isinstance(_admission, Transform):
+            network_mode = _admission.spec.network_mode
+
+        # Route through the single host-id source of truth: on Windows
+        # _host_ids() returns None (no uid concept), so there is no root host
+        # to refuse.
+        if ids is not None and ids[0] == 0:
+            raise RuntimeError(
+                "root_host_unsupported: refusing to create a container for the "
+                "host root user (uid 0); the container user must match a "
+                "non-root host user"
+            )
+
+        spec = ContainerCreateSpec(
+            image=self.image,
+            command=["tail", "-f", "/dev/null"],
+            name=container_name,
+            container_type="user",
+            lifecycle_class=LIFECYCLE_PERSISTENT,
+            hardening=HardeningRecipe(
+                cap_drop=("ALL",),
+                security_opt=("no-new-privileges:true",),
+                read_only=True,
+                user=(host_user() or "0:0"),  # container user matches the host uid:gid
+            ),
+            workspace_id=self.workspace_id,
+            labels={
+                "thoughtmachine.workspace_id": str(self.workspace_id)
+                if self.workspace_id is not None else "default",
+                "thoughtmachine.note": "",
+                CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
+            },
+            environment=container_env,
+            mounts=[
+                MountSpec(
+                    source=m["Source"],
+                    target=m["Target"],
+                    type=m["Type"],
+                    read_only=m["ReadOnly"],
+                )
+                for m in mounts
+            ],
+            tmpfs=tmpfs,
+            network_mode=network_mode,
+            mem_limit=self.mem_limit,
+            cpu_quota=self.cpu_quota,
+            oom_score_adj=1000,
+        )
+        created = create_hardened_container(
+            self.client, spec, admission=None, record=True,
+        )
+        self.container = created.container
+        # Wave-10a: record the executor-side container creation as a
+        # container_lifecycle (action="create") event. The call is fail-safe
+        # (telemetry never breaks a caller) and strictly additive.
+        ContainerLifecycle.record_create(
+            self.container,
+            reason="executor_container_created",
+            contributing_source="docker_executor._ensure_container",
+            workspace_id=self.workspace_id,
+            session_id=getattr(self, "session_id", None),
+        )
+        # Workspace bind mount already has correct UID (matches host)
+        self.last_used = time.time()
+
+    def execute(self, command, timeout=30, workdir="/workspace", environment=None):
+        # Check idle timeout and close container if expired
+        if self.container and (time.time() - self.last_used) > self.idle_timeout:
+            self.close()
+        
+        self._ensure_container()
+        self.last_used = time.time()
+        # Auto-create working directory with correct ownership if needed
+        if workdir != "/workspace":
+            # Route through the single host-id source of truth: on Windows
+            # _host_ids() returns None (no uid concept); omit the chown there.
+            ids = _host_ids()
+            if ids is not None:
+                _mkdir = f"mkdir -p {workdir} && chown {ids[0]}:{ids[1]} {workdir}"
+            else:
+                _mkdir = f"mkdir -p {workdir}"
+            self.container.exec_run(
+                cmd=["sh", "-c", _mkdir],
+                workdir="/workspace"
+            )
+        try:
+            exit_code, output = self._exec_with_timeout(
+                command=command,
+                timeout=timeout,
+                workdir=workdir,
+                environment=environment
+            )
+            stdout = output[0].decode() if output[0] else ""
+            stderr = output[1].decode() if output[1] else ""
+            return stdout, stderr, exit_code
+        except TimeoutError as e:
+            # Timeout occurred - container was killed and recreated
+            return "", f"Command timed out after {timeout} seconds", -2
+        except docker.errors.APIError as e:
+            return "", str(e), -1
+
+    def close(self):
+        from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+        # Safely check if container attribute exists and is not None
+        if hasattr(self, 'container') and self.container:
+            decision = ContainerLifecycle.reconcile(
+                self.container,
+                self.session_permissions,
+                ContainerIntent(
+                    kind="reap",
+                    explicit=True,
+                    reason="executor_close",
+                    workspace_id=self.workspace_id,
+                    session_id=getattr(self, "session_id", None),
+                ),
+            )
+            if decision.destroys:
+                # Destroy proceeds: audit BEFORE the stop so the state is real.
+                emit_destroy_audit(_audit, "executor.close", self.container,
+                                   reason="executor_close")
+                try:
+                    self.container.stop()
+                    self.container.remove()
+                except docker.errors.NotFound:
+                    pass
+                self.container = None
+            else:
+                log("WARNING", "tools.docker_executor.container",
+                    "Refusing to destroy container on close",
+                    {"container_id": self.container.id[:12], "reason": decision.reason})
+                # Refused close is audited too, with reason="refused" so it can
+                # never be mistaken for a destroy.
+                emit_destroy_audit(
+                    _audit, "executor.close", self.container, reason="refused",
+                    detail=f"action={getattr(decision, 'action', 'unknown')} "
+                           f"decision_reason={getattr(decision, 'reason', 'unknown')}")
+
+    def _exec_with_timeout(self, command, timeout=30, workdir="/workspace", environment=None):
+        """Execute command with timeout support using threading."""
+        exec_kwargs = {
+            "cmd": ["/bin/sh", "-c", command],
+            "demux": True,
+            "workdir": workdir,
+        }
+        if environment:
+            exec_kwargs["environment"] = environment
+
+        # Use a queue to pass result from thread
+        result_queue = queue.Queue()
+        
+        def run_exec():
+            try:
+                exit_code, output = self.container.exec_run(**exec_kwargs)
+                result_queue.put((exit_code, output, None))
+            except Exception as e:
+                result_queue.put((None, None, e))
+        
+        # Start thread
+        exec_thread = threading.Thread(target=run_exec)
+        exec_thread.daemon = True
+        exec_thread.start()
+        
+        # Wait for thread to complete with timeout
+        exec_thread.join(timeout)
+        
+        if exec_thread.is_alive():
+            # Timeout occurred - try to kill the container to stop the command
+            try:
+                if self.container:
+                    self.container.kill()
+                    self.container = None
+            except Exception:
+                pass
+            # Recreate container for future use
+            self._ensure_container()
+            raise TimeoutError(f"Command timed out after {timeout} seconds")
+        
+        # Get result from queue
+        if result_queue.empty():
+            # Thread finished but didn't put result (shouldn't happen)
+            raise RuntimeError("Execution thread finished but no result")
+        
+        exit_code, output, error = result_queue.get()
+        if error:
+            raise error
+        
+        return exit_code, output
+    def _ensure_image(self, verbose_build=False):
+        """Build Docker image if it doesn't exist locally, is stale, or force_rebuild is True.
+
+        An existing image is reused only when its ``EXECUTOR_BUILD_HASH_LABEL``
+        label matches the current build-source hash; a missing or mismatched
+        label means the build sources drifted and the image is rebuilt.
+
+        Args:
+            verbose_build: If True, log build output summary on success.
+
+        Returns:
+            The Docker image object.
+        """
+        if self.force_rebuild:
+            self.close()
+            image, _ = self._build_image(verbose_build=verbose_build, nocache=True)
+            return image
+        try:
+            image = self.client.images.get(self.image)
+        except docker.errors.ImageNotFound:
+            image = None
+        if image is not None:
+            try:
+                build_hash = compute_executor_build_hash()
+            except OSError as e:
+                log("WARNING", "tools.docker_executor.image",
+                    f"Cannot read executor build sources ({e}) \u2014 reusing existing image")
+                return image
+            labels = getattr(image, "labels", None) or {}
+            if labels.get(EXECUTOR_BUILD_HASH_LABEL) == build_hash:
+                return image
+            log("INFO", "tools.docker_executor.image",
+                f"Image {self.image} build sources drifted (label mismatch) \u2014 rebuilding")
+            image, _ = self._build_image(verbose_build=verbose_build)
+            return image
+        image, _ = self._build_image(verbose_build=verbose_build)
+        return image
+
+    def _build_image(self, verbose_build=False, nocache=False):
+        """Build Docker image from committed requirements.txt and vault Dockerfile.
+
+        Creates a temporary build context with a generated Dockerfile and the
+        workspace's requirements.txt (retrieved from Git HEAD). This ensures
+        builds are reproducible and independent of local file system layout.
+
+        Args:
+            verbose_build: If True, log build output summary on success.
+            nocache: If True, force rebuild without Docker layer cache.
+
+        Returns:
+            Tuple of (image, log_lines) where log_lines is a list of build output lines.
+            The log_lines are also stored in the module-level ``_build_log_cache``.
+
+        Raises:
+            RuntimeError: If requirements.txt is not committed or build fails.
+        """
+        import subprocess
+        import tempfile
+        import shutil
+
+        global _build_in_progress
+        _build_in_progress = True
+
+        try:
+            build_hash = compute_executor_build_hash()
+        except OSError as e:
+            raise RuntimeError(
+                f"Cannot read executor build sources ({e}); "
+                "requirements.txt and resources/default_dockerfile.txt must exist."
+            ) from e
+
+        # Compute container_name for cache key alignment with get_container_status
+        normalised = self.workspace_path.replace("\\", "/")
+        network_mode, workspace_mode = self._compute_container_config()
+        _container_name = build_container_name(
+            self.workspace_path,
+            LIFECYCLE_PERSISTENT,
+            network_mode=network_mode,
+            workspace_mode=workspace_mode,
+        )
+
+        log_lines: list[str] = []
+        image_id: str | None = None
+
+        # Create temporary build context
+        tmpdir = tempfile.mkdtemp(prefix="docker_build_")
+        try:
+            # 1. Copy vault Dockerfile into build context
+            vault_dockerfile = os.path.expanduser(
+                f"~/.thoughtmachine/workspaces/{self.workspace_id}/Dockerfile"
+            )
+            if not os.path.exists(vault_dockerfile):
+                raise RuntimeError(
+                    f"Vault Dockerfile not found at {vault_dockerfile}. "
+                    "Please run the vault bootstrap to create it."
+                )
+            shutil.copy2(vault_dockerfile, os.path.join(tmpdir, "Dockerfile"))
+
+            # 2. Extract requirements.txt from Git HEAD
+            result = subprocess.run(
+                ["git", "show", "HEAD:requirements.txt"],
+                capture_output=True,
+                text=True,
+                cwd=self.workspace_path,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "requirements.txt is not committed. Please commit it before rebuilding."
+                )
+
+            req_path = os.path.join(tmpdir, "requirements.txt")
+            with open(req_path, "w") as f:
+                f.write(result.stdout)
+
+            # 2b. Guard: the build context must contain only the staged files
+            staged = set(os.listdir(tmpdir))
+            if not staged <= {"Dockerfile", "requirements.txt"}:
+                raise RuntimeError(
+                    f"Unexpected files staged in build context: {sorted(staged)}"
+                )
+
+            # 3. Build Docker image from temp context
+            log('DEBUG', 'tools.docker_executor.build',
+                f"Building Docker image {self.image} from temp context {tmpdir}")
+
+            def _stream_line(line: str) -> None:
+                log_lines.append(line)
+                log('DEBUG', 'tools.docker_executor.build', f"Build: {line}")
+                # Live-stream to the shared cache so the frontend polling
+                # loop sees each line as it arrives
+                with _build_log_cache_lock:
+                    _build_log_cache[normalised] = '\n'.join(log_lines)
+                try:
+                    sys.stdout.write(line + '\n')
+                    sys.stdout.flush()
+                except Exception:
+                    pass  # stdout may be None/closed in headless runtimes
+
+            image_id, _ = _run_image_build(
+                self.client, tmpdir, "Dockerfile", self.image,
+                nocache=nocache, on_line=_stream_line,
+                labels={EXECUTOR_BUILD_HASH_LABEL: build_hash},
+                networkmode=("none" if network_mode == "none" else None),
+            )
+
+        except RuntimeError:
+            # Re-raise the committed-requirements error as-is, but keep any
+            # partial build output visible in the shared cache
+            if log_lines:
+                with _build_log_cache_lock:
+                    cache_value = "\n".join(log_lines)
+                    _build_log_cache[self.workspace_path] = cache_value
+                    _build_log_cache[_container_name] = cache_value
+            raise
+        except Exception as e:
+            log_lines.append(str(e))
+            with _build_log_cache_lock:
+                cache_value = "\n".join(log_lines)
+                _build_log_cache[self.workspace_path] = cache_value
+                _build_log_cache[_container_name] = cache_value
+            raise RuntimeError(f"Docker build failed: {e}") from e
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            _build_in_progress = False
+
+        if verbose_build and log_lines:
+            log('INFO', 'tools.docker_executor.build',
+                f"Build complete for {self.image}:\n" + "\n".join(log_lines))
+
+        # \u2500\u2500 Store build log in shared cache \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        with _build_log_cache_lock:
+            cache_value = "\n".join(log_lines)
+            _build_log_cache[self.workspace_path] = cache_value
+            _build_log_cache[_container_name] = cache_value
+
+        return image_id, log_lines
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Container status helper (used by Flask endpoint)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ── Container rebuild helper ─────────────────────────────────────────────
+
+
+def _remove_container_by_workspace(workspace_path: str) -> None:
+    """Stop and remove the Docker container for the given workspace, if it exists.
+
+    Uses the same deterministic naming scheme as :class:`DockerExecutor`
+    (SHA-256 of the normalised absolute path, first 12 hex digits prefixed by
+    ``agent-exec-``).  This is safe to call even when no container exists.
+    """
+    normalised = os.path.abspath(workspace_path).replace("\\", "/")
+    workspace_id = _resolve_workspace_id(normalised)
+    network_mode, workspace_mode = _resolve_container_config_via_gate(
+        workspace_id, None, None
+    )
+    container_name = build_container_name(
+        normalised,
+        LIFECYCLE_PERSISTENT,
+        network_mode=network_mode,
+        workspace_mode=workspace_mode,
+    )
+    try:
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+        from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+        decision = ContainerLifecycle.reconcile(
+            container,
+            None,
+            ContainerIntent(
+                kind="reap",
+                explicit=True,
+                reason="remove_container_by_workspace",
+                workspace_id=workspace_id,
+            ),
+        )
+        if decision.destroys:
+            emit_destroy_audit(
+                _audit, "executor.remove_container_by_workspace", container,
+                reason="remove_container_by_workspace")
+            container.stop()
+            container.remove()
+            log("INFO", "tools.docker_executor.rebuild",
+                f"Removed old container {container_name} after rebuild")
+    except docker.errors.NotFound:
+        pass  # container didn't exist — nothing to do
+    except docker.errors.DockerException as exc:
+        log("WARNING", "tools.docker_executor.rebuild",
+            f"Could not remove container {container_name}: {exc}")
+
+
+# Background build results cache — populated by rebuild_container background
+# thread, consumed by get_container_status() to surface build results.
+_background_build_results: dict[str, dict] = {}
+_background_build_results_lock = threading.Lock()
+
+
+def rebuild_container(workspace_path: str) -> dict:
+    """
+    Start a **background** rebuild of the Docker image for *workspace_path*
+    with --no-cache and return immediately.
+
+    The background thread stores its result in ``_background_build_results``;
+    ``get_container_status()`` merges that result into its return value so the
+    frontend can pick it up via its polling loop.
+
+    Returns:
+        A dict with:
+        - **status** -- ``"building"``, ``"ok"``, or ``"error"``
+        - **build_log** -- full build log from the build attempt
+    """
+    global _build_in_progress
+
+    normalised = os.path.abspath(workspace_path).replace("\\", "/")
+
+    if _build_in_progress:
+        with _background_build_results_lock:
+            result = _background_build_results.get(normalised, {})
+        return result or {
+            "status": "building",
+            "build_log": "Build already in progress...",
+        }
+
+    def _run_build():
+        global _build_in_progress
+        _build_in_progress = True
+        try:
+            executor = DockerExecutor(
+                workspace_path=normalised,
+                force_rebuild=True,   # triggers nocache build
+                idle_timeout=0,       # ephemeral, no pooling needed
+            )
+            executor.close()  # ensure any old container is gone
+            image, log_lines = executor._build_image(verbose_build=True, nocache=True)
+
+            # ── Remove the old container so the next execution creates a fresh one ──
+            # The rebuild only builds the image; the old container with the previous
+            # image continues to run unless we explicitly tear it down.
+            _remove_container_by_workspace(normalised)
+
+            result = {
+                "status": "ok",
+                "build_log": "\n".join(log_lines) if log_lines else "Build completed successfully.",
+            }
+        except RuntimeError as exc:
+            result = {"status": "error", "build_log": str(exc)}
+        except Exception as exc:
+            log("ERROR", "tools.docker_executor.rebuild", f"Unexpected rebuild error: {exc}")
+            result = {"status": "error", "build_log": f"Unexpected error: {exc}"}
+        finally:
+            _build_in_progress = False
+
+        with _background_build_results_lock:
+            _background_build_results[normalised] = result
+
+    thread = threading.Thread(target=_run_build, daemon=True)
+    thread.start()
+
+    return {
+        "status": "building",
+        "build_log": "Build started in background...",
+    }
+
+
+
+
+
+def get_container_status(workspace_path: str) -> dict:
+    """
+    Return the status of the Docker container for *workspace_path*.
+
+    The returned dict has the following keys:
+
+    - **status** — ``"running"``, ``"stopped"``, ``"building"``, or ``"error"``
+    - **capabilities** — workspace capability flags (see below)
+    - **build_log** — full build log from the most recent ``_build_image()`` call
+
+    Capabilities (fallback to fully-permissive defaults when no workspace
+    capabilities file is found):
+
+    .. code-block:: python
+
+        {
+            "allow_network": bool,
+            "allow_docker": bool,
+            "allowed_file_extensions": list[str],
+            "max_file_size_bytes": int,
+            "allowed_workspace_dirs": list[str],
+        }
+    """
+    global _build_in_progress
+
+    # ── 1. Normalise path ───────────────────────────────────────────────────
+    normalised = os.path.abspath(workspace_path).replace("\\", "/")
+
+    # ── 2. Compute container name ──────────────────────────────────────────
+    workspace_id = _resolve_workspace_id(normalised)
+    network_mode, workspace_mode = _resolve_container_config_via_gate(
+        workspace_id, None, None
+    )
+    container_name = build_container_name(
+        normalised,
+        LIFECYCLE_PERSISTENT,
+        network_mode=network_mode,
+        workspace_mode=workspace_mode,
+    )
+
+    # ── 3. Check build-in-progress ──────────────────────────────────────────
+    with _build_log_cache_lock:
+        is_building = _build_in_progress
+
+    if is_building:
+        caps = _compute_effective_capabilities(normalised)
+        with _build_log_cache_lock:
+            live_log = _build_log_cache.get(normalised, "")
+        return {
+            "status": "building",
+            "capabilities": caps,
+            "image": _compute_image_tag(normalised),
+            "build_log": live_log or "Build started...",
+        }
+
+    # ── 4. Query Docker for container status ────────────────────────────────
+    status = "stopped"
+    try:
+        client = docker.from_env()
+        try:
+            container = client.containers.get(container_name)
+            container.reload()
+            if container.status == "running":
+                status = "running"
+            else:
+                status = "stopped"
+        except docker.errors.NotFound:
+            status = "stopped"
+    except docker.errors.DockerException as exc:
+        status = "error"
+        # Retrieve any existing build log; append the error
+        with _build_log_cache_lock:
+            log_text = _build_log_cache.get(container_name, "")
+        log_text += f"\nDocker query error: {exc}"
+        caps = _compute_effective_capabilities(normalised)
+        return {
+            "status": status,
+            "capabilities": caps,
+            "image": _compute_image_tag(normalised),
+            "build_log": log_text.strip(),
+        }
+
+    # ── 5. Load effective capabilities (caps × policy) ──────────────────────
+    caps = _compute_effective_capabilities(normalised)
+
+    # ── 6. Retrieve build log ───────────────────────────────────────────────
+    with _build_log_cache_lock:
+        build_log = _build_log_cache.get(container_name, "")
+
+    # ── 7. Check background rebuild result ───────────────────────────────────
+    with _background_build_results_lock:
+        bg_result = _background_build_results.get(normalised)
+    if bg_result and bg_result.get("status") in ("ok", "error"):
+        # A background rebuild finished — surface its log as the primary one
+        build_log = bg_result.get("build_log", build_log)
+        status = bg_result["status"] if bg_result["status"] == "error" else status
+
+    # ── 8. Return ───────────────────────────────────────────────────────────
+    return {
+        "status": status,
+        "capabilities": caps,
+        "image": _compute_image_tag(normalised),
+        "build_log": build_log,
+    }
+
+
+def get_integrity_status(
+    workspace_path: str,
+    session_permissions: dict = None,
+) -> dict:
+    """Return a lightweight integrity-check result for the given workspace.
+
+    Wraps ``verify_container_integrity()`` into a dict suitable for the
+    frontend API.  The returned dict always includes at least:
+
+    - **status** -- ``"ok"``, ``"mismatch"``, ``"removed"``, or ``"error"``
+      (a refused mismatch reports ``"mismatch"``)
+    - **container_name** -- the expected container name (str)
+    - **desired** -- ``{"network": ..., "mode": ...}``
+    - **actual** -- ``{"network": ..., "mode": ...}`` or ``None`` if not found
+
+    When a mismatch was detected and the container was removed, ``status``
+    is ``"removed"`` and ``mismatch_reason`` explains why.  When the mismatch
+    was refused (the container was left intact), ``status`` is ``"mismatch"``.
+
+    Args:
+        workspace_path: Absolute path to the workspace.
+        session_permissions: Session permissions dict, or None for
+            restrictive defaults.
+
+    Returns:
+        dict with ``status``, ``container_name``, ``desired``, ``actual``,
+        and optionally ``mismatch_reason``.
+    """
+    result = verify_container_integrity(workspace_path, session_permissions)
+    # Map action_taken to frontend-friendly status
+    action_map = {
+        "none": "ok" if result.get("matches_config") in (True, None) else "mismatch",
+        "removed": "removed",
+        "refused": "mismatch",
+        "error": "error",
+    }
+    return {
+        "status": action_map.get(result["action_taken"], "error"),
+        "container_name": result["container_name"],
+        "desired": result["desired"],
+        "actual": result["actual"],
+        "mismatch_reason": result.get("mismatch_reason"),
+    }
+
+
+def _load_capabilities(workspace_path: str) -> dict:
+    """Load workspace capabilities, falling back to fully-permissive defaults."""
+    try:
+        from thoughtmachine.workspace_capabilities import (
+            load_workspace_capabilities,
+            resolve_workspace_id,
+        )
+
+        workspace_id = resolve_workspace_id(workspace_path)
+        if workspace_id is None:
+            return _default_capabilities()
+
+        caps = load_workspace_capabilities(workspace_id)
+        if caps is None:
+            return _default_capabilities()
+
+        return {
+            "allow_network": caps.allow_network,
+            "allow_docker": caps.allow_docker,
+            "allowed_file_extensions": list(caps.allowed_file_extensions),
+            "max_file_size_bytes": caps.max_file_size_bytes,
+            "allowed_workspace_dirs": list(caps.allowed_workspace_dirs),
+        }
+    except Exception:
+        return _default_capabilities()
+
+
+def _compute_effective_capabilities(workspace_path: str) -> dict:
+    """Return workspace capabilities directly — no policy merging.
+
+    The old security_policy.json merging layer has been removed as part
+    of Phase 1 of the security refactor.  Workspace capabilities are now
+    the sole source of truth for what a workspace is allowed to do.
+    Container-level enforcement is handled by _compute_container_config()
+    via the security gate.
+    """
+    return _load_capabilities(workspace_path)
+
+
+def _load_admission_capabilities(workspace_id):
+    """Load a workspace's capabilities for the admission gate.
+
+    Lazy import so a test that monkeypatches
+    ``security.security_gate.get_workspace_capabilities`` is honoured.  Any
+    failure returns ``None``; the admission gate then fails closed on the
+    ``capabilities_required`` code (mirrors the fail-closed config resolver).
+    """
+    try:
+        from security.security_gate import get_workspace_capabilities
+        return get_workspace_capabilities(workspace_id)
+    except Exception:
+        return None
+
+
+def _default_capabilities() -> dict:
+    """Return fully-permissive capability defaults."""
+    return {
+        "allow_network": True,
+        "allow_docker": True,
+        "allowed_file_extensions": ["*"],
+        "max_file_size_bytes": 0,
+        "allowed_workspace_dirs": ["."],
+    }
+

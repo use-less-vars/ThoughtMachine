@@ -160,12 +160,16 @@ A: No — Docker is optional. Without it, the agent can still edit files, search
 code, use git, etc. Docker only enables code execution.
 
 **Q: What Docker image does the agent use?**
-A: It builds `agent-executor` from `docker/executor.Dockerfile` — a minimal
-Python image with common packages.
+A: It builds a per-workspace image from the vault Dockerfile at
+`~/.thoughtmachine/workspaces/<workspace_id>/Dockerfile` — a minimal
+Python image with common packages. It is tagged
+`agent-executor-<hash of the workspace path>` — there is no shared
+`agent-executor:latest`.
 
 **Q: How do I add packages to the Docker image?**
-A: Edit `docker/requirements-docker.txt` and set `build=True` in DockerCodeRunner
-to rebuild the image.
+A: Edit the Dockerfile and `requirements.txt` in
+`~/.thoughtmachine/workspaces/<workspace_id>/`, then rebuild with
+`ContainerBuildTool` (`nocache=True` forces a fresh build).
 
 **Q: Can I enable network in Docker?**
 A: Yes — edit `~/.thoughtmachine/security_policy.json` and set

@@ -1,0 +1,358 @@
+#===============================================================================
+# cross-platform-smoke.yml - cross-platform install + backend smoke CI.
+#
+# Proves the two supported platforms boot the real backend and answer the
+# real health contract (GET /api/health - the legacy /health route does not
+# exist in the backend):
+#
+#   * linux-install (ubuntu-latest, NO job container): ./install.sh
+#     completes, ./start_thoughtmachine.sh --check-only passes (Docker
+#     problems only WARN in --check-only mode - degraded mode is supported),
+#     then the backend is started exactly like the launcher does
+#     (.venv/bin/python -m web_ui.backend.server) and GET /api/health is
+#     polled until HTTP 200, then the server is stopped.
+#
+#   * windows-smoke (windows-latest): a fresh venv is created, the Python
+#     dependencies are installed, the critical import is verified, and
+#     scripts/smoke_windows.ps1 boots the backend the same way the Windows
+#     launcher does (python -m web_ui.backend.server) and polls
+#     GET http://127.0.0.1:8000/api/health until HTTP 200, then stops it.
+#
+#   * macos-launcher (macos-latest): a GATING preflight asserting the LAUNCHER
+#     class of macOS code paths (ss-absent lsof port fallback, Darwin skip for
+#     Linux-only tools, doctor naming its Docker verdict). The SUBSTRATE class
+#     (Docker Desktop + VirtioFS host integration) is a NAMED GAP, not asserted.
+#===============================================================================
+name: Cross-Platform Smoke
+
+on:
+  push:
+    branches: [dev, master]
+  pull_request:
+
+concurrency:
+  group: cross-platform-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  #---------------------------------------------------------------------------
+  # Job A - Linux: real installer + preflight gate + backend /api/health smoke
+  # on a stock ubuntu-latest runner (no container, no mounted docker socket
+  # needed - --check-only tolerates an unusable Docker daemon).
+  #---------------------------------------------------------------------------
+  linux-install:
+    name: Linux install + check-only + backend smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # install.sh check [4/5] needs `python3 -m venv` (python3-venv). The
+      # runner already ships python3, node >= 18, git, curl and a running
+      # Docker daemon, so python3-venv is the only apt-guaranteed gap.
+      - name: Install prerequisite packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-venv curl
+
+      # start_thoughtmachine.sh check [6/8] (~/.thoughtmachine writable) is
+      # fatal in ALL modes - even --check-only - so it must exist up front.
+      - name: Pre-create $HOME/.thoughtmachine
+        run: mkdir -p "$HOME/.thoughtmachine"
+
+      # install.sh: platform gate (Linux/x86_64/debian-or-ubuntu), Python
+      # >= 3.11, Docker daemon (already running on the runner), docker
+      # group, venv (created + dependencies installed), Node.js >= 18.
+      # Exits 0 only when every critical check passes.
+      - name: Run ./install.sh
+        run: bash install.sh
+
+      # Full pre-launch gate without starting anything. Docker daemon_down /
+      # lib_missing / permission problems only WARN in --check-only mode
+      # (the project supports a docker-less degraded mode), so this proves
+      # the checks that matter: tools, venv, ports, Node.js, vault.
+      #
+      # NON-VACUITY (Part A): capture the run and prove the [2/8] Docker step
+      # actually RESOLVED. `set -o pipefail` is REQUIRED so a non-zero launcher
+      # rc is not swallowed by the pipe into tee. This runner ships a live
+      # Docker daemon, so --expect-docker is the right contract here: the [2/8]
+      # section must carry "      ok." and emit no Docker WARNING.
+      - name: Run ./start_thoughtmachine.sh --check-only (non-vacuous)
+        run: |
+          set -o pipefail
+          bash start_thoughtmachine.sh --check-only 2>&1 | tee /tmp/tm-check-only.log
+          bash scripts/assert_check_only_not_vacuous.sh --expect-docker /tmp/tm-check-only.log
+
+      # Boot the real backend exactly like start_thoughtmachine.sh does
+      # (.venv/bin/python -m web_ui.backend.server), poll GET /api/health
+      # until HTTP 200 (up to 60s), then stop the server.
+      - name: Start backend and smoke GET /api/health
+        run: |
+          mkdir -p logs
+          .venv/bin/python -m web_ui.backend.server > logs/backend_ci.log 2>&1 &
+          BACKEND_PID=$!
+          echo "backend pid: $BACKEND_PID"
+          HTTP_CODE=""
+          for _ in $(seq 1 60); do
+            HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:8000/api/health 2>/dev/null || true)"
+            if [ "$HTTP_CODE" = "200" ]; then
+              break
+            fi
+            if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+              echo "::error::backend exited before /api/health answered - tail of logs/backend_ci.log:"
+              tail -n 40 logs/backend_ci.log || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::GET /api/health never returned HTTP 200 within 60s (last code: ${HTTP_CODE:-none})"
+            tail -n 60 logs/backend_ci.log || true
+            kill "$BACKEND_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "OK: GET /api/health returned HTTP 200"
+          kill "$BACKEND_PID" 2>/dev/null || true
+          wait "$BACKEND_PID" 2>/dev/null || true
+
+  #---------------------------------------------------------------------------
+  # Job B - Windows: venv + deps + critical import + scripts/smoke_windows.ps1
+  # (the smoke script polls GET http://127.0.0.1:8000/api/health - it was
+  # updated from the legacy /health route; the backend has no /health route).
+  #---------------------------------------------------------------------------
+  windows-smoke:
+    name: Windows venv + smoke script
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Guard for the cmd.exe parser bug that crashed the installer for real
+      # Windows users AND this job, right after the '--- Python ---' banner.
+      # ROOT CAUSE (line endings exonerated - the .bat already arrived CRLF):
+      # cmd.exe mis-parses parenthesized content - REM comment text, quoted
+      # python -c one-liners - INSIDE multi-line IF blocks, emitting
+      # '". was unexpected at this time.' / 'kann syntaktisch an dieser
+      # Stelle nicht verarbeitet werden'. a9ee26e rewrote the Python check
+      # with flat single-line probes + goto labels: zero parenthesized
+      # blocks. This guard stops the installer the moment it echoes the
+      # Node.js banner - reaching it proves the whole Python section parsed
+      # and executed under real cmd.exe.
+      #
+      # NOTE: we run with Python PRESENT, i.e. the exact user scenario.
+      # Simulating 'no Python' by stripping PATH is impossible on these
+      # runners: the py launcher resolves installed interpreters via the
+      # registry, so 'py --version' still succeeds, the installer runs the
+      # full install and exits 0 (observed). A reintroduced parens-in-block
+      # dies here with the parse-error text BEFORE the Node.js marker.
+      - name: install_thoughtmachine.bat Python section parses under cmd.exe
+        run: |
+          # Run the real installer under real cmd.exe, kill it once it
+          # reaches the Node.js section - that is all this guard needs.
+          $outLog = Join-Path $env:RUNNER_TEMP 'tm_install_guard_out.log'
+          $errLog = Join-Path $env:RUNNER_TEMP 'tm_install_guard_err.log'
+          $empty = Join-Path $env:RUNNER_TEMP 'tm_install_guard_empty.txt'
+          Remove-Item $outLog, $errLog, $empty -ErrorAction SilentlyContinue
+          Set-Content -Path $empty -Value ''
+          $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c install_thoughtmachine.bat' -RedirectStandardInput $empty -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -NoNewWindow
+          if ($null -eq $p) {
+            Write-Output '::error::could not start cmd.exe'
+            exit 1
+          }
+          $deadline = (Get-Date).AddSeconds(45)
+          $reachedNode = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $outLog) {
+              $partial = Get-Content $outLog -Raw -ErrorAction SilentlyContinue
+              if ($partial -match '--- Node\.js ---') { $reachedNode = $true; break }
+            }
+            if ($p.HasExited) { break }
+            Start-Sleep -Milliseconds 250
+          }
+          if (-not $p.HasExited) { try { $p.Kill() } catch { } }
+          $p.WaitForExit()
+          $out = Get-Content $outLog -Raw -ErrorAction SilentlyContinue
+          $err = Get-Content $errLog -Raw -ErrorAction SilentlyContinue
+          Write-Output 'install_thoughtmachine.bat (Python present, stopped after Node.js banner):'
+          Write-Output '----- output -----'
+          Write-Output $out
+          if ($err) { Write-Output '----- stderr -----'; Write-Output $err }
+          Write-Output '------------------'
+          $all = $out + "`n" + $err
+          $failed = $false
+          if ($all -notmatch '--- Python ---') {
+            Write-Output '::error::installer never reached the --- Python --- banner'
+            $failed = $true
+          }
+          if ($all -match 'unexpected at this time|kann syntaktisch|is not recognized as an internal') {
+            Write-Output '::error::cmd.exe mis-parsed the .bat (parenthesized content inside a block) - see output above'
+            $failed = $true
+          }
+          if (-not $reachedNode) {
+            Write-Output '::error::installer never reached the Node.js section - Python check crashed or hung'
+            $failed = $true
+          }
+          if ($failed) {
+            Write-Output '::error::windows-smoke guard failed - see install output above'
+            exit 1
+          }
+          Write-Output 'OK: cmd.exe parsed the installer cleanly; Python section ran and fell through to Node.js'
+          exit 0
+
+      # Python 3.14: the newest supported release line (the installers accept
+      # 3.11+ with no ceiling). This job proves the full Windows stack - venv
+      # creation, pip cp314 wheel resolution, critical import and the smoke
+      # script - works on it.
+      - name: Set up Python (3.14)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Upgrade pip and install project dependencies
+        run: |
+          .venv\Scripts\python -m pip install --upgrade pip
+          .venv\Scripts\python -m pip install -r requirements.txt
+
+      - name: Verify critical imports
+        run: .venv\Scripts\python -c "import web_ui.backend.server; print('IMPORTS_OK')"
+
+      # The script reuses the .venv, re-installs deps (idempotent), verifies
+      # imports, then boots the backend with the same invocation the Windows
+      # launcher uses (.venv\Scripts\python.exe -m web_ui.backend.server).
+      - name: Run scripts/smoke_windows.ps1
+        run: |
+          # Polls GET http://127.0.0.1:8000/api/health until HTTP 200 (inside the script), then stops the backend.
+          powershell -ExecutionPolicy Bypass -File scripts\smoke_windows.ps1
+
+  #---------------------------------------------------------------------------
+  # Job C - macOS launcher preflight (GATING: deliberately NO continue-on-error).
+  #
+  # CLASS BOUNDARY - this job asserts the LAUNCHER class only: the macOS code
+  # paths inside start_thoughtmachine.sh / scripts/doctor_checks.py, i.e.
+  #   (i)   the port check falls back to `lsof` when `ss` is absent
+  #         (doctor_checks.py:142-180, lsof branch :160, cannot-verify :165);
+  #   (ii)  the Darwin branch skips the Linux-only tool requirements
+  #         (start_thoughtmachine.sh:197-209, skip echo :199); and
+  #   (iii) `doctor --check-docker` NAMES its Docker verdict in its own terms
+  #         (doctor_checks.py:115-139).
+  # It does NOT assert the SUBSTRATE class (Docker Desktop + VirtioFS host
+  # integration): that is environment-/licence-dependent and stays with the
+  # advisory macos-docker-probe in platform-matrix.yml.
+  # A fourth assertion (iv) - `--check-only` reaching [8/8] with rc 0 - is
+  # OMITTED on purpose: it hinges on the [1/8] venv, [5/8] node, [6/8] vault
+  # and [7/8] locale checks, which cannot be proven deterministically from
+  # code alone, so shipping it GATING would risk a flaky RED.
+  #---------------------------------------------------------------------------
+  macos-launcher:
+    name: macOS launcher preflight (gating)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python (3.12)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # (i) `ss` is iproute2 = Linux-only; on macOS the port check MUST use the
+      # lsof fallback and still reach a DEFINITIVE verdict (not "cannot verify").
+      - name: '[macOS launcher] port check uses the lsof fallback'
+        run: |
+          set -euo pipefail
+          # Collision-proof: pick a random high port (49152-65535) instead of a
+          # fixed one, so a busy/tested 58214 can never turn this into a flaky RED.
+          PORT="$(( (RANDOM % 16384) + 49152 ))"
+          if command -v ss >/dev/null 2>&1; then echo "::error::ss unexpectedly present on macOS - cannot prove the lsof fallback"; exit 1; fi
+          if ! command -v lsof >/dev/null 2>&1; then echo "::error::lsof absent too - the ss-less port check has no resolver to fall back to"; exit 1; fi
+          OUT="$(python3 scripts/doctor_checks.py --check-port "$PORT")" && RC=0 || RC=$?
+          echo "doctor --check-port $PORT (rc=$RC): $OUT"
+          printf '%s' "$OUT" | python3 -c '
+          import json, sys
+          port = sys.argv[1]
+          d = json.load(sys.stdin)
+          detail = d.get("detail", "")
+          free = "port %s is free" % port
+          in_use = "%s is in use by " % port  # real string: "%d is in use by %s" % (port, proc)
+          # RED if doctor_checks.py:160-165 lsof fallback is removed: the whole
+          # verdict then degrades to the :165 cannot-verify string.
+          assert "cannot verify" not in detail, "unresolved port verdict: %r" % detail
+          assert "Neither ss nor lsof" not in detail, "lsof fallback did not fire: %r" % detail
+          assert str(port) in detail, "port %s not named in detail: %r" % (port, detail)
+          assert detail == free or detail.startswith(in_use), "unexpected detail: %r" % detail
+          if detail == free:
+              assert d.get("ok") is True, "free port must be ok=true: %r" % d
+              print("OK lsof fallback resolved: ok=true detail=%r" % detail)
+          else:
+              assert d.get("ok") is False, "in-use port must be ok=false: %r" % d
+              print("OK lsof fallback resolved (port in use): ok=false detail=%r" % detail)
+          ' "$PORT"
+
+      # (ii) `ss` is a CRITICAL tool in doctor --check-tools (doctor_checks.py:
+      # 444-450) and iproute2 is never present on macOS, so --check-tools exits
+      # non-zero => TOOLS_RC != 0 => the Darwin branch (start_thoughtmachine.sh:
+      # 197-199) fires. The skip echo is emitted at :194-199, BEFORE [1/8], so
+      # this is deterministic regardless of any later failing check.
+      #
+      # We START the launcher in the background and POLL for the skip marker
+      # rather than run it to completion: on macOS [1/8] may perform a real venv
+      # creation + pip install, which is slow and irrelevant here. The marker is
+      # emitted BEFORE any [N/8] banner, so polling it is fast and exact.
+      - name: '[macOS launcher] Darwin skip for Linux-only tool requirements fires'
+        run: |
+          set -euo pipefail
+          TOOLS_JSON="$(python3 scripts/doctor_checks.py --check-tools)" && TRC=0 || TRC=$?
+          echo "doctor --check-tools (rc=$TRC): $TOOLS_JSON"
+          printf '%s' "$TOOLS_JSON" | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d.get("ok") is False, "expected ok=false on macOS (ss missing): %r" % d
+          assert "ss" in d.get("critical_missing", []), "ss not critical-missing: %r" % d.get("critical_missing")
+          print("OK precondition: check-tools ok=false, critical_missing includes ss -> TOOLS_RC!=0")
+          '
+          [ "$TRC" -ne 0 ] || { echo "::error::--check-tools returned 0 on macOS - Darwin skip would NOT fire"; exit 1; }
+          MARKER='macOS detected - skipping Linux-only tool requirements.'
+          LOG=/tmp/tm-macos-start.log
+          bash start_thoughtmachine.sh --check-only > "$LOG" 2>&1 &
+          LAUNCH_PID=$!
+          SEEN=0
+          for _ in $(seq 1 60); do
+            if grep -Fq "$MARKER" "$LOG" 2>/dev/null; then SEEN=1; break; fi
+            if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          kill "$LAUNCH_PID" 2>/dev/null || true
+          wait "$LAUNCH_PID" 2>/dev/null || true
+          if [ "$SEEN" -ne 1 ]; then
+            echo "::error::Darwin skip line (start_thoughtmachine.sh:199) missing - launcher aborted early or never emitted it"
+            tail -n 40 "$LOG" || true
+            exit 1
+          fi
+          echo "OK: start_thoughtmachine.sh:199 fired on macOS: $MARKER"
+
+      # (iii) Without Docker Desktop, `doctor --check-docker` must not be silent:
+      # it NAMES the verdict (reason in permission_denied|daemon_down|lib_missing|
+      # other) with a non-empty detail. Tolerant if Docker IS usable.
+      - name: '[macOS launcher] doctor names Docker unusable in its own terms'
+        run: |
+          set -euo pipefail
+          D_JSON="$(python3 scripts/doctor_checks.py --check-docker)" && DRC=0 || DRC=$?
+          echo "doctor --check-docker (rc=$DRC): $D_JSON"
+          printf '%s' "$D_JSON" | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          ok = d.get("ok"); reason = d.get("reason"); detail = d.get("detail", "")
+          if ok is True:
+              assert detail == "docker info succeeded", "Docker claimed usable but detail=%r" % detail
+              print("OK: Docker present and named usable (detail=%r)" % detail)
+          else:
+              assert reason in ("permission_denied","daemon_down","lib_missing","other"), "Docker unusable but no NAME: %r" % d
+              assert detail, "Docker unusable but no detail: %r" % d
+              print("OK: doctor NAMED Docker unusable: reason=%r detail=%r" % (reason, detail[:80]))
+          '

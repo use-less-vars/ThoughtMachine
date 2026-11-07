@@ -70,7 +70,6 @@ HIDDEN_IMPORTS = [
     "tools.git_info_tool",
     "tools.knowledge_base",
     "tools.mcp_validator",
-    "tools.paginate_tool",
     "tools.progress_report",
     "tools.respond",
     "tools.summarize_tool",
@@ -214,6 +213,14 @@ if system_prompt.exists():
 agent_config = PROJECT_ROOT / "agent_config.json"
 if agent_config.exists():
     DATA_FILES.append((str(agent_config), "."))
+
+# ── git askpass helper (W3: git auth travels through the environment) ─────
+# thoughtmachine.git_auth_env.askpass_path() resolves the script relative to
+# the thoughtmachine package, so the bundle needs the same layout: the script
+# goes next to the package inside _internal/thoughtmachine/.
+git_askpass = PROJECT_ROOT / "thoughtmachine" / "git_askpass.sh"
+if git_askpass.exists():
+    DATA_FILES.append((str(git_askpass), "thoughtmachine"))
 
 
 # ══════════════════════════════════════════════════════════════════════════

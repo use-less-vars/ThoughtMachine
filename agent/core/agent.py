@@ -11,12 +11,16 @@ This is the main Agent class that delegates to specialized modules:
 The original Agent class (1972 lines) is reduced to a coordinator.
 """
 from __future__ import annotations
+import asyncio
 import hashlib
 import json
 import os
 import queue
+import sys
 import time
+import threading
 import traceback
+import uuid
 from datetime import datetime
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Generator
 from agent.logging import log
@@ -26,13 +30,15 @@ from llm_providers.exceptions import ProviderError, RateLimitExceeded
 from tools import SIMPLIFIED_TOOL_CLASSES
 from tools.utils import model_to_openai_tool
 from tools.summarize_tool import SummarizeTool
-from agent.core.message import Message
+from agent.core.message import Message, is_system_notice_text, make_system_notice
 from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
-from agent.core.state import AgentState, ExecutionState, SessionState
+from agent.core.state import AgentState, ExecutionState, SessionState, TimeState
 from agent import events as ev
+from agent.events import global_event_bus
 from .token_counter import TokenCounter
 from .llm_client import LLMClient, LLMError
+from .stream_events import Done, Interrupted, ReasoningDelta, TextDelta, ToolCallComplete, UsageUpdate
 from .conversation_manager import ConversationManager
 from .tool_executor import ToolExecutor
 from .turn_transaction import TurnTransaction
@@ -43,13 +49,386 @@ if TYPE_CHECKING:
     from session.models import Session
 
 from .debug_context import PAUSE_DEBUG, pause_debug
+from agent.config.defaults import DEFAULT_RESPONSE_TOKENS
+from agent.config.audit import log_config_audit
+from agent.config.models import normalize_base_url
+
+
+def _config_diff(old_config, new_config) -> List[str]:
+    """Return a list of ``'field: old -> new'`` strings for changed config fields.
+
+    Mirrors ``Agent._configs_are_identical`` semantics: excludes sensitive
+    (``api_key``) and non-comparable (``stop_check``) fields, and treats
+    ``None``/``''`` as equivalent for string fields so trivial normalisation
+    mismatches are not reported as changes.
+    """
+    excluded_fields = {'api_key', 'stop_check'}
+    diff = []
+    for field_name in type(old_config).model_fields:
+        if field_name in excluded_fields:
+            continue
+        old_val = getattr(old_config, field_name)
+        new_val = getattr(new_config, field_name)
+        if isinstance(old_val, str) and old_val == '':
+            old_val = None
+        if isinstance(new_val, str) and new_val == '':
+            new_val = None
+        if old_val != new_val:
+            diff.append(f'{field_name}: {repr(old_val)[:80]} -> {repr(new_val)[:80]}')
+    return diff
+
+
+def config_requires_respawn(old_config, new_config) -> bool:
+    """True when *new_config* cannot be hot-swapped onto *old_config*.
+
+    The single authority for the config tier (W9): ``Agent._can_hot_swap``
+    delegates here, so a caller that holds two config objects but no ``Agent``
+    instance -- the worker runtime, which has to answer a ``config_ack`` with a
+    tier -- reaches exactly the verdict this process will act on.
+
+    The field list is spelled out here rather than read off
+    ``AgentConfig.FIELD_CATEGORIES``: those categories are metadata for the
+    settings UI, while what actually decides a hot-swap is whether
+    ``Agent._hot_swap`` / ``Agent.restart`` rebuild the component that owns the
+    field, and this list mirrors those two methods.
+    """
+    if new_config.provider_type != old_config.provider_type:
+        return True
+    if new_config.model != old_config.model:
+        return True
+    if new_config.api_key != old_config.api_key:
+        return True
+    if normalize_base_url(new_config.base_url) != normalize_base_url(old_config.base_url):
+        return True
+    if new_config.system_prompt != old_config.system_prompt:
+        return True
+    # Workspace path changes require a full restart
+    if new_config.workspace_path != old_config.workspace_path:
+        return True
+    # Provider config changes (e.g. timeout/max_retries) require a full
+    # restart so the LLM provider is re-initialised with the new settings.
+    return new_config.provider_config != old_config.provider_config
+
+
+def _tier_probe_value(value: Any) -> Any:
+    """A value guaranteed to differ from *value* for a one-field probe.
+
+    Type-directed but deliberately dumb: the point is only that
+    ``config_requires_respawn`` *sees* a difference, so the probe must differ
+    under the comparison the authority actually performs. Anything this does
+    not recognise becomes a fresh ``object()``, which is unequal to every
+    other value -- including ``None`` -- under ``!=``.
+    """
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, str):
+        return value + '-tier-probe'
+    if isinstance(value, (int, float)):
+        return value + 1
+    if isinstance(value, dict):
+        return {**value, '_tier_probe': True}
+    if isinstance(value, (list, tuple)):
+        return [*value, '_tier_probe']
+    if value is None:
+        return '-tier-probe'
+    return object()
+
+
+def config_field_tiers(base_config=None) -> Dict[str, str]:
+    """Map every ``AgentConfig`` field name to its config tier (W9).
+
+    The tier of a field is not a property anyone declares -- it is whatever
+    :func:`config_requires_respawn` decides when that *one* field differs. So
+    this builds a one-field-differing copy of *base_config* per field and asks
+    the authority, using ``CONFIG_TIER_HOT_SWAP`` /
+    ``CONFIG_TIER_REQUIRES_RESPAWN`` from the protocol module so the strings
+    cannot drift from the ones a ``config_ack`` carries.
+
+    That is why the compared-field list is never written down here: a UI badge
+    built from this map shows the verdict the agent will actually act on, and
+    the two cannot disagree even after someone edits the authority.
+
+    A field whose probe cannot even be classified (the authority raised) is
+    reported ``requires_respawn``: fail closed, because claiming a hot swap the
+    agent will not perform is the one wrong answer here.
+    """
+    from tools.workspace.worker_runtime_protocol import (
+        CONFIG_TIER_HOT_SWAP,
+        CONFIG_TIER_REQUIRES_RESPAWN,
+    )
+
+    if base_config is None:
+        from agent.config import AgentConfig
+
+        base_config = AgentConfig.model_construct()
+
+    tiers: Dict[str, str] = {}
+    for field_name in type(base_config).model_fields:
+        current = getattr(base_config, field_name, None)
+        try:
+            candidate = base_config.model_copy(
+                update={field_name: _tier_probe_value(current)}
+            )
+            requires = bool(config_requires_respawn(base_config, candidate))
+        except Exception:  # noqa: BLE001 - unclassifiable is not a hot swap
+            tiers[field_name] = CONFIG_TIER_REQUIRES_RESPAWN
+            continue
+        tiers[field_name] = (
+            CONFIG_TIER_REQUIRES_RESPAWN if requires else CONFIG_TIER_HOT_SWAP
+        )
+    return tiers
+
+
+def _audit_config_change(old_config, new_config, restart_required: bool) -> None:
+    """Audit a worker-side config change (redacted); never raises.
+
+    ``restart_required=True`` is used for full-restart applications
+    (component ``agent.restart``), ``False`` for hot-swaps
+    (component ``agent.hot_swap``).
+    """
+    try:
+        log_config_audit(
+            source='worker',
+            component='agent.restart' if restart_required else 'agent.hot_swap',
+            old=old_config,
+            new=new_config,
+            restart_required=restart_required,
+            injected=None,
+        )
+    except Exception:
+        pass
+
+
+#: Per-thread private event loop, used to drive streaming LLM adapters from
+#: synchronous code. Created lazily by :func:`_iter_stream_events` and kept for
+#: the lifetime of the thread: a loop object must be owned by exactly one
+#: driving thread, and each provider's async HTTP client is bound to the loop it
+#: was first used on, so the loop must be stable across calls. It is closed once
+#: the thread is done with it, by :func:`_close_stream_resources`, which closes
+#: the client first and then forgets this thread-local.
+_STREAM_LOCAL = threading.local()
+
+
+def _iter_stream_events(agen):
+    """Drive an async-generator stream from synchronous code, one event at a time.
+
+    ``agen`` is an ``AsyncIterator`` (today: ``LLMClient.stream_completion``).
+    Each ``__anext__()`` is run to completion on this thread's private event
+    loop, so the caller can stay a plain sync generator (``process_query``) and
+    keep yielding dict events to its own consumers.
+
+    Thread safety: each thread gets its own private event loop, so concurrent
+    callers on different threads cannot contend for a shared loop object. Within
+    a thread the loop is reused rather than recreated, because each provider's
+    async HTTP client is bound to the loop it was first used on - a fresh loop
+    per call would break that client on the next turn.
+
+    Termination: ``StopAsyncIteration`` is the normal end of the stream, not an
+    error. An exception raised by ``agen`` propagates to the caller.
+
+    Reentrancy: if ``asyncio.get_running_loop()`` succeeds in the calling thread
+    there is already a running loop, and ``run_until_complete()`` would raise
+    ``RuntimeError: This event loop is already running`` - the stream could never
+    be driven from here. A dedicated-thread fallback is deliberately NOT
+    provided (it would silently reorder events / hide cancellation); instead a
+    clear ``RuntimeError`` is raised immediately. The only supported caller is
+    the synchronous controller worker thread, so this is a programming error,
+    not a runtime condition.
+
+    Closing: the ``finally`` block guarantees ``agen.aclose()`` - an abandoned
+    async generator would otherwise leak the provider's HTTP stream. It is a
+    no-op when the stream was already exhausted (the ``exhausted`` flag skips it
+    entirely) and idempotent when the generator is already closed; errors raised
+    *while* closing are logged rather than propagated, so they can never mask
+    the caller's own exception or a ``GeneratorExit``.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError('_iter_stream_events() must be called from synchronous code: this thread already has a running event loop, so the stream cannot be driven with run_until_complete().')
+    local = _STREAM_LOCAL
+    loop = getattr(local, 'loop', None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        local.loop = loop
+    exhausted = False
+    try:
+        while True:
+            try:
+                event = loop.run_until_complete(agen.__anext__())
+            except StopAsyncIteration:
+                exhausted = True
+                break
+            yield event
+    finally:
+        # Guarantee the stream is closed even on cancellation,
+        # GeneratorExit or an exception from the consumer.
+        if not exhausted:
+            try:
+                loop.run_until_complete(agen.aclose())
+            except (StopAsyncIteration, GeneratorExit):
+                pass
+            except RuntimeError as close_error:
+                log('WARNING', 'core.agent', f'_iter_stream_events: could not close stream: {close_error}')
+
+
+def _close_stream_resources(provider=None) -> bool:
+    """Close this thread's private stream loop and everything bound to it.
+
+    Must be called on the thread that owns the loop - in practice the
+    controller worker thread, at the end of ``AgentController._run``:
+    ``_STREAM_LOCAL`` is a thread-local and a loop object may only be driven by
+    the thread that created it.
+
+    Order matters. The provider's async HTTP client is bound to the loop it was
+    first used on, so it has to be closed *by* that loop through
+    ``run_until_complete()`` before the loop itself is closed. The thread-local
+    is dropped afterwards, so the next turn on this thread builds a fresh loop
+    instead of finding a closed corpse (a closed loop cannot drive anything,
+    and the old client went with it).
+
+    Best-effort by construction: every step is guarded and nothing is raised,
+    because this runs from a ``finally`` where an exception would replace the
+    one that ended the thread. Idempotent: a second call after the loop is gone
+    is a no-op.
+
+    Returns:
+        True when a live loop was found and closed, False when there was
+        nothing to do.
+    """
+    local = _STREAM_LOCAL
+    loop = getattr(local, 'loop', None)
+    if loop is None:
+        return False
+    if loop.is_closed():
+        # Already cleaned up (or closed behind our back): just forget it, so a
+        # later turn cannot be handed a corpse.
+        try:
+            del local.loop
+        except AttributeError:
+            pass
+        return False
+    if loop.is_running():
+        # A running loop cannot be driven with run_until_complete(), and closing
+        # it would abandon whatever is in flight. Leave it alone.
+        log('WARNING', 'core.agent', '_close_stream_resources: stream loop is running, skipping cleanup')
+        return False
+    try:
+        aclose = getattr(provider, 'aclose', None)
+        if callable(aclose):
+            try:
+                loop.run_until_complete(aclose())
+            except Exception as close_error:
+                log('WARNING', 'core.agent', f'_close_stream_resources: closing provider failed: {close_error}')
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception as asyncgen_error:
+            log('WARNING', 'core.agent', f'_close_stream_resources: closing async generators failed: {asyncgen_error}')
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        if pending:
+            # Never abandon work silently: cancel it, record how much there was,
+            # then let the cancellations settle before the loop is closed.
+            log('WARNING', 'core.agent', f'_close_stream_resources: cancelling {len(pending)} pending task(s)')
+            for task in pending:
+                task.cancel()
+            try:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception as gather_error:
+                log('WARNING', 'core.agent', f'_close_stream_resources: awaiting cancelled tasks failed: {gather_error}')
+        # Only touch the executor when one was actually created: the shutdown
+        # call waits for its threads, which must not happen speculatively.
+        if getattr(loop, '_default_executor', None) is not None:
+            try:
+                loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception as executor_error:
+                log('WARNING', 'core.agent', f'_close_stream_resources: shutting down executor failed: {executor_error}')
+    finally:
+        try:
+            loop.close()
+        except Exception as loop_error:
+            log('WARNING', 'core.agent', f'_close_stream_resources: closing loop failed: {loop_error}')
+        try:
+            del local.loop
+        except AttributeError:
+            pass
+    return True
+
+
+#: Provider exception class names an adapter may report through
+#: ``Interrupted.reason`` (``'provider_error: <ClassName>'``) mapped to the
+#: error the synchronous ``chat_completion()`` path would have raised for the
+#: same failure. ``llm_providers/openai_compatible.py`` raises those mapped
+#: errors from ``chat_completion`` and only names the raw class in the event,
+#: so the class name is the whole discrimination the event carries.
+_INTERRUPTED_ERROR_TYPES = {
+    'ratelimiterror': ('rate_limit_exceeded', 'Rate limit exceeded'),
+    'apitimeouterror': ('timeout', 'Request timed out'),
+    'timeouterror': ('timeout', 'Request timed out'),
+    'authenticationerror': ('authentication_error', 'Authentication failed'),
+    'modelnotfounderror': ('model_not_found', 'Model not found'),
+    'tokenlimitexceedederror': ('token_limit_exceeded', 'Token limit exceeded'),
+}
+
+
+def _exception_for_interrupted(reason: str):
+    """Turn an ``Interrupted`` reason into the exception the turn loop handles.
+
+    The stream cannot raise across the adapter boundary, so an ``Interrupted``
+    event stands in for the exception ``chat_completion()`` used to raise. The
+    caller re-raises this inside the ``try`` that owns the LLMError /
+    RateLimitExceeded / ProviderError handlers, so retry, backoff and the
+    user-facing error event stay reachable. An unrecognised (or empty) reason
+    falls back to a generic provider error rather than a silent empty turn.
+    """
+    detail = reason.split(':', 1)[1].strip() if ':' in reason else ''
+    error_type, label = _INTERRUPTED_ERROR_TYPES.get(detail.lower(), ('provider_error', 'Provider error'))
+    message = f'{label} during streaming: {reason or "stream interrupted"}'
+    if error_type == 'rate_limit_exceeded':
+        return RateLimitExceeded(message)
+    return LLMError(error_type=error_type, message=message)
+
+
+def _discard_session_main_pause(session_id: Optional[str], *, worker_mode: bool) -> bool:
+    """Drop a stranded session-level "main agent paused" marker.
+
+    ``Worker(action="pause")`` with main scope records the session id in
+    ``tools.workspace.worker_thread._SESSION_MAIN_PAUSED``; while an id is in
+    that set ``join`` / ``wait_for_job`` short-circuit to
+    ``{"status": "paused"}`` and ``pause`` keeps reporting
+    ``main_agent_paused: true``.  The operator-facing resume path (workspace
+    HTTP route -> ``WorkerThread.resume()``) only clears the WORKER-scope
+    ``_manual_only_pause`` marker, and the agent-facing ``resume`` action no
+    longer exists (operator-only), so the session marker would otherwise
+    outlive the pause forever.  The genuine "this session is no longer
+    paused" event is the start of the next operator turn, which is where this
+    is called.
+
+    Worker (sub-)agent turns share the parent ``session_id`` (``WorkerThread``
+    builds its ``WorkerContext`` from it), so ``worker_mode`` turns must NOT
+    clear the marker: a worker finishing a turn is not an operator turn.
+
+    Returns True when a marker was actually discarded.
+    """
+    if worker_mode or not session_id:
+        return False
+    # The marker lives in the worker stack; if that module was never imported
+    # in this process the set cannot have been populated, so skip the import.
+    module = sys.modules.get("tools.workspace.worker_thread")
+    paused = getattr(module, "_SESSION_MAIN_PAUSED", None) if module is not None else None
+    if not paused or session_id not in paused:
+        return False
+    paused.discard(session_id)
+    return True
+
 
 class Agent:
     """Modular agent coordinating specialized components."""
     SAFETY_MARGIN = 1000
-    DEFAULT_RESPONSE_TOKENS = 4096
+    DEFAULT_RESPONSE_TOKENS = DEFAULT_RESPONSE_TOKENS
 
-    def __init__(self, config: AgentConfig, session=None, session_id: str=None):
+    def __init__(self, config: AgentConfig, session=None, session_id: str=None, event_bus=None):
         """
         Initialize modular agent.
         
@@ -100,10 +479,12 @@ class Agent:
         self._display_turn = user_msg_count
         self._conversation_start_time = time.time()
         self.token_counter = TokenCounter(config)
+        self._resolve_credential_placeholder(config)
         self.llm_client = LLMClient(config, session, self.logger)
         self.conversation_manager = ConversationManager(session, None, self.logger)
         self.debug_context = DebugContext(self.logger)
         self._pending_warnings = []  # Buffer for token warnings, flushed after turn commit
+        self._pending_warning_events = []  # Buffer for token warning events, yielded after turn commit
         self.tool_classes = config.get_filtered_tool_classes()
         # Register MCP tools in background (non-blocking, no startup delay)
         # MCP tools become available later once background registration completes.
@@ -113,7 +494,7 @@ class Agent:
         except Exception as e:
             log('WARNING', 'core.agent', f"Failed to start MCP background registration: {e}")
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
-        self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self)
+        self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self, event_bus=event_bus or global_event_bus, is_worker_context=config.worker_mode)
         self.provider = self.llm_client.provider
         from session.models import RuntimeParams
         self.runtime_params = RuntimeParams(temperature=config.temperature, top_p=None)
@@ -123,16 +504,23 @@ class Agent:
         else:
             self._token_counts = {'input': 0, 'output': 0}
         self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
-        log('DEBUG', 'core.context_builder', f'Agent init: session is None={session is None}')
-        self.context_builder = self.llm_client.create_context_builder(token_limit=None)
-        log('DEBUG', 'core.context_builder', f'Agent init: context_builder created, is None={self.context_builder is None}')
+        self.context_builder = self.llm_client.create_context_builder()
+        log('DEBUG', 'core.context_builder', f'Agent init: session is None={session is None}, cb is None={self.context_builder is None}')
         if self.context_builder:
             self.conversation_manager.context_builder = self.context_builder
         self.stop_check = config.stop_check
+        # Hard stop (halt) is deliberately SEPARATE from stop_check: stop_check
+        # returns 'PAUSED' at a checkpoint and lets the turn finish cleanly,
+        # whereas a halt is terminal and must truncate the running stream.
+        self.halt_check = getattr(config, 'halt_check', None)
         self._next_query_queue = queue.Queue()
         self._paused = False
         self._should_reset = False
         self._pause_requested = False
+        # Reading mode: at most ONE pause nudge per turn.
+        self._pause_nudge_sent = False
+        # Stop: at most ONE stop notice per turn.
+        self._stop_notice_sent = False
         self.rate_limit_delay = 1.0
         self.rate_limit_base_wait = 10.0
         self.rate_limit_backoff_factor = 1.2
@@ -146,6 +534,61 @@ class Agent:
         # Mailbox pattern: pending config update to be applied at next process_query()
         self._pending_config: Optional[AgentConfig] = None
         self._last_config_error: Optional[str] = None
+        # Tier 1 (ruling D-5): addendum writes are queued here and drained at the
+        # per-stream-event poll, so a mid-turn write reaches the UI between tokens
+        # instead of waiting for the turn boundary. The queue is exposed on the
+        # session so the write boundary (session/addendum.py) can enqueue without
+        # holding this Agent; it is NOT persisted -- Session.to_persistable_dict
+        # lists its keys explicitly, so the session file shape is unchanged.
+        # Imported here, not at module scope: ``session/models.py`` imports
+        # ``agent.core.message``, which imports this package, so a module-level
+        # ``session.addendum`` import would close a cycle for anyone who imports
+        # ``session.models`` first (e.g. tests/test_addendum_schema.py).
+        from session.addendum import AddendumQueue
+
+        self._addendum_queue = AddendumQueue()
+        if session is not None:
+            try:
+                session.addendum_queue = self._addendum_queue
+            except Exception as e:
+                log('WARNING', 'core.agent', f'could not attach the addendum queue to the session: {e}')
+
+    def should_halt(self) -> bool:
+        """
+        Return True when a HARD stop has been requested.
+
+        Distinct from stop_check, which is a cooperative checkpoint that
+        returns 'PAUSED' and lets the current turn complete. A halt is
+        terminal: the stream is truncated and the partial answer is kept.
+
+        Returns:
+            bool: True if the configured halt_check callable is set and truthy.
+        """
+        if not callable(self.halt_check):
+            return False
+        try:
+            return bool(self.halt_check())
+        except Exception as e:
+            log('WARNING', 'core.agent', f'halt_check raised, treating as no halt: {e}')
+            return False
+
+    def _drain_addendum_queue(self):
+        """Yield every queued Tier-1 addendum notification exactly once.
+
+        Called from the stream loop immediately after the halt poll and before
+        the event-type ladder, so it runs on EVERY stream event -- text and
+        reasoning deltas, tool calls, ``Done`` and ``Interrupted`` alike -- and
+        always *between* ``__anext__`` calls, which is the only window a
+        synchronous consumer has (ruling D-5, design doc §7.2).
+
+        ``AddendumQueue.drain`` pops, so a payload is delivered at most once
+        even if this is called again later in the same turn. The payloads are
+        runtime-channel dicts (design doc §7.3), never ``StreamEvent``s: they
+        are re-yielded verbatim and never enter the ladder below.
+        """
+        for payload in self._addendum_queue.drain():
+            log('DEBUG', 'core.addendum', f"draining addendum event: {payload.get('type')}")
+            yield payload
 
     def request_config_update(self, new_config: AgentConfig):
         """
@@ -159,7 +602,7 @@ class Agent:
             new_config: New AgentConfig to apply.
         """
         self._pending_config = new_config
-        log('DEBUG', 'agent.core', f'Pending config update queued: provider={new_config.provider_type}, model={new_config.model}')
+        log('DEBUG', 'core.agent', f'Pending config update queued: provider={new_config.provider_type}, model={new_config.model}')
 
     def _apply_pending_config(self) -> bool:
         """Apply pending configuration update if one exists.
@@ -186,7 +629,7 @@ class Agent:
         # Prevents spurious "config updated" notifications on every query
         # when the frontend re-sends an identical config.
         if self._configs_are_identical(old_config, new_config):
-            log('DEBUG', 'agent.core',
+            log('DEBUG', 'core.agent',
                 f'Skipping no-op config update: pending config is identical '
                 f'to current config (provider={new_config.provider_type}, '
                 f'model={new_config.model})')
@@ -194,15 +637,19 @@ class Agent:
             return True
 
         if self._can_hot_swap(new_config):
+            diff = _config_diff(old_config, new_config)
+            log('INFO', 'core.config',
+                f'Hot-swapping config ({len(diff)} changed field(s)): ' + '; '.join(diff))
             self._hot_swap(new_config)
             self._pending_config = None
             self._notify_config_change(old_config, new_config)
+            _audit_config_change(old_config, new_config, restart_required=False)
             return True
         else:
 
             # Validate that the new config has an API key available before attempting restart
             if not self._has_api_key(new_config):
-                log('WARNING', 'agent.core', f'Cannot restart with provider {new_config.provider_type}: '
+                log('WARNING', 'core.agent', f'Cannot restart with provider {new_config.provider_type}: '
                     f'no API key available. Set {new_config.provider_type.upper()}_API_KEY '
                     f'environment variable or provide api_key in config.')
                 log('WARNING', 'core.config',
@@ -213,10 +660,15 @@ class Agent:
                     f'Set {new_config.provider_type.upper()}_API_KEY environment variable '
                     f'or provide an api_key in the configuration.')
                 return False
+            diff = _config_diff(old_config, new_config)
+            log('INFO', 'core.config',
+                f'Full restart required for config change '
+                f'({len(diff)} changed field(s)): ' + '; '.join(diff))
             success = self._restart_with_config(new_config)
             if success:
                 self._pending_config = None
                 self._notify_config_change(old_config, new_config)
+                _audit_config_change(old_config, new_config, restart_required=True)
             return success
 
     def _configs_are_identical(self, config_a: 'AgentConfig', config_b: 'AgentConfig') -> bool:
@@ -244,8 +696,14 @@ class Agent:
             if isinstance(new_val, str) and new_val == '':
                 new_val = None
 
+            # base_url is a URL: a trailing slash or a differently-cased host
+            # is the same endpoint, not a config change.
+            if field_name == 'base_url':
+                old_val = normalize_base_url(old_val)
+                new_val = normalize_base_url(new_val)
+
             if old_val != new_val:
-                log('DEBUG', 'agent.core',
+                log('DEBUG', 'core.agent',
                     f'Config field "{field_name}" differs: '
                     f'old={type(old_val).__name__}({repr(old_val)[:60]}) '
                     f'!= new={type(new_val).__name__}({repr(new_val)[:60]})')
@@ -275,7 +733,12 @@ class Agent:
 
             old_val = getattr(old_config, field_name)
             new_val = getattr(new_config, field_name)
-            changed = old_val != new_val
+            if field_name == 'base_url':
+                # Compare URLs in normalised form so a trailing slash or a
+                # differently-cased host does not report a phantom change.
+                changed = normalize_base_url(old_val) != normalize_base_url(new_val)
+            else:
+                changed = old_val != new_val
 
             field_log.append(f'{field_name}: changed={changed} old={_json2.dumps(old_val, default=str) if not callable(old_val) else "<callable>"} new={_json2.dumps(new_val, default=str) if not callable(new_val) else "<callable>"}')
 
@@ -303,24 +766,10 @@ class Agent:
         
         Hot-swap is safe when only simple runtime parameters change
         (temperature, top_p, enabled_tools). Changes to
-        model, provider, system_prompt, tool_classes, api_key, base_url
-        etc. require a full restart.
+        model, provider, system_prompt, tool_classes, api_key, base_url,
+        provider_config etc. require a full restart.
         """
-        if new_config.provider_type != self.config.provider_type:
-            return False
-        if new_config.model != self.config.model:
-            return False
-        if new_config.api_key != self.config.api_key:
-            return False
-        if new_config.base_url != self.config.base_url:
-            return False
-        if new_config.system_prompt != self.config.system_prompt:
-            return False
-
-        # Workspace path changes require a full restart
-        if new_config.workspace_path != self.config.workspace_path:
-            return False
-        return True
+        return not config_requires_respawn(self.config, new_config)
 
     def _hot_swap(self, new_config: AgentConfig):
         """Apply a lightweight config update without restarting.
@@ -333,7 +782,7 @@ class Agent:
         # Update runtime params
         if new_config.temperature != self.config.temperature:
             self.runtime_params.temperature = new_config.temperature
-            changed.append(f'temperature={new_config.temperature}')
+            changed.append(f'temperature={self.config.temperature} -> {new_config.temperature}')
         # Update config reference
         old_config = self.config
         self.config = new_config
@@ -346,16 +795,20 @@ class Agent:
         if new_config.enabled_tools != old_config.enabled_tools:
             self.tool_classes = new_config.get_filtered_tool_classes()
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
+            # Preserve event bus from old executor before closing
+            event_bus = self.tool_executor._event_bus if self.tool_executor else None
             self.tool_executor.close()
             self.tool_executor = ToolExecutor(
                 self.tool_classes, new_config, None, self.logger,
-                self.security_available, agent=self
+                self.security_available, agent=self,
+                event_bus=event_bus or global_event_bus,
+                is_worker_context=new_config.worker_mode,
             )
             self.tool_executor.state = self.state
             changed.append(f'enabled_tools={", ".join(new_config.enabled_tools)}')
         
         if changed:
-            log('DEBUG', 'agent.core', f'Config hot-swapped: {", ".join(changed)}')
+            log('DEBUG', 'core.agent', f'Config hot-swapped: {", ".join(changed)}')
             if self.logger:
                 self.logger.log_system_event(f'Config hot-swapped: {", ".join(changed)}')
 
@@ -371,7 +824,7 @@ class Agent:
         success = self.restart(new_config)
         if not success:
             error_detail = self._last_config_error or 'Unknown error during restart'
-            log('ERROR', 'agent.core', f'Agent restart with provider={new_config.provider_type} failed: {error_detail}')
+            log('ERROR', 'core.agent', f'Agent restart with provider={new_config.provider_type} failed: {error_detail}')
         return success
 
     @staticmethod
@@ -396,6 +849,45 @@ class Agent:
                 return True
         return False
 
+    def _resolve_credential_placeholder(self, config: 'AgentConfig') -> None:
+        """Resolve {{credential:key}} placeholders in config.api_key in-place.
+        
+        If the api_key contains a placeholder, resolve it from the vault
+        using the session's workspace_id.
+        """
+        if not config.api_key or not isinstance(config.api_key, str) or "{{credential:" not in config.api_key:
+            if config.api_key and isinstance(config.api_key, str):
+                from agent.logging import log
+                log('INFO', 'credential', 'Using direct API key for provider (no credential placeholder)')
+            return  # No placeholder, nothing to do
+        
+        if not self._session or not self._session.workspace_id:
+            from agent.credentials import CredentialError
+            raise CredentialError(
+                "Cannot resolve credential placeholder: no workspace associated with session"
+            )
+        
+        from agent.credentials import CredentialInjector
+        import re as _re
+        
+        match = _re.search(r"\{\{credential:([^}]+)\}\}", config.api_key)
+        if not match:
+            from agent.credentials import CredentialError
+            raise CredentialError("Invalid credential placeholder syntax in api_key config")
+        
+        key_name = match.group(1).strip()
+        injector = CredentialInjector(self._session.workspace_id)
+        
+        try:
+            resolved = injector.resolve(key_name)
+        except Exception as e:
+            from agent.logging import log
+            log('WARNING', 'credential', f"Failed to resolve credential '{key_name}': {e}")
+            from agent.credentials import CredentialError
+            raise CredentialError(f"Failed to resolve credential '{key_name}': {e}") from e
+        
+        config.api_key = resolved
+
     def restart(self, new_config: AgentConfig) -> bool:
         """
         Restart the agent with a new configuration while preserving conversation history.
@@ -417,6 +909,8 @@ class Agent:
         old_config = getattr(self, 'config', None)
         old_llm_client = getattr(self, 'llm_client', None)
         old_tool_executor = getattr(self, 'tool_executor', None)
+        # Capture event bus from old executor before closing
+        old_event_bus = old_tool_executor._event_bus if old_tool_executor else None
 
         try:
             # Preserve conversation and token state BEFORE closing
@@ -435,6 +929,7 @@ class Agent:
             self._paused = False
             self._pause_requested = False
             self._should_reset = False
+            self._pause_nudge_sent = False
 
             # Update config reference
             self.config = new_config
@@ -443,16 +938,17 @@ class Agent:
             self.token_counter = TokenCounter(new_config)
 
             # Re-initialise LLM client and provider from new_config
+            self._resolve_credential_placeholder(new_config)
             self.llm_client = LLMClient(new_config, self._session, old_logger)
             self.provider = self.llm_client.provider
 
             # Rebuild tool_classes and tool_definitions
             self.tool_classes = new_config.get_filtered_tool_classes()
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
-            self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self)
+            self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self, event_bus=old_event_bus or global_event_bus, is_worker_context=new_config.worker_mode)
 
             # Rebuild context builder
-            self.context_builder = self.llm_client.create_context_builder(token_limit=None)
+            self.context_builder = self.llm_client.create_context_builder()
             if self.context_builder:
                 self.conversation_manager.context_builder = self.context_builder
 
@@ -475,20 +971,21 @@ class Agent:
             # Reset rate limiting
             self.reset_rate_limiting()
 
-            log('DEBUG', 'agent.core', f'Agent restarted with provider={new_config.provider_type}, model={new_config.model}')
+            log('DEBUG', 'core.agent', f'Agent restarted with provider={new_config.provider_type}, model={new_config.model}')
             if self.logger:
                 self.logger.log_info('AGENT_RESTART', f'Configuration reloaded, provider: {self.provider}')
             return True
         except Exception as e:
-            log('ERROR', 'agent.core', f'Failed to restart agent: {e}')
+            log('ERROR', 'core.agent', f'Failed to restart agent: {e}')
             self._last_config_error = str(e)
             # Restore old LLM client so agent isn't left in a broken state
             if old_config is not None and old_logger is not None:
                 try:
+                    self._resolve_credential_placeholder(old_config)
                     self.llm_client = LLMClient(old_config, self._session, old_logger)
                     self.provider = self.llm_client.provider
                 except Exception as restore_error:
-                    log('CRITICAL', 'agent.core', f'Failed to restore old LLM client after restart failure: {restore_error}')
+                    log('CRITICAL', 'core.agent', f'Failed to restore old LLM client after restart failure: {restore_error}')
             else:
                 self.llm_client = None
                 self.provider = None
@@ -508,10 +1005,9 @@ class Agent:
             self.llm_client.session = value
         if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, 'session'):
             self.context_builder.session = value
-            log('DEBUG', 'core.context_builder', f'Updated existing context_builder.session')
         elif value is not None and hasattr(self, 'llm_client') and (self.llm_client is not None):
-            self.context_builder = self.llm_client.create_context_builder(token_limit=None)
-            log('DEBUG', 'core.context_builder', f'Created new context_builder with token_limit=None: is None={self.context_builder is None}')
+            self.context_builder = self.llm_client.create_context_builder()
+            log('DEBUG', 'core.context_builder', f'Session setter: cb created, is None={self.context_builder is None}')
             if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
                 self.conversation_manager.context_builder = self.context_builder
         if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
@@ -550,7 +1046,6 @@ class Agent:
 
     def _initialize_session_state(self):
         """Initialize session state based on existing history."""
-        log('DEBUG', 'core.agent', f'_initialize_session_state: session exists={self.session is not None}')
         if self.session is not None:
             if len(self.session.user_history) > 0:
                 events = self.state.set_session_state(SessionState.CONTINUING)
@@ -568,98 +1063,100 @@ class Agent:
         For warning events, inject warning message into conversation.
         """
         if event.get('type') == 'token_warning':
-            pass
+            if self.logger:
+                pass
+            self._add_conversation_data_to_event(event)
+            yield event
         elif event.get('type') == 'turn_warning':
-            pass
+            if self.logger:
+                log('DEBUG', 'core.token', f'Turn warning event: {event.get("warning_message", "")}')
+            self._add_conversation_data_to_event(event)
+            yield event
         elif event.get('type') == 'execution_state_change':
             old_state = event.get('old_state')
             new_state = event.get('new_state')
             if self.logger:
-                log('DEBUG', 'agent.core', f'Execution state change: {old_state} -> {new_state}')
+                log('DEBUG', 'core.agent', f'Execution state change: {old_state} -> {new_state}')
             self._add_conversation_data_to_event(event)
             yield event
         elif event.get('type') == 'session_state_change':
             old_state = event.get('old_state')
             new_state = event.get('new_state')
             if self.logger:
-                log('DEBUG', 'agent.core', f'Session state change: {old_state} -> {new_state}')
+                log('DEBUG', 'core.agent', f'Session state change: {old_state} -> {new_state}')
+            self._add_conversation_data_to_event(event)
+            yield event
+        elif event.get('type') == 'token_recovery':
+            if self.logger:
+                log('DEBUG', 'core.token', f'Token recovery event: {event.get("recovery_message", "")}')
+            self._add_conversation_data_to_event(event)
+            yield event
+        elif event.get('type') == 'context_summarized':
+            if self.logger:
+                log('DEBUG', 'core.token', 'Context summarized event after summarization')
+            self._add_conversation_data_to_event(event)
+            yield event
+        elif event.get('type') == 'context_cleared':
+            if self.logger:
+                log('DEBUG', 'core.token', 'Context cleared event after summarization')
             self._add_conversation_data_to_event(event)
             yield event
     def _update_conversation_token_estimate(self):
         """Update current_conversation_tokens by estimating tokens for runtime context."""
-        log('DEBUG', 'core.context_builder', f"_update_conversation_token_estimate: has context_builder={hasattr(self, 'context_builder')}, context_builder is None={(self.context_builder if hasattr(self, 'context_builder') else 'no attr')}")
-        log('DEBUG', 'core.context_builder', f'conversation length: {len(self.conversation)}')
         if self.session is not None:
             needs_update = False
             if not hasattr(self, 'context_builder') or self.context_builder is None:
-                log('DEBUG', 'core.context_builder', 'Creating missing context_builder for token estimation')
                 needs_update = True
             if needs_update:
                 if hasattr(self, 'llm_client') and self.llm_client is not None:
                     self.llm_client.session = self.session
-                    self.context_builder = self.llm_client.create_context_builder(token_limit=None)
-                    log('DEBUG', 'core.context_builder', 'Created/updated context_builder with token_limit=None')
+                    self.context_builder = self.llm_client.create_context_builder()
                     if self.context_builder and hasattr(self, 'conversation_manager') and (self.conversation_manager is not None):
                         self.conversation_manager.context_builder = self.context_builder
         if not hasattr(self, 'context_builder') or self.context_builder is None:
             runtime_context = self.conversation
-            log('DEBUG', 'core.context_builder', f'Token estimation path: context_builder is None, using full conversation, length={len(runtime_context)}')
         elif hasattr(self.context_builder, 'get_context_for_llm'):
             runtime_context = self.context_builder.get_context_for_llm()
-            log('DEBUG', 'core.context_builder', f'Token estimation path: used context_builder.get_context_for_llm, length={len(runtime_context)}')
         else:
             runtime_context = self.context_builder.build(self.conversation)
-            log('DEBUG', 'core.context_builder', f'Token estimation path: used context_builder.build, length={len(runtime_context)}')
         original_len = len(runtime_context)
         runtime_context = ContextBuilder._cleanup_orphaned_tool_messages(runtime_context)
-        if original_len != len(runtime_context):
-            log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Token estimate: cleaned {original_len - len(runtime_context)} orphaned tool messages')
         estimated_tokens = 0
         for msg in runtime_context:
             estimated_tokens += self.token_counter.estimate_tokens(msg)
         self.state.current_conversation_tokens = estimated_tokens
-        log('DEBUG', 'core.token_estimate', f'Estimated tokens: {estimated_tokens}, runtime_context length: {len(runtime_context)}, conversation length: {len(self.conversation)}')
-        if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, 'token_limit'):
-            log('DEBUG', 'core.token_estimate', f'context_builder.token_limit: {self.context_builder.token_limit}')
-        log('DEBUG', 'core.pruning', f'Runtime context token estimate (from {len(runtime_context)}/{len(self.conversation)} messages)', {'tokens': estimated_tokens})
-        if self.logger and hasattr(self.logger, 'py_logger'):
-            log('INFO', 'agent.core', f'[TOKEN_ESTIMATE] Updated runtime context token estimate: {estimated_tokens} tokens (from {len(runtime_context)}/{len(self.conversation)} messages)')
+        cleaned = original_len - len(runtime_context)
+        cb_status = hasattr(self, 'context_builder') and self.context_builder is not None
+        token_limit = getattr(getattr(self, 'context_builder', None), 'token_limit', None) if cb_status else None
+        log('DEBUG', 'core.token', f'Token estimate: {estimated_tokens} tokens ({len(runtime_context)}/{len(self.conversation)} msgs, cleaned={cleaned}, cb={cb_status}, limit={token_limit})')
 
     def _add_to_conversation(self, message):
         """Add a message via conversation_manager (ensures cache invalidation)."""
-        pause_debug(f"_add_to_conversation called for {message.get('role')}...")
-        pause_debug(f'Before add, conversation length: {len(self.conversation)}')
+
         updated = self.conversation_manager.add_message(message, self.conversation)
         self.conversation = updated
-        # Phase 1 logging: user_history after add
-        log("DEBUG", "core.history", "Message added", {"role": message.get("role"), "content_preview": message.get("content", "")[:100]})
-        is_sys_notif = message.get('is_system_notification', False)
-        content_hash = hashlib.md5(str(message.get('content', '')).encode()).hexdigest()[:8]
-        log('DEBUG', 'core.history', f"append: role={message.get('role')}, is_sys_notif={is_sys_notif}, content_hash={content_hash}")
-        dump_messages(self.conversation, "user_history after add")
         # Validation: flag consistency check
         role = message.get('role', '')
         content = message.get('content', '')
+        is_sys_notif = message.get('is_system_notification', False)
         content_preview = content[:100]
-        if content.startswith('[SYSTEM NOTIFICATION]'):
-            if message.get('is_system_notification') is not True:
+        if is_system_notice_text(content):
+            if is_sys_notif is not True:
                 log('WARNING', 'core.validation', 'Flag inconsistency detected', {
                     'reason': 'missing is_system_notification flag',
                     'role': role,
                     'content_preview': content_preview,
                 })
         else:
-            if message.get('is_system_notification') is True:
+            if is_sys_notif is True:
                 log('WARNING', 'core.validation', 'Flag inconsistency detected', {
                     'reason': 'unexpected is_system_notification flag',
                     'role': role,
                     'content_preview': content_preview,
                 })
-        pause_debug(f'After add, conversation length: {len(self.conversation)}')
         if hasattr(self, 'context_builder') and self.context_builder is not None:
             if hasattr(self.context_builder, '_cached_context'):
                 self.context_builder._cached_context = None
-                pause_debug(f"Cleared context builder cache after adding {message.get('role')} message")
 
     def _estimate_tokens(self, message):
         """Estimate tokens for a message."""
@@ -677,19 +1174,27 @@ class Agent:
         """
         if tool_tokens is not None:
             self.state.current_conversation_tokens += tool_tokens
-            log('DEBUG', 'core.agent.token', f'Tool result added {tool_tokens}, current_tokens now: {self.state.current_conversation_tokens}')
-            log('DEBUG', 'core.token', f"tool tokens added: {tool_tokens}, total={self.state.current_conversation_tokens}, token_state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}")
+            log('DEBUG', 'core.token', f'Tool result: +{tool_tokens} tokens, total={self.state.current_conversation_tokens}')
 
         # Process any warnings or state changes from the token update
         for event in self.state.update_token_state(self.state.current_conversation_tokens):
             if event['type'] == 'token_warning':
                 # Buffer the warning instead of injecting immediately — it will be flushed
                 # after turn_transaction.commit() so it lands in correct chronological order.
-                warning_msg = Message(role='user', content=f'[SYSTEM NOTIFICATION] {event.get("message", event.get("warning", ""))}', is_system_notification=True)
+                warning_msg = Message(role='user', content=f'[SYSTEM NOTIFICATION] {event.get("warning_message", event.get("message", event.get("warning", "")))}', is_system_notification=True, metadata={'warning_id': str(uuid.uuid4())})
                 self._pending_warnings.append(warning_msg)
+                # Also buffer the raw event for yielding to event stream subscribers
+                self._add_conversation_data_to_event(event)
+                self._pending_warning_events.append(event)
                 log('DEBUG', 'core.token', f"warning buffered: state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, count={len(self._pending_warnings)}")
+                log('DEBUG', '**pipeline.warning**', f"Warning buffered in _update_tokens_after_tool: state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, count={len(self._pending_warnings)}")
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
+            elif event['type'] == 'token_recovery':
+                # Buffer the raw event for yielding to event stream subscribers
+                self._add_conversation_data_to_event(event)
+                self._pending_warning_events.append(event)
+                log('DEBUG', '**pipeline.warning**', f"Recovery buffered in _update_tokens_after_tool: token_state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}")
     @property
     def total_input_tokens(self):
         if self.session is not None:
@@ -713,13 +1218,6 @@ class Agent:
         if self.session is not None:
             self.session.total_output_tokens = value
         self._token_counts['output'] = value
-
-    def _get_max_context_tokens(self) -> int:
-        """Calculate maximum tokens available for context."""
-        context_window = self.token_counter.get_model_context_window()
-        max_context = context_window - self.SAFETY_MARGIN
-        max_context -= self.DEFAULT_RESPONSE_TOKENS
-        return max_context
 
     def _get_conversation_data_for_event(self) -> Dict[str, Any]:
         """
@@ -764,15 +1262,132 @@ class Agent:
         self.rate_limit_count = 0
         self.rate_limit_active = False
 
-    def request_pause(self):
-        """Request pause at the next atomic turn boundary."""
-        pause_debug(f'request_pause called, setting _pause_requested=True')
+    def enter_reading_mode(self, reason: str = 'pause') -> bool:
+        """Put the agent into reading mode: it concludes, it does not act.
+
+        This is what the Pause button calls. It does NOT stop, truncate or
+        interrupt the running turn -- the turn concludes itself. The turn
+        thread's pause checkpoint (see _apply_pause_reading_mode) notices the
+        restriction and nudges the model to wrap up with a Respond, and every
+        further tool call is refused by the executor, because
+        AgentState.get_allowed_tools() narrows the allow-list to ['Respond']
+        for the 'pause' reason. So the agent stops taking actions without the
+        turn being cut short.
+
+        CROSS-THREAD BOUNDARY: this runs on the bridge thread (Pause button)
+        or a worker's manager thread -- never on the agent's turn thread. It
+        therefore performs single atomic assignments only: the state
+        restriction plus the _pause_requested flag that makes the turn
+        thread's checkpoint fire. NO Message is constructed or appended here;
+        all message construction happens on the turn thread inside
+        _apply_pause_reading_mode().
+
+        Returns whatever AgentState.restrict() returned: True only when this
+        call changed the restriction, False when 'pause' was already in force.
+        """
+        changed = self.state.restrict(reason)
         self._pause_requested = True
+        pause_debug(f'enter_reading_mode({reason!r}) -> changed={changed}')
+        return changed
+
+    def leave_reading_mode(self, reason: str = 'pause') -> bool:
+        """Take the agent out of reading mode.
+
+        CROSS-THREAD BOUNDARY: same rule as enter_reading_mode() -- flags and
+        state attributes only, no message construction, no turn interaction.
+
+        The clear is OWNER-SCOPED: with the default reason='pause' only a
+        pause-owned restriction is released, so resuming a paused session can
+        never wipe a 'token'/'timeout'/'turn' restriction owned by the
+        monitors. Pass reason=None for the owner-agnostic clear.
+
+        Returns True only when this call actually released the restriction.
+        """
+        released = self.state.clear_restriction(reason)
+        if released:
+            self._pause_requested = False
+            self._pause_nudge_sent = False
+        pause_debug(f'leave_reading_mode({reason!r}) -> released={released}')
+        return released
+
+    def _apply_pause_reading_mode(self, tool_calls=None) -> None:
+        """Reading-mode checkpoint: nudge the model to conclude, never halt.
+
+        Runs ON THE TURN THREAD, after the LLM response has been received and
+        before the pending tool calls execute. When the active restriction is
+        owned by 'pause' it buffers at most one [System Notice: ...] message
+        asking the model to summarise and reply with Respond, then consumes
+        the pause request.
+
+        Delivery: the nudge is pushed onto _pending_warnings -- the very same
+        buffer the token/timeout/turn monitors use -- which the tool-execution
+        branch flushes after turn_transaction.commit(). The nudge therefore
+        lands in user_history AFTER the tool results and is part of the
+        messages the NEXT LLM iteration reads.
+
+        It deliberately does none of the following: no early return, no state
+        transition to PAUSING, no halt flag, no truncation of the turn, and no
+        hand-rejection of the pending tool calls (the executor refuses them
+        because of the restriction -- one rejection path, not two).
+
+        A restriction owned by anything other than 'pause' makes this a no-op:
+        the monitors own those and inject their own warnings.
+        """
+        if getattr(self.state, 'restriction_reason', None) != 'pause':
+            return
+        if not self._pause_nudge_sent and tool_calls:
+            nudge = make_system_notice(
+                'You were paused by the user. Do not start new work and do not call tools — '
+                'tool calls are refused. Summarize what you have done and what remains, then '
+                'reply with Respond. The session stays paused until it is resumed.',
+                kind='pause_nudge',
+                pause_nudge=True,
+            )
+            self._pending_warnings.append(nudge)
+            self._pause_nudge_sent = True
+            log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [2] after_llm: reading-mode nudge buffered')
+        # Reading mode is in force, so there is nothing left to pause: consume
+        # the request. The turn keeps running and concludes with a Respond.
+        if self._pause_requested:
+            pause_debug('Consuming _pause_requested: reading mode is in force')
+            self._pause_requested = False
+
+    def request_pause(self):
+        """Request pause at the next atomic turn boundary.
+
+        Kept as a thin alias of enter_reading_mode() for existing callers
+        (tools/workspace/worker_thread.py, web_ui/backend/bridge.py). See
+        enter_reading_mode() for the actual semantics.
+        """
+        pause_debug(f'request_pause -> enter_reading_mode(pause)')
+        return self.enter_reading_mode('pause')
 
     def process_query(self, query):
         """Process a user query, appending it to conversation and running the agent.
         Yields events as dicts."""
+        # PHASE 2.1a: a new operator turn un-pauses the session.  Drop any
+        # stranded main-pause marker here so join/wait_for_job stop reporting
+        # "paused" for a pause that ended turns ago (see the helper).
+        _discard_session_main_pause(
+            self.session_id,
+            worker_mode=bool(getattr(self.config, 'worker_mode', False)),
+        )
         self._emergency_retries = 0
+        final_pending = False
+        # TURN CANCELLATION: this thread is about to run a turn, so it needs a
+        # token of its own.  Bind a FRESH event for the whole turn (binding also
+        # drops any stale reason, so the turn starts clear) and publish it on the
+        # agent, because the Stop button runs on the BRIDGE thread and needs a
+        # handle it can set.  Polling sites (container exec waits, sleep) only
+        # ever read this thread's binding.
+        _turn_cancel = threading.Event()
+        try:
+            from tools.cancellation import bind_turn_cancel
+            bind_turn_cancel(_turn_cancel)
+        except Exception as _cancel_exc:  # pragma: no cover - import guard
+            log('WARNING', 'core.agent',
+                f'process_query: turn-cancel binding unavailable: {_cancel_exc}')
+        self._turn_cancel_event = _turn_cancel
         try:
             log('DEBUG', 'core.agent', f'process_query: query="{query[:80]}..." turn_display={self._display_turn}')
 
@@ -781,19 +1396,20 @@ class Agent:
             self._add_to_conversation(user_msg)
             estimated_tokens = self._estimate_tokens(user_msg)
             self.state.current_conversation_tokens += estimated_tokens
+            log('DEBUG', '**pipeline.token_update**', f"Token update after user query: tokens={self.state.current_conversation_tokens}, input={self.total_input_tokens}, output={self.total_output_tokens}")
             yield self._create_token_update_event()
             self._display_turn = getattr(self, '_display_turn', 0) + 1
             log('DEBUG', 'core.agent', f"User query added: turn={self._display_turn}")
-
+    
             # Apply any pending configuration update BEFORE yielding user_query,
             # so the [SYSTEM NOTIFICATION] is already in user_history when the
             # bridge syncs the conversation for the frontend.
             config_applied = self._apply_pending_config()
-
+    
             if not config_applied:
                 error_detail = self._last_config_error or 'Unknown error'
                 log('ERROR', 'core.agent', f'Configuration update failed: {error_detail}')
-
+    
                 # Add a visible system notification to the conversation
                 error_message = (
                     '[SYSTEM NOTIFICATION] Configuration change failed: '
@@ -803,7 +1419,7 @@ class Agent:
                 )
                 notif_msg = Message(role='user', content=error_message, is_system_notification=True)
                 self._add_to_conversation(notif_msg)
-
+    
                 event_dict = {
                     'type': 'error',
                     'error_type': 'invalid_config',
@@ -814,7 +1430,7 @@ class Agent:
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict
                 return
-
+    
             # Now yield user_query — the bridge syncs the conversation, and any
             # config-change notification from _apply_pending_config is already visible.
             event_dict = {'type': 'user_query', 'content': query, 'turn': self._display_turn}
@@ -822,7 +1438,7 @@ class Agent:
             if 'timestamp' not in event_dict:
                 event_dict['timestamp'] = event_dict.get('created_at', time.time())
             yield event_dict
-
+    
             pause_debug(f"process_query called with query: '{query[:50]}...'")
             pause_debug(f'Current execution state: {self.state.execution_state}')
             pause_debug(f'Conversation length after adding query: {len(self.conversation)}')
@@ -837,6 +1453,8 @@ class Agent:
             self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
             pause_debug(f'Clearing _pause_requested (was {self._pause_requested})')
             self._pause_requested = False
+            self._pause_nudge_sent = False
+            self._stop_notice_sent = False
             current_exec_state = self.state.execution_state
             if current_exec_state == ExecutionState.RUNNING:
                 log('WARNING', 'core.agent', f'process_query called while already in RUNNING state')
@@ -859,9 +1477,16 @@ class Agent:
             prev_conversation_len = len(self.conversation)
             last_input_tokens = 0
             last_output_tokens = 0
+            # Initialize time monitoring at start of agent execution
+            self.state.time_start = time.time()
+            # max_turns is a per-query limit: read fresh at loop entry so a
+            # mailbox config update (Agent.request_config_update / hot-swap)
+            # is honored on the next query. Mid-loop changes do not extend
+            # the already-computed range.
             for turn in range(self.config.max_turns):
                 turn_start_time = time.time()
                 log('DEBUG', 'core.agent', f'process_query: starting turn {turn}/{self.config.max_turns}, conversation length={len(self.conversation)}')
+
                 if self.logger:
                     self.logger.log_turn_start(turn)
                     if turn % 5 == 0:
@@ -882,38 +1507,66 @@ class Agent:
                     self._add_conversation_data_to_event(stopped_event)
                     yield stopped_event
                     return
+                # Time monitoring
+                if self.state.time_start is not None:
+                    elapsed = time.time() - self.state.time_start
+                    time_events = self.state.update_time_state(elapsed)
+                    for event in time_events:
+                        if event['type'] == 'time_warning':
+                            warning_msg = Message(
+                                role='user',
+                                content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning_message', '')),
+                                is_system_notification=True
+                            )
+                            self._add_to_conversation(warning_msg)
+                            warning_tokens = self._estimate_tokens(warning_msg)
+                            self.state.current_conversation_tokens += warning_tokens
+                            log('DEBUG', '**pipeline.token_update**', f"Token update after time_warning: tokens={self.state.current_conversation_tokens}")
+                            yield self._create_token_update_event()
+                            # If time is critical, log it but don't stop — soft restriction
+                            if self.state.time_state == TimeState.CRITICAL:
+                                log('WARNING', 'core.agent', f'Time critical: soft restriction applied after {elapsed:.1f}s')
+                                if self.logger:
+                                    self.logger.log_agent_end('timeout', f'Agent execution timed out after {elapsed:.1f}s')
+                        event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning_message', '')), 'elapsed_seconds': event.get('elapsed_seconds', elapsed), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                        self._add_conversation_data_to_event(event_dict)
+                        yield event_dict
+    
                 turn_events = self.state.update_turn_state(turn)
                 for event in turn_events:
                     if event['type'] == 'turn_warning':
-                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), is_system_notification=True)
+                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('warning_message', event.get('message', event.get('warning', ''))), is_system_notification=True)
                         self._add_to_conversation(warning_msg)
                         warning_tokens = self._estimate_tokens(warning_msg)
                         self.state.current_conversation_tokens += warning_tokens
+                        log('DEBUG', '**pipeline.token_update**', f"Token update after turn_warning: tokens={self.state.current_conversation_tokens}")
                         yield self._create_token_update_event()
-                    event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning', '')), 'turn_count': event.get('turn_count', turn), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    event_dict = {'type': event['type'], 'message': event.get('warning_message', event.get('message', event.get('warning', ''))), 'turn_count': event.get('turn_count', turn), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
                 # Don't recalculate full estimate here - truth-based current_conversation_tokens
                 # is maintained by LLM prompt_tokens + estimated additions for new content
+                log('DEBUG', '**pipeline.token_update**', f"Token update after turn state: tokens={self.state.current_conversation_tokens}, turn={self._display_turn}")
                 yield self._create_token_update_event()
                 token_events = self.state.update_token_state(self.state.current_conversation_tokens)
                 for event in token_events:
                     if event['type'] == 'token_warning':
-                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), is_system_notification=True)
+                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('warning_message', event.get('message', event.get('warning', ''))), is_system_notification=True, metadata={'warning_id': str(uuid.uuid4())})
                         self._add_to_conversation(warning_msg)
                         warning_tokens = self._estimate_tokens(warning_msg)
                         self.state.current_conversation_tokens += warning_tokens
+                        log('DEBUG', '**pipeline.token_update**', f"Token update after token_warning: tokens={self.state.current_conversation_tokens}")
                         yield self._create_token_update_event()
-                    event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning', '')), 'token_count': event.get('token_count', self.state.current_conversation_tokens), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-                    self._add_conversation_data_to_event(event_dict)
-                    yield event_dict
+                    # Yield the original event (not reconstructed) to preserve all fields
+                    self._add_conversation_data_to_event(event)
+                    yield event
                 for msg in self.conversation:
                     if msg.get('role') == 'assistant' and 'tool_calls' in msg:
                         if msg.get('reasoning_content') is None:
                             msg['reasoning_content'] = ''
                 if self.logger and hasattr(self.logger, 'py_logger'):
                     system_msgs = [msg for msg in self.conversation if msg.get('role') == 'system']
-                    log('INFO', 'agent.core', f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
+                    log('INFO', 'core.agent', f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
                 self.debug_context.debug_context('before_build', context_builder=self.context_builder)
                 if hasattr(self, 'context_builder') and self.context_builder is not None:
                     messages = self.context_builder.build(self.conversation)
@@ -928,7 +1581,7 @@ class Agent:
                 original_len = len(messages)
                 messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
                 if original_len != len(messages):
-                    log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
+                    log('DEBUG', 'core.agent', f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
                 if self.logger and hasattr(self.logger, 'py_logger'):
                     import tiktoken
                     try:
@@ -936,29 +1589,29 @@ class Agent:
                     except Exception:
                         encoder = None
                     total_tokens = sum((self.token_counter.estimate_tokens(msg) for msg in messages))
-                    log('INFO', 'agent.core', f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
+                    log('INFO', 'core.agent', f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
                 if self.logger:
                     self.logger.log_llm_request(messages, self.tool_definitions)
                 if self.rate_limit_active:
                     delay = min(self.rate_limit_delay, self.rate_limit_max_wait)
                     if delay > 0:
                         if self.logger and hasattr(self.logger, 'py_logger'):
-                            log('INFO', 'agent.core', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
+                            log('INFO', 'core.agent', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
                         time.sleep(delay)
                 tools = self.llm_client.format_tools(self.tool_definitions)
                 # EMERGENCY TRACE: dump conversation and messages before LLM call
-                log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
+                log('DEBUG', 'core.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
                 for i, msg in enumerate(self.conversation):
                     role = msg.get('role', 'unknown')
                     content = msg.get('content', '')
                     preview = content[:80].replace('\n', '\\n')
-                    log('DEBUG', 'debug.emergency', f'  CONV[{i}] role={role}: {preview}')
-                log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: messages from build() ({len(messages)} msgs) ======')
+                    log('DEBUG', 'core.emergency', f'  CONV[{i}] role={role}: {preview}')
+                log('DEBUG', 'core.emergency', f'====== EMERGENCY TRACE: messages from build() ({len(messages)} msgs) ======')
                 for i, msg in enumerate(messages):
                     role = msg.get('role', 'unknown')
                     content = msg.get('content', '')
                     preview = content[:80].replace('\n', '\\n')
-                    log('DEBUG', 'debug.emergency', f'  MSG[{i}] role={role}: {preview}')
+                    log('DEBUG', 'core.emergency', f'  MSG[{i}] role={role}: {preview}')
                 try:
                     chat_kwargs = {'temperature': self.runtime_params.temperature}
                     if self.runtime_params.top_p is not None:
@@ -969,17 +1622,144 @@ class Agent:
                         f"last_user={'present' if any(m['role']=='user' for m in messages[-2:]) else 'MISSING'}")
                     log('DEBUG', 'core.pause', 'LLM CALL START')
                     llm_start_time = time.time()
-                    response = self.llm_client.chat_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
+                    # Token truth vs. estimate: current_conversation_tokens holds the
+                    # pre-call ESTIMATE, so capture it BEFORE the stream reports
+                    # provider truth or the drift log below loses its baseline.
+                    previous_tokens = self.state.current_conversation_tokens
+                    content = ''
+                    reasoning = None
+                    tool_calls = []
+                    input_tokens = 0
+                    output_tokens = 0
+                    final_pending = False
+                    halted = False
+                    stream_agen = self.llm_client.stream_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
+                    for stream_event in _iter_stream_events(stream_agen):
+                        # In-stream HARD STOP interception. A cooperative pause is
+                        # still handled only by PAUSE CHECKPOINT [1] (turn_start),
+                        # which returns 'PAUSED' and lets the turn finish; a hard
+                        # stop is different and must truncate the answer, so it is
+                        # tested here at the top of every iteration.
+                        #
+                        # This reuses the SAME stop_reason terminal shape as the
+                        # checkpoint path (the controller already converts
+                        # stop_reason into session_stop), so the 'interrupted'
+                        # event below is a report of partial content, not a second
+                        # stop producer.
+                        #
+                        # A partially received tool call is safe to discard: tool
+                        # execution happens AFTER this loop, so breaking here can
+                        # never act on a half-parsed call.
+                        if self.should_halt():
+                            log('DEBUG', 'core.pause', f'[HALT] hard stop requested mid-stream (turn={turn})')
+                            halted = True
+                            break
+                        # Tier 1 drain (ruling D-5): fires on EVERY stream event,
+                        # including the Done and Interrupted terminals below,
+                        # because it sits before the type ladder opens. Between
+                        # __anext__ calls is the only window a sync loop has.
+                        for _addendum_event in self._drain_addendum_queue():
+                            yield _addendum_event
+                        if isinstance(stream_event, TextDelta):
+                            content += stream_event.text or ''
+                            yield {'type': 'text_delta', 'text': stream_event.text, 'turn': self._display_turn}
+                        elif isinstance(stream_event, ReasoningDelta):
+                            reasoning = (reasoning or '') + (stream_event.text or '')
+                            yield {'type': 'reasoning_delta', 'text': stream_event.text, 'turn': self._display_turn}
+                        elif isinstance(stream_event, ToolCallComplete):
+                            canonical = stream_event.tool_call
+                            raw_arguments = canonical.raw_arguments
+                            if raw_arguments is None:
+                                raw_arguments = json.dumps(canonical.arguments or {})
+                            wire_call = {'id': canonical.id, 'type': 'function', 'function': {'name': canonical.name, 'arguments': raw_arguments}}
+                            if stream_event.parse_error is not None:
+                                wire_call['parse_error'] = stream_event.parse_error
+                            tool_calls.append(wire_call)
+                            if canonical.name == 'Respond':
+                                # Terminal is emitted further down, after tool results
+                                # are committed - keep consuming the stream.
+                                final_pending = True
+                        elif isinstance(stream_event, UsageUpdate):
+                            # Provider truth replaces the estimate.
+                            input_tokens = stream_event.input_tokens or 0
+                            output_tokens = stream_event.output_tokens or 0
+                            self.state.current_conversation_tokens = input_tokens
+                            log('DEBUG', 'core.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
+                            for token_event in self.state.update_token_state(input_tokens):
+                                if token_event['type'] == 'token_warning':
+                                    warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + token_event.get('warning_message', token_event.get('message', token_event.get('warning', ''))), is_system_notification=True, metadata={'warning_id': str(uuid.uuid4())})
+                                    self._add_to_conversation(warning_msg)
+                                    warning_tokens = self._estimate_tokens(warning_msg)
+                                    self.state.current_conversation_tokens += warning_tokens
+                                    log('DEBUG', '**pipeline.token_update**', f"Token update after token_warning: tokens={self.state.current_conversation_tokens}")
+                                    yield self._create_token_update_event()
+                                # Yield the original event (not reconstructed) to preserve all fields
+                                self._add_conversation_data_to_event(token_event)
+                                yield token_event
+                        elif isinstance(stream_event, Done):
+                            break
+                        elif isinstance(stream_event, Interrupted):
+                            # The adapter closed the stream because the provider
+                            # failed (it cannot raise across the async boundary),
+                            # so this event stands in for the exception the
+                            # non-streaming path raised. Re-raise it here - still
+                            # inside the try that owns the LLMError /
+                            # RateLimitExceeded / ProviderError handlers below -
+                            # so retry, rate-limit backoff, the token-limit
+                            # emergency retry and the user-facing error event all
+                            # stay reachable. Swallowing it would end the turn as
+                            # an empty "success" and loop to max_turns.
+                            raise _exception_for_interrupted(stream_event.reason or '')
+                        # ToolCallStart / ToolCallArgumentsDelta are progress signals
+                        # only (no UI event).
+                    if halted:
+                        # Persist the partial answer so the truncated text is not
+                        # lost with the discarded stream. Mirror the normal commit
+                        # path exactly, but gate on has_assistant_message() so an
+                        # empty halt (stopped before any delta) leaves history
+                        # untouched instead of pushing a blank assistant message.
+                        halt_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
+                        halt_msg = {'role': 'assistant', 'content': content}
+                        if reasoning is not None:
+                            halt_msg['reasoning_content'] = reasoning
+                        halt_tx.add_assistant_message(halt_msg)
+                        if halt_tx.has_assistant_message():
+                            halt_tx.commit_assistant_only()
+                        else:
+                            halt_tx.rollback()
+                        # The model has to learn WHY its stream vanished, or the
+                        # next turn resumes as if the answer had been finished.
+                        # This cannot go through _pending_warnings: every flush
+                        # site is behind the `return` below, so it is written
+                        # straight to history -- and only now, AFTER the partial
+                        # assistant message committed above, so the truncated
+                        # answer stays ahead of the notice that explains it.
+                        if not self._stop_notice_sent:
+                            self._add_to_conversation(make_system_notice(
+                                'You were stopped by the user. Review your current progress and resume.',
+                                kind='stop_notice',
+                            ))
+                            self._stop_notice_sent = True
+                        self.total_input_tokens += input_tokens
+                        self.total_output_tokens += output_tokens
+                        interrupted_event = {
+                            'type': 'interrupted',
+                            'stop_reason': 'interrupted',
+                            'content': content,
+                            'turn': self._display_turn,
+                            'context_length': self.state.current_conversation_tokens,
+                            'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens},
+                        }
+                        if reasoning is not None:
+                            interrupted_event['reasoning'] = reasoning
+                        self._add_conversation_data_to_event(interrupted_event)
+                        log('DEBUG', 'core.pause', f'[HALT] committed partial assistant message (chars={len(content)})')
+                        yield interrupted_event
+                        return
                     llm_duration_ms = (time.time() - llm_start_time) * 1000
                     log('DEBUG', 'core.pause', f'LLM CALL END (duration_ms={llm_duration_ms:.0f})')
                     if self.logger:
                         self.logger.log_latency('llm_call', llm_duration_ms, {'turn': turn, 'model': self.config.model, 'has_tools': bool(tools)})
-                    input_tokens = response.usage.get('prompt_tokens', 0) if response.usage else 0
-                    output_tokens = response.usage.get('completion_tokens', 0) if response.usage else 0
-                    # Use LLM-reported prompt_tokens as ground truth for conversation token count
-                    previous_tokens = self.state.current_conversation_tokens
-                    self.state.current_conversation_tokens = input_tokens
-                    log('DEBUG', 'core.agent.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
                     # Token drift detection: compare pre-call estimate vs LLM-reported
                     if previous_tokens is not None and previous_tokens > 0 and input_tokens > 0:
                         drift = abs(input_tokens - previous_tokens)
@@ -1031,6 +1811,31 @@ class Agent:
                         self.logger.log_system_resources()
                         self.logger.log_agent_end('provider_error', f'Provider error: {e}')
                         self.logger.close()
+                    # Persist the partial answer so the truncated text is not lost.
+                    # The stream loop raised out of the LLM call before reaching the
+                    # normal commit site further down, so whatever the model already
+                    # streamed would vanish from history while the UI kept it. This
+                    # mirrors the hard-stop commit above: same TurnTransaction usage,
+                    # same message shape. It is gated on a non-empty accumulator so an
+                    # immediate failure that streamed nothing leaves history untouched
+                    # instead of pushing a blank assistant message.
+                    # Unexecuted tool_calls are deliberately not persisted (see the if halted: block above).
+                    if content or reasoning:
+                        try:
+                            error_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
+                            error_msg = {'role': 'assistant', 'content': content}
+                            if reasoning is not None:
+                                error_msg['reasoning_content'] = reasoning
+                            error_tx.add_assistant_message(error_msg)
+                            if error_tx.has_assistant_message():
+                                error_tx.commit_assistant_only()
+                            else:
+                                error_tx.rollback()
+                            log('DEBUG', 'core.agent', f'[PROVIDER ERROR] committed partial assistant message (chars={len(content)})')
+                        except Exception as commit_error:
+                            # Persistence must never suppress the error event or
+                            # change the turn's stop reason.
+                            log('WARNING', 'core.agent', f'[PROVIDER ERROR] could not persist partial assistant message: {commit_error}')
                     if self.session is not None:
                         self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: {error_type}: {e}', is_system_notification=True))
                     event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
@@ -1071,7 +1876,7 @@ class Agent:
                     yield event_dict
                     return
                 except Exception as e:
-                    log('ERROR', 'agent.core', f'[Agent] Unexpected exception in process_query: {e}')
+                    log('ERROR', 'core.agent', f'[Agent] Unexpected exception in process_query: {e}')
                     if self.logger:
                         self.logger.log_error('UNEXPECTED_ERROR', str(e))
                         self.logger.log_system_resources()
@@ -1083,9 +1888,6 @@ class Agent:
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
                     return
-                content = response.content or ''
-                reasoning = response.reasoning
-                tool_calls = response.tool_calls
                 # Log raw tool call arguments at the closest point to the LLM response
                 if tool_calls:
                     log('DEBUG', 'core.agent', 'RAW TOOL CALL ARGUMENTS from LLM response',
@@ -1095,40 +1897,16 @@ class Agent:
                 user_interaction_message = None
                 pause_debug(f'Checking pause request before turn: _pause_requested={self._pause_requested}')
                 log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [2] after_llm: _pause_requested={self._pause_requested}, has_tool_calls={bool(tool_calls)}')
-                if self._pause_requested:
-                    if tool_calls:
-                        log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [2] after_llm: DEFERRED (tool_calls present)')
-                        # Defer pause: tools need to execute first.
-                        # _pause_requested stays True -> checkpoint 2 (line ~998) will catch it
-                        # after tools have run and turn_transaction has been committed.
-                        pause_debug(f'Pause requested but tool_calls present, deferring to after tool execution')
-                    else:
-                        log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [2] after_llm: DETECTED')
-                        pause_debug(f'Pause detected! Transitioning to PAUSING')
-                        # Save grace turn: commit LLM response to user_history BEFORE yielding pause
-                        assistant_msg = {'role': 'assistant', 'content': content}
-                        if reasoning is not None:
-                            assistant_msg['reasoning_content'] = reasoning
-                        elif tool_calls:
-                            assistant_msg['reasoning_content'] = ''
-                        # Don't include tool_calls — they weren't executed
-                        grace_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
-                        grace_tx.add_assistant_message(assistant_msg)
-                        grace_tx.commit()
-                        events = self.state.set_execution_state(ExecutionState.PAUSING)
-                        for event in events:
-                            for yielded_event in self._handle_state_event(event):
-                                yield yielded_event
-                        pause_debug(f'Clearing _pause_requested after pause')
-                        self._pause_requested = False
-                        pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
-                        self._add_conversation_data_to_event(pause_event)
-                        yield pause_event
-                        turn_duration = time.time() - turn_start_time
-                        if self.logger:
-                            self.logger.log_system_resources()
-                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                        return
+                # READING MODE (pause): the turn is never halted or truncated
+                # here. If a pause is in force the helper buffers a one-shot
+                # nudge telling the model to wrap up with Respond. The tool
+                # calls below are still handed to the executor, which refuses
+                # them because the state restriction limits the allow-list to
+                # ['Respond']. The old "defer until the tools have executed"
+                # branch is gone -- with reading mode there is nothing to
+                # defer to, and the old no-tool-calls branch is gone too: that
+                # turn was already concluding.
+                self._apply_pause_reading_mode(tool_calls)
                 turn_transaction = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
                 assistant_msg = {'role': 'assistant', 'content': content}
                 if reasoning is not None:
@@ -1144,6 +1922,7 @@ class Agent:
                 # doesn't lose the assistant's tool_calls data from user_history.
                 if turn_transaction and turn_transaction.has_assistant_message():
                     turn_transaction.commit_assistant_only()
+                log('DEBUG', '**pipeline.token_update**', f"Token update after assistant commit: tokens={self.state.current_conversation_tokens}")
                 yield self._create_token_update_event()
                 turn_event = {'type': 'turn', 'content': content, 'assistant_content': content, 'tool_calls': [], 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 if reasoning is not None:
@@ -1153,43 +1932,107 @@ class Agent:
                 self._add_conversation_data_to_event(turn_event)
                 yield turn_event
                 if tool_calls:
-                    executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, session_id=self.session_id, turn_transaction=turn_transaction)
+                    # Emit a START event for each tool call BEFORE executing it, so
+                    # consumers (e.g. the worker panel) can render a pending
+                    # "running" tool-call row. The post-completion tool_call /
+                    # tool_result events below remain the source of truth for the
+                    # outcome. Emitted before execute_tool_calls() so the pending
+                    # row appears while the tool is still running.
+                    for _tc in tool_calls:
+                        _fn = _tc.get('function', {}) if isinstance(_tc, dict) else {}
+                        start_event = {
+                            'type': 'tool_call_start',
+                            'tool_name': _fn.get('name', '') if isinstance(_fn, dict) else '',
+                            'arguments': _fn.get('arguments', '') if isinstance(_fn, dict) else '',
+                            'tool_call_id': _tc.get('id', '') if isinstance(_tc, dict) else '',
+                            'turn': self._display_turn,
+                        }
+                        self._add_conversation_data_to_event(start_event)
+                        yield start_event
+                    executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, session_id=self.session_id, workspace_id=getattr(getattr(self, '_session', None), 'workspace_id', None) or "", turn_transaction=turn_transaction)
                     processed_tools = []
                     for tool_info in executed_tools:
                         result = tool_info.get('result', '')
-                        success = True
                         error = None
-                        if isinstance(result, str):
-                            if result.startswith('❌') or 'TOOL CALL REJECTED' in result or 'Error executing tool' in result:
-                                success = False
-                                error = result
-                        processed_tools.append({'name': tool_info.get('name'), 'arguments': tool_info.get('arguments'), 'result': result, 'success': success, 'error': error, 'turn': self._display_turn})
+                        # Structural verdict first: the executor marks every
+                        # refusal / failure path with an explicit success=False.
+                        # Prose sniffing only runs when the executor supplied no
+                        # verdict (None), i.e. for results produced outside the
+                        # executor path; a denial's prose carries no marker, which
+                        # is why sniffing alone reported refusals as successes.
+                        success = tool_info.get('success', None)
+                        if success is None:
+                            success = True
+                            if isinstance(result, str):
+                                if result.startswith('❌') or 'TOOL CALL REJECTED' in result or 'Error executing tool' in result:
+                                    success = False
+                        if not success:
+                            error = result
+                        processed_tools.append({'name': tool_info.get('name'), 'arguments': tool_info.get('arguments'), 'result': result, 'success': success, 'error': error, 'turn': self._display_turn, 'tool_call_id': tool_info.get('tool_call_id', '')})
                     # Commit ALL tool results to user_history BEFORE yielding any events
                     # (tool_call, tool_result) so a pause between yields doesn't lose data.
                     if turn_transaction:
                         turn_transaction.commit()
                     for tool in processed_tools:
-                        event_dict = {'type': 'tool_call', 'tool_name': tool['name'], 'arguments': tool['arguments'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
+                        event_dict = {'type': 'tool_call', 'tool_name': tool['name'], 'arguments': tool['arguments'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn'], 'tool_call_id': tool['tool_call_id']}
                         self._add_conversation_data_to_event(event_dict)
                         yield event_dict
                     for tool in processed_tools:
-                        event_dict = {'type': 'tool_result', 'tool_name': tool['name'], 'result': tool['result'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
+                        event_dict = {'type': 'tool_result', 'tool_name': tool['name'], 'result': tool['result'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn'], 'tool_call_id': tool['tool_call_id']}
                         self._add_conversation_data_to_event(event_dict)
                         yield event_dict
                     # Flush any buffered token warnings after the turn is committed
                     # so they land chronologically after tool results in user_history
+                    log('DEBUG', '**pipeline.warning**', f"Flushing {len(self._pending_warnings)} buffered warnings after tool execution")
                     for warning in self._pending_warnings:
                         self._add_to_conversation(warning)
-                    log('DEBUG', 'core.token', f"warning flushed (tool path): count={len(self._pending_warnings)}")
+                    # Yield token_warning events to event stream subscribers (worker, EventLogger, etc.)
+                    for warning_event in self._pending_warning_events:
+                        yield warning_event
                     self._pending_warnings.clear()
+                    self._pending_warning_events.clear()
                     log('DEBUG', 'core.agent', f"[TOOL LOOP] conversation length now {len(self.conversation)}, last 3 roles: {[m.get('role') for m in self.conversation[-3:]]}")
-                    if final_detected:
+                    if summary_text is not None:
+                        log('DEBUG', 'core.summary', f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
+                        recovery_events = self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
+                        log('DEBUG', '**pipeline.token_update**', f"Token update after summary pruning: tokens={self.state.current_conversation_tokens}")
+                        yield self._create_token_update_event()
+                        # Yield ONLY a context_summarized event — the canonical notification.
+                        # The old token_recovery + context_summarized double-emit caused
+                        # duplicate "Token usage has returned to safe levels" + "Context has been
+                        # summarized" messages in the worker panel.  context_summarized alone
+                        # is sufficient: it carries the meaningful user-facing message, while
+                        # (context_cleared was already removed for the same reason)
+                        summarized_event = {'type': 'context_summarized', 'message': 'Context has been summarized. You now have a fresh context window and full access to tools.'}
+                        yield summarized_event
+
+                        # Continue the turn loop — summary frees context, agent keeps working
+                        turn_duration = time.time() - turn_start_time
+                        if self.logger:
+                            self.logger.log_system_resources()
+                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
+                        # Skip the 'if not tool_calls' check since we had tools (SummarizeTool)
+                        # D1: Respond AND SummarizeTool in the SAME batch. Pruning has
+                        # happened, but a terminal is still owed — so fall through to
+                        # the deferred `if final_pending:` block below (which emits the
+                        # agent_responded terminal and returns) instead of continuing
+                        # the loop, which would drop the terminal entirely.
+                        if not final_pending:
+                            continue
+                    if final_pending:
                         # Unified respond event — carries response_type so consumers
                         # can distinguish 'answer' (no reply needed) from 'question' (waiting for user).
+                        # Emitted only here: after the Respond tool result has been
+                        # committed above and after the summary branch, so a Respond
+                        # tool call never produces a terminal before its own result
+                        # is in history (and never twice).
                         respond_event = {
                             'type': 'agent_responded',
                             'response_type': respond_result['response_type'] if respond_result else 'answer',
                             'content': respond_result['content'] if respond_result else content,
+                            'status': respond_result.get('status') if respond_result else None,
+                            'confidence': respond_result.get('confidence') if respond_result else None,
+                            'meta': respond_result.get('meta') if respond_result else None,
                             'turn': self._display_turn,
                             'context_length': self.state.current_conversation_tokens,
                             'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}
@@ -1205,43 +2048,37 @@ class Agent:
                             self.logger.log_system_resources()
                             self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
                         return
-                    if summary_text is not None:
-                        log('DEBUG', 'core.summary', f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
-                        self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
-                        yield self._create_token_update_event()
                 pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
                 log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [3] after_turn: _pause_requested={self._pause_requested}')
-                if self._pause_requested:
-                    log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [3] after_turn: DETECTED')
-                    pause_debug(f'Pause detected after turn processing! Transitioning to PAUSING')
-                    events = self.state.set_execution_state(ExecutionState.PAUSING)
-                    for event in events:
-                        for yielded_event in self._handle_state_event(event):
-                            yield yielded_event
-                    pause_debug(f'Clearing _pause_requested after pause (after turn processing)')
-                    self._pause_requested = False
-                    pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
-                    self._add_conversation_data_to_event(pause_event)
-                    yield pause_event
-                    turn_duration = time.time() - turn_start_time
-                    if self.logger:
-                        self.logger.log_system_resources()
-                        self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                    return
+                # A pause that arrived WHILE the tools were executing used to
+                # truncate the turn here (PAUSING + 'paused' event + return).
+                # It is the same reading mode as checkpoint [2]: one nudge to
+                # conclude with a Respond, and the turn runs on. Checkpoint
+                # [2]'s flush point (after the turn commit) is already behind
+                # us, so the nudge is flushed inline; that flush also cleared
+                # _pending_warnings, so only the helper's nudge can be in it.
+                self._apply_pause_reading_mode(tool_calls)
+                for warning in self._pending_warnings:
+                    self._add_to_conversation(warning)
+                self._pending_warnings.clear()
                 if not tool_calls:
                     log('DEBUG', 'core.agent', f'No tool calls in turn {turn}, committing directly and yielding final')
                     if turn_transaction and turn_transaction.has_assistant_message():
                         turn_transaction.commit()
                     # Flush any buffered token warnings (unlikely here, but be safe)
+                    log('DEBUG', '**pipeline.warning**', f"Flushing {len(self._pending_warnings)} buffered warnings in non-tool branch")
                     for warning in self._pending_warnings:
                         self._add_to_conversation(warning)
-                    log('DEBUG', 'core.token', f"warning flushed (no-tool path): count={len(self._pending_warnings)}")
+                    # Yield token_warning events to event stream subscribers
+                    for warning_event in self._pending_warning_events:
+                        yield warning_event
                     self._pending_warnings.clear()
+                    self._pending_warning_events.clear()
                     if self.logger:
                         self.logger.log_system_resources()
                         self.logger.log_agent_end('completed', 'Assistant provided direct answer with no tool calls')
                         self.logger.close()
-                    final_event = {'type': 'agent_responded', 'response_type': 'answer', 'content': content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    final_event = {'type': 'agent_responded', 'response_type': 'answer', 'content': content, 'status': None, 'confidence': None, 'meta': None, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     if reasoning is not None:
                         final_event['reasoning'] = reasoning
                     elif tool_calls:
@@ -1249,9 +2086,29 @@ class Agent:
                     self._add_conversation_data_to_event(final_event)
                     yield final_event
                     return
+    
 
             # Max turns reached - loop exhausted naturally
             log('WARNING', 'core.agent', f'Max turns ({self.config.max_turns}) reached - loop exhausted')
+            if final_pending:
+                # A Respond tool call arrived in the final turn but the loop ran out
+                # before the terminal could be emitted (the summary branch continues).
+                # Emit it now, before the max_turns stop_reason, so the answer is not lost.
+                final_pending_event = {
+                    'type': 'agent_responded',
+                    'response_type': 'answer',
+                    'content': content,
+                    'status': None,
+                    'confidence': None,
+                    'meta': None,
+                    'turn': self._display_turn,
+                    'context_length': self.state.current_conversation_tokens,
+                    'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}
+                }
+                if reasoning is not None:
+                    final_pending_event['reasoning'] = reasoning
+                self._add_conversation_data_to_event(final_pending_event)
+                yield final_pending_event
             if self.logger:
                 self.logger.log_agent_end('max_turns_reached', f'Max turns ({self.config.max_turns}) reached')
                 self.logger.close()
@@ -1266,10 +2123,18 @@ class Agent:
             self._add_conversation_data_to_event(max_turns_event)
             yield max_turns_event
             return
-
         finally:
+            # TURN CANCELLATION: the turn is over.  Drop this thread's binding and
+            # the published handle, so a Stop that arrives after the turn cannot
+            # latch an event nobody polls (the next turn binds a fresh one).
+            try:
+                from tools.cancellation import unbind
+                unbind()
+            except Exception:
+                pass
+            self._turn_cancel_event = None
             self.state.execution_state = ExecutionState.READY
-            log('DEBUG', 'agent.core', 'process_query finished, reset execution_state to READY')
+            log('DEBUG', 'core.agent', 'process_query finished, reset execution_state to READY')
     def _apply_summary_pruning(self, summary: str, keep_recent_turns: int):
         """Add summary message to append-only history with metadata.
         
@@ -1293,7 +2158,7 @@ class Agent:
             self.state.update_token_state(self.state.current_conversation_tokens)
             log('DEBUG', 'core.pruning', f'Fallback pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}')
             if self.logger and hasattr(self.logger, 'py_logger'):
-                log('INFO', 'agent.core', f'[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
+                log('INFO', 'core.agent', f'[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
             return
         user_history = self.session.user_history
         log('DEBUG', 'core.session_history', f'session.user_history length: {len(user_history)}')
@@ -1315,7 +2180,8 @@ class Agent:
         MAX_SUMMARY_LENGTH = 20000
         truncated_summary = summary
         if len(truncated_summary) > MAX_SUMMARY_LENGTH:
-            truncated_summary = truncated_summary[:MAX_SUMMARY_LENGTH] + '... (truncated)'
+            truncated_summary = truncated_summary[:MAX_SUMMARY_LENGTH] + '... [truncated]'
+        # Insert summary message into history
         summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {truncated_summary}', 'summary': True, 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_discarded_msg_count': discarded_msg_count, 'pruning_insertion_idx': insertion_idx}
         if insertion_idx >= len(user_history):
             user_history.append(summary_msg)
@@ -1332,31 +2198,22 @@ class Agent:
         if self.conversation is not user_history:
             self.conversation = user_history
         log('DEBUG', 'core.context_builder', f"_apply_summary_pruning: clearing context_builder cache, exists={hasattr(self, 'context_builder')}, is None={(self.context_builder if hasattr(self, 'context_builder') else 'no attr')}, has _cached_context={(hasattr(self.context_builder, '_cached_context') if hasattr(self, 'context_builder') and self.context_builder is not None else False)}")
-        # Phase 4 logging: after summarization
-        log('DEBUG', 'core.pruning', f'Conversation length after summarization: {len(self.conversation) if self.conversation else 0}')
-        if self.conversation:
-            dump_messages(self.conversation, "Conversation after summarization")
-        if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
-            self.context_builder._cached_context = None
-            log('DEBUG', 'core.context_builder', f'_apply_summary_pruning: cleared _cached_context')
-        if self.logger:
-            self.logger.log_conversation_prune(len(user_history) - 1, len(user_history), 'summary_pruning_append_only')
-        log('DEBUG', 'core.summary', f'Added summary to append-only history: kept {kept_turns_count} turns, inserted at index {insertion_idx}')
-        if self.logger and hasattr(self.logger, 'py_logger'):
-            log('INFO', 'agent.core', f'[PRUNING] Added summary to append-only history: kept {kept_turns_count} turns, inserted summary at index {insertion_idx}, history length: {len(user_history)} messages')
+        # Update token estimate AFTER summary insertion
         old_token_count = self.state.current_conversation_tokens
         self._update_conversation_token_estimate()
         # Immediately re-evaluate token state to clear restrictions if below critical
-        self.state.update_token_state(self.state.current_conversation_tokens)
+        token_events = self.state.update_token_state(self.state.current_conversation_tokens)
         log('INFO', 'core.token', f"post-summary: tokens={self.state.current_conversation_tokens}, token_state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, turn_state={self.state.turn_state.value if hasattr(self.state, 'turn_state') else 'N/A'}, restrictions_active={self.state.restrictions_active}")
         log('DEBUG', 'core.pruning', f'Summary pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}, summary_idx={insertion_idx}, kept_turns={kept_turns_count}')
         if self.logger and hasattr(self.logger, 'py_logger'):
-            log('INFO', 'agent.core', f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
+            log('INFO', 'core.agent', f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
         log('DEBUG', 'core.pruning', f'_apply_summary_pruning completed. History length: {len(user_history)} messages')
         log('DEBUG', 'core.session_history', f'session.summary exists: {self.session.summary is not None}')
         # Reset emergency mode after a successful summary
         self.context_builder.emergency_mode = False
         self._emergency_retries = 0
+        return [ev for ev in token_events if ev['type'] == 'token_recovery']
+
 
     def _apply_summary_pruning_fallback(self, summary: str, keep_recent_turns: int):
         """Fallback pruning for when no session is available (legacy behavior).
@@ -1452,7 +2309,7 @@ class Agent:
         for tool_cls in SIMPLIFIED_TOOL_CLASSES:
             if tool_cls.__name__ in preset_tool_names:
                 tool_classes.append(tool_cls)
-        config_data = {'api_key': api_key or '', 'base_url': base_url, 'model': preset.model, 'temperature': preset.temperature, 'enabled_tools': list(preset_tool_names), 'system_prompt': preset.system_prompt, 'provider_type': 'openai_compatible', 'max_turns': overrides.get('max_turns', 100), 'detail': overrides.get('detail', 'normal'), 'workspace_path': overrides.get('workspace_path'), 'tool_output_token_limit': overrides.get('tool_output_token_limit', 10000), 'token_monitor_warning_threshold': overrides.get('token_monitor_warning_threshold', 35000), 'token_monitor_critical_threshold': overrides.get('token_monitor_critical_threshold', 50000), 'turn_monitor_enabled': overrides.get('turn_monitor_enabled', True), 'enable_logging': overrides.get('enable_logging', True), 'log_dir': overrides.get('log_dir', './logs'), 'log_level': overrides.get('log_level', 'INFO'), 'enable_file_logging': overrides.get('enable_file_logging', True), 'jsonl_format': overrides.get('jsonl_format', True), 'log_categories': overrides.get('log_categories', ['SESSION', 'LLM', 'TOOLS']), 'max_file_size_mb': overrides.get('max_file_size_mb', 10)}
+        config_data = {'api_key': api_key or '', 'base_url': base_url, 'model': preset.model, 'temperature': preset.temperature, 'enabled_tools': list(preset_tool_names), 'system_prompt': preset.system_prompt, 'provider_type': 'openai_compatible', 'max_turns': overrides.get('max_turns', 100), 'detail': overrides.get('detail', 'normal'), 'workspace_path': overrides.get('workspace_path'), 'tool_output_token_limit': overrides.get('tool_output_token_limit', 10000), 'token_monitor_warning_threshold': overrides.get('token_monitor_warning_threshold', 65000), 'token_monitor_critical_threshold': overrides.get('token_monitor_critical_threshold', 80000), 'turn_monitor_enabled': overrides.get('turn_monitor_enabled', True), 'enable_logging': overrides.get('enable_logging', True), 'log_dir': overrides.get('log_dir'), 'log_level': overrides.get('log_level', 'INFO'), 'enable_file_logging': overrides.get('enable_file_logging', True), 'jsonl_format': overrides.get('jsonl_format', True), 'log_categories': overrides.get('log_categories', ['SESSION', 'LLM', 'TOOLS']), 'max_file_size_mb': overrides.get('max_file_size_mb', 10)}
         config_data.update(overrides)
         from agent.config import AgentConfig
         config = AgentConfig(**config_data)

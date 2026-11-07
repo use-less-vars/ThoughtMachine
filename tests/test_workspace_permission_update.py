@@ -1,0 +1,208 @@
+"""PUT /api/workspace/{ws_id}/permissions persistence tests.
+
+Covers the permission-map update path: validated writes merge into
+``config.json`` (preserving purpose / capabilities / domain_allowlist) and
+are reflected by ``GET /api/workspace/{ws_id}/summary``, while unknown
+resources and invalid levels are rejected with HTTP 422 and leave the saved
+config untouched.
+
+All workspace filesystem access is redirected to the pytest tmp_path.
+"""
+
+import asyncio
+import json
+from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
+from starlette.requests import Request as StarletteRequest
+
+from web_ui.backend import workspace_routes
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+
+def _no_origin_request() -> StarletteRequest:
+    """A real Starlette Request with no Origin header."""
+    return StarletteRequest(
+        {"type": "http", "method": "POST", "path": "/", "headers": []}
+    )
+
+
+def _use_tmp_workspace(monkeypatch, tmp_path):
+    """Point the vault root at the pytest tmp_path (canonical seam).
+
+    The SSOT config reader (``tools.host_resource_policy.load_workspace_config``)
+    and the routes' writer (_workspace_dir) both resolve
+    ``<vault_root>/workspaces/<id>/config.json``, so a single
+    ``THOUGHTMACHINE_VAULT_ROOT`` override keeps them in agreement.
+    """
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+    monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
+
+
+def _write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _read_config(tmp_path):
+    return json.loads(
+        (tmp_path / "workspaces" / "ws-1" / "config.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def _put(ws_id, permissions, allow_host_resources=None):
+    body = workspace_routes.WorkspacePermissionsBody(
+        permissions=permissions,
+        **({"allow_host_resources": allow_host_resources}
+           if allow_host_resources is not None else {}),
+    )
+    return asyncio.run(
+        workspace_routes.put_workspace_permissions(
+            ws_id=ws_id, body=body, request=_no_origin_request()
+        )
+    )
+
+
+def _patch_registry(monkeypatch, ws_id="ws-1"):
+    """Patch WorkspaceRegistry.get_default with an entry for *ws_id* (and
+    None for anything else, exercising the 404 branch)."""
+    entry = SimpleNamespace(id=ws_id, label="L", root_path="/tmp/ws-root")
+    fake = SimpleNamespace(get_workspace=lambda wid: entry if wid == ws_id else None)
+    monkeypatch.setattr(
+        workspace_routes.WorkspaceRegistry,
+        "get_default",
+        classmethod(lambda cls: fake),
+    )
+    return entry
+
+
+def _patch_summary_deps(monkeypatch, tmp_path):
+    """Patch every external dependency the summary touches onto tmp_path /
+    fakes so the payload is fully deterministic.  The permission ceiling is
+    left REAL: both the SSOT config reader and config_manager's
+    ``_workspace_dir`` resolve ``<vault_root>/workspaces/<id>/config.json``,
+    so overriding the vault root is enough."""
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+    monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
+
+    # Capability loader returns None -> fully-permissive default.
+    monkeypatch.setattr(workspace_routes, "load_workspace_capabilities",
+                        lambda ws_id: None)
+
+    import session.session_registry as sreg
+
+    fake_sessions = SimpleNamespace(get_all=lambda: {})
+    monkeypatch.setattr(
+        sreg.SessionRegistry, "get_default", classmethod(lambda cls: fake_sessions)
+    )
+
+    monkeypatch.setattr(workspace_routes, "_collect_active_workers",
+                        lambda ws_id: [])
+    monkeypatch.setattr(workspace_routes, "_containers_for_workspace",
+                        lambda entry: [])
+
+    import session.tool_presets as tool_presets
+
+    monkeypatch.setattr(tool_presets, "_ALL_TOOLS", [])
+
+    catalog_path = tmp_path / "resource_catalog.json"
+    monkeypatch.setattr(workspace_routes, "_RESOURCE_CATALOG_PATH", catalog_path)
+    _write_json(catalog_path, [])
+
+
+# ── PUT /api/workspace/{ws_id}/permissions ────────────────────────────────────
+
+
+def test_update_workspace_permissions_persists_and_reflects_in_summary(
+        tmp_path, monkeypatch):
+    """A valid update merges into config.json (other keys preserved) and the
+    saved map becomes the permission ceiling reported by the summary."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    _write_json(tmp_path / "workspaces" / "ws-1" / "config.json", {
+        "purpose": "general",
+        "capabilities": {"fs": True, "net": False},
+        "domain_allowlist": ["example.com"],
+    })
+
+    saved = {"git": "write", "filesystem": "ask"}
+    result = _put("ws-1", saved)
+    assert result["permissions"] == saved
+    assert result["purpose"] == "general"
+    assert result["allow_host_resources"] is False
+    assert "risk" in result
+
+    cfg = _read_config(tmp_path)
+    assert cfg["permissions"] == saved
+    assert cfg["purpose"] == "general"
+    assert cfg["capabilities"] == {"fs": True, "net": False}
+    assert cfg["domain_allowlist"] == ["example.com"]
+
+    # The saved map is the ceiling for the summary endpoint.
+    _patch_registry(monkeypatch)
+    _patch_summary_deps(monkeypatch, tmp_path)
+    summary = asyncio.run(workspace_routes.get_workspace_overview("ws-1"))
+    assert summary["permissions"] == saved
+
+
+def test_update_workspace_permissions_rejects_unknown_resource(
+        tmp_path, monkeypatch):
+    """An unknown resource name is a 422 and nothing is persisted."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    _write_json(tmp_path / "workspaces" / "ws-1" / "config.json", {"purpose": "general"})
+
+    with pytest.raises(HTTPException) as exc:
+        _put("ws-1", {"nonexistent_resource": "read"})
+    assert exc.value.status_code == 422
+    assert isinstance(exc.value.detail, dict)
+    assert "unknown resource 'nonexistent_resource'" in exc.value.detail["errors"]
+
+    assert _read_config(tmp_path) == {"purpose": "general"}
+
+
+def test_workspace_permissions_survive_restart(tmp_path, monkeypatch):
+    """Gap A regression: the saved map round-trips through a fresh (restart)
+    config read, the GET route, and the permission-ceiling loader used by
+    config resolution — no in-memory state is required."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    _write_json(tmp_path / "workspaces" / "ws-1" / "config.json", {"purpose": "general"})
+
+    saved = {"git": "write", "filesystem": "ask", "network": "banned"}
+    result = _put("ws-1", saved)
+    assert result["permissions"] == saved
+
+    # ── simulated restart: fresh reads only (no module-level state) ──
+    cfg = workspace_routes._load_workspace_config("ws-1")
+    assert cfg["permissions"] == saved
+    assert cfg["purpose"] == "general"
+
+    got = asyncio.run(workspace_routes.get_workspace_permissions("ws-1"))
+    assert got["permissions"] == saved
+    assert got["allow_host_resources"] is False
+
+    # The saved map is the ceiling config resolution applies to sessions.
+    from web_ui.backend import config_manager as cm
+
+    assert cm._load_workspace_permission_ceiling("ws-1") == saved
+
+
+def test_update_workspace_permissions_rejects_invalid_level(tmp_path, monkeypatch):
+    """An invalid permission level for a known resource is a 422 and nothing
+    is persisted."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    _write_json(tmp_path / "workspaces" / "ws-1" / "config.json", {"purpose": "general"})
+
+    with pytest.raises(HTTPException) as exc:
+        _put("ws-1", {"git": "superuser"})
+    assert exc.value.status_code == 422
+    assert isinstance(exc.value.detail, dict)
+    assert any(
+        "invalid level 'superuser' for resource 'git'" in err
+        for err in exc.value.detail["errors"]
+    )
+
+    assert _read_config(tmp_path) == {"purpose": "general"}

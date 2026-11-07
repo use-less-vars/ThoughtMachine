@@ -1,0 +1,757 @@
+"""
+Tests for workspace permission validation and the permissions REST endpoints.
+"""
+
+from __future__ import annotations
+
+import sys
+
+_bad_prefix = "/workspace/tests"
+sys.path = [p for p in sys.path if not p.startswith(_bad_prefix)]
+_stubs_path = "/tmp/stubs"
+if _stubs_path in sys.path:
+    sys.path.remove(_stubs_path)
+if "/workspace" in sys.path:
+    sys.path.remove("/workspace")
+sys.path.insert(0, _stubs_path)
+sys.path.insert(1, "/workspace")
+
+import json
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from agent.config.resource_catalog import validate_workspace_permissions
+
+
+def test_workspace_permissions_validation_rejects_unknown():
+    """Unknown resources and invalid levels are dropped and reported as errors."""
+    normalized, errors = validate_workspace_permissions(
+        {"git": "read", "not_a_resource": "write", "filesystem": "banana"}
+    )
+    assert normalized == {"git": "read"}
+    assert any("unknown resource 'not_a_resource'" in e for e in errors)
+    assert any("invalid level 'banana' for resource 'filesystem'" in e for e in errors)
+
+    normalized, errors = validate_workspace_permissions({"git_write": "banana"})
+    assert normalized == {}
+    assert errors == [
+        "legacy permission resource 'git_write' is no longer supported; use 'git'"
+    ]
+
+
+def test_workspace_permissions_validation_docker_alias_write():
+    """docker 'write' (legacy alias of container) normalises to container True
+    with no errors and never survives into the result as a docker key."""
+    normalized, errors = validate_workspace_permissions({"docker": "write"})
+    assert errors == []
+    assert normalized == {"container": True}
+    assert "docker" not in normalized
+
+
+def test_workspace_permissions_validation_docker_alias_non_write():
+    """docker banned/read/ask map to container False (never a grant)."""
+    for level in ("banned", "read", "ask"):
+        normalized, errors = validate_workspace_permissions({"docker": level})
+        assert errors == [], level
+        assert normalized == {"container": False}, level
+
+
+def test_workspace_permissions_validation_docker_alias_invalid_level():
+    """docker with an invalid level errors naming the container alias -- it is
+    NEVER reported as 'unknown resource docker'."""
+    normalized, errors = validate_workspace_permissions({"docker": "banana"})
+    assert normalized == {}
+    assert len(errors) == 1
+    assert "for resource 'docker'" in errors[0]
+    assert "legacy alias of 'container'" in errors[0]
+    assert "unknown resource" not in errors[0]
+
+
+def test_workspace_permissions_validation_canonical_container_bool():
+    """Canonical container booleans pass through verbatim."""
+    normalized, errors = validate_workspace_permissions({"container": True})
+    assert errors == []
+    assert normalized == {"container": True}
+    normalized, errors = validate_workspace_permissions({"container": False})
+    assert errors == []
+    assert normalized == {"container": False}
+
+
+def test_workspace_permissions_persist_and_load(tmp_path, monkeypatch):
+    """PUT /permissions validates, persists to config.json, and GET reloads it."""
+    vault = tmp_path / "vault"
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+    ws_dir = vault / "workspaces" / "ws-test"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "config.json").write_text(
+        json.dumps({"purpose": "general", "permissions": {"git": "read"}}),
+        encoding="utf-8",
+    )
+
+    from web_ui.backend.workspace_routes import router
+
+    app = FastAPI()
+    app.include_router(router)
+    with TestClient(app) as client:
+        put = client.put(
+            "/api/workspace/ws-test/permissions",
+            json={"permissions": {"git": "read", "host_bash": "banned"}},
+        )
+        assert put.status_code == 200
+        data = put.json()
+        assert data["permissions"] == {"git": "read", "host_bash": "banned"}
+        assert data["risk"]["level"] in ("low", "medium", "high")
+
+        get = client.get("/api/workspace/ws-test/permissions")
+        assert get.status_code == 200
+        assert get.json()["permissions"] == {"git": "read", "host_bash": "banned"}
+
+        bad = client.put(
+            "/api/workspace/ws-test/permissions", json={"permissions": {"nope": "write"}}
+        )
+        assert bad.status_code == 422
+        assert bad.json()["detail"]["errors"] == ["unknown resource 'nope'"]
+
+    saved = json.loads((ws_dir / "config.json").read_text(encoding="utf-8"))
+    assert saved["permissions"] == {"git": "read", "host_bash": "banned"}
+
+
+def test_workspace_permissions_validation_accepts_canonical_catalog_levels():
+    """Every canonical catalog level is accepted verbatim by the PUT validator."""
+    accepted = [
+        {"git": "write_on_feature_branch"},
+        {"git": "write"},
+        {"git": "read"},
+        {"git": "ask"},
+        {"git": "banned"},
+        {"network": "outbound"},
+        {"network": "write"},
+        {"network": "ask"},
+        {"network": "banned"},
+        {"mcp": "full"},
+        {"mcp": "connect"},
+        {"mcp": "banned"},
+        {"host_bash": "allow"},
+        {"host_bash": "ask"},
+        {"host_bash": "banned"},
+        {"container": True},
+        {"container": False},
+        {"filesystem": "write"},
+    ]
+    for entry in accepted:
+        key, value = next(iter(entry.items()))
+        normalized, errors = validate_workspace_permissions(entry)
+        assert errors == [], (key, value, errors)
+        assert normalized == entry, (key, value, normalized)
+
+
+def test_workspace_permissions_validation_rejects_off_catalog_levels():
+    """Levels outside each resource's canonical scale are rejected (PUT 422)."""
+    rejected = [
+        ({"network": "read"}, "invalid level 'read' for resource 'network'"),
+        ({"mcp": "ask"}, "invalid level 'ask' for resource 'mcp'"),
+        ({"mcp": "read"}, "invalid level 'read' for resource 'mcp'"),
+        ({"mcp": "write"}, "invalid level 'write' for resource 'mcp'"),
+        ({"git": "full"}, "invalid level 'full' for resource 'git'"),
+        ({"filesystem": "full"}, "invalid level 'full' for resource 'filesystem'"),
+        ({"host_bash": "read"}, "invalid level 'read' for resource 'host_bash'"),
+        (
+            {"git": "write_feature_branches"},
+            "invalid level 'write_feature_branches' for resource 'git'",
+        ),
+    ]
+    for entry, message in rejected:
+        normalized, errors = validate_workspace_permissions(entry)
+        assert normalized == {}, entry
+        assert any(message in e for e in errors), (entry, errors)
+
+
+def test_workspace_permissions_validation_container_rejects_all_string_forms():
+    """container is a real-boolean ceiling: every string form is rejected
+    (pre-catalog vocab and JSON-stringified booleans alike)."""
+    for value in ("ask", "write", "banned", "read", "full", "true", "1"):
+        normalized, errors = validate_workspace_permissions({"container": value})
+        assert normalized == {}, value
+        assert any(
+            "invalid level %r for resource 'container' (expected a boolean)" % value in e
+            for e in errors
+        ), (value, errors)
+
+
+from security.resource_catalog import GRANT_LEVEL_RANKS
+from security.security_gate import apply_workspace_ceiling, get_effective_permissions
+from thoughtmachine.security import SessionPermissions
+from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
+
+from web_ui.backend import config_manager
+
+
+def test_grant_level_ranks_orders_read_strictly_below_ask():
+    """A2: on the shared grant-level scale ``read`` is STRICTLY LESS
+    PERMISSIVE than ``ask`` -- an ``ask`` grant opens an interactive-approval
+    path that ``read`` does not -- so its rank must be strictly lower."""
+    assert GRANT_LEVEL_RANKS["read"] < GRANT_LEVEL_RANKS["ask"]
+    # Anchor the surrounding corrected order so a bad re-rank is caught too.
+    assert (
+        GRANT_LEVEL_RANKS["banned"]
+        < GRANT_LEVEL_RANKS["read"]
+        < GRANT_LEVEL_RANKS["ask"]
+        < GRANT_LEVEL_RANKS["write"]
+    )
+    assert (
+        GRANT_LEVEL_RANKS["write"]
+        == GRANT_LEVEL_RANKS["write_on_feature_branch"]
+    )
+    assert GRANT_LEVEL_RANKS["outbound"] < GRANT_LEVEL_RANKS["full"]
+
+
+def test_grant_level_ranks_connect_aligns_with_read_tier():
+    """Edge 3.1: the mcp ``connect`` grant level ranks AT the read tier on the
+    shared grant-level scale -- matching ``WORKSPACE_CEILING_LEVELS_RANKS``
+    (where ``connect`` == ``read`` == 1.0) -- and therefore strictly BELOW
+    ``ask``.  A bare ``connect`` grant authorises read-equivalent mcp access,
+    not the interactive ``ask`` tier nor the ``write`` tier."""
+    assert GRANT_LEVEL_RANKS["connect"] == GRANT_LEVEL_RANKS["read"]
+    assert GRANT_LEVEL_RANKS["connect"] < GRANT_LEVEL_RANKS["ask"]
+
+
+class TestApplyWorkspaceCeiling:
+    """Unit tests for apply_workspace_ceiling (pure dict reduction)."""
+
+    def test_banned_caps_write(self):
+        result = apply_workspace_ceiling({"filesystem": "banned"}, {"filesystem": "write"})
+        assert result == {"filesystem": "banned"}
+
+    def test_read_caps_write(self):
+        result = apply_workspace_ceiling({"filesystem": "read"}, {"filesystem": "write"})
+        assert result == {"filesystem": "read"}
+
+    def test_ask_ceiling_caps_write_to_ask(self):
+        # An ask ceiling caps a more-permissive session value to the ceiling
+        # level itself -- 'ask' -- by ordering (write rank 3.0 -> ask rank 2.0).
+        result = apply_workspace_ceiling({"filesystem": "ask"}, {"filesystem": "write"})
+        assert result == {"filesystem": "ask"}
+
+    def test_write_keeps_write(self):
+        result = apply_workspace_ceiling({"filesystem": "write"}, {"filesystem": "write"})
+        assert result == {"filesystem": "write"}
+
+    def test_more_restrictive_session_stands(self):
+        result = apply_workspace_ceiling({"filesystem": "write"}, {"filesystem": "read"})
+        assert result == {"filesystem": "read"}
+
+    def test_legacy_write_feature_branches_token_is_unknown_level_fail_open(self):
+        # A raw legacy 'write_feature_branches' token is not part of any
+        # canonical ceiling vocabulary (git uses 'write_on_feature_branch').
+        # When such a token reaches the gate directly (loader bypassed) it is
+        # an UNKNOWN level: fail-open with a WARN, so the session grant stands.
+        for resource in ("filesystem", "git"):
+            result = apply_workspace_ceiling(
+                {resource: "write_feature_branches"}, {resource: "write"}
+            )
+            assert result == {resource: "write"}, resource
+
+    def test_git_write_on_feature_branch_ceiling_caps_write_grant(self):
+        # Normative DISPATCH-6 example: ceiling write_on_feature_branch
+        # (rank 2.5) is more restrictive than a session write grant (3.0),
+        # so the ceiling level itself becomes the effective git level.
+        result = apply_workspace_ceiling(
+            {"git": "write_on_feature_branch"}, {"git": "write"}
+        )
+        assert result == {"git": "write_on_feature_branch"}
+
+    def test_missing_resource_not_capped(self):
+        # A ceiling for a resource the session has not granted is not injected.
+        result = apply_workspace_ceiling({"network": "read"}, {"filesystem": "write"})
+        assert result == {"filesystem": "write"}
+
+    def test_docker_banned_blocks_container_true(self):
+        result = apply_workspace_ceiling({"docker": "banned"}, {"container": True})
+        assert result == {"container": False}
+
+    def test_docker_write_allows_container_true(self):
+        result = apply_workspace_ceiling({"docker": "write"}, {"container": True})
+        assert result == {"container": True}
+
+    def test_docker_read_blocks_container_true(self):
+        result = apply_workspace_ceiling({"docker": "read"}, {"container": True})
+        assert result == {"container": False}
+
+    def test_docker_banned_blocks_container_ask(self):
+        result = apply_workspace_ceiling({"docker": "banned"}, {"container": "ask"})
+        assert result == {"container": False}
+
+    def test_docker_write_allows_container_write(self):
+        result = apply_workspace_ceiling({"docker": "write"}, {"container": "write"})
+        assert result == {"container": True}
+
+    def test_host_bash_banned_caps_allow(self):
+        # host_bash session vocabulary is banned/ask/allow (no legacy "write"
+        # grain); a banned ceiling caps the strongest session grant (allow).
+        result = apply_workspace_ceiling({"host_bash": "banned"}, {"host_bash": "allow"})
+        assert result == {"host_bash": "banned"}
+
+    def test_git_read_ceiling_caps_write(self):
+        result = apply_workspace_ceiling({"git": "read"}, {"git": "write"})
+        assert result == {"git": "read"}
+
+    def test_filesystem_read_caps_full(self):
+        result = apply_workspace_ceiling({"filesystem": "read"}, {"filesystem": "full"})
+        assert result == {"filesystem": "read"}
+
+    def test_unknown_ceiling_level_fail_open(self):
+        result = apply_workspace_ceiling({"filesystem": "mega"}, {"filesystem": "write"})
+        assert result == {"filesystem": "write"}
+
+    def test_unknown_resource_ignored(self):
+        result = apply_workspace_ceiling({"not_a_resource": "banned"}, {"filesystem": "write"})
+        assert result == {"filesystem": "write"}
+
+    def test_fail_policy_unknown_ceiling_value_is_fail_open(self):
+        # B4 fail-policy, *value* direction: an unknown ceiling VALUE -- an
+        # unknown level token, or a resource token outside the catalog -- must
+        # NOT cap the session grant. The unknown value is dropped (never
+        # injected, never banned): fail-OPEN, the session value stands uncapped.
+        session = {"filesystem": "write", "git": "write"}
+        result = apply_workspace_ceiling(
+            {"filesystem": "mega", "git": "banana", "not_a_resource": "banned"},
+            session,
+        )
+        assert result == {"filesystem": "write", "git": "write"}
+        # Fail-open == "no ceiling applied": the unknown resource is neither
+        # capped nor injected, and the permissive session levels survive verbatim.
+        assert "not_a_resource" not in result
+        assert result is not session
+
+    def test_git_ask_ceiling_caps_write_to_ask(self):
+        result = apply_workspace_ceiling({"git": "ask"}, {"git": "write"})
+        assert result == {"git": "ask"}
+
+    def test_ask_ceiling_over_session_ask_stands(self):
+        # A genuine session-level ask grant ranks AT the ask ceiling and
+        # passes through unchanged (interactive prompt flow preserved).
+        result = apply_workspace_ceiling({"filesystem": "ask"}, {"filesystem": "ask"})
+        assert result == {"filesystem": "ask"}
+
+    def test_ask_ceiling_over_session_read_stands(self):
+        # A session read grant is already below the ask ceiling: it stands.
+        result = apply_workspace_ceiling({"filesystem": "ask"}, {"filesystem": "read"})
+        assert result == {"filesystem": "read"}
+
+    def test_network_ask_ceiling_caps_write_to_ask(self):
+        # An ask ceiling caps a more-permissive network grant to the ceiling
+        # level itself -- 'ask' -- by ordering (write rank 3.0 -> ask rank 2.0).
+        result = apply_workspace_ceiling({"network": "ask"}, {"network": "write"})
+        assert result == {"network": "ask"}
+
+    def test_network_ask_ceiling_caps_outbound_to_ask(self):
+        result = apply_workspace_ceiling({"network": "ask"}, {"network": "outbound"})
+        assert result == {"network": "ask"}
+
+    def test_host_bash_ask_ceiling_caps_allow_to_banned(self):
+        # host_bash has no tier between banned and ask, so an ask ceiling
+        # over an allow grant caps to banned (never a fabricated ask).
+        result = apply_workspace_ceiling({"host_bash": "ask"}, {"host_bash": "allow"})
+        assert result == {"host_bash": "banned"}
+
+    def test_host_bash_ask_ceiling_over_ask_grant_stands(self):
+        result = apply_workspace_ceiling({"host_bash": "ask"}, {"host_bash": "ask"})
+        assert result == {"host_bash": "ask"}
+
+    def test_git_write_ceiling_does_not_cap_write_on_feature_branch_grant(self):
+        # Normative DISPATCH-6 example: a write ceiling (3.0) is NOT more
+        # restrictive than a wofb grant (2.5) -- the feature-branch-restricted
+        # grant stands unchanged.
+        result = apply_workspace_ceiling(
+            {"git": "write"}, {"git": "write_on_feature_branch"}
+        )
+        assert result == {"git": "write_on_feature_branch"}
+
+    def test_write_on_feature_branch_ceiling_does_not_cap_wofb_grant(self):
+        result = apply_workspace_ceiling(
+            {"git": "write_on_feature_branch"}, {"git": "write_on_feature_branch"}
+        )
+        assert result == {"git": "write_on_feature_branch"}
+
+    def test_write_on_feature_branch_ceiling_invalid_on_git_grains_fail_open(self):
+        # wofb exists on the git aggregate scale only; git_read/git_write take
+        # the four-level scale, so a wofb ceiling there is an unknown level:
+        # fail-open with a WARN and the session grant stands.
+        result = apply_workspace_ceiling(
+            {"git_write": "write_on_feature_branch"}, {"git_write": "write"}
+        )
+        assert result == {"git_write": "write"}
+
+    def test_read_ceiling_caps_write_on_feature_branch_grant(self):
+        result = apply_workspace_ceiling({"git": "read"}, {"git": "write_on_feature_branch"})
+        assert result == {"git": "read"}
+
+    def test_network_write_ceiling_caps_outbound_grant(self):
+        # Normative DISPATCH-6 example: outbound (3.5 grant / 4.0 ceiling
+        # rank) sits above write, so a write ceiling pulls an outbound
+        # grant down to the ceiling level 'write'.
+        result = apply_workspace_ceiling({"network": "write"}, {"network": "outbound"})
+        assert result == {"network": "write"}
+
+    def test_network_outbound_ceiling_is_unlimited_for_lower_grants(self):
+        # Normative DISPATCH-6 example: an outbound ceiling ranks 4.0
+        # (unlimited tier) -- a plain write grant stands untouched.
+        result = apply_workspace_ceiling({"network": "outbound"}, {"network": "write"})
+        assert result == {"network": "write"}
+
+    def test_mcp_connect_ceiling_caps_full_grant(self):
+        result = apply_workspace_ceiling({"mcp": "connect"}, {"mcp": "full"})
+        assert result == {"mcp": "connect"}
+
+    def test_mcp_full_ceiling_is_unlimited_for_connect_grant(self):
+        result = apply_workspace_ceiling({"mcp": "full"}, {"mcp": "connect"})
+        assert result == {"mcp": "connect"}
+
+    def test_host_bash_allow_ceiling_keeps_ask_grant(self):
+        result = apply_workspace_ceiling({"host_bash": "allow"}, {"host_bash": "ask"})
+        assert result == {"host_bash": "ask"}
+
+    def test_container_false_ceiling_caps_true_session(self):
+        result = apply_workspace_ceiling({"container": False}, {"container": True})
+        assert result == {"container": False}
+
+    def test_container_true_ceiling_keeps_false_session(self):
+        # A ceiling can only restrict; a disabled session container stays off
+        # even under an unlimited (True) container ceiling.
+        result = apply_workspace_ceiling({"container": True}, {"container": False})
+        assert result == {"container": False}
+
+    def test_empty_workspace_permissions_copies_session(self):
+        session = {"filesystem": "write", "network": "banned"}
+        result = apply_workspace_ceiling({}, session)
+        assert result == session
+        assert result is not session
+
+    def test_original_session_dict_not_mutated(self):
+        session = {"filesystem": "write", "container": True}
+        apply_workspace_ceiling({"filesystem": "read", "docker": "banned"}, session)
+        assert session == {"filesystem": "write", "container": True}
+
+
+class TestEffectivePermissionsCeilingWiring:
+    """get_effective_permissions applies workspace ceilings on top of session perms."""
+
+    @staticmethod
+    def _session():
+        return SessionPermissions(
+            filesystem="write",
+            network="write",
+            container=True,
+            git="write",
+        )
+
+    def test_filesystem_ceiling_read(self):
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, {"filesystem": "read"})
+        assert eff["filesystem"] == "read"
+
+    def test_docker_ceiling_banned_blocks_container(self):
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, {"docker": "banned"})
+        assert eff["container"] is False
+
+    def test_network_ceiling_banned(self):
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, {"network": "banned"})
+        assert eff["network"] == "banned"
+
+    def test_git_ceiling_read_splits(self):
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, {"git": "read"})
+        assert eff["git"] == "read"
+        assert "git_read" not in eff and "git_write" not in eff
+
+    def test_git_ceiling_ask_splits_to_ask(self):
+        # An ask ceiling over a session write grant caps git to the ceiling
+        # level itself -- 'ask'.
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, {"git": "ask"})
+        assert eff["git"] == "ask"
+
+    def test_filesystem_ceiling_ask_caps_write_to_ask(self):
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, {"filesystem": "ask"})
+        assert eff["filesystem"] == "ask"
+
+    def test_network_ceiling_ask_caps_write_to_ask(self):
+        # The ask ceiling over the write grant caps network to the ceiling
+        # level itself -- 'ask'.
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, {"network": "ask"})
+        assert eff["network"] == "ask"
+
+    def test_genuine_session_ask_git_preserved(self):
+        # A session-level git ask grant ranks AT the ask ceiling and passes
+        # through unchanged -- the interactive prompt flow is not regressed.
+        workspace = WorkspaceCapabilities()
+        session = SessionPermissions(
+            filesystem="write",
+            network="write",
+            container=True,
+            git="ask",
+        )
+        eff = get_effective_permissions(session, workspace, {"git": "ask"})
+        assert eff["git"] == "ask"
+
+    def test_git_write_on_feature_branch_ceiling_wiring(self):
+        # Normative DISPATCH-6 example end-to-end: ceiling wofb over a
+        # session write grant -> effective git is write_on_feature_branch.
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(
+            self._session(), workspace, {"git": "write_on_feature_branch"}
+        )
+        assert eff["git"] == "write_on_feature_branch"
+
+    def test_git_write_ceiling_does_not_cap_wofb_grant_wiring(self):
+        workspace = WorkspaceCapabilities()
+        session = SessionPermissions(
+            filesystem="write",
+            network="write",
+            container=True,
+            git="write_on_feature_branch",
+        )
+        eff = get_effective_permissions(session, workspace, {"git": "write"})
+        assert eff["git"] == "write_on_feature_branch"
+
+    def test_git_read_ceiling_caps_wofb_grant_wiring(self):
+        workspace = WorkspaceCapabilities()
+        session = SessionPermissions(
+            filesystem="write",
+            network="write",
+            container=True,
+            git="write_on_feature_branch",
+        )
+        eff = get_effective_permissions(session, workspace, {"git": "read"})
+        assert eff["git"] == "read"
+
+    def test_git_ask_ceiling_caps_wofb_grant_wiring(self):
+        # The ask ceiling (rank 2.0) caps the wofb grant (rank 2.5) to the
+        # ceiling level itself -- 'ask'.
+        workspace = WorkspaceCapabilities()
+        session = SessionPermissions(
+            filesystem="write",
+            network="write",
+            container=True,
+            git="write_on_feature_branch",
+        )
+        eff = get_effective_permissions(session, workspace, {"git": "ask"})
+        assert eff["git"] == "ask"
+
+    def test_network_write_ceiling_caps_outbound_grant_wiring(self):
+        workspace = WorkspaceCapabilities()
+        session = SessionPermissions(
+            filesystem="write",
+            network="outbound",
+            container=True,
+            git="write",
+            system="read",
+            mcp="banned",
+            execution="banned",
+        )
+        eff = get_effective_permissions(session, workspace, {"network": "write"})
+        assert eff["network"] == "write"
+
+    def test_network_outbound_ceiling_is_unlimited_wiring(self):
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, {"network": "outbound"})
+        assert eff["network"] == "write"
+        session = SessionPermissions(
+            filesystem="write",
+            network="outbound",
+            container=True,
+            git="write",
+            system="read",
+            mcp="banned",
+            execution="banned",
+        )
+        eff = get_effective_permissions(session, workspace, {"network": "outbound"})
+        assert eff["network"] == "outbound"
+
+    def test_mcp_connect_ceiling_caps_full_grant_wiring(self):
+        workspace = WorkspaceCapabilities()
+        session = SessionPermissions(
+            filesystem="write",
+            network="write",
+            container=True,
+            git="write",
+            system="read",
+            mcp="full",
+            execution="banned",
+        )
+        eff = get_effective_permissions(session, workspace, {"mcp": "connect"})
+        assert eff["mcp"] == "connect"
+
+    def test_mcp_full_ceiling_is_unlimited_wiring(self):
+        workspace = WorkspaceCapabilities()
+        session = SessionPermissions(
+            filesystem="write",
+            network="write",
+            container=True,
+            git="write",
+            system="read",
+            mcp="connect",
+            execution="banned",
+        )
+        eff = get_effective_permissions(session, workspace, {"mcp": "full"})
+        assert eff["mcp"] == "connect"
+
+    def test_container_false_ceiling_blocks_container(self):
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, {"container": False})
+        assert eff["container"] is False
+
+    def test_container_true_ceiling_keeps_disabled_session(self):
+        workspace = WorkspaceCapabilities()
+        session = SessionPermissions(
+            filesystem="write",
+            network="write",
+            container=False,
+            git="write",
+            system="read",
+            mcp="banned",
+            execution="banned",
+        )
+        eff = get_effective_permissions(session, workspace, {"container": True})
+        assert eff["container"] is False
+
+    def test_no_ceiling_keeps_session_perms(self):
+        workspace = WorkspaceCapabilities()
+        eff = get_effective_permissions(self._session(), workspace, None)
+        assert eff["filesystem"] == "write"
+        assert eff["network"] == "write"
+        assert eff["container"] is True
+        assert eff["git"] == "write"
+
+
+class TestResolveFullConfigCeiling:
+    """resolve_full_config applies the workspace permission ceiling to merged config."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_layers(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            config_manager,
+            "_load_factory_defaults",
+            lambda: {
+                "session_permissions": {
+                    "filesystem": "write",
+                    "network": "write",
+                    "container": True,
+                    "git": "write",
+                }
+            },
+        )
+        monkeypatch.setattr(config_manager, "_load_global_defaults_layer", lambda: {})
+        monkeypatch.setattr(config_manager, "_load_agent_config_layer", lambda: {})
+        monkeypatch.setattr(
+            config_manager,
+            "_resolve_provider_layer",
+            lambda merged, provider_id=None, fallback_any=True: merged,
+        )
+        monkeypatch.setattr(
+            config_manager,
+            "_get_workspace_defaults_path",
+            lambda ws_id: tmp_path / "no-workspace" / "defaults.json",
+        )
+
+    def test_ceiling_applied_to_merged_permissions(self, monkeypatch):
+        monkeypatch.setattr(
+            config_manager,
+            "_load_workspace_permission_ceiling",
+            lambda ws_id: {
+                "filesystem": "read",
+                "docker": "banned",
+                "network": "banned",
+                "git": "read",
+            },
+        )
+        merged = config_manager.resolve_full_config(workspace_id="ws1")
+        assert merged["session_permissions"] == {
+            "filesystem": "read",
+            "network": "banned",
+            "container": False,
+            "git": "read",
+        }
+
+    def test_worker_overrides_still_capped(self, monkeypatch):
+        monkeypatch.setattr(
+            config_manager,
+            "_load_workspace_permission_ceiling",
+            lambda ws_id: {"filesystem": "read"},
+        )
+        merged = config_manager.resolve_full_config(
+            workspace_id="ws1",
+            worker_overrides={"session_permissions": {"filesystem": "write", "network": "write"}},
+        )
+        perms = merged["session_permissions"]
+        assert perms["filesystem"] == "read"
+        assert perms["network"] == "write"
+        assert perms["container"] is True
+
+    def test_no_workspace_skips_ceiling(self, monkeypatch):
+        calls = []
+
+        def spy(ws_id):
+            calls.append(ws_id)
+            return {}
+
+        monkeypatch.setattr(config_manager, "_load_workspace_permission_ceiling", spy)
+        merged = config_manager.resolve_full_config()
+        assert merged["session_permissions"]["filesystem"] == "write"
+        assert merged["session_permissions"]["container"] is True
+        assert calls == []
+
+    def test_no_session_permissions_key_no_crash(self, monkeypatch):
+        monkeypatch.setattr(config_manager, "_load_factory_defaults", lambda: {"model": "gpt-x"})
+        monkeypatch.setattr(
+            config_manager,
+            "_load_workspace_permission_ceiling",
+            lambda ws_id: {"filesystem": "read"},
+        )
+        merged = config_manager.resolve_full_config(workspace_id="ws1")
+        assert "session_permissions" not in merged
+
+    def test_real_vault_config_file(self, monkeypatch, tmp_path):
+        import thoughtmachine.workspace_capabilities as wc_mod
+
+        monkeypatch.setattr(
+            wc_mod, "_workspace_dir", lambda ws_id: tmp_path / "workspaces" / ws_id
+        )
+        ws_dir = tmp_path / "workspaces" / "ws1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "config.json").write_text(
+            json.dumps({"purpose": "general", "permissions": {"filesystem": "read", "docker": "banned"}}),
+            encoding="utf-8",
+        )
+        merged = config_manager.resolve_full_config(workspace_id="ws1")
+        perms = merged["session_permissions"]
+        assert perms["filesystem"] == "read"
+        assert perms["container"] is False
+
+    def test_presets_not_applied_at_read_time(self, monkeypatch, tmp_path):
+        import thoughtmachine.workspace_capabilities as wc_mod
+
+        monkeypatch.setattr(
+            wc_mod, "_workspace_dir", lambda ws_id: tmp_path / "workspaces" / ws_id
+        )
+        ws_dir = tmp_path / "workspaces" / "ws1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "config.json").write_text(
+            json.dumps({"purpose": "coding"}), encoding="utf-8"
+        )
+        merged = config_manager.resolve_full_config(workspace_id="ws1")
+        perms = merged["session_permissions"]
+        # No stored permissions -> NO read-time ceiling -> the factory grants
+        # pass uncapped.  The purpose preset is applied at CREATION time
+        # (workspace_routes.create_workspace), never at read time.
+        assert perms["container"] is True
+        assert perms["network"] == "write"
+        assert perms["filesystem"] == "write"
+        assert perms["git"] == "write"
+

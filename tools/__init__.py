@@ -1,9 +1,25 @@
 # tools/__init__.py - Explicit tool registration to avoid circular imports
 import logging
-from typing import List, Type, Set
+from typing import List, Dict, Type, Set, Optional, Tuple
 from .base import ToolBase
 
 logger = logging.getLogger(__name__)
+
+# Import-failure registry: no tool import failure is silent anymore.
+# Every failure is recorded here (and logged at ERROR level) so the agent
+# can surface degraded tooling instead of quietly missing tools.
+IMPORT_FAILURES: List[Dict[str, str]] = []
+
+
+def _record_import_failure(tool_name: str, exc: Exception) -> None:
+    """Record a tool import failure and log it loudly."""
+    IMPORT_FAILURES.append({"tool": tool_name, "error": str(exc)})
+    logger.error(f"Failed to import {tool_name}: {exc}")
+
+
+def get_import_failures() -> List[Dict[str, str]]:
+    """Return a copy of the recorded tool import failures."""
+    return list(IMPORT_FAILURES)
 
 # Global tool registries
 TOOL_CLASSES: List[Type[ToolBase]] = []
@@ -50,6 +66,42 @@ def register_tool(cls: Type[ToolBase]) -> Type[ToolBase]:
         _update_simplified_toolset()
     return cls
 
+
+# ── registry accessors ──────────────────────────────────────────────────────
+# The registry lists above are module state with one writer (this module) and
+# no lock; everything outside tools/__init__.py goes through these accessors
+# instead of naming TOOL_CLASSES / SIMPLIFIED_TOOL_CLASSES itself
+# (hygiene/no-tool-wrapping, letter (b)).
+def register_tool_class(cls: Type[ToolBase]) -> bool:
+    """Add *cls* to the registry; return True when it was not already there.
+
+    Keeps registration order identical to a plain ``TOOL_CLASSES.append`` and
+    refreshes SIMPLIFIED_TOOL_CLASSES afterwards.
+    """
+    added = cls not in TOOL_CLASSES
+    if added:
+        TOOL_CLASSES.append(cls)
+    _update_simplified_toolset()
+    return added
+
+
+def iter_tool_classes() -> Tuple[Type[ToolBase], ...]:
+    """All registered tool classes, in registration order (immutable snapshot)."""
+    return tuple(TOOL_CLASSES)
+
+
+def simplified_tool_classes() -> List[Type[ToolBase]]:
+    """The current simplified toolset as a fresh copy -- the live list is not exposed."""
+    return list(SIMPLIFIED_TOOL_CLASSES)
+
+
+def get_tool_class(name: str) -> Optional[Type[ToolBase]]:
+    """The registered tool class whose ``__name__`` is *name*, or None if absent."""
+    for cls in TOOL_CLASSES:
+        if cls.__name__ == name:
+            return cls
+    return None
+
 # Import all tool modules explicitly
 # Note: Import order matters for potential dependencies
 
@@ -57,167 +109,211 @@ try:
     from .file_editor import FileEditor
     TOOL_CLASSES.append(FileEditor)
 except ImportError as e:
-    logger.warning(f"Failed to import FileEditor: {e}")
+    _record_import_failure("FileEditor", e)
 
 try:
     from .read_file_tool import ReadFile
     TOOL_CLASSES.append(ReadFile)
 except ImportError as e:
-    logger.warning(f"Failed to import ReadFile: {e}")
+    _record_import_failure("ReadFile", e)
 
 try:
     from .file_preview_tool import FilePreviewTool
     TOOL_CLASSES.append(FilePreviewTool)
 except ImportError as e:
-    logger.warning(f"Failed to import FilePreviewTool: {e}")
+    _record_import_failure("FilePreviewTool", e)
 
 try:
     from .directory_tree_tool import DirectoryTreeTool
     TOOL_CLASSES.append(DirectoryTreeTool)
 except ImportError as e:
-    logger.warning(f"Failed to import DirectoryTreeTool: {e}")
+    _record_import_failure("DirectoryTreeTool", e)
 
 try:
     from .glob_tool import GlobTool
     TOOL_CLASSES.append(GlobTool)
 except ImportError as e:
-    logger.warning(f"Failed to import GlobTool: {e}")
+    _record_import_failure("GlobTool", e)
 
 try:
     from .file_search_tool import FileSearchTool
     TOOL_CLASSES.append(FileSearchTool)
 except ImportError as e:
-    logger.warning(f"Failed to import FileSearchTool: {e}")
+    _record_import_failure("FileSearchTool", e)
 
 try:
     from .apply_edits import ApplyEdits
     TOOL_CLASSES.append(ApplyEdits)
 except ImportError as e:
-    logger.warning(f"Failed to import ApplyEdits: {e}")
+    _record_import_failure("ApplyEdits", e)
 
 try:
     from .code_modifier import CodeModifier
     TOOL_CLASSES.append(CodeModifier)
 except ImportError as e:
-    logger.warning(f"Failed to import CodeModifier: {e}")
+    _record_import_failure("CodeModifier", e)
 
 try:
     from .refactor_tool import RefactorTool
     TOOL_CLASSES.append(RefactorTool)
 except ImportError as e:
-    logger.warning(f"Failed to import RefactorTool: {e}")
+    _record_import_failure("RefactorTool", e)
 
 try:
     from .search_codebase import SearchCodebaseTool
     TOOL_CLASSES.append(SearchCodebaseTool)
 except ImportError as e:
-    logger.warning(f"Failed to import SearchCodebaseTool: {e}")
+    _record_import_failure("SearchCodebaseTool", e)
 
 try:
     from .datetime_tool import DateTimeTool
     TOOL_CLASSES.append(DateTimeTool)
 except ImportError as e:
-    logger.warning(f"Failed to import DateTimeTool: {e}")
+    _record_import_failure("DateTimeTool", e)
 
 try:
     from .directory_creator import DirectoryCreator
     TOOL_CLASSES.append(DirectoryCreator)
 except ImportError as e:
-    logger.warning(f"Failed to import DirectoryCreator: {e}")
+    _record_import_failure("DirectoryCreator", e)
 
 try:
     from .docker_code_runner import DockerCodeRunner
     TOOL_CLASSES.append(DockerCodeRunner)
 except ImportError as e:
-    logger.warning(f"Failed to import DockerCodeRunner: {e}")
+    _record_import_failure("DockerCodeRunner", e)
+
+try:
+    from .visual_tool import VisualTool
+    TOOL_CLASSES.append(VisualTool)
+except ImportError as e:
+    _record_import_failure("VisualTool", e)
+
+try:
+    from .container_control import (
+        ContainerStartTool,
+        ContainerExecTool,
+        ContainerStopTool,
+        ContainerRestartTool,
+        ContainerRemoveTool,
+        ContainerStatusTool,
+        ContainerListTool,
+        ContainerBuildTool,
+        ContainerLogsTool,
+    )
+    TOOL_CLASSES.append(ContainerStartTool)
+    TOOL_CLASSES.append(ContainerExecTool)
+    TOOL_CLASSES.append(ContainerStopTool)
+    TOOL_CLASSES.append(ContainerRestartTool)
+    TOOL_CLASSES.append(ContainerRemoveTool)
+    TOOL_CLASSES.append(ContainerStatusTool)
+    TOOL_CLASSES.append(ContainerListTool)
+    TOOL_CLASSES.append(ContainerBuildTool)
+    TOOL_CLASSES.append(ContainerLogsTool)
+except ImportError as e:
+    _record_import_failure("container_control", e)
 
 try:
     from .field_viewer import FieldViewer
     TOOL_CLASSES.append(FieldViewer)
 except ImportError as e:
-    logger.warning(f"Failed to import FieldViewer: {e}")
+    _record_import_failure("FieldViewer", e)
 
 try:
     from .file_mover import FileMover
     TOOL_CLASSES.append(FileMover)
 except ImportError as e:
-    logger.warning(f"Failed to import FileMover: {e}")
+    _record_import_failure("FileMover", e)
 
 try:
     from .file_summary_tool import FileSummaryTool
     TOOL_CLASSES.append(FileSummaryTool)
 except ImportError as e:
-    logger.warning(f"Failed to import FileSummaryTool: {e}")
+    _record_import_failure("FileSummaryTool", e)
 
 # Final/FinalReport removed in Phase B — use Respond instead
 
 try:
-    from .git_info_tool import GitInfoTool
-    TOOL_CLASSES.append(GitInfoTool)
+    from .ci_read_tool import CiReadTool
+    TOOL_CLASSES.append(CiReadTool)
 except ImportError as e:
-    logger.warning(f"Failed to import GitInfoTool: {e}")
+    _record_import_failure("CiReadTool", e)
+
+try:
+    from .git_info_tool import GitReadTool
+    TOOL_CLASSES.append(GitReadTool)
+except ImportError as e:
+    _record_import_failure("GitReadTool", e)
+
+try:
+    from .git_write_tool import GitWriteTool
+    TOOL_CLASSES.append(GitWriteTool)
+except ImportError as e:
+    _record_import_failure("GitWriteTool", e)
+
+try:
+    from .host_bash_tool import HostBashTool
+    TOOL_CLASSES.append(HostBashTool)
+except ImportError as e:
+    _record_import_failure("HostBashTool", e)
 
 try:
     from .knowledge_base import KnowledgeBaseTool
     TOOL_CLASSES.append(KnowledgeBaseTool)
 except ImportError as e:
-    logger.warning(f"Failed to import KnowledgeBaseTool: {e}")
+    _record_import_failure("KnowledgeBaseTool", e)
 
-try:
-    from .mcp_validator import MCPValidator
-    TOOL_CLASSES.append(MCPValidator)
-except ImportError as e:
-    logger.warning(f"Failed to import MCPValidator: {e}")
-
-try:
-    from .paginate_tool import PaginateTool
-    TOOL_CLASSES.append(PaginateTool)
-except ImportError as e:
-    logger.warning(f"Failed to import PaginateTool: {e}")
+# Removed Gen 48 - tool-wrapping pattern banned as a class (see hygiene/no-tool-wrapping).
 
 try:
     from .progress_report import ProgressReport
     TOOL_CLASSES.append(ProgressReport)
 except ImportError as e:
-    logger.warning(f"Failed to import ProgressReport: {e}")
+    _record_import_failure("ProgressReport", e)
 
 # RequestUserInteraction removed in Phase B — use Respond instead
 try:
     from .respond import Respond
     TOOL_CLASSES.append(Respond)
 except ImportError as e:
-    logger.warning(f"Failed to import Respond: {e}")
+    _record_import_failure("Respond", e)
 
 
 try:
     from .summarize_tool import SummarizeTool
     TOOL_CLASSES.append(SummarizeTool)
 except ImportError as e:
-    logger.warning(f"Failed to import SummarizeTool: {e}")
+    _record_import_failure("SummarizeTool", e)
 
 try:
     from .thought import Thought
     TOOL_CLASSES.append(Thought)
 except ImportError as e:
-    logger.warning(f"Failed to import Thought: {e}")
+    _record_import_failure("Thought", e)
 
 try:
     from .workspace.check_system import CheckSystem
     TOOL_CLASSES.append(CheckSystem)
 except ImportError as e:
-    logger.warning(f"Failed to import CheckSystem: {e}")
+    _record_import_failure("CheckSystem", e)
 
 try:
     from .workspace.worker import Worker
     TOOL_CLASSES.append(Worker)
 except ImportError as e:
-    logger.warning(f"Failed to import Worker: {e}")
+    _record_import_failure("Worker", e)
 
 try:
-    from .workspace.edit_dockerfile import EditDockerfile
-    TOOL_CLASSES.append(EditDockerfile)
+    from .workspace.working_document import WorkingDocument
+    TOOL_CLASSES.append(WorkingDocument)
 except ImportError as e:
-    logger.warning(f"Failed to import EditDockerfile: {e}")
+    _record_import_failure("WorkingDocument", e)
+
+try:
+    from .sleep_tool import Sleep
+    TOOL_CLASSES.append(Sleep)
+except ImportError as e:
+    _record_import_failure("Sleep", e)
 
 # MCP tools are registered lazily via register_mcp_tools() when the agent starts.
 # Do NOT call register_mcp_tools() here - it starts MCP server subprocesses
@@ -226,4 +322,6 @@ except ImportError as e:
 # Initialize SIMPLIFIED_TOOL_CLASSES
 _update_simplified_toolset()
 
-__all__ = ['TOOL_CLASSES', 'SIMPLIFIED_TOOL_CLASSES', 'register_tool', 'ToolBase']
+__all__ = ['TOOL_CLASSES', 'SIMPLIFIED_TOOL_CLASSES', 'IMPORT_FAILURES', 'get_import_failures',
+           'register_tool', 'register_tool_class', 'iter_tool_classes',
+           'simplified_tool_classes', 'get_tool_class', 'ToolBase']

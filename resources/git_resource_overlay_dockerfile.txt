@@ -1,0 +1,11 @@
+# Git resource overlay — builds the tm-resource-git image on top of the
+# workspace runtime image (resources/default_dockerfile.txt).
+# Adds ONLY the OS tooling needed for containerized git execution.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl && rm -rf /var/lib/apt/lists/*
+USER agent
+ENV HOME=/home/agent
+WORKDIR /workspace
+CMD ["tail", "-f", "/dev/null"]

@@ -1,0 +1,590 @@
+"""
+vault.py — User vault management for ThoughtMachine.
+
+Provides the directory layout for ``~/.thoughtmachine/`` and factory-defaults
+bootstrap logic.
+
+The vault is the user-side counterpart of the project-level ``resources/``
+directory.  On first run (or factory reset) the bootstrap module calls
+:func:`ensure_vault_structure` to create the compartment hierarchy, then
+:func:`ensure_vault_defaults` to populate it from bundled resources.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import shutil
+from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
+
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+
+
+def vault_root() -> Path:
+    """Return the absolute path to the user's ThoughtMachine vault directory.
+
+    Honors the ``THOUGHTMACHINE_VAULT_ROOT`` environment variable when set
+    (useful for tests and multi-profile setups); otherwise returns
+    ``~/.thoughtmachine/`` on Linux/macOS or the equivalent on Windows.
+    """
+    override = os.environ.get("THOUGHTMACHINE_VAULT_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.home() / ".thoughtmachine"
+
+
+# ── Vault structure ─────────────────────────────────────────────────────────
+
+# Sub-directories that form the vault compartment hierarchy.
+VAULT_SUBDIRS: tuple[str, ...] = (
+    "system",
+    "user",
+    "credentials",
+    "workspaces",
+    "global",
+    "state",
+    "logs",
+)
+
+
+def ensure_vault_structure() -> list[str]:
+    """Create the vault compartment structure under ``~/.thoughtmachine/``.
+
+    The vault root itself is created (with permissions ``0o700``) when it is
+    missing; each subdirectory is likewise created only if it does not already
+    exist (idempotent).  Newly created directories get permissions ``0o700``
+    (owner-only access).  An existing vault is left exactly as it is -- never
+    widened or narrowed.
+
+    Returns:
+        A list of absolute paths to directories that were **created**
+        during this call.
+    """
+    root = vault_root()
+    created: list[str] = []
+
+    # Create the vault root itself first so its own permissions are
+    # owner-only. ``mode=0o700`` only applies to directories mkdir actually
+    # creates and can be masked by the process umask, so an explicit chmod is
+    # applied as well -- but ONLY when this call created the root (an existing
+    # vault is never re-chmod'd, i.e. never widened or narrowed).
+    if not root.exists():
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        created.append(str(root))
+
+    for subdir in VAULT_SUBDIRS:
+        target = root / subdir
+        if not target.exists():
+            target.mkdir(parents=True, exist_ok=True)
+            target.chmod(0o700)
+            created.append(str(target))
+
+    return created
+
+
+# ── Factory defaults ────────────────────────────────────────────────────────
+
+_FACTORY_DEFAULTS_RELPATH = "system/factory_defaults.json"
+_CHECKSYSTEM_ALLOWLIST_RELPATH = "system/checksystem_allowlist.json"
+
+
+def _copy_resource(
+    src: Path,
+    dst: Path,
+    overwrite_existing: bool,
+    created: list[str],
+) -> None:
+    """Copy *src* to *dst* if conditions are met and set 0o644 permissions."""
+    if src.exists() and (overwrite_existing or not dst.exists()):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst))
+        dst.chmod(0o644)
+        created.append(str(dst))
+
+
+def _write_file(
+    content: str,
+    dst: Path,
+    overwrite_existing: bool,
+    created: list[str],
+) -> None:
+    """Write *content* to *dst* if conditions are met and set 0o644 permissions."""
+    if overwrite_existing or not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(content, encoding="utf-8")
+        dst.chmod(0o644)
+        created.append(str(dst))
+
+
+def _seed_manifest_safe_default(
+    resources_dir: Path,
+    relpath: str,
+    root: Path,
+    overwrite_existing: bool,
+    created: list[str],
+) -> None:
+    """Write *relpath* from the schema manifest's own ``safe_default``.
+
+    Used for manifest-declared default files that have no bundled resource
+    file (e.g. ``vault_version.json``, ``user/defaults.json``): the
+    ``safe_default`` in ``agent/config/schema_manifest.json`` stays the single
+    source of truth for their contents.  Fails soft -- a missing/unreadable
+    manifest, or an absent entry/``safe_default``, is a quiet no-op so the
+    bootstrap can never break on it.
+    """
+    try:
+        manifest_path = (
+            resources_dir.parent / "agent" / "config" / "schema_manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        spec = (manifest.get("files") or {}).get(relpath) or {}
+        safe_default = spec.get("safe_default")
+        if not isinstance(safe_default, dict):
+            return
+        content = json.dumps(safe_default, indent=2) + "\n"
+    except Exception:  # pragma: no cover - fail soft by design
+        return
+    _write_file(content, root / relpath, overwrite_existing, created)
+
+
+# ── Factory-owned seed re-sync ──────────────────────────────────────────────
+
+# Seeds whose *vault* copy is re-synced from the shipped ``resources/`` file
+# whenever its content differs.  Deliberately narrow: exactly two entries.
+#
+# DELIBERATE POLICY REVERSAL (operator-directed, not an oversight).  Both the
+# drift checker -- ``agent/config/vault_drift.py:58-61``: "When a seeded file
+# exists in the vault but differs from the seed, the checker reports a warning
+# drift (never auto-fixes -- the operator may have deliberately customised
+# it)." -- and the repair engine -- ``thoughtmachine/vault_repair.py:1223-1239``:
+# "quarantined allowlist drift; not auto-fixed" -- treat a modified seed copy as
+# the operator's and leave it alone.  This helper reverses that for exactly the
+# two factory-owned files below: they are machine-owned defaults, not operator
+# configuration, so a stale vault copy surviving an upgrade silently defeats
+# the very fix it shipped (a new checksystem allowlist entry that never reaches
+# the vault; a new factory-default key that never materialises).
+#
+# Neither the drift checker nor the repair quarantine is weakened: both keep
+# reporting a mismatch if one is present when they run -- this helper only
+# removes the *cause* at bootstrap time.
+#
+# Narrower alternative considered and rejected only for now: re-sync solely
+# when the *shipped* seed changed since the last deploy.  That requires a
+# persisted record of the previously deployed hash, and no marker/manifest/hash
+# record may be added to the vault, so the content comparison below stands.
+# Narrowing it later is a one-line change (compare against a recorded hash
+# instead of against the live file).
+#
+# Deliberately NOT re-synced (behaviour unchanged):
+#   * ``system/providers.json``                - operator-owned provider profiles
+#   * ``system/default_system_prompt.txt``     - operator-editable prompt
+#   * ``system/engineer_system_prompt.txt``    - operator-editable prompt
+#   * ``system/resource_catalog.json``         - operator-editable catalog
+#   * ``docker/resource/*``                    - ``never_overwrite: true`` trust
+#                                                anchors (see bootstrap Step 2b)
+#   * ``worker_templates/*``                   - deployed only when ``dest_empty``
+_FACTORY_OWNED_SEEDS: tuple[tuple[str, str], ...] = (
+    ("checksystem_allowlist.json", _CHECKSYSTEM_ALLOWLIST_RELPATH),
+    ("factory_defaults.json", _FACTORY_DEFAULTS_RELPATH),
+)
+
+
+def _sync_factory_owned_seeds(root: Path, resources_dir: Path) -> list[str]:
+    """Re-sync factory-owned vault seed copies from the shipped ``resources/``.
+
+    Content-based, not version-based: a vault copy whose content already equals
+    the shipped seed is left completely untouched (no write, so ``st_mtime`` --
+    which :func:`get_checksystem_allowlist` caches on -- is preserved); a copy
+    whose content differs is overwritten from the seed and reported once; a
+    missing copy is simply created.  See ``_FACTORY_OWNED_SEEDS`` for the scope
+    and for the deliberate policy reversal this implements.
+
+    Idempotent: a second call with unchanged inputs writes nothing.
+
+    Args:
+        root: Absolute path to the vault root.
+        resources_dir: Absolute path to the project-level ``resources/``
+            directory holding the shipped seeds.
+
+    Returns:
+        Absolute paths of the files written (empty when everything matched).
+    """
+    written: list[str] = []
+
+    for seed_name, relpath in _FACTORY_OWNED_SEEDS:
+        src = resources_dir / seed_name
+        dst = root / relpath
+        if not src.is_file():
+            continue  # no bundled seed -> nothing to re-sync
+
+        mismatch = False
+        if dst.is_file():
+            try:
+                src_bytes = src.read_bytes()
+                dst_bytes = dst.read_bytes()
+            except OSError:
+                continue  # unreadable -> leave it alone
+            if seed_name.endswith(".json"):
+                # JSON-normalised equality (mirrors
+                # ``vault_repair._collect_seeded_files``): formatting-only
+                # differences are NOT drift.
+                try:
+                    same = json.loads(src_bytes) == json.loads(dst_bytes)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    same = False
+            else:
+                same = src_bytes == dst_bytes
+            if same:
+                continue
+            mismatch = True
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst))
+        dst.chmod(0o644)
+        written.append(str(dst))
+
+        if mismatch:
+            logger.warning(
+                "Vault seed %s re-synced from shipped seed resources/%s "
+                "(content changed)", relpath, seed_name,
+            )
+
+    return written
+
+
+def ensure_vault_defaults(
+    resources_dir: Path,
+    overwrite_existing: bool = False,
+) -> list[str]:
+    """Deploy factory-default resource files into the vault.
+
+    Copies / creates the following files:
+
+    * ``system/factory_defaults.json``          — from ``resources/factory_defaults.json``
+    * ``system/checksystem_allowlist.json``     — from ``resources/checksystem_allowlist.json``
+    * ``system/providers.json``                 — from ``resources/default_providers.json``
+    * ``system/resource_catalog.json``          — from ``agent/config/resource_catalog.json``
+    * ``system/default_system_prompt.txt``      — from ``resources/default_system_prompt.txt``
+    * ``system/engineer_system_prompt.txt``     — from ``resources/engineer_system_prompt.txt``
+    * ``system/.vault_version``                 — from ``get_version()``
+    * ``state/session_registry.json``           — written as ``{}``
+    * ``state/workspace_registry.json``         — written as ``{}``
+
+    Args:
+        resources_dir: Absolute path to the project-level ``resources/``
+            directory.
+        overwrite_existing: If ``True``, overwrite any existing file.
+            Otherwise only deploy when the destination does not exist.
+
+    Returns:
+        A list of absolute paths to files that were written.
+    """
+    from thoughtmachine.bootstrap import get_version
+
+    created: list[str] = []
+    root = vault_root()
+
+    # 0. Re-sync factory-owned seed copies whose content drifted from the
+    # shipped resource file (see ``_FACTORY_OWNED_SEEDS`` / the policy-reversal
+    # note above).  Run FIRST so the ``_copy_resource`` calls below find the
+    # destination already present and never touch the same path twice in one
+    # boot.
+    created.extend(_sync_factory_owned_seeds(root, resources_dir))
+
+    # 1–2. Copy factory_defaults.json and checksystem_allowlist.json
+    _copy_resource(
+        resources_dir / "factory_defaults.json",
+        root / _FACTORY_DEFAULTS_RELPATH,
+        overwrite_existing, created,
+    )
+    _copy_resource(
+        resources_dir / "checksystem_allowlist.json",
+        root / _CHECKSYSTEM_ALLOWLIST_RELPATH,
+        overwrite_existing, created,
+    )
+
+    # 3. Copy providers.json (from default_providers.json)
+    _copy_resource(
+        resources_dir / "default_providers.json",
+        root / "system" / "providers.json",
+        overwrite_existing, created,
+    )
+
+    # 4. Copy resource_catalog.json (from agent/config/resource_catalog.json)
+    _copy_resource(
+        resources_dir.parent / "agent" / "config" / "resource_catalog.json",
+        root / "system" / "resource_catalog.json",
+        overwrite_existing, created,
+    )
+
+    # 5–6. Copy system prompt files
+    _copy_resource(
+        resources_dir / "default_system_prompt.txt",
+        root / "system" / "default_system_prompt.txt",
+        overwrite_existing, created,
+    )
+    _copy_resource(
+        resources_dir / "engineer_system_prompt.txt",
+        root / "system" / "engineer_system_prompt.txt",
+        overwrite_existing, created,
+    )
+
+    # 7. Write .vault_version marker
+    _write_file(
+        get_version(),
+        root / "system" / ".vault_version",
+        overwrite_existing, created,
+    )
+
+    # 8–9. Write empty state registry files
+    _write_file(
+        "{}\n",
+        root / "state" / "session_registry.json",
+        overwrite_existing, created,
+    )
+    _write_file(
+        "{}\n",
+        root / "state" / "workspace_registry.json",
+        overwrite_existing, created,
+    )
+
+    # 10–11. Manifest-declared default files that have no bundled resource
+    # file; seed them from the manifest's own safe_default (single source of
+    # truth for their contents).
+    _seed_manifest_safe_default(
+        resources_dir, "vault_version.json", root, overwrite_existing, created,
+    )
+    _seed_manifest_safe_default(
+        resources_dir, "user/defaults.json", root, overwrite_existing, created,
+    )
+
+    return created
+
+
+# Legacy single-file path (pre-provenance layout) — read only for promotion.
+_RESOURCE_DOCKERFILE_RELPATH = "docker/resource/Dockerfile"
+# Authoritative build-file directory: the vault's resource-image build seeds.
+_RESOURCE_BUILD_DIR_RELPATH = "docker/resource"
+
+
+def ensure_resource_build_files(
+    resources_dir: Path,
+    repo_root: Path,
+    overwrite_existing: bool = False,
+) -> list[str]:
+    """Seed the vault-managed resource-image build files (authoritative).
+
+    The vault directory ``~/.thoughtmachine/docker/resource/`` is the
+    AUTHORITATIVE source for resource-image builds (see
+    ``infra/resource_container_manager.py``): auto-builds read these vault
+    files only, never the repo directly, so the image definition cannot be
+    tampered with from the agent workspace.  Deploys:
+
+    * ``default_runtime.Dockerfile``  — from ``resources/default_dockerfile.txt``
+    * ``git_overlay.Dockerfile``      — from ``resources/git_resource_overlay_dockerfile.txt``
+    * ``requirements.txt``            — from ``<repo_root>/requirements.txt``
+
+    If a legacy vault copy at ``docker/resource/Dockerfile`` exists (from a
+    pre-provenance release), it is PROMOTED into the authoritative
+    ``default_runtime.Dockerfile`` slot: an existing vault copy is a trust
+    anchor and wins over the repo seed.
+
+    Callers MUST pass ``overwrite_existing=False`` (the default): existing
+    vault copies are trust anchors and must never be replaced by bootstrap.
+
+    Args:
+        resources_dir: Absolute path to the project-level ``resources/``
+            directory.
+        repo_root: Absolute path to the repository root (parent of
+            ``resources/``) — source of ``requirements.txt``.
+        overwrite_existing: If ``True``, overwrite existing vault copies.
+            Keep ``False`` (the default) — see docstring above.
+
+    Returns:
+        A list of absolute paths to files that were written.
+    """
+    created: list[str] = []
+    build_dir = vault_root() / _RESOURCE_BUILD_DIR_RELPATH
+    # Promote a legacy vault Dockerfile (pre-provenance layout) into the
+    # authoritative runtime slot when present.
+    legacy_dockerfile = vault_root() / _RESOURCE_DOCKERFILE_RELPATH
+    runtime_source = (
+        legacy_dockerfile if legacy_dockerfile.exists()
+        else resources_dir / "default_dockerfile.txt"
+    )
+    _copy_resource(
+        runtime_source,
+        build_dir / "default_runtime.Dockerfile",
+        overwrite_existing, created,
+    )
+    _copy_resource(
+        resources_dir / "git_resource_overlay_dockerfile.txt",
+        build_dir / "git_overlay.Dockerfile",
+        overwrite_existing, created,
+    )
+    _copy_resource(
+        repo_root / "requirements.txt",
+        build_dir / "requirements.txt",
+        overwrite_existing, created,
+    )
+    return created
+
+
+def ensure_resource_dockerfile(
+    resources_dir: Path,
+    overwrite_existing: bool = False,
+) -> list[str]:
+    """DEPRECATED — legacy single-file seeder, kept for backward compatibility.
+
+    Prefer :func:`ensure_resource_build_files`, which seeds the three
+    authoritative build files (runtime Dockerfile, git overlay, pinned
+    requirements).  This wrapper delegates to it; the legacy
+    ``docker/resource/Dockerfile`` path is no longer written here (an existing
+    legacy copy is promoted by :func:`ensure_resource_build_files`).
+    """
+    return ensure_resource_build_files(
+        resources_dir,
+        resources_dir.parent,
+        overwrite_existing=overwrite_existing,
+    )
+
+
+def load_factory_defaults() -> dict:
+    """Load and return the factory defaults from the vault.
+
+    Returns an empty dict if the file does not exist or is unreadable.
+    """
+    path = vault_root() / _FACTORY_DEFAULTS_RELPATH
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+# ── CheckSystem allowlist ──────────────────────────────────────────────────
+
+
+def verify_allowlist_integrity(allowlist_path: Path) -> tuple[bool, str]:
+    """Verify the SHA-256 integrity of an allowlist file.
+
+    Reads the file, extracts the 'allowlist' array and the stored 'sha256'
+    hash, computes SHA-256 of the sorted, joined allowlist entries,
+    and compares.
+
+    Args:
+        allowlist_path: Path to the allowlist JSON file.
+
+    Returns:
+        A tuple of (is_valid: bool, message: str).
+        If valid: (True, "Integrity check passed").
+        If invalid: (False, description of the issue).
+    """
+    try:
+        data = json.loads(allowlist_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        return False, f"Cannot read allowlist: {exc}"
+
+    if not isinstance(data, dict):
+        return False, "Allowlist must be a JSON object"
+
+    allowlist = data.get("allowlist")
+    if not isinstance(allowlist, list):
+        return False, "'allowlist' must be a JSON array"
+
+    stored_hash = data.get("sha256", "")
+    if not isinstance(stored_hash, str) or len(stored_hash) != 64:
+        return False, "'sha256' must be a 64-character hex string"
+
+    # Compute hash over sorted, joined entries (no wildcards allowed)
+    sorted_entries = sorted(str(e) for e in allowlist)
+    canonical = "\n".join(sorted_entries)
+    computed_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    if computed_hash != stored_hash:
+        return (
+            False,
+            f"Integrity mismatch: computed {computed_hash}, stored {stored_hash}",
+        )
+
+    return True, "Integrity check passed"
+
+
+_checksystem_allowlist_cache: tuple[list[str], float] | None = None
+"""Module-level cache: (allowlist entries, mtime of file at load time)."""
+
+
+def get_checksystem_allowlist() -> list[str]:
+    """Load and return the CheckSystem allowlist from the vault.
+
+    Reads ``~/.thoughtmachine/system/checksystem_allowlist.json``,
+    verifies integrity via SHA-256, and returns the list of allowed
+    filenames.  Results are cached based on file mtime.
+
+    Returns:
+        A list of explicit filenames (no wildcards).
+        Returns an empty list if the file is missing, unreadable,
+        or fails integrity check.
+    """
+    import time
+
+    path = vault_root() / "system" / "checksystem_allowlist.json"
+    global _checksystem_allowlist_cache
+
+    # Check cache freshness
+    try:
+        current_mtime = path.stat().st_mtime
+    except OSError:
+        # File doesn't exist or can't be stat'd
+        _checksystem_allowlist_cache = None
+        return []
+
+    if _checksystem_allowlist_cache is not None:
+        cached_entries, cached_mtime = _checksystem_allowlist_cache
+        if cached_mtime == current_mtime:
+            return cached_entries
+
+    # Load and verify
+    is_valid, msg = verify_allowlist_integrity(path)
+    if not is_valid:
+        logger.warning("CheckSystem allowlist integrity check failed: %s", msg)
+        _checksystem_allowlist_cache = ([], current_mtime)
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries: list[str] = list(str(e) for e in data.get("allowlist", []))
+        # Validate: no wildcards (Amendment 3)
+        for entry in entries:
+            if "*" in entry or "?" in entry or "[" in entry:
+                logger.warning(
+                    "Allowlist entry '%s' contains wildcard — rejecting entire allowlist",
+                    entry,
+                )
+                _checksystem_allowlist_cache = ([], current_mtime)
+                return []
+        _checksystem_allowlist_cache = (entries, current_mtime)
+        return entries
+    except Exception as exc:
+        logger.error("Failed to load allowlist: %s", exc)
+        _checksystem_allowlist_cache = ([], current_mtime)
+        return []
+
+
+def is_path_allowed(filename: str) -> bool:
+    """Check if a filename is in the CheckSystem allowlist.
+
+    Args:
+        filename: A bare filename (not a full path) to check.
+
+    Returns:
+        True if the filename is in the allowlist.
+    """
+    allowlist = get_checksystem_allowlist()
+    return filename in allowlist

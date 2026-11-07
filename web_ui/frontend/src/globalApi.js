@@ -1,0 +1,125 @@
+// --- globalApi.js ---
+// API access for the Global Management landing view (WorkspaceSelector).
+// Every endpoint here is optional: the backend may not expose it yet, so all
+// fetchers degrade to null / [] instead of throwing.
+
+const API_BASE = ''
+
+async function safeGet(url) {
+  try {
+    const res = await fetch(API_BASE + url)
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+export async function fetchGlobalSummary() {
+  const data = await safeGet('/api/global/summary')
+  return data && typeof data === 'object' ? data : null
+}
+
+export async function fetchVaultStatus() {
+  const data = await safeGet('/api/vault/status')
+  return data && typeof data === 'object' ? data : null
+}
+
+export async function fetchResourceCatalog() {
+  const data = await safeGet('/api/resource-catalog')
+  if (Array.isArray(data)) return data
+  if (data && Array.isArray(data.items)) return data.items
+  return []
+}
+
+// Permission safe defaults published by the backend's SINGLE owner
+// (thoughtmachine.security.SAFE_DEFAULTS via GET /api/permission-defaults).
+// Returns the object (network defaults to 'banned') or null when the backend
+// does not expose the endpoint yet -- callers then keep their boot fallback.
+export async function fetchPermissionDefaults() {
+  const data = await safeGet('/api/permission-defaults')
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : null
+}
+
+export async function fetchCredentials() {
+  const data = await safeGet('/api/credentials')
+  if (Array.isArray(data)) return data
+  if (data && Array.isArray(data.credentials)) return data.credentials
+  if (data && Array.isArray(data.items)) return data.items
+  return []
+}
+
+export async function createCredential({ name, secret }) {
+  try {
+    const res = await fetch(API_BASE + '/api/credentials', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, value: secret }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+export async function deleteCredential(name) {
+  try {
+    const res = await fetch(API_BASE + '/api/credentials/' + encodeURIComponent(name), {
+      method: 'DELETE',
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+export async function fetchVaultRepairStatus() {
+  const data = await safeGet('/api/vault/repair/status')
+  return data && typeof data === 'object' ? data : null
+}
+
+export async function fetchVaultRepairApply(payload) {
+  try {
+    const res = await fetch(API_BASE + '/api/vault/repair/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+    })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+export async function fetchProviders() {
+  const data = await safeGet('/api/providers')
+  return Array.isArray(data) ? data : null
+}
+
+export async function saveProvider(provider) {
+  try {
+    const res = await fetch(API_BASE + '/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: provider || {} }),
+    })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+export async function deleteProvider(id) {
+  try {
+    const res = await fetch(API_BASE + '/api/providers/' + encodeURIComponent(id), {
+      method: 'DELETE',
+    })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+

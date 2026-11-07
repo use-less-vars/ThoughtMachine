@@ -27,6 +27,7 @@ debug.log
 # Temporary files
 temp/
 tmp/
+.tmp-test/
 test_*.json
 *test*.json
 sess_*.json
@@ -99,3 +100,285 @@ output_panel_phase1.py
 
 dummy_data/
 tmp_packages/
+
+# Temporary analysis scripts and artifacts
+FINAL_SUMMARY.md
+PROJECT_ANALYSIS.md
+TEST_INFRASTRUCTURE_REPORT.md
+_run_git_cmds.py
+_runner.py
+check_syntax.py
+count_with_delay.py
+run_git_commands.py
+hello_worker_demo.txt
+worker_live_test.txt
+
+# Workspace auto-generated files
+.thoughtmachine/workers.json
+.thoughtmachine/working_docs/
+!.thoughtmachine/working_docs/
+.thoughtmachine/working_docs/*
+!.thoughtmachine/working_docs/reproduce_p0.py
+!.thoughtmachine/working_docs/reproduce_p0.sh
+!.thoughtmachine/working_docs/P0_REPRODUCER_README.md
+!.thoughtmachine/working_docs/ticket-*.md
+# The parked hygiene/no-tool-wrapping guard source: real code, not scratch.
+!.thoughtmachine/working_docs/tool_no_wrapping_guard.py
+# Protocols are meant to be run by someone else — they are not scratch.
+!.thoughtmachine/working_docs/protocol-*.md
+.thoughtmachine/knowledge/project/test_protocols.md
+
+# Node.js binary distribution (vendored)
+node-bin/
+config_snapshot.json
+
+# Local working docs — not part of the repo
+docs/*
+# Design pass — streaming and the canonical IR (public, per operator ruling 2026-10-27)
+!docs/design-streaming-canonical-ir.md
+!docs/installation_guide.md
+!docs/logging.md
+!docs/decisions/
+!docs/decisions/logging-architecture.md
+# Public architecture docs ship with the repo (operator ruling 2026-09-24).
+# Both lines are required: `docs/*` excludes the `docs/architecture/`
+# DIRECTORY itself, and git cannot re-include files beneath an excluded
+# directory. The directory negation lets git descend; `**` re-includes the
+# contents.
+!docs/architecture/
+!docs/architecture/**
+# First-read machine model doc (wave 2026-10-20): public tier, ships with the repo.
+!docs/ARCHITECTURE_MACHINE_MODEL.md
+!docs/audit_resource_container_isolation_2026_08_13.md
+!docs/container_registry_design.md
+!docs/container_record_design.md
+!docs/container_aggregate_envelope.md
+
+# Root-only Dockerfile pattern: ignores the repo-root Dockerfile (a stray
+# build artifact) but NOT resources/resource_dockerfile.txt — the tracked seed
+# for the vault-managed git sandbox image Dockerfile
+# (~/.thoughtmachine/docker/resource/Dockerfile).
+/Dockerfile
+!docs/architecture-map.md
+!docs/architecture-map.html
+!docs/workspace_office_operational_analysis_2026_08_15.md
+!docs/operational_unknowns_2026_08_15.md
+!docs/resource_execution_contract.md
+!docs/git_resource_execution_audit.md
+!docs/param_ownership_map.md
+!docs/container_p0_bug4_git_fallback.md
+!docs/container_subsystem_audit.md
+!docs/workspace_isolation_matrix.md
+!docs/vault_ownership_manifest.md
+# Host port design spec (Gen 49, 2026-10-24): public-tier design doc.
+!docs/host-port.md
+!docs/design-auth-boundary.md
+# KB policy: the three document tiers (Public docs / Internal KB / Diary).
+# Public tier ships with the repo — every docs/ file needs its own line.
+!docs/KB_POLICY.md
+
+# Hygiene cleanup (2026-08-28): vendored pytest site-packages + pytest cache
+pytest_install/
+.pytest_cache/
+# WIP probes removed from tracking
+.docker_mount_test.txt
+test_ask_permission.txt
+# root scratch working docs
+/working_docs/
+line_number_report.md
+# huge WIP test-run log (removed from tracking)
+docs/testing/test_run_on_host.txt
+!docs/container_subsystem_target_architecture.md
+
+# Allowlisted build docs (platform-matrix deliverables, 2026)
+!docs/CAPABILITIES.md
+!docs/testing/
+!docs/testing/ci_process.md
+!docs/ui_map.md
+# web-ui backend test-dispositions doc (platform-matrix deliverable, 2026).
+# The directory negation lets git descend into docs/ci/; `docs/*` matches only
+# one level and does not cross `/`, so the contents negation is belt-and-braces.
+!docs/ci/
+!docs/ci/**
+scratch/
+# Hygiene (2026-09-21): local toolchain caches, probes, scratch dirs and KB noise
+.deb-cache/
+.ms-playwright/
+.pip-cache/
+.pip-tmp/
+.tm-node/
+.tm-fix-scratch/
+chrome-libs/
+datetime
+.tm_probe_write_check.txt
+live_fs_probe.txt
+tm_livemount_probe.txt
+tm_permission_probe.txt
+tm_round6_write_probe.txt
+venv*
+.thoughtmachine/knowledge_backups/
+.thoughtmachine/readme_recon.md
+.thoughtmachine/knowledge/manifest.yaml
+.thoughtmachine/knowledge/project/**/*.md
+
+.thoughtmachine/knowledge/archive/
+.thoughtmachine/gate_log.txt
+web_ui/frontend/.npmrc
+web_ui/frontend/.npmrc
+
+# --- KB onboarding contract (Gen 48, 2026-10-23) --------------------------
+# KB_POLICY says "all KB is gitignored". That left MANDATORY_STOP.md -- the
+# entry file every new seat is told to read FIRST -- outside the repository, so
+# it did not survive clone. The KB is the machine's memory; memory must survive
+# the machine. These seven files are the onboarding contract set and are
+# tracked deliberately. Everything else under knowledge/ stays ignored.
+#
+# Order matters: negations must follow the ignores they override, and git
+# cannot re-include a file whose parent DIRECTORY is excluded. Hence the
+# directory negation + re-ignore + re-include shape for personal/ (the same
+# shape as the .thoughtmachine/working_docs/ block above).
+!.thoughtmachine/knowledge/project/MANDATORY_STOP.md
+!.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md
+!.thoughtmachine/knowledge/project/working_agreements.md
+!.thoughtmachine/knowledge/project/security_architecture.md
+!.thoughtmachine/knowledge/project/status.md
+!.thoughtmachine/knowledge/project/operator_observations.md
+# Gen 54 (2026-10-29) — operator-owned records that must survive a clone:
+!.thoughtmachine/knowledge/project/hall_of_fame.md
+!.thoughtmachine/knowledge/project/operator-dashboard.md
+!.thoughtmachine/working_docs/backlog-delivery-arc.md
+!.thoughtmachine/knowledge/personal/
+.thoughtmachine/knowledge/personal/*
+!.thoughtmachine/knowledge/personal/handoffs.md
+# Gen 58 (stabilization sprint) — `architecture_invariants.md` is named by
+# MANDATORY_STOP.md item 1d, so it belongs to the same onboarding contract set
+# as the files above: a read-on-entry file that does not survive a clone is a
+# dangling instruction. `.thoughtmachine/knowledge/project/**/*.md` is ignored
+# wholesale (`!` lines must follow the ignore they override), so without this
+# negation a fresh clone would tell every new seat to read a file it does not
+# have. Everything else under project/ stays ignored, as KB_POLICY intends.
+!.thoughtmachine/knowledge/project/architecture_invariants.md
+
+# Gen 50 design pass: auth layer — re-included because docs/* is a catch-all.
+!docs/design-auth-layer.md
+
+# --- Source module re-include (Gen 51, 2026-10-26) -----------------------
+# `*secret*` above is a deliberate guard against committing secret MATERIAL,
+# but it also silently swallowed `agent/config/secret.py` — the redaction
+# wrapper module — so a commit of its importers would have shipped a broken
+# tree while every test stayed green locally. Re-include the source file only;
+# the guard above stays exactly as it is.
+!agent/config/secret.py
+
+# Gen 51 logging design pass: sink inventory, redaction truth, deletion
+# decidability and the per-call-site keep/delete/unclear marking. Public tier,
+# ships with the repo (`docs/*` is a catch-all, so the negation is required).
+!docs/design-logging-audit.md
+
+# Gen 51 artifacts published by operator ruling (tier: public, 2026-10-26):
+# the agent-core spec and the provider-compatibility findings. Both lived in
+# ignored space (docs/* catch-all, .thoughtmachine/working_docs/* re-ignore),
+# so `git clean -xdf` would have destroyed them.
+!docs/agent-core-spec.md
+!docs/provider-compat-findings-2026-10-26.md
+
+# Gen 52 design pass (2026-10-28): the concurrency/affinity design doc and the
+# two task briefs written from the running machine. Public tier — the operator
+# asked for them saved under docs/. `docs/*` is a catch-all, so each needs its
+# own negation line; the directory negation lets git descend into docs/briefs/.
+!docs/design-concurrency-and-affinity.md
+!docs/briefs/
+!docs/briefs/**
+
+# Gen 53 docs/KB catch-up (2026-10-28): the catch-up brief, the post-core-sprint
+# integration backlog, and the interruptible-tool-calls design doc. Public tier —
+# the operator ruled all three publishable. Two sit in ignored space
+# (`.thoughtmachine/working_docs/*` is re-ignored above) and one under the `docs/*`
+# catch-all, so each needs its own negation line or `git clean -xdf` would destroy
+# them.
+!docs/design-interruptible-tool-calls.md
+!.thoughtmachine/working_docs/brief-docs-kb-catchup.md
+!.thoughtmachine/working_docs/backlog-core-integration.md
+# Standing backlog triage (oldest-open-tickets review). Same reason as the two
+# lines above: it lives in ignored space, so without this negation it is never
+# versioned and vanishes on the next clone.
+!.thoughtmachine/working_docs/backlog-triage.md
+
+# Docker pipeline trace: a tracked, public-tier doc left in ignored space by
+# the `docs/*` catch-all, so `git add` refused to stage edits to an
+# already-tracked file. Both lines are required: `docs/*` excludes the
+# docs/infrastructure/ DIRECTORY itself, and git cannot re-include files
+# beneath an excluded directory. The directory negation lets git descend;
+# `**` re-includes the contents.
+!docs/infrastructure/
+!docs/infrastructure/**
+!docs/brief-sysprompt-implementation-brief.md
+!docs/design-sysprompt-addendum-and-injection.md
+
+# Tracked docs still hidden from the RAG index (Gen 56, 2026-10-31).
+# Every file below is versioned in git, yet the `docs/*` catch-all above still
+# matches it, and codebase_indexer.should_skip_file() matches .gitignore
+# patterns through pathspec without ever consulting git tracking
+# (agent/knowledge/codebase_indexer.py:200-211). A tracked, committed doc can
+# therefore be silently absent from the RAG index. One line per file; no
+# directory negation is needed, because git does not apply .gitignore to paths
+# it already tracks and pathspec's match_file() needs no descent line.
+!docs/LLM_quality insurance.md
+!docs/audit_logging_testing_introspection_2026_08_13.md
+!docs/docker_usage.md
+!docs/event_pipeline_audit.md
+!docs/logging_manual.md
+!docs/message_metadata.md
+!docs/pruning_system.md
+!docs/rag_for_code.md
+!docs/research/r3-bootstrap.md
+!docs/research/r4-checksystem.md
+!docs/research/r6-worker-config.md
+!docs/research/synthesis-and-recommendations.md
+!docs/security_layer.md
+!docs/system_notifications.md
+!docs/token_pipeline.md
+!docs/windows_installation_saga.md
+!docs/windows_stability_contract.md
+!docs/worker_smoke_checklist.md
+.worktrees/
+
+# Internal audit working documents -- deliberately NOT published to docs/.
+# These nine untracked files are under a pending tier ruling; named explicitly
+# (belt-and-braces on top of the `docs/*` catch-all) so no later `!docs/...`
+# negation above can re-include them.
+/docs/audit-worker-core.md
+/docs/audit/sprint_audit.md
+/docs/backend-audit.md
+/docs/design-input-auth-layer-prerequisite.md
+/docs/frontend-audit.md
+/docs/frontend-state-qa.md
+/docs/system-map.md
+/docs/xray/backend_runtime.md
+/docs/xray/frontend.md
+!.thoughtmachine/knowledge/project/archive/status-archive-gen48-55.md
+# Gen 55 W6 design brief (worker lifecycle): public tier, ships with the repo.
+# `docs/*` above is a catch-all, so the negation is required or the file is
+# never versioned and vanishes on the next clone.
+!docs/design-worker-lifecycle.md
+
+# Gen 56 W7 design brief (process isolation): public tier, ships with the repo.
+# `docs/*` above is a catch-all, so the negation is required or the file is never
+# versioned and vanishes on the next clone.
+!docs/design-process-isolation.md
+!docs/design-pause-reading-mode.md
+
+# Gen 56 W7 P3 design brief (worker runtime process): public tier, ships with the repo.
+# `docs/*` above is a catch-all, so the negation is required or the file is never
+# versioned and vanishes on the next clone.
+!docs/design-worker-runtime-process.md
+
+# Design placeholder (worker dispatch fence): public tier, ships with the repo.
+# `docs/*` above is a catch-all, so the negation is required or the file is never
+# versioned and vanishes on the next clone.
+!docs/design-worker-dispatch-fence.md
+
+# Design brief (permission bins shape): public tier, ships with the repo.
+# `docs/*` above is a catch-all, so the negation is required or the file is never
+# versioned and vanishes on the next clone.
+!docs/design_permission_bins_shape.md

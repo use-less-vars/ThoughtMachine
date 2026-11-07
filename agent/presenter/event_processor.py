@@ -38,9 +38,10 @@ class EventProcessor:
         """
         typed_event = ev.convert_from_legacy_format(event)
         event_type = typed_event.type.value
-        log('DEBUG', 'core.signal', f"event: type={event_type}")
+        log('DEBUG', 'presenter.event_processor', f"event: type={event_type}")
         log('DEBUG', 'presenter.event_processor', f'Processing event: {event_type}')
-        state_event_types = ['error', 'paused', 'stopped', 'thread_finished', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
+        log('DEBUG', 'pipeline.event_processor', f"entry: type={event_type}, session_id={event.get('session_id')}")
+        state_event_types = ['error', 'stopped', 'thread_finished', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
         if event_type not in state_event_types:
             event_session_id = event.get('session_id')
             if event_session_id is not None:
@@ -52,44 +53,55 @@ class EventProcessor:
         if self.gui_integration:
             log('DEBUG', 'presenter.event_processor', f'GUI integration available, checking emission for {event_type}')
             if event_type != 'token_update':
-                log('DEBUG', 'core.signal', 'Path A: emit_conversation_changed()')
+                log('DEBUG', 'presenter.event_processor', 'Path A: emit_conversation_changed()')
                 self.gui_integration.emit_conversation_changed()
             else:
                 log('DEBUG', 'presenter.event_processor', f'Skipping token_update event (handled separately)')
         else:
             log('DEBUG', 'presenter.event_processor', f'No GUI integration, skipping emission for {event_type}')
-        if event_type == 'turn':
-            self._process_turn_event(event)
-        elif event_type == 'token_update':
-            self._process_token_update_event(event)
-        elif event_type == 'agent_responded':
-            self._process_terminal_event(event, event_type)
-        elif event_type == 'user_interaction_requested':
-            self._process_user_interaction_event(event)
-        elif event_type == 'user_query':
-            self._process_user_query_event(event)
-        elif event_type == 'paused':
-            self._process_paused_event(event)
-        elif event_type == 'stop_reason':
-            self._process_stop_reason_event(event)
-        elif event_type in ['stopped', 'max_turns', 'thread_finished']:
-            self._process_terminal_event(event, event_type)
-        elif event_type == 'error':
-            self._process_error_event(event)
-        elif event_type == 'session_stop':
-            self._process_session_stop_event(event)
-        elif event_type == 'execution_state_change':
-            self._process_execution_state_change_event(event)
-        elif event_type == 'session_state_change':
-            self._process_session_state_change_event(event)
-        elif event_type in ('tool_call', 'tool_result'):
-            self._process_tool_event(event, event_type)
-        elif event_type == 'rate_limit_warning':
-            self._process_rate_limit_warning_event(event)
-        elif event_type == 'token_warning':
-            self._process_token_warning_event(event)
-        elif event_type == 'turn_warning':
-            self._process_turn_warning_event(event)
+        # The session save is a `finally` invariant for terminal events: an
+        # exception raised anywhere in the handler must not skip persisting the
+        # completed turn (a lost turn never reaches disk).  Granularity is
+        # unchanged — only the types routed to _process_terminal_event save —
+        # so non-terminal events still never trigger a session write.
+        try:
+            if event_type == 'turn':
+                self._process_turn_event(event)
+            elif event_type == 'token_update':
+                self._process_token_update_event(event)
+            elif event_type == 'agent_responded':
+                self._process_terminal_event(event, event_type)
+            elif event_type == 'user_interaction_requested':
+                self._process_user_interaction_event(event)
+            elif event_type == 'user_query':
+                self._process_user_query_event(event)
+            elif event_type == 'stop_reason':
+                self._process_stop_reason_event(event)
+            elif event_type in ['stopped', 'max_turns', 'thread_finished']:
+                self._process_terminal_event(event, event_type)
+            elif event_type == 'error':
+                self._process_error_event(event)
+            elif event_type == 'session_stop':
+                self._process_session_stop_event(event)
+            elif event_type == 'execution_state_change':
+                self._process_execution_state_change_event(event)
+            elif event_type == 'session_state_change':
+                self._process_session_state_change_event(event)
+            elif event_type in ('tool_call', 'tool_result'):
+                self._process_tool_event(event, event_type)
+            elif event_type == 'rate_limit_warning':
+                self._process_rate_limit_warning_event(event)
+            elif event_type == 'token_warning':
+                self._process_token_warning_event(event)
+            elif event_type == 'turn_warning':
+                self._process_turn_warning_event(event)
+            elif event_type == 'context_cleared':
+                self._process_context_cleared_event(event)
+            elif event_type == 'token_recovery':
+                self._process_token_recovery_event(event)
+        finally:
+            if event_type in ('agent_responded', 'stopped', 'max_turns', 'thread_finished'):
+                self.session_lifecycle.auto_save_current_session()
         if self.gui_integration:
             self.gui_integration.emit_status_message(f'Event: {event_type}')
 
@@ -108,8 +120,19 @@ class EventProcessor:
                 self.gui_integration.emit_context_updated(context_length)
 
     def _process_token_update_event(self, event: Dict[str, Any]) -> None:
-        """Process a token update event."""
+        """Process token update event — update token counts and context length."""
+        event_type = event.get('type')
+        if event_type == 'token_warning':
+            self._process_token_warning_event(event)
+        elif event_type == 'turn_warning':
+            self._process_turn_warning_event(event)
+        elif event_type == 'context_cleared':
+            self._process_context_cleared_event(event)
+        elif event_type == 'token_recovery':
+            self._process_token_recovery_event(event)
+
         log('DEBUG', 'presenter.event_processor', f'_process_token_update_event: context_length={event.get("context_length")}')
+        log('DEBUG', 'pipeline.token_update', f"received: context_length={event.get('context_length')}, total_input={event.get('total_input')}, total_output={event.get('total_output')}")
         input_tokens, output_tokens = self._extract_token_counts(event)
         if input_tokens is not None and output_tokens is not None:
             self.state_bridge.update_token_totals(input_tokens, output_tokens)
@@ -131,18 +154,6 @@ class EventProcessor:
     def _process_user_query_event(self, event: Dict[str, Any]) -> None:
         """Process user query event."""
         log('DEBUG', 'presenter.event_processor', f'Processing user_query event')
-
-    def _process_paused_event(self, event: Dict[str, Any]) -> None:
-        """Process paused event.
-
-        Note: We do NOT transition PAUSING→READY here because that would
-        prevent the GUI from painting 'Pausing…' before immediately jumping
-        to 'Ready'. The session_stop event (which follows 'paused') handles
-        the PAUSING→READY transition naturally.
-        """
-        log('DEBUG', 'presenter.event_processor', f'_process_paused_event: stop_reason={event.get("stop_reason","unknown")}')
-        if self.gui_integration:
-            self.gui_integration.emit_status_message('Paused')
 
     def _process_stop_reason_event(self, event: Dict[str, Any]) -> None:
         """Process stop_reason event (max_turns_reached, rate_limit)."""
@@ -189,7 +200,19 @@ class EventProcessor:
             if self.gui_integration:
                 message = 'Stopped' if event_type == 'stopped' else 'Thread finished'
                 self.gui_integration.emit_status_message(message)
-        self.session_lifecycle.auto_save_current_session()
+
+    def _process_context_cleared_event(self, event: Dict[str, Any]) -> None:
+        """Process context cleared event after summarization."""
+        log('DEBUG', 'presenter.event_processor', f'_process_context_cleared_event: tokens={event.get("token_count", 0)}')
+        if self.gui_integration:
+            self.gui_integration.emit_status_message('Context summarized - restrictions cleared')
+
+    def _process_token_recovery_event(self, event: Dict[str, Any]) -> None:
+        """Process token recovery event."""
+        recovery_message = event.get('recovery_message', 'Token usage returned to safe levels')
+        log('DEBUG', 'presenter.event_processor', f'_process_token_recovery_event: {recovery_message}')
+        if self.gui_integration:
+            self.gui_integration.emit_status_message(f'Token recovery: {recovery_message}')
 
     def _process_error_event(self, event: Dict[str, Any]) -> None:
         """Process error event."""
@@ -244,6 +267,7 @@ class EventProcessor:
         """Process token warning event."""
         warning_message = event.get('warning_message', 'Token usage warning')
         token_count = event.get('token_count', 0)
+        log('DEBUG', 'pipeline.warning', f"token_warning_received: message={warning_message}, token_count={token_count}")
         if self.gui_integration:
             self.gui_integration.emit_status_message(f'Token warning: {warning_message}')
             if hasattr(self.gui_integration, 'emit_warning'):
@@ -253,6 +277,7 @@ class EventProcessor:
         """Process turn warning event."""
         warning_message = event.get('warning_message', 'Turn limit warning')
         turn_count = event.get('turn_count', 0)
+        log('DEBUG', 'pipeline.warning', f"turn_warning_received: message={warning_message}, turn_count={turn_count}")
         if self.gui_integration:
             self.gui_integration.emit_status_message(f'Turn warning: {warning_message}')
             if hasattr(self.gui_integration, 'emit_warning'):
@@ -274,7 +299,6 @@ class EventProcessor:
             self.gui_integration.emit_status_message(f'Rate limit: {message}')
             if hasattr(self.gui_integration, 'emit_warning'):
                 self.gui_integration.emit_warning(f'Rate limit exceeded, waiting {wait_time}s')
-
 
     def _extract_token_counts(self, event: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
         """Extract token counts from event."""

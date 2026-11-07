@@ -3,10 +3,58 @@ Configuration models for the ThoughtMachine agent.
 """
 from typing import ClassVar, Optional, Callable, List, Any, Dict, Literal
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, Field, field_validator, model_validator, model_serializer, ConfigDict
 from agent.logging import log
+from agent.config.secret import Secret
+from agent.config.presets import AGENT_TOOLS, ENGINEER_TOOLS
 from tools import SIMPLIFIED_TOOL_CLASSES
 from thoughtmachine.security import SessionPermissions
+from thoughtmachine.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
+
+
+def normalize_base_url(url: Optional[str]) -> Optional[str]:
+    """Canonicalise a ``base_url`` for *comparison* purposes only.
+
+    Two spellings of the same endpoint must not look like a config change, so
+    the scheme and host are lowercased and trailing ``/`` characters are
+    stripped from the path::
+
+        'https://API.DeepSeek.com/v1/'  ->  'https://api.deepseek.com/v1'
+        'https://api.deepseek.com'      ->  'https://api.deepseek.com'
+
+    The path is left otherwise untouched (it is case-sensitive on most
+    servers), ``None`` and blank strings both become ``None``, and the result
+    never ends with ``/``.  Unparseable input falls back to a stripped,
+    lowercased, trailing-``/``-free copy of the input.  This function never
+    raises.
+
+    WARNING - do NOT add, remove, strip or otherwise canonicalise a ``/v1``
+    (or any other) path suffix here.  ``https://api.openai.com/v1`` and
+    ``https://api.openai.com`` are *different* endpoints - the bare host
+    returns 404 - so they must stay unequal.  Collapsing the version segment
+    would silently rewrite the request routing of a live session.
+    """
+    if url is None:
+        return None
+    text = url.strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+    except Exception:
+        # Malformed URL (e.g. a broken IPv6 literal): never raise, just apply
+        # the crude normalisation the caller can still compare.
+        return text.lower().rstrip('/') or None
+    normalized = urlunsplit((
+        parts.scheme.lower(),
+        parts.netloc.lower(),
+        parts.path.rstrip('/'),
+        parts.query,
+        parts.fragment,
+    ))
+    return normalized.rstrip('/') or None
+
 
 # Category constants for AgentConfig fields
 RESTART_REQUIRED = "restart_required"
@@ -40,7 +88,7 @@ class AgentConfig(BaseModel):
         'log_categories': GLOBAL_STATIC,
         'max_file_size_mb': GLOBAL_STATIC,
         'max_backup_files': GLOBAL_STATIC,
-        'workspace_path': RESTART_REQUIRED,
+        'workspace_path': RESTART_REQUIRED,  # DEPRECATED: tools should resolve via SessionRegistry → WorkspaceRegistry instead
         'detail': HOT_SWAPPABLE,
         'rag_enabled': RESTART_REQUIRED,
         'rag_embedding_model': RESTART_REQUIRED,
@@ -56,9 +104,36 @@ class AgentConfig(BaseModel):
         'provider_id': RESTART_REQUIRED,
         'model_override': RESTART_REQUIRED,
         'session_permissions': HOT_SWAPPABLE,
+        'timeout_seconds': HOT_SWAPPABLE,
+        'time_monitor_enabled': HOT_SWAPPABLE,
+        'time_warning_threshold': HOT_SWAPPABLE,
+        'worker_mode': HOT_SWAPPABLE,
+        'max_workers_per_session': HOT_SWAPPABLE,
+        'worker_timeout_seconds': HOT_SWAPPABLE,
+        'worker_max_retries': HOT_SWAPPABLE,
+        'use_workspace_lifecycle_manager': HOT_SWAPPABLE,
+        'mode': RESTART_REQUIRED,
     }
 
     api_key: str = Field(default='', exclude=True)
+
+    @field_validator('api_key', mode='after')
+    def _wrap_api_key_as_secret(cls, v):
+        """Wrap the key in :class:`~agent.config.secret.Secret`.
+
+        The wrapper's ``__str__``/``__repr__``/``__format__`` render
+        ``<secret>``, so interpolating ``config.api_key`` into any log line,
+        f-string, ``print()`` or container ``repr()`` cannot leak it.
+
+        The field stays annotated as ``str`` (``Secret`` *is* a ``str``) so
+        equality, truthiness, membership and every existing ``isinstance(v,
+        str)`` check keep working unchanged.  The empty default is left as a
+        plain ``""`` so "no key configured" behaves exactly as before.
+        """
+        if v == '' or isinstance(v, Secret):
+            return v
+        return Secret(v)
+    worker_mode: bool = False
     base_url: str = 'https://api.deepseek.com'
     model: str = 'deepseek-reasoner'
     # NOTE: str (not Literal) so that provider plugins registered via
@@ -71,21 +146,37 @@ class AgentConfig(BaseModel):
     model_override: Optional[str] = Field(default=None, description='Override model from the profile (leaves provider_id intact)')
     temperature: float = 0.2
     max_turns: int = 100
+    max_workers_per_session: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description='Maximum number of live worker threads a session may run at once (None = factory default 3)',
+    )
+    worker_timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description='Per-worker query timeout in seconds (None = factory default WORKER_TIMEOUT_SECONDS)',
+    )
+    worker_max_retries: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description='Maximum number of retries for a worker query (None = factory default WORKER_MAX_RETRIES)',
+    )
     stop_check: Optional[Callable[[], bool]] = Field(default=None, description='Runtime stop-check callback. Called periodically during agent execution to check if processing should be aborted. Return True to signal stop. Not serialised to/from JSON config.')
+    mode: str = Field(default="agent", description='Session mode: "agent", "engineer", or "custom". Determines the default system prompt used when no explicit system prompt is provided.')
     system_prompt: Optional[str] = None
-    token_monitor_warning_threshold: int = Field(default=35000, description='Token count threshold for warning (user)')
-    token_monitor_critical_threshold: int = Field(default=50000, description='Token count threshold for critical warning (user)')
+    token_monitor_warning_threshold: int = Field(default=65000, description='Token count threshold for warning state')
+    token_monitor_critical_threshold: int = Field(default=80000, description='Token count threshold for critical warning state')
     turn_monitor_enabled: bool = Field(default=True, description='Enable automatic turn limit warnings')
 
     enable_logging: bool = Field(default=True, description='Enable agent logging')
-    log_dir: str = Field(default='./logs', description='Directory for log files')
+    log_dir: Optional[str] = Field(default=None, description='Directory for log files (None = canonical vault ~/.thoughtmachine/logs)')
     log_level: str = Field(default='INFO', description='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
     enable_file_logging: bool = Field(default=True, description='Write logs to files')
     jsonl_format: bool = Field(default=True, description='Use JSONL format for log files')
     log_categories: List[str] = Field(default_factory=lambda: ['SESSION', 'LLM', 'TOOLS'], description='List of log categories to enable (SESSION, UI, LLM, TOOLS, SECURITY, PERFORMANCE). Can be overridden by AGENT_LOG_CATEGORIES environment variable.')
     max_file_size_mb: int = Field(default=10, description='Maximum log file size in MB before rotation')
     max_backup_files: int = Field(default=5, description='Maximum number of backup log files to keep')
-    workspace_path: Optional[str] = Field(default=None, description='Root directory for file operations (None = unrestricted)')
+    workspace_path: Optional[str] = Field(default=None, description='[DEPRECATED] Root directory for file operations (None = unrestricted). Tools should resolve workspace path via SessionRegistry → WorkspaceRegistry instead of relying on this field.')
     rag_enabled: bool = Field(default=False, description='Enable RAG functionality')
     rag_embedding_model: str = Field(default='BAAI/bge-small-en-v1.5', description='Model name for sentence-transformers embeddings')
     rag_vector_store_path: Optional[str] = Field(default=None, description='Path to vector store database (None = default .thoughtmachine/rag/)')
@@ -97,19 +188,42 @@ class AgentConfig(BaseModel):
     kb_path: Optional[str] = Field(default=None, description="Path to knowledge base directory (None = default .thoughtmachine/knowledge/)")
     tool_output_token_limit: int = Field(default=10000, description='Maximum token limit for tool outputs (default 10,000 tokens)')
     detail: Literal['minimal', 'normal', 'verbose'] = Field(default='normal', description='Detail level for event display')
-    enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool class names')
+    enabled_tools: List[str] = Field(default_factory=lambda: [cls.tool_name() for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool names (stable tool_name(); legacy class names also accepted)')
+    timeout_seconds: int = Field(default=SOFT_BUDGET_FALLBACK_SECONDS, description='Maximum runtime in seconds before timeout')
+    time_monitor_enabled: bool = Field(default=False, description='Enable time-based execution monitoring')
+    time_warning_threshold: int = Field(default=240, description='Elapsed seconds at which a time warning is issued (default 80% of timeout)')
     session_permissions: SessionPermissions = Field(
         default_factory=SessionPermissions,
         description='Session permissions profile controlling tool access categories.',
     )
-
+    #: Worker-only DECLARED capability cap, exactly as written in the worker
+    #: definition (``permission_footprint`` / legacy ``worker_permissions``).
+    #: It is NOT the spawn-time snapshot of the session's permissions: the
+    #: session's live permissions are re-read from disk on every tool call, so a
+    #: later grant must take effect without respawning the worker.  This dict is
+    #: therefore the only thing the runtime may use to narrow a worker below its
+    #: session, and the effective permissions of a worker are
+    #: ``min(permission_footprint, live_session - workspace_ceiling)``.
+    #: Empty (the default) means "no declared cap" -- nothing is narrowed.
+    permission_footprint: Dict[str, Any] = Field(
+        default_factory=dict,
+        description='Worker-only declared permission cap from the worker definition (empty = no cap).',
+    )
+    use_workspace_lifecycle_manager: bool = Field(
+        default=False,
+        description='Enable the Workspace Lifecycle Manager for worker queries (feature flag).',
+    )
     @field_validator('system_prompt')
     def load_default_system_prompt(cls, v):
         """Load the system prompt with the following precedence:
 
         1. ``~/.thoughtmachine/custom_system_prompt.txt`` (if it exists and is non-empty)
         2. Explicit value passed to constructor (if non-empty)
-        3. Fallback to ``resources/default_system_prompt.txt``
+
+        The mode-specific fallback (``resources/default_system_prompt.txt`` for
+        ``"agent"`` mode, ``resources/engineer_system_prompt.txt`` for
+        ``"engineer"`` mode) is handled by ``_apply_mode_system_prompt``
+        after all fields have been validated.
         """
         from pathlib import Path
         # 1. Check custom_system_prompt.txt first
@@ -124,13 +238,8 @@ class AgentConfig(BaseModel):
         # 2. Use the explicit value if non-empty
         if v is not None and (isinstance(v, str) and v.strip() != ''):
             return v
-        # 3. Fallback to factory default
-        prompt_path = Path(__file__).resolve().parent.parent.parent / 'resources' / 'default_system_prompt.txt'
-        try:
-            return prompt_path.read_text(encoding='utf-8')
-        except (FileNotFoundError, IOError) as exc:
-            log.warning('Could not load default system prompt from %s: %s', prompt_path, exc)
-            return 'You are ThoughtMachine, an AI agent.'
+        # 3. Leave as None so the after-validator can apply mode-specific fallback
+        return None
 
     @field_validator('enabled_tools')
     def filter_search_codebase_tool(cls, v, info):
@@ -145,6 +254,95 @@ class AgentConfig(BaseModel):
         if filtered != v:
             return filtered
         return v
+
+    @model_validator(mode='before')
+    def map_agent_soft_budget_seconds(cls, values):
+        """Map the ``agent_soft_budget_seconds`` config key onto ``timeout_seconds``.
+
+        The shipped factory config (``resources/default_config.json``) carries
+        ``agent_soft_budget_seconds`` (300). When that key is present and no
+        explicit ``timeout_seconds`` is supplied, it becomes the soft-budget
+        value; when the key is absent, the field default
+        (``SOFT_BUDGET_FALLBACK_SECONDS`` = 300) applies.
+        """
+        if isinstance(values, dict):
+            budget = values.pop('agent_soft_budget_seconds', None)
+            if budget is not None and 'timeout_seconds' not in values:
+                values['timeout_seconds'] = budget
+        return values
+
+    @model_validator(mode='before')
+    def migrate_git_allow_worktree_commits(cls, values):
+        """Migrate the removed ``git_allow_worktree_commits`` flag.
+
+        The legacy operator flag is folded into the canonical session git
+        permission: ``True`` -> ``session_permissions['git'] = 'write'`` (the
+        flag only ever enabled the ``write`` level; the split
+        ``git_read``/``git_write`` grains no longer exist).
+        ``False`` / absent -> no change (default remains fail-closed).
+        Handles ``session_permissions`` already being a
+        :class:`~thoughtmachine.security.SessionPermissions` instance by
+        round-tripping through ``to_dict()``.
+        """
+        if isinstance(values, dict):
+            legacy = values.pop('git_allow_worktree_commits', None)
+            if legacy is True:
+                sp = values.get('session_permissions')
+                if isinstance(sp, SessionPermissions):
+                    sp = sp.to_dict()
+                if not isinstance(sp, dict):
+                    sp = {}
+                sp['git'] = 'write'
+                values['session_permissions'] = sp
+        return values
+
+    @model_validator(mode='after')
+    def _apply_mode_system_prompt(self):
+        """Apply mode-specific system prompt.
+
+        Unlike the ``load_default_system_prompt`` field validator (which loads
+        from ``~/.thoughtmachine/custom_system_prompt.txt``), this after-validator
+        ALWAYS applies the mode-specific factory prompt for ``"agent"`` and
+        ``"engineer"`` modes, regardless of what was loaded earlier.
+
+        - ``"agent"``     → ``resources/default_system_prompt.txt``
+        - ``"engineer"``  → ``resources/engineer_system_prompt.txt``
+        - ``"custom"``    → leave the user-provided prompt intact (no override)
+
+        Worker-mode configs (``worker_mode=True``, built by
+        ``WorkerThread._build_agent_config``) are exempt: they carry their
+        definition-provided system prompt and blocklist-filtered enabled_tools,
+        so neither the factory prompt nor the mode preset is applied.
+        """
+        # Workers carry their definition-provided system prompt + blocklist-filtered
+        # enabled_tools (tools/workspace/worker.py). The mode factory prompt /
+        # tool-preset stomp must NOT apply to them.
+        if self.worker_mode:
+            return self
+        resources_dir = Path(__file__).resolve().parent.parent.parent / 'resources'
+        if self.mode == 'agent':
+            prompt_path = resources_dir / 'default_system_prompt.txt'
+            try:
+                text = prompt_path.read_text(encoding='utf-8')
+                if text:
+                    object.__setattr__(self, 'system_prompt', text)
+            except (FileNotFoundError, IOError) as exc:
+                log.warning('Could not load default system prompt from %s: %s', prompt_path, exc)
+        elif self.mode == 'engineer':
+            prompt_path = resources_dir / 'engineer_system_prompt.txt'
+            try:
+                text = prompt_path.read_text(encoding='utf-8')
+                if text:
+                    object.__setattr__(self, 'system_prompt', text)
+            except (FileNotFoundError, IOError) as exc:
+                log.warning('Could not load engineer system prompt from %s: %s', prompt_path, exc)
+        # Enforce mode-specific tool presets
+        if self.mode == 'agent':
+            object.__setattr__(self, 'enabled_tools', list(AGENT_TOOLS))
+        elif self.mode == 'engineer':
+            object.__setattr__(self, 'enabled_tools', list(ENGINEER_TOOLS))
+        # mode == 'custom': leave existing enabled_tools unchanged
+        return self
 
     @model_validator(mode='after')
     def filter_default_enabled_tools(self):
@@ -183,8 +381,22 @@ class AgentConfig(BaseModel):
         if not self.kb_enabled:
             tool_classes = [cls for cls in tool_classes if cls.__name__ != 'KnowledgeBaseTool']
         active_tools = enabled_tools if enabled_tools is not None else self.enabled_tools
-        if active_tools:
-            tool_classes = [cls for cls in tool_classes if cls.__name__ in active_tools]
+        if active_tools is not None:
+            # Legacy class names (configs written before the naming cleanup,
+            # e.g. enabled_tools: ["GitInfoTool"]) map onto the stable tool
+            # names so they keep working after GitInfoTool -> GitReadTool.
+            _LEGACY_TOOL_NAMES = {
+                "GitInfoTool": "git_read",
+                "GitWriteTool": "git_write",
+            }
+            active_tools = [_LEGACY_TOOL_NAMES.get(name, name) for name in active_tools]
+            # Match by stable tool name first, then legacy class name, so
+            # presets/configs written with either identifier keep working.
+            tool_classes = [
+                cls
+                for cls in tool_classes
+                if cls.tool_name() in active_tools or cls.__name__ in active_tools
+            ]
         return tool_classes
 
     def resolve_from_profile(self, manager) -> 'AgentConfig':
@@ -234,4 +446,4 @@ class AgentConfig(BaseModel):
 
         return self.model_copy(update=updates)
 
-    model_config = ConfigDict(extra='ignore')
+    model_config = ConfigDict(extra='forbid')

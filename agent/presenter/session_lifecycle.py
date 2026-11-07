@@ -97,16 +97,31 @@ class SessionLifecycle:
                 self._cached_config = agent_config
                 self._cached_preset_name = preset_name
             else:
-                agent_config = self.state_bridge.create_agent_config(config, total_input=self.state_bridge.total_input, total_output=self.state_bridge.total_output)
+                session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
+                # Convert frontend config dict to SessionConfig via AgentConfig bridge
+                from agent.config.session_config import SessionConfig
+                from agent.config import AgentConfig
+                agent_cfg = AgentConfig(**config) if config else AgentConfig()
+                session_cfg = SessionConfig.from_agent_config(agent_cfg)
+                agent_config = self.state_bridge.create_agent_config(session_cfg, mode=session_mode)
                 self._cached_config = agent_config
                 self._cached_preset_name = None
             if self.state_bridge.current_session is None:
                 ws_path = self.state_bridge.current_config.workspace_path
+                workspace_id = None
                 metadata = {}
+                # Main-agent sessions only: this flag gates session history bounding
+                # (session/size_bounding.py) and session_size_bytes exposure.
+                metadata['agent_type'] = 'main'
                 if ws_path:
+                    from thoughtmachine.workspace_capabilities import resolve_workspace_id
+                    try:
+                        workspace_id = resolve_workspace_id(ws_path)
+                    except Exception:
+                        workspace_id = None
                     metadata['workspace_path'] = ws_path
-                metadata['agent_config'] = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
-                new_session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata)
+                metadata['agent_config'] = agent_config.model_dump(exclude={'api_key', 'session_permissions'}, exclude_none=True)
+                new_session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata, workspace_id=workspace_id)
                 new_session.ensure_name()
                 self.state_bridge.bind_session(new_session)
                 self._register_session_callbacks(new_session)
@@ -131,15 +146,25 @@ class SessionLifecycle:
         self.auto_save_current_session()
         if self.controller.is_running:
             self.controller.stop()
-        agent_config = self.state_bridge.create_agent_config()
+        session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
+        agent_config = self.state_bridge.create_agent_config(mode=session_mode)
         ws_path = self.state_bridge.current_config.workspace_path
+        workspace_id = None
         metadata = {}
+        # Main-agent sessions only: this flag gates session history bounding
+        # (session/size_bounding.py) and session_size_bytes exposure.
+        metadata['agent_type'] = 'main'
         if name:
             metadata['name'] = name
         if ws_path:
+            from thoughtmachine.workspace_capabilities import resolve_workspace_id
+            try:
+                workspace_id = resolve_workspace_id(ws_path)
+            except Exception:
+                workspace_id = None
             metadata['workspace_path'] = ws_path
-        metadata['agent_config'] = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
-        session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata)
+        metadata['agent_config'] = agent_config.model_dump(exclude={'api_key', 'session_permissions'}, exclude_none=True)
+        session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata, workspace_id=workspace_id)
         session.ensure_name()
         self.state_bridge.bind_session(session)
         self._register_session_callbacks(session)
@@ -166,7 +191,18 @@ class SessionLifecycle:
             raise
 
     def pause_session(self):
-        """Request pause of current session."""
+        """Request pause of current session.
+
+        Pause is READING MODE, not a halt: the controller puts the agent under a
+        'pause'-owned restriction, so the turn in flight concludes itself with a
+        Respond while every further tool call is refused. Nothing here aborts
+        the running turn -- the PAUSING state below only tells the UI that the
+        session accepts no new turns.
+
+        The release side lives in Controller.resume() (reached from
+        continue_session), which calls Agent.leave_reading_mode('pause'); there
+        is no separate resume entry point on the presenter.
+        """
         log('DEBUG', 'presenter.lifecycle', f'pause_session called, state={self.state}')
         if self.state == ExecutionState.RUNNING:
             self.controller.request_pause()
@@ -195,7 +231,8 @@ class SessionLifecycle:
         Does NOT automatically start a new session. After restart, state is IDLE.
         """
         try:
-            self._cached_config = self.state_bridge.create_agent_config()
+            session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
+            self._cached_config = self.state_bridge.create_agent_config(mode=session_mode)
         except Exception as e:
             log('DEBUG', 'presenter.lifecycle', f'Error creating agent config for restart: {e}')
             raise
@@ -292,7 +329,7 @@ class SessionLifecycle:
             # If a container exists with stale permissions (e.g. from before
             # the security refactor), remove it so it gets recreated.
             try:
-                from docker_executor import verify_container_integrity
+                from infra.containers.executor import verify_container_integrity
                 ws_path = (
                     session.metadata.get('workspace_path')
                     or getattr(self.state_bridge.current_config, 'workspace_path', None)
@@ -348,7 +385,7 @@ class SessionLifecycle:
 
         # ── Verify container integrity on session load ──────────────
         try:
-            from docker_executor import verify_container_integrity
+            from infra.containers.executor import verify_container_integrity
             ws_path = (
                 session.metadata.get('workspace_path')
                 or getattr(self.state_bridge.current_config, 'workspace_path', None)
@@ -483,7 +520,8 @@ class SessionLifecycle:
                 log('DEBUG', 'presenter.lifecycle', f'_build_session_from_current_state: No conversation found and no current session')
                 return None
         try:
-            agent_config = self.state_bridge.create_agent_config()
+            session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
+            agent_config = self.state_bridge.create_agent_config(mode=session_mode)
         except Exception as e:
             log('DEBUG', 'presenter.lifecycle', f'Error creating agent config: {e}')
             return None
@@ -495,7 +533,7 @@ class SessionLifecycle:
                     metadata[k] = v
         if self.state_bridge.session_name:
             metadata['name'] = self.state_bridge.session_name
-        metadata['agent_config'] = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
+        metadata['agent_config'] = agent_config.model_dump(exclude={'api_key', 'session_permissions'}, exclude_none=True)
         session = Session(session_id=self.state_bridge.current_session_id or str(uuid.uuid4()), user_history=conversation, metadata=metadata)
         session.ensure_name()
         if self.state_bridge.total_input > 0:

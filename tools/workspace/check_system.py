@@ -22,13 +22,28 @@ network_diagnostics:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
 from pydantic import Field
 
 from tools.base import ToolBase
+from tools.host_resource_policy import load_workspace_config
+
+from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
+
+# Vault-relative prefix for per-workspace entries in a vault_status report.
+_VAULT_WORKSPACE_PREFIX = "workspaces/"
+
+# Queries that are always permitted regardless of the workspace allowlist.
+# These are read-only facts about the caller's own machine/workspace (revision,
+# own container list) and must not be deniable: the tool schema advertises them
+# unconditionally, so a runtime denial is displayed != enforced.
+SAFE_QUERIES = frozenset({"version", "containers"})
 
 # ---------------------------------------------------------------------------
 # Optional dependencies
@@ -52,21 +67,159 @@ except ImportError:
     get_effective_permissions = None
 
 try:
-    from docker_executor import get_container_status as _get_docker_status
+    from infra.containers.executor import get_container_status as _get_docker_status
     DOCKER_EXECUTOR_AVAILABLE = True
 except ImportError:
     DOCKER_EXECUTOR_AVAILABLE = False
     _get_docker_status = None
 
 try:
-    from docker_executor import DockerExecutor
+    from infra.containers.executor import DockerExecutor
     DOCKER_EXECUTOR_CLS_AVAILABLE = True
 except ImportError:
     DOCKER_EXECUTOR_CLS_AVAILABLE = False
     DockerExecutor = None
 
+try:
+    from infra.container_manager import (
+        ContainerManager as _ContainerManager,
+        DOCKER_AVAILABLE as CONTAINER_MANAGER_AVAILABLE,
+    )
+except ImportError:
+    _ContainerManager = None
+    CONTAINER_MANAGER_AVAILABLE = False
+
+try:
+    from docker.errors import ImageNotFound as _ImageNotFound
+except ImportError:
+    _ImageNotFound = None
+
+# Worker registry access (for running_workers query)
+try:
+    from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
+    _registry_instance = _WorkerRegistry.get_instance()
+    _worker_registry = _registry_instance._worker_registry
+    _registry_lock = _registry_instance._registry_lock
+    WORKER_REGISTRY_AVAILABLE = True
+except ImportError:
+    _worker_registry = None
+    _registry_lock = None
+    WORKER_REGISTRY_AVAILABLE = False
+
+# Vault allowlist support (CheckSystem query allowlist)
+try:
+    from thoughtmachine.vault import get_checksystem_allowlist
+    VAULT_AVAILABLE = True
+except ImportError:
+    get_checksystem_allowlist = None
+    VAULT_AVAILABLE = False
+
+# Git execution-mode resolver (shared with GitInfoTool; used to surface
+# whether git runs containerized or on the host).
+try:
+    from tools.git_info_tool import resolve_git_execution_mode
+    GIT_MODE_RESOLVER_AVAILABLE = True
+except ImportError:
+    resolve_git_execution_mode = None
+    GIT_MODE_RESOLVER_AVAILABLE = False
+
+
+# Resource catalog (canonical session-resource keys used for display folding)
+try:
+    from security.resource_catalog import RESOURCE_CATALOG, canonical_resource_keys
+    RESOURCE_CATALOG_AVAILABLE = True
+except ImportError:
+    RESOURCE_CATALOG = {}
+    canonical_resource_keys = ()
+    RESOURCE_CATALOG_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
+
+
+# Canonical git permission levels (display fold order, most permissive last) —
+# DISPLAY-ONLY; never feeds gating.
+_CANONICAL_GIT_LEVELS = ('banned', 'ask', 'read', 'write', 'write_on_feature_branch')
+
+
+def _canonical_git_level(effective):
+    """Fold the effective ``git`` level into one canonical display value.
+
+    DISPLAY-ONLY: this fold is for human-readable output (CheckSystem
+    'effective_permissions'). Gating consumes the canonical ``git`` grain from
+    the security gate directly — nothing here feeds authorization. Legacy
+    stored values (``full``, ``write_feature_branches``) are normalized to the
+    canonical ladder for display.
+    """
+    if not isinstance(effective, dict):
+        return None
+    git = effective.get('git')
+    if git in (None, False):
+        return None
+    git = str(git).lower()
+    if git == 'full':
+        git = 'write'
+    if git == 'write_feature_branches':
+        git = 'write_on_feature_branch'
+    if git in _CANONICAL_GIT_LEVELS:
+        return git
+    return None
+
+
+def _canonical_permission_display(effective):
+    """Return the canonical session-resource view of an effective-permissions dict.
+
+    DISPLAY-ONLY (see _canonical_git_level): the effective dict is filtered to
+    the canonical session-resource keys and the git level is folded to the
+    canonical ladder, so what the operator sees matches the session-resource
+    vocabulary the ConfigPanel edits. Stray or legacy keys never appear.
+    """
+    if not isinstance(effective, dict):
+        return {}
+    reported = {k: v for k, v in effective.items() if k in canonical_resource_keys}
+    if 'git' in effective:
+        level = _canonical_git_level(effective)
+        if level is not None:
+            reported['git'] = level
+        elif 'git' in reported:
+            del reported['git']
+    return reported
+
+
+def _server_revision() -> str:
+    """Return the web-UI server revision (git HEAD), or "unknown".
+
+    Lazily imported so CheckSystem has no hard dependency on the web UI
+    package; the /health route surfaces the same value as ``revision``.
+    """
+    try:
+        from web_ui.backend.server import _SERVER_REVISION
+        return _SERVER_REVISION
+    except Exception:
+        return "unknown"
+
+
+def _server_version() -> dict:
+    """Return the runtime version ``{revision, branch, dirty}``.
+
+    All three fields are read from the SAME import-time snapshot captured by
+    the web-UI server module, so they describe one consistent revision.  There
+    is no subprocess git invocation here: ``revision`` comes from
+    :func:`_server_revision` and ``branch``/``dirty`` come from
+    ``_SERVER_BRANCH``/``_SERVER_DIRTY``.  Any failure (web UI package not
+    importable, no git at server-import time) degrades to
+    ``"unknown"``/``False`` rather than raising.
+    """
+    branch = "unknown"
+    dirty = False
+    try:
+        from web_ui.backend.server import _SERVER_BRANCH, _SERVER_DIRTY
+        branch = _SERVER_BRANCH
+        dirty = bool(_SERVER_DIRTY)
+    except Exception:
+        branch = "unknown"
+        dirty = False
+    return {"revision": _server_revision(), "branch": branch, "dirty": dirty}
 
 
 # ---------------------------------------------------------------------------
@@ -77,48 +230,183 @@ class CheckSystem(ToolBase):
     """Inspect the runtime environment — permissions, container, workspace, config, and network."""
 
     tool: str = "CheckSystem"
+    # System checks are always available: no gate category here. The security
+    # gate's effective dict has no 'system' key (canonical session resources:
+    # filesystem/network/container/git/mcp/host_bash), so declaring a
+    # "system:read" category would make check_required_categories deny EVERY
+    # query (unknown category -> fail closed). The vault query allowlist
+    # (_load_allowlist_from_vault / get_checksystem_allowlist) is the access
+    # control for CheckSystem.
     required_categories: ClassVar[List[str]] = []
 
     query: str = Field(
-        description="What to inspect: effective_permissions, container_status, workspace_info, my_config, network_diagnostics",
+        description="What to check. Valid values: 'my_config' (full agent config), "
+                      "'workers' (all worker definitions), 'running_workers' (active worker statuses), "
+                      "'worker/<name>' (specific worker config), 'capabilities' (workspace features), "
+                      "'dockerfile' (container environment), 'mcp_servers' (external tool servers), "
+                      "'effective_permissions' (session × workspace permissions), "
+                      "'version' (runtime git revision, branch, dirty), "
+                      "'container_status' (Docker status), 'containers' (per-workspace container list with notes), "
+                      "'workspace_info' (workspace metadata), "
+                      "'network_diagnostics' (connectivity checks), "
+                      "'event_bus_status' (EventBus subscriber info), "
+                      "'event_log' (tail recent EventLogger entries), "
+                      "'vault_status' (vault drift vs schema manifest), "
+                      "'vault_repair_status' (full read-only vault repair dry-run report), "
+                      "'runtime_state' (redacted runtime snapshot — token limits, worker caps, "
+                      "session sandbox status, permissions, allowlist).",
     )
 
     skip_output_truncation: ClassVar[bool] = True
 
+    allowlist: Optional[list] = Field(default=None, description="Loaded allowlist from vault (list of allowed query names)")
+
+    workspace_id: Optional[str] = Field(
+        default=None,
+        description="Explicit workspace ID override. If set, used directly instead of resolving from session.",
+    )
+
+    def _check_path_allowed(self, query_name: str) -> bool:
+        """Check if a CheckSystem query name is allowed by the vault allowlist.
+
+        Returns True if allowed or if vault is unavailable (degraded mode).
+        Logs a warning if the query is denied.
+        """
+        if query_name in SAFE_QUERIES:
+            # Always allowed: own revision / own container list (see SAFE_QUERIES).
+            return True
+        if self.allowlist is None:
+            return True  # degraded mode: vault not available, assume allowed
+        if query_name in self.allowlist:
+            return True
+        logger.warning("CheckSystem: query '%s' not in allowlist", query_name)
+        return False
+
+    # ------------------------------------------------------------------
+    def _load_allowlist_from_vault(self) -> Optional[list]:
+        """Load and verify the allowlist from vault.
+
+        Returns the allowlist list, or None if vault is unavailable.
+        Uses get_checksystem_allowlist() which handles integrity verification internally.
+        """
+        if get_checksystem_allowlist is None:
+            return None
+        try:
+            entries = get_checksystem_allowlist()
+            logger.info(
+                "CheckSystem: loaded allowlist with %d allowed queries",
+                len(entries),
+            )
+            return entries
+        except Exception as exc:
+            logger.exception("CheckSystem: failed to load allowlist: %s", exc)
+            return None
+
     # ------------------------------------------------------------------
     def execute(self) -> str:
         try:
-            ws_id = None
-            if resolve_workspace_id and self.workspace_path:
-                ws_id = resolve_workspace_id(self.workspace_path)
+            # === Resolve workspace path from registries (primary, always correct) ===
+            workspace_path = None
+            if self.session_id:
+                try:
+                    from session.session_registry import SessionRegistry
+                    session_info = SessionRegistry.get_default().get(self.session_id)
+                    ws_id_from_registry = session_info.get("workspace_id") if session_info else None
+                    if ws_id_from_registry:
+                        from thoughtmachine.workspace_registry import WorkspaceRegistry
+                        entry = WorkspaceRegistry.get_default().get_workspace(ws_id_from_registry)
+                        workspace_path = entry.root_path if entry else None
+                except Exception:
+                    pass
+
+            # Fallback to deprecated self.workspace_path
+            if not workspace_path:
+                workspace_path = getattr(self, 'workspace_path', None)
+                if workspace_path:
+                    logging.warning(
+                        "CheckSystem falling back to deprecated AgentConfig.workspace_path")
+
+            # Resolve workspace ID — explicit field takes priority
+            ws_id = self.workspace_id
+            if not ws_id and workspace_path and resolve_workspace_id:
+                ws_id = resolve_workspace_id(workspace_path)
+
+            # Load vault allowlist
+            self.allowlist = self._load_allowlist_from_vault()
+
+            # Allowlist enforcement for ALL queries (not just a subset)
+            query = self.query
+            if self.allowlist is not None:
+                # Handle worker/<name> prefix: check base "workers" against allowlist
+                check_query = query
+                if query.startswith("worker/"):
+                    check_query = "workers"
+                allowed = self._check_path_allowed(check_query)
+                if not allowed:
+                    return json.dumps({
+                        'error': f'Query "{query}" not allowed by system configuration',
+                        'status': 'denied',
+                    }, indent=2)
+
+            # Dynamic handlers: worker/<name> needs special handling
+            if query.startswith("worker/"):
+                worker_name = query[len("worker/"):]
+                result = self._query_worker_detail(ws_id, worker_name)
+                return json.dumps(result, indent=2, default=str)
 
             handler_map = {
                 "effective_permissions": lambda: self._query_permissions(ws_id),
-                "container_status": lambda: self._query_container_status(),
+                "version": lambda: self._query_version(),
+                "container_status": lambda: self._query_container_status(workspace_path),
+                "containers": lambda: self._query_containers(workspace_path),
                 "workspace_info": lambda: self._query_workspace_info(ws_id),
                 "my_config": lambda: self._query_my_config(),
-                "network_diagnostics": lambda: self._query_network_diagnostics(ws_id),
+                "network_diagnostics": lambda: self._query_network_diagnostics(ws_id, workspace_path),
+                "workers": lambda: self._query_workers(ws_id),
+                "running_workers": lambda: self._query_running_workers(),
+                "capabilities": lambda: self._query_capabilities(ws_id, workspace_path),
+                "dockerfile": lambda: self._query_dockerfile(ws_id),
+                "mcp_servers": lambda: self._query_mcp_servers(ws_id),
+                "event_bus_status": lambda: self._query_event_bus_status(),
+                "event_log": lambda: self._query_event_log(),
+                "vault_status": lambda: self._query_vault_status(ws_id),
+                "vault_repair_status": lambda: self._query_vault_repair_status(),
+                "runtime_state": lambda: self._query_runtime_state(ws_id, workspace_path),
             }
 
-            handler = handler_map.get(self.query)
+            handler = handler_map.get(query)
             if handler is None:
                 return json.dumps({
-                    "error": f"Unknown query: {self.query}",
-                    "available_queries": list(handler_map.keys()),
+                    "error": f"Unknown query: {query}",
+                    "valid_queries": list(handler_map.keys()),
                 })
 
             result = handler()
+            if isinstance(result, str):
+                return result
             return json.dumps(result, indent=2, default=str)
         except Exception as exc:
             logger.exception("CheckSystem failed")
             return json.dumps(
-                {"error": str(exc), "query": self.query}, indent=2
+                {"error": str(exc), "query": getattr(self, 'query', 'unknown')}, indent=2
             )
 
     # -- query implementations -------------------------------------------
 
     def _query_permissions(self, ws_id: Optional[str]) -> dict:
-        """Return effective permissions (session × workspace)."""
+        """Return effective permissions (session × workspace).
+
+        Source-of-truth precedence:
+        1. ``self.effective_permissions`` (when a non-empty dict) — injected by
+           ToolExecutor, computed FRESH THIS CALL from the disk grants + ceiling
+           via the session_id + workspace_id 4-arg gate. Authoritative over the
+           session-start mirror in ``self.session_permissions``, which is never
+           refreshed when the operator changes permissions on disk.
+        2. Legacy 2-arg merge of the in-memory session mirror against the
+           workspace capabilities file — kept only for id-less executors /
+           direct construction, where the disk 4-arg mode cannot engage.
+        3. Raw session mirror when the gate module is unavailable.
+        """
         # Load workspace capabilities from file
         workspace_capabilities = {}
         if CAPABILITIES_AVAILABLE and _workspace_dir and ws_id:
@@ -130,63 +418,156 @@ class CheckSystem(ToolBase):
                     workspace_capabilities = {}
 
         effective = {}
-        if GATE_AVAILABLE and get_effective_permissions and self.session_permissions:
-            # Build a simple SessionPermissions object or use raw dict
+        permission_fetch_error = None
+        permission_origin = "none"
+        injected = getattr(self, "effective_permissions", None)
+        if isinstance(injected, dict) and injected:
+            # Executor's per-call disk-authoritative merge (see docstring).
+            effective = dict(injected)
+            permission_origin = "executor-disk"
+        elif GATE_AVAILABLE and get_effective_permissions and self.session_permissions:
+            # Id-less / direct-construction fallback: 2-arg merge of the
+            # in-memory session mirror with the workspace capabilities file.
             try:
                 from thoughtmachine.security import SessionPermissions
                 session_obj = SessionPermissions(**self.session_permissions)
                 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
                 caps_obj = WorkspaceCapabilities(**{
                     k: v for k, v in workspace_capabilities.items()
-                    if k in [f.name for f in __import__('dataclasses').fields(WorkspaceCapabilities)]
+                    if k in [f.name for f in dataclasses.fields(WorkspaceCapabilities)]
                 })
                 effective = get_effective_permissions(session_obj, caps_obj)
-            except Exception:
-                effective = dict(self.session_permissions)
+                permission_origin = "mirror-merge"
+            except Exception as exc:
+                # Fail-closed: surface the error instead of silently returning
+                # the raw session permissions (which could overstate effective
+                # rights when capability computation fails).
+                logger.error("check_system: effective-permission computation failed: %s", exc)
+                effective = {}
+                permission_fetch_error = str(exc)
         elif self.session_permissions:
             effective = dict(self.session_permissions)
+            permission_origin = "session-mirror"
 
         return {
-            "effective_permissions": effective,
+            # DISPLAY-ONLY fold: the effective dict is reduced to the canonical
+            # session-resource keys (git level folded to the canonical ladder)
+            # so the report matches the ConfigPanel vocabulary.
+            "effective_permissions": _canonical_permission_display(effective),
             "workspace_capabilities": workspace_capabilities,
             "workspace_id": ws_id,
             "source": "gate" if GATE_AVAILABLE else "session_fallback",
+            "permission_origin": permission_origin,
+            "permission_fetch_error": permission_fetch_error,
         }
 
-    def _query_container_status(self) -> dict:
+    def _query_version(self) -> dict:
+        """Return the runtime version ``{revision, branch, dirty}``.
+
+        ``revision`` is the same value the web-UI ``/health`` route exposes;
+        ``branch``/``dirty`` are resolved best-effort from git and degrade to
+        ``"unknown"``/``False`` when git is unavailable.
+        """
+        return _server_version()
+
+    def _query_container_status(self, ws_path: Optional[str]) -> dict:
         """Return Docker container status for the workspace."""
-        ws_path = self.workspace_path
+        ws_path = ws_path or getattr(self, 'workspace_path', None)
         if not ws_path:
             return {"status": "unavailable", "reason": "No workspace path"}
 
         if DOCKER_EXECUTOR_AVAILABLE and _get_docker_status:
             try:
-                result = _get_docker_status(workspace_path=ws_path, session_permissions=self.session_permissions)
+                result = _get_docker_status(workspace_path=ws_path)
+                if isinstance(result, dict):
+                    # Alias the server revision under runtime_commit so the panel
+                    # can pin which runtime produced this status. Existing image
+                    # build-hash handling is left untouched.
+                    result.setdefault("runtime_commit", _server_revision())
                 return result
             except Exception as e:
                 return {"status": "error", "error": str(e)}
 
         return {"status": "unavailable", "reason": "Docker executor not available"}
 
+    def _query_containers(self, ws_path: Optional[str]) -> dict:
+        """Return the per-workspace container list with sticky notes; NEVER raises.
+
+        Delegates to ``ContainerManager.list_containers()`` so the result is
+        scoped by the ``thoughtmachine.workspace_id`` label and each entry's
+        ``note`` comes from the vault bulletin board
+        (``<vault_root>/workspaces/<workspace_id>/container_notes.json``),
+        not from Docker labels.
+        """
+        ws_path = ws_path or getattr(self, 'workspace_path', None)
+        if not ws_path:
+            return {"containers": [], "count": 0, "reason": "No workspace path",
+                    "status": "unavailable"}
+
+        sp = self.effective_permissions or {}
+        if not sp.get("container"):
+            return {"containers": [], "count": 0,
+                    "reason": "no container permission", "status": "unavailable"}
+
+        if _ContainerManager is None:
+            return {"containers": [], "count": 0,
+                    "reason": "Container manager not available",
+                    "status": "unavailable"}
+
+        try:
+            manager = _ContainerManager(
+                workspace_path=ws_path,
+                session_id=getattr(self, "session_id", None),
+                workspace_id=getattr(self, "workspace_id", None),
+                session_permissions=sp,
+            )
+            entries = manager.list_containers()
+        except Exception as e:
+            return {"containers": [], "count": 0,
+                    "reason": f"failed: {e}", "status": "error"}
+
+        containers = []
+        for entry in entries:
+            item = {
+                "name": entry.get("name"),
+                "status": entry.get("status"),
+                "note": entry.get("note", ""),
+                "uptime_seconds": entry.get("uptime_seconds"),
+            }
+            # Phase 6: decorate running containers with a cheap live summary
+            # (packages_count + disk_usage); best-effort, never raises.
+            if entry.get("status") == "running":
+                try:
+                    summary = manager.container_summary(entry.get("container_id"))
+                    if summary:
+                        item.update(summary)
+                except Exception:
+                    pass
+            containers.append(item)
+        return {"containers": containers, "count": len(containers), "status": "ok"}
+
     def _query_workspace_info(self, ws_id: Optional[str]) -> dict:
-        """Return workspace info including workers and MCP tools."""
+        """Return workspace info including workers, MCP tools and risk."""
         capabilities = {}
         domain_allowlist = []
         workers = []
         mcp_tools = []
+        purpose = None
+        permissions = {}
+        allow_host_resources = False
 
         if CAPABILITIES_AVAILABLE and _workspace_dir and ws_id:
             ws_dir = _workspace_dir(ws_id)
 
-            # Load config.json
-            config_path = ws_dir / "config.json"
-            if config_path.exists():
-                try:
-                    config_data = json.loads(config_path.read_text(encoding="utf-8"))
-                    capabilities = config_data.get("capabilities", {})
-                    domain_allowlist = config_data.get("domain_allowlist", [])
-                except (json.JSONDecodeError, OSError):
-                    pass
+            # Load config.json (single source of truth for the read)
+            config_data = load_workspace_config(ws_id)
+            capabilities = config_data.get("capabilities", {})
+            domain_allowlist = config_data.get("domain_allowlist", [])
+            purpose = config_data.get("purpose")
+            saved_permissions = config_data.get("permissions")
+            if isinstance(saved_permissions, dict):
+                permissions = saved_permissions
+            allow_host_resources = config_data.get("allow_host_resources") is True
 
             # Load workers.json
             workers_path = ws_dir / "workers.json"
@@ -204,44 +585,875 @@ class CheckSystem(ToolBase):
                 except (json.JSONDecodeError, OSError):
                     mcp_tools = []
 
+        # Runtime risk assessment (lazy import; degraded response on ImportError)
+        risk = {"level": "low", "error": "risk_model unavailable"}
+        try:
+            from agent.config.risk_model import compute_workspace_risk
+
+            risk = compute_workspace_risk(
+                permissions=permissions,
+                allow_host_resources=allow_host_resources,
+                purpose=purpose,
+            )
+        except ImportError:
+            risk = {"level": "low", "error": "risk_model unavailable"}
+
+        # GATE-RESOLVED: the config-declared ``permissions`` above is the
+        # on-disk request, not the effective grant. Resolve the effective
+        # (session x workspace) dict once and surface both the host_bash value
+        # and the full effective_permissions block; fail closed to "banned".
+        effective_permissions = {}
+        host_bash = "banned"
+        try:
+            eff = self._query_permissions(ws_id)
+            if isinstance(eff, dict):
+                effective_permissions = eff.get("effective_permissions") or {}
+                host_bash = effective_permissions.get("host_bash", "banned")
+        except Exception:
+            host_bash = "banned"
+        if not host_bash:
+            host_bash = "banned"
+
         return {
             "workspace_id": ws_id,
             "capabilities": capabilities,
             "domain_allowlist": domain_allowlist,
             "workers": workers,
             "mcp_tools": mcp_tools,
+            "purpose": purpose,
+            # DECLARED config (the workspace ceiling), read verbatim from
+            # config.json. This is NOT the session-effective grant; read the
+            # sibling ``effective_permissions`` for the gate-resolved value.
+            "permissions": permissions,
+            # GATE-RESOLVED (session x workspace). This is what the agent
+            # should read.
+            "effective_permissions": effective_permissions,
+            "host_bash": host_bash,
+            "allow_host_resources": allow_host_resources,
+            "risk": risk,
         }
 
     def _query_my_config(self) -> dict:
-        """Return the agent-config snapshot injected by ToolExecutor."""
+        """Return the agent-config snapshot injected by ToolExecutor (clean JSON)."""
         if self.agent_config is not None:
-            return dict(self.agent_config)
+            cfg = dict(self.agent_config)
+            # Redact API key to prevent security leak inside raw_config
+            raw_cfg = cfg.copy()
+            raw_cfg["api_key"] = "***" if raw_cfg.get("api_key") else None
+            # Ensure key fields are always present
+            result = {
+                "provider": cfg.get("provider", cfg.get("provider_type", "")),
+                "model": cfg.get("model", ""),
+                "timeout_seconds": cfg.get("timeout_seconds", IDLE_TIMEOUT_SECONDS),
+                "max_turns": cfg.get("max_turns", 50),
+                "enabled_tools": cfg.get("enabled_tools", []),
+                "temperature": cfg.get("temperature", 0.7),
+                "system_prompt": cfg.get("system_prompt", ""),
+                "session_permissions": cfg.get("session_permissions", {}),
+                "token_monitor_warning_threshold": cfg.get("token_monitor_warning_threshold", None),
+                "token_monitor_critical_threshold": cfg.get("token_monitor_critical_threshold", None),
+                "restriction_reason": cfg.get("restriction_reason", None),
+                "reasoning_effort": cfg.get("reasoning_effort", None),
+                "base_url": cfg.get("base_url", None),
+                "api_key": "***" if cfg.get("api_key") else None,
+                # Redact API key inside raw_config to prevent security leak
+                "raw_config": raw_cfg,
+            }
+            return result
         return {"error": "agent_config not available"}
 
-    def _query_network_diagnostics(self, ws_id: Optional[str]) -> dict:
-        """Quick connectivity checks, running inside container if available."""
-        ws_path = self.workspace_path
+    def _query_network_diagnostics(self, ws_id: Optional[str], ws_path: Optional[str]) -> dict:
+        """Quick connectivity check inside a throwaway Docker probe container.
+
+        The probe container is created with the SAME isolation the session's
+        sandboxes get (network_mode/workspace_mode derived from session
+        permissions via ContainerManager), so the result reflects what
+        containers in this session actually see. The probe container is
+        always stopped afterwards (finally-cleanup). No image pull is
+        performed - the probe only runs if ``python:3.11-slim`` is already
+        present locally, so a down daemon can never hang this query.
+        """
+        ws_path = ws_path or getattr(self, 'workspace_path', None)
         if not ws_path:
             return {"container": False, "message": "No workspace path"}
 
-        if DOCKER_EXECUTOR_CLS_AVAILABLE and DockerExecutor:
+        # Keep the existing guard: the legacy test contract expects a clean
+        # {"container": False} when the Docker executor is unavailable.
+        if not (DOCKER_EXECUTOR_CLS_AVAILABLE and DockerExecutor):
+            return {"container": False, "message": "Docker executor not available"}
+
+        if not CONTAINER_MANAGER_AVAILABLE or _ContainerManager is None:
+            return {"container": False, "message": "Container manager not available"}
+
+        import uuid
+        name = f"tm-net-diag-{uuid.uuid4().hex[:8]}"
+        result = {
+            "daemon": False,
+            "container": False,
+            "container_id": None,
+            "container_status": None,
+            "image_present": False,
+            "probe": None,
+            "egress": False,
+            "message": "",
+        }
+        manager = None
+        container_id = None
+        try:
+            manager = _ContainerManager(
+                workspace_path=ws_path,
+                session_permissions=self.effective_permissions or {},
+                session_id=getattr(self, "session_id", None),
+            )
+            # Daemon reachability + image presence in one API call. No pull:
+            # a missing image is reported and the probe is skipped.
             try:
-                executor = DockerExecutor(workspace_path=ws_path)
-                result = {}
-
-                # DNS checks
-                for host in ["pypi.org", "api.github.com"]:
-                    dns_result = executor.run_command(f"nslookup {host}")
-                    http_result = executor.run_command(
-                        f"curl -s -o /dev/null -w '%{{http_code}}' https://{host}"
-                    )
-                    result[host] = {
-                        "dns": "ok" if dns_result else "error",
-                        "http": http_result.strip() if http_result else "error",
-                    }
-
-                return result
+                manager.client.images.get("python:3.11-slim")
+                result["daemon"] = True
+                result["image_present"] = True
             except Exception as e:
-                return {"container": False, "message": f"No container running: {e}"}
+                if _ImageNotFound is not None and isinstance(e, _ImageNotFound):
+                    result["message"] = (
+                        "python:3.11-slim image not present locally; probe skipped"
+                    )
+                else:
+                    result["message"] = f"Docker daemon unreachable: {e}"
+                return result
 
-        return {"container": False, "message": "No container running"}
+            started = manager.start(image="python:3.11-slim", name=name)
+            result["container"] = True
+            container_id = started.get("id")
+            result["container_id"] = container_id
+            result["container_status"] = started.get("status")
+
+            probe_cmd = (
+                "python3 - <<'PY'\n"
+                "import urllib.request\n"
+                "try:\n"
+                "    r = urllib.request.urlopen('https://example.com', timeout=8)\n"
+                "    print('EGRESS_OK', r.status)\n"
+                "except Exception as e:\n"
+                "    print('EGRESS_BLOCKED', type(e).__name__, e)\n"
+                "PY\n"
+            )
+            out = manager.exec(container_id, probe_cmd, timeout=30)
+            result["probe"] = {
+                "exit_code": out.get("exit_code"),
+                "stdout": out.get("stdout", ""),
+                "stderr": out.get("stderr", ""),
+            }
+            egress = (
+                out.get("exit_code") == 0
+                and "EGRESS_OK" in (out.get("stdout") or "")
+            )
+            result["egress"] = egress
+            result["message"] = (
+                "egress OK (bridge network)" if egress
+                else "egress blocked (no network / DNS failure)"
+            )
+        except Exception as e:
+            result["message"] = f"Network diagnostics failed: {e}"
+        finally:
+            if manager is not None and container_id:
+                try:
+                    manager.stop(container_id)
+                except Exception:
+                    pass
+        return result
+
+    # ── new query handlers ─────────────────────────────────────────
+
+    def _query_workers(self, ws_id: Optional[str]) -> dict:
+        """Return all worker definitions from workers.json."""
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir:
+            return {"workers": [], "count": 0}
+        if not ws_id:
+            scanned = self._scan_workspace_dirs_for_workers()
+            if scanned:
+                return {"workers": scanned, "count": len(scanned)}
+            return {"workers": [], "count": 0}
+        workers_path = _workspace_dir(ws_id) / "workers.json"
+        if not workers_path.exists():
+            return {"workers": [], "count": 0}
+        try:
+            workers = json.loads(workers_path.read_text(encoding="utf-8"))
+            return {"workers": workers, "count": len(workers)}
+        except (json.JSONDecodeError, OSError) as e:
+            return {"error": f"Failed to read workers.json: {e}", "workers": [], "count": 0}
+
+    def _query_worker_detail(self, ws_id: Optional[str], worker_name: str) -> dict:
+        """Return full definition of a specific worker by name."""
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir:
+            return {"error": "workspace not available"}
+        if not ws_id:
+            scanned = self._scan_workspace_dirs_for_workers()
+            for w in scanned:
+                if isinstance(w, dict) and w.get("name") == worker_name:
+                    return w
+            return {"error": f"worker '{worker_name}' not found"}
+        workers_path = _workspace_dir(ws_id) / "workers.json"
+        if not workers_path.exists():
+            return {"error": "worker not found"}
+        try:
+            workers = json.loads(workers_path.read_text(encoding="utf-8"))
+            for w in workers:
+                if isinstance(w, dict) and w.get("name") == worker_name:
+                    return w
+            return {"error": f"worker '{worker_name}' not found"}
+        except (json.JSONDecodeError, OSError) as e:
+            return {"error": f"Failed to read workers.json: {e}"}
+
+    def _query_running_workers(self) -> dict:
+        """Return list of currently running workers with status details."""
+        # The registry is process-global: scope to this session (fail-closed) so
+        # another session's worker name / current_task never leaks into the payload.
+        session_id = self.session_id or ""
+        running = []
+        if WORKER_REGISTRY_AVAILABLE and _worker_registry is not None and _registry_lock is not None:
+            with _registry_lock:
+                for key, thread in list(_worker_registry.items()):
+                    if not isinstance(key, tuple) or key[0] != session_id:
+                        continue
+                    entry = {
+                        "name": key[1] if isinstance(key, tuple) else str(key),
+                        "session_id": key[0] if isinstance(key, tuple) else None,
+                        "status": thread.status,
+                        "alive": thread.is_alive(),
+                        "current_task": thread.current_task,
+                        "last_heartbeat": thread.last_heartbeat,
+                        "error": thread.error,
+                        "conversation_length": len(thread._worker_ctx.user_history) if thread._worker_ctx else 0,
+                    }
+                    elapsed = thread._last_elapsed()
+                    if elapsed is not None:
+                        entry["elapsed_seconds"] = round(elapsed, 1)
+                    running.append(entry)
+        return {"running_workers": running, "count": len(running)}
+
+    def _workspace_metadata(self) -> dict:
+        """Resolve metadata of the session's registered workspace.
+
+        Best-effort mirror of ``GitInfoTool._workspace_metadata`` so the git
+        execution mode surfaced in capabilities uses the same precedence
+        (agent config → workspace metadata → default). Any registry failure
+        or missing session/entry yields ``{}``.
+        """
+        session_id = getattr(self, "session_id", None)
+        if not session_id:
+            return {}
+        try:
+            from session.session_registry import SessionRegistry
+            from thoughtmachine.workspace_registry import WorkspaceRegistry
+
+            session_info = SessionRegistry.get_default().get(session_id)
+            if not session_info:
+                return {}
+            ws_id = session_info.get("workspace_id")
+            if not ws_id:
+                return {}
+            entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
+            metadata = getattr(entry, "metadata", None)
+            return dict(metadata) if metadata else {}
+        except Exception:
+            return {}
+
+    def _query_capabilities(self, ws_id: Optional[str], ws_path: Optional[str] = None) -> dict:
+        """Return workspace capabilities: provider, model, tools, docker, git, OS, token limits."""
+        result = {
+            "provider": None,
+            "model": None,
+            "enabled_tools": [],
+            "has_docker": False,
+            "has_git": False,
+            "os": None,
+            "token_limits": {},
+            "git": {"mode": "unavailable"},
+            "resources": {},
+        }
+
+        # Surface the effective git execution mode (containerized vs
+        # host_fallback) using the same resolution as GitInfoTool.
+        # The module-level import can fail during a circular-import window
+        # (e.g. when security_gate is imported before check_system), so retry
+        # the import lazily here at call time.
+        resolver = resolve_git_execution_mode if GIT_MODE_RESOLVER_AVAILABLE else None
+        if resolver is None:
+            try:
+                from tools.git_info_tool import resolve_git_execution_mode as resolver
+            except Exception:
+                resolver = None
+        if resolver is not None:
+            result["git"]["mode"] = resolver(
+                dict(self.agent_config) if self.agent_config else {},
+                self._workspace_metadata(),
+                ws_path or getattr(self, "workspace_path", None),
+                ws_id,
+            )
+
+        # Probe the ACTUAL hidden-resource state (read-only; never builds or
+        # creates containers). The live probe overrides the static resolver
+        # default so the surfaced mode matches what git execution would do.
+        try:
+            from infra.resource_container_manager import resource_status
+        except Exception:
+            resource_status = None
+        if callable(resource_status):
+            try:
+                probe = resource_status(
+                    "git",
+                    workspace_id=ws_id,
+                    session_permissions=getattr(self, "effective_permissions", None),
+                )
+            except Exception:
+                probe = None
+            if isinstance(probe, dict) and probe.get("mode") in ("containerized", "host_fallback"):
+                result["git"]["mode"] = probe.get("mode")
+                result["resources"]["git"] = probe
+            elif isinstance(probe, dict):
+                # 'unavailable' (unknown resource / policy-denied): keep the
+                # resolver value; still surface the raw probe payload.
+                result["resources"]["git"] = probe
+            else:
+                result["resources"]["git"] = {
+                    "mode": result["git"]["mode"],
+                    "detail": "probe unavailable",
+                }
+        else:
+            result["resources"]["git"] = {
+                "mode": result["git"]["mode"],
+                "detail": "probe unavailable",
+            }
+
+        # Try to get from agent_config first
+        if self.agent_config:
+            cfg = dict(self.agent_config)
+            result["provider"] = cfg.get("provider", cfg.get("provider_type"))
+            result["model"] = cfg.get("model")
+            result["enabled_tools"] = cfg.get("enabled_tools", [])
+
+        # Check Docker availability
+        try:
+            import shutil
+            result["has_docker"] = shutil.which("docker") is not None
+        except Exception:
+            pass
+
+        # Check git availability
+        try:
+            import shutil
+            result["has_git"] = shutil.which("git") is not None
+        except Exception:
+            pass
+
+        result["os"] = os.name
+
+        # Try to read capabilities.json for token limits
+        if CAPABILITIES_AVAILABLE and _workspace_dir and ws_id:
+            caps_path = _workspace_dir(ws_id) / "capabilities.json"
+            if caps_path.exists():
+                try:
+                    caps_data = json.loads(caps_path.read_text(encoding="utf-8"))
+                    result["token_limits"] = {
+                        "max_context_length": caps_data.get("max_context_length", 0),
+                        "max_conversation_turns": caps_data.get("max_conversation_turns", 0),
+                        "max_file_size_bytes": caps_data.get("max_file_size_bytes", 0),
+                    }
+                    result["has_docker"] = caps_data.get("allow_docker", result["has_docker"])
+                    result["has_git"] = caps_data.get("git_available", result["has_git"])
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+        return result
+
+    def _scan_workspace_dirs_for_workers(self) -> list:
+        """
+        Scan ``~/.thoughtmachine/workspaces/<id>/workers.json`` for all workspace
+        directories and return the first valid workers list found.
+
+        This is a fallback when ``ws_id`` cannot be resolved.
+        """
+        import os
+
+        base = Path(os.path.expanduser("~/.thoughtmachine/workspaces"))
+        if not base.is_dir():
+            return []
+
+        for entry in sorted(base.iterdir()):
+            if not entry.is_dir():
+                continue
+            workers_path = entry / "workers.json"
+            if not workers_path.is_file():
+                continue
+            try:
+                data = json.loads(workers_path.read_text(encoding="utf-8"))
+                if data and isinstance(data, list):
+                    return data
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        return []
+
+    def _query_dockerfile(self, ws_id: Optional[str]) -> dict:
+        """Return current Dockerfile content as a string."""
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
+            return {"available": False, "error": "workspace not available"}
+        dockerfile_path = _workspace_dir(ws_id) / "Dockerfile"
+        if not dockerfile_path.exists():
+            return {"available": False, "error": "Dockerfile not found"}
+        try:
+            content = dockerfile_path.read_text(encoding="utf-8")
+            return {"available": True, "content": content}
+        except OSError as e:
+            return {"available": False, "error": str(e)}
+
+    def _query_event_bus_status(self) -> dict:
+        """Return EventBus subscriber info for diagnostics."""
+        try:
+            from agent.events import global_event_bus
+            with global_event_bus._lock:
+                subscribers = {k.value: len(v) for k, v in global_event_bus._subscribers.items()}
+                wildcard_count = len(global_event_bus._wildcard_subscribers)
+            return {
+                "subscribers_by_type": subscribers,
+                "wildcard_subscribers": wildcard_count,
+                "total_subscriber_types": len(subscribers),
+            }
+        except Exception as e:
+            return {"error": f"Failed to get event bus status: {e}"}
+
+    # Event types whose ``data`` carries a human-readable message body.  Their
+    # free text is redacted to a length/shape marker before the log is shown;
+    # ``container_lifecycle`` is deliberately absent -- see _redact_event_body.
+    _MESSAGE_BODY_EVENT_TYPES: ClassVar[frozenset] = frozenset({"user_query", "tool_result", "turn"})
+
+    @staticmethod
+    def _event_belongs_to_session(record: dict, session_id: str) -> bool:
+        """True when *record* is attributable to *session_id*.
+
+        Three shapes are in play today, so a record may match on any of them:
+
+        1. ``record["session_id"]`` -- top level, written by EventLogger for
+           every event (the write-side half of this scoping).
+        2. ``record["data"]["session_id"]`` -- how ``container_lifecycle``
+           events carry it (infra/container_lifecycle.py::_build_event).
+        3. ``record["data"]["conversation_id"]`` -- how ``user_query`` /
+           ``turn`` / ``tool_result`` carry it (agent/core/agent.py::
+           _get_conversation_data_for_event).
+
+        A record matching none of them is unattributed: it belongs to nobody
+        and is therefore excluded for every caller.
+        """
+        if not session_id:
+            return False
+        if record.get("session_id") == session_id:
+            return True
+        data = record.get("data")
+        if not isinstance(data, dict):
+            return False
+        if data.get("session_id") == session_id:
+            return True
+        return data.get("conversation_id") == session_id
+
+    @classmethod
+    def _redact_event_body(cls, event_type: Any, data: Any) -> Any:
+        """Return a shallow copy of *data* with message bodies redacted.
+
+        Only the message-carrying types (``user_query`` / ``tool_result`` /
+        ``turn``) are touched.  ``container_lifecycle`` is NEVER redacted: its
+        payload is the destroy/restart audit record (action, reason,
+        contributing_source, container identity) and is also the only
+        session/workspace scoping key for those events.
+        """
+        if not isinstance(data, dict):
+            return data
+        if not isinstance(event_type, str) or event_type not in cls._MESSAGE_BODY_EVENT_TYPES:
+            return data
+        redacted = dict(data)
+        for key in ("content", "assistant_content", "result"):
+            value = redacted.get(key)
+            if value is None:
+                continue
+            try:
+                size = len(value)
+            except TypeError:
+                size = len(str(value))
+            redacted[key] = f"[content: {size} chars, type: {type(value).__name__}]"
+        tool_calls = redacted.get("tool_calls")
+        # Tool arguments and results ride inside tool_calls, so leaving it whole
+        # would be a half-redaction.
+        if isinstance(tool_calls, (list, tuple, dict)) and len(tool_calls):
+            redacted["tool_calls"] = f"[tool_calls: {len(tool_calls)} items]"
+        return redacted
+
+    def _query_event_log(self) -> str:
+        """Tail the EventLogger JSONL file, scoped to the calling session.
+
+        The event log is ONE vault-global file shared by every session, so it is
+        never served unfiltered: the caller's session id is required (fail
+        closed, per _query_running_workers), the ownership filter is applied
+        while scanning backwards so a busy neighbour cannot starve the caller
+        out of the window, and only attributable records are shown -- with
+        message bodies redacted.
+        """
+        try:
+            # Fail closed: without a session scope there is no safe view.  A
+            # global tail must never be the fallback.
+            sid = self.session_id or ""
+            if not sid:
+                return (
+                    "[event_log] No session scope on this call; refusing to "
+                    "return the global event log."
+                )
+
+            from agent.logging.event_logger import EventLogger
+            file_path = EventLogger.instance().file_path
+            if not os.path.exists(file_path):
+                return f"[event_log] No log file found at: {file_path}"
+
+            # Filter WHILE scanning backwards, so the read window is spent on
+            # the caller's own records first.  A fixed line window is taken
+            # from the *shared* file before the ownership filter, so on a busy
+            # machine a neighbour can write more records between two of this
+            # session's than the window holds, pushing this session's records
+            # out of the view entirely (R4: starvation, not disclosure -- the
+            # filter still discards every unmatched record).  The scan stops as
+            # soon as ``wanted`` owned records are buffered, and is hard-capped
+            # at ``scan_max_bytes`` so a session with no recent records cannot
+            # turn one query into a full read of a vault-global file.
+            #
+            # In-process filesystem read (migration category 2), not host
+            # execution: the log is a local append-only file this process owns,
+            # so it needs no host process and no host bridge.  Only the scanned
+            # tail is loaded -- the file itself is unbounded -- by seeking from
+            # EOF backwards in growing chunks.  Encoding matches EventLogger's
+            # writer (utf-8); errors="replace" keeps a torn multibyte sequence
+            # from making the whole query fail.
+            wanted = 50
+            scan_max_bytes = 4 * 1024 * 1024
+            chunk_size = 8192
+            owned_reversed: list = []
+            scanned = 0
+            leftover = b""
+            with open(file_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                pos = fh.tell()
+                while (
+                    pos > 0
+                    and len(owned_reversed) < wanted
+                    and scanned < scan_max_bytes
+                ):
+                    read_size = min(chunk_size, pos, scan_max_bytes - scanned)
+                    pos -= read_size
+                    fh.seek(pos)
+                    data = fh.read(read_size)
+                    scanned += read_size
+                    segments = (data + leftover).split(b"\n")
+                    if pos > 0:
+                        # The chunk opened mid-line: that leading fragment is
+                        # not a record, and the next (earlier) chunk completes
+                        # it.
+                        leftover = segments.pop(0)
+                    else:
+                        leftover = b""
+                    for segment in reversed(segments):
+                        if not segment.strip():
+                            continue
+                        try:
+                            parsed = json.loads(segment.decode("utf-8", errors="replace"))
+                        except json.JSONDecodeError:
+                            # Unparseable line: cannot be attributed to any session.
+                            continue
+                        if not isinstance(parsed, dict):
+                            continue
+                        if not self._event_belongs_to_session(parsed, sid):
+                            continue
+                        # Most recent first; reversed into reading order below.
+                        owned_reversed.append(parsed)
+                        if len(owned_reversed) >= wanted:
+                            break
+                    chunk_size = min(chunk_size * 2, 1024 * 1024)
+            shown = list(reversed(owned_reversed))
+
+            parts = [
+                f"Event log ({len(shown)} recent entries, scoped to this session):",
+                f"Path: {file_path}",
+                "",
+            ]
+            for i, parsed in enumerate(shown, 1):
+                event_type = parsed.get("event_type", "?")
+                data = self._redact_event_body(event_type, parsed.get("data", {}))
+                parts.append(
+                    f"  #{i}: [{event_type}] {parsed.get('source', '?')} — "
+                    f"{json.dumps(data, default=str)[:200]}"
+                )
+
+            return "\n".join(parts)
+        except Exception as e:
+            return f"[event_log] Error: {e}"
+
+    def _query_vault_status(self, caller_ws_id: Optional[str] = None) -> dict:
+        """Run VaultDriftChecker against the vault root; returns a structured, secret-free report.
+
+        Strictly read-only: repairable drift is reported but never auto-fixed.
+        ``repairs_available`` is the read-only count of machine-applyable
+        findings (vault_repair.run_inspection's by_classification.machine_apply);
+        manual-review and GAW findings never count. ``repair_hint`` points the
+        operator at the Vault Health panel in the landing page, where repairs
+        are applied. This query tool has no apply capability.
+
+        Cross-tenant scoping: the report is filtered to the caller's own
+        workspace plus vault-wide files; foreign workspace session titles are
+        dropped.  The vault-wide view requires the explicit
+        ``vault_status: global`` grant (operator-only).
+        """
+        checker = None
+        try:
+            from agent.config.vault_drift import VaultDriftChecker, DriftAbortError
+            from thoughtmachine.vault import vault_root
+        except ImportError as exc:
+            return {"status": "error", "error": f"vault status unavailable: {exc}", "aborted": True}
+        try:
+            checker = VaultDriftChecker(vault_root=vault_root())
+            # Read-only by design: never mutate the vault from a query tool.
+            report = checker.check(apply_repairs=False)
+        except DriftAbortError:
+            partial = checker.report() if checker is not None else None
+            if isinstance(partial, dict):
+                report = partial
+            else:
+                return {"status": "error", "aborted": True, "error": "vault drift check aborted"}
+        if isinstance(report, dict):
+            report = dict(report)
+            repairs_available = None
+            try:
+                from thoughtmachine.vault_repair import run_inspection
+                inspection = run_inspection(vault_root())
+                summary = (inspection or {}).get("summary") or {}
+                repairs_available = int(
+                    summary.get("by_classification", {}).get("machine_apply", 0) or 0
+                )
+            except Exception:
+                # Engine unavailable (degraded env): count unknown, not zero.
+                repairs_available = None
+            report["repairs_available"] = repairs_available
+            report["repair_hint"] = (
+                "use the Vault Health panel in the landing page to apply repairs"
+            )
+            report = self._scope_vault_status_report(report, caller_ws_id)
+        return report
+
+    def _vault_status_global_allowed(self) -> bool:
+        """True only when the caller holds the explicit ``vault_status: global`` grant.
+
+        Operator-only: opt-in vault-wide visibility is granted by the literal
+        ``{"vault_status": "global"}`` entry in the caller's injected
+        permission / config snapshot (checked in precedence order:
+        effective_permissions, session_permissions, agent_config).  Anything
+        else -- including a boolean truthy value -- is NOT a grant.  Read-only.
+        """
+        for source in (self.effective_permissions, self.session_permissions,
+                       self.agent_config):
+            if isinstance(source, dict) and source.get("vault_status") == "global":
+                return True
+        return False
+
+    def _scope_vault_status_report(
+        self, report: dict, caller_ws_id: Optional[str]
+    ) -> dict:
+        """Restrict a vault_status report to the caller's workspace + vault-wide files.
+
+        By default (no ``vault_status: global`` grant) only the caller's own
+        ``workspaces/<caller>/`` entries are kept alongside vault-wide
+        (non-``workspaces/``) files; every other workspace's entries are
+        dropped from ``files``, ``warnings`` and ``pending_repairs`` so foreign
+        session titles never leak.  A ``workspaces/*/...`` manifest-pattern
+        placeholder is vault-wide (not tenant data) and is kept.  With the
+        grant, the report is returned vault-wide (``scope: "global"``).
+        """
+        prefix = _VAULT_WORKSPACE_PREFIX
+        if self._vault_status_global_allowed():
+            scoped = dict(report)
+            scoped["scope"] = "global"
+            return scoped
+
+        own_prefix = f"{prefix}{caller_ws_id}/" if caller_ws_id else None
+
+        def _in_scope(relpath: Any) -> bool:
+            if not isinstance(relpath, str) or not relpath.startswith(prefix):
+                return True  # vault-wide / shared file
+            if relpath.startswith(f"{prefix}*/"):
+                return True  # manifest-pattern placeholder, not tenant data
+            return bool(own_prefix) and relpath.startswith(own_prefix)
+
+        def _warning_mentions_foreign(warning: Any) -> bool:
+            if not isinstance(warning, str):
+                return False
+            for match in re.finditer(r"workspaces/([^/\s]+)/", warning):
+                if f"{prefix}{match.group(1)}/" != own_prefix:
+                    return True
+            return False
+
+        scoped = dict(report)
+        files = report.get("files")
+        if isinstance(files, dict):
+            scoped["files"] = {k: v for k, v in files.items() if _in_scope(k)}
+        warnings = report.get("warnings")
+        if isinstance(warnings, list):
+            scoped["warnings"] = [
+                w for w in warnings if not _warning_mentions_foreign(w)
+            ]
+        pending = report.get("pending_repairs")
+        if isinstance(pending, list):
+            scoped["pending_repairs"] = [
+                p for p in pending
+                if not (isinstance(p, dict) and not _in_scope(p.get("file", "")))
+            ]
+        scoped["scope"] = "workspace"
+        if caller_ws_id:
+            scoped["scoped_to"] = caller_ws_id
+        else:
+            scoped["scope_note"] = (
+                "no workspace context resolved; only vault-wide files reported"
+            )
+        return scoped
+
+    def _query_vault_repair_status(self) -> dict:
+        """Full read-only vault repair dry run (vault_repair.run_inspection).
+
+        Mirrors vault_status' root resolution (thoughtmachine.vault.vault_root(),
+        honoring THOUGHTMACHINE_VAULT_ROOT) but reports the whole repair
+        pipeline: manifest drift + permission issues + extra files + seed
+        tracking (run/summary/issues/extra_files/seeded_files). Strictly
+        read-only — never mutates the vault; fixes are applied only via the
+        CLI (python3 -m thoughtmachine.vault_repair --apply), never through
+        this agent-callable query.
+        """
+        try:
+            from thoughtmachine.vault import vault_root
+            from thoughtmachine.vault_repair import run_inspection
+        except ImportError as exc:
+            return {"status": "error",
+                    "error": f"vault repair status unavailable: {exc}",
+                    "aborted": True}
+        try:
+            # Same resolution as _query_vault_status: vault_root() (env-aware).
+            return run_inspection(vault_root())
+        except Exception as exc:
+            return {"status": "error",
+                    "error": f"vault repair inspection failed: {exc}",
+                    "aborted": True}
+
+    def _query_runtime_state(self, ws_id: Optional[str], workspace_path: Optional[str] = None) -> dict:
+        """Return a REDACTED runtime snapshot: token limits, worker caps,
+        session sandbox status, effective permission levels, allowlist, vault status.
+
+        Never exposes api_key, raw_config or secret material; every sub-probe
+        is best-effort and failures degrade to explicit status values.
+        """
+        try:
+            cfg = dict(self.agent_config) if self.agent_config else {}
+            token_limits = {
+                "warning_threshold": cfg.get("token_monitor_warning_threshold"),
+                "critical_threshold": cfg.get("token_monitor_critical_threshold"),
+                "context_limit": None,
+            }
+            try:
+                caps = self._query_capabilities(ws_id, workspace_path)
+                token_limits["context_limit"] = (caps.get("token_limits") or {}).get("max_context_length")
+            except Exception:
+                token_limits["context_limit"] = None
+
+            worker_limits = {
+                "max_workers_per_session": cfg.get("max_workers_per_session"),
+                "worker_timeout_seconds": cfg.get("worker_timeout_seconds"),
+                "worker_max_retries": cfg.get("worker_max_retries"),
+            }
+
+            container_status = {"status": "unavailable"}
+            try:
+                cstatus = self._query_container_status(workspace_path)
+                if isinstance(cstatus, dict):
+                    container_status = {k: cstatus.get(k) for k in ("status", "reason", "error")}
+            except Exception as exc:
+                container_status = {"status": "error", "error": str(exc)}
+
+            # Provenance of the levels above, so an ambiguous reading is
+            # traceable. Mapped from signals ``_query_permissions`` already
+            # reports -- no extra probe is run here:
+            #   * "executor-disk" -- the executor's per-call, disk-authoritative
+            #     merge (persisted session grants x ceiling) -> session_sidecar.
+            #   * a non-empty permission_fetch_error -- that method failed closed
+            #     instead of reporting the raw session mirror -> fail_closed.
+            #   * "mirror-merge" / "session-mirror" / "none" -- the in-memory
+            #     session-start mirror (or no source at all); its own provenance
+            #     (persisted sidecar vs seeded defaults) is NOT observable here,
+            #     so it reports unknown rather than guessing.
+            # Neither value carries secret material: one is a fixed vocabulary
+            # string, the other the permission resolver's exception text.
+            effective_permission_levels = {}
+            permission_origin = "unavailable"
+            permission_fetch_error = None
+            try:
+                perms = self._query_permissions(ws_id)
+                if isinstance(perms, dict):
+                    effective_permission_levels = perms.get("effective_permissions", {}) or {}
+                    fetch_error = perms.get("permission_fetch_error")
+                    if fetch_error:
+                        permission_origin = "fail_closed"
+                        permission_fetch_error = str(fetch_error)
+                    elif perms.get("permission_origin") == "executor-disk":
+                        permission_origin = "session_sidecar"
+                    else:
+                        permission_origin = "unknown"
+                else:
+                    permission_fetch_error = "permission query returned no mapping"
+            except Exception as exc:
+                effective_permission_levels = {}
+                permission_fetch_error = str(exc)
+
+            allowlist_count = len(self.allowlist) if self.allowlist is not None else 0
+            enabled_tools = getattr(self, "enabled_tools", None) or []
+            enabled_tools_count = len(enabled_tools)
+
+            vault_status = {"status": "error"}
+            try:
+                vs = self._query_vault_status()
+                if isinstance(vs, dict):
+                    vault_status = {"status": vs.get("status"), "aborted": vs.get("aborted", False)}
+            except Exception:
+                vault_status = {"status": "error"}
+
+            return {
+                "status": "ok",
+                "token_limits": token_limits,
+                "worker_limits": worker_limits,
+                "session_sandbox_status": container_status,
+                "effective_permission_levels": effective_permission_levels,
+                "permission_origin": permission_origin,
+                "permission_fetch_error": permission_fetch_error,
+                "allowlist_count": allowlist_count,
+                "enabled_tools_count": enabled_tools_count,
+                "vault_status": vault_status,
+            }
+        except Exception as exc:
+            # The provenance keys are present on the error shape too: an absent
+            # key is exactly what makes a reading ambiguous.
+            return {
+                "status": "error",
+                "error": str(exc),
+                "permission_origin": "unavailable",
+                "permission_fetch_error": str(exc),
+            }
+
+    def _query_mcp_servers(self, ws_id: Optional[str]) -> dict:
+        """Return list of configured MCP servers."""
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
+            return {"mcp_servers": [], "count": 0}
+        mcp_path = _workspace_dir(ws_id) / "mcp_servers.json"
+        if not mcp_path.exists():
+            return {"mcp_servers": [], "count": 0}
+        try:
+            servers = json.loads(mcp_path.read_text(encoding="utf-8"))
+            return {"mcp_servers": servers, "count": len(servers)}
+        except (json.JSONDecodeError, OSError) as e:
+            return {"error": f"Failed to read mcp_servers.json: {e}", "mcp_servers": [], "count": 0}

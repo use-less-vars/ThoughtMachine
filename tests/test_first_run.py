@@ -2,10 +2,10 @@
 Integration test for the full first-run WebSocket lifecycle.
 
 Tests:
-1. new_session      → 6 events (session_loaded, state_changed, tokens_updated,
+1. new_session      → 5 events (session_loaded, tokens_updated,
                         context_updated, config_changed, status_message)
 2. continue_session → status_message about API key error (no key configured)
-3. apply_config     → config_changed with api_key_configured: True
+3. apply_config     → config_changed with api_key_configured: False
 """
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ from unittest.mock import patch
 
 import pytest
 from starlette.testclient import TestClient
+
+from tests.integration.harness import SysModulesSnapshot
 
 
 @pytest.fixture(scope="module")
@@ -53,9 +55,9 @@ def clean_home():
     # ── 5. Remove affected modules from cache & re-import ────────────────
     mod_prefixes = ("web_ui.backend", "agent.config.provider_profile",
                     "thoughtmachine.bootstrap")
-    for mod_name in list(sys_mod.modules.keys()):
-        if any(mod_name.startswith(p) for p in mod_prefixes):
-            del sys_mod.modules[mod_name]
+    snapshot = SysModulesSnapshot(mod_prefixes)
+    snapshot.snapshot()
+    snapshot.purge()
 
     # Ensure the project root is on sys.path so web_ui can be found
     _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -79,6 +81,7 @@ def clean_home():
 
     import shutil
     shutil.rmtree(tmp_home, ignore_errors=True)
+    snapshot.restore()
 
 
 @pytest.fixture
@@ -144,16 +147,15 @@ def test_full_first_run_lifecycle(client):
         # ═══ Step 1: new_session emits 6 events ═══
         ws.send_json({"command": "new_session"})
 
-        messages = recv_n(ws, 6, timeout=5.0)
+        messages = recv_n(ws, 5, timeout=5.0)
 
-        assert len(messages) == 6, (
-            f"Expected 6 messages from new_session, got {len(messages)}: "
+        assert len(messages) == 5, (
+            f"Expected 5 messages from new_session, got {len(messages)}: "
             f"{[m.get('type') for m in messages]}"
         )
 
         expected_types = [
             "session_loaded",
-            "state_changed",
             "tokens_updated",
             "context_updated",
             "config_changed",
@@ -168,12 +170,8 @@ def test_full_first_run_lifecycle(client):
         session_id = messages[0]["session_id"]
         assert isinstance(session_id, str) and len(session_id) > 0
 
-        # Verify state_changed content
-        assert messages[1]["state"] == "IDLE"
-        assert messages[1]["is_running"] is False
-
         # Verify config_changed content
-        assert "config" in messages[4]
+        assert "config" in messages[3]
 
         # ═══ Step 2: continue_session without API key → error ═══
         ws.send_json({
@@ -208,7 +206,7 @@ def test_full_first_run_lifecycle(client):
         # (Failed start in step 2 left the controller in a bad state; a fresh
         # session clears it, matching real frontend behavior.)
         ws.send_json({"command": "new_session"})
-        recv_n(ws, 6, timeout=5.0)  # drain new_session events
+        recv_n(ws, 5, timeout=5.0)  # drain new_session events
 
         ws.send_json({
             "command": "apply_config",
@@ -230,7 +228,9 @@ def test_full_first_run_lifecycle(client):
         )
 
         last_config = config_msgs[-1]["config"]
-        assert last_config.get("api_key_configured") is True, (
-            f"Expected api_key_configured=True, got api_key_configured="
+        # api_key is no longer applied/persisted via apply_config, so the
+        # frontend reports api_key_configured=False even after a config update.
+        assert last_config.get("api_key_configured") is False, (
+            f"Expected api_key_configured=False, got api_key_configured="
             f"{last_config.get('api_key_configured')!r}. Full config: {last_config}"
         )

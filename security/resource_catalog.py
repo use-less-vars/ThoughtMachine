@@ -1,0 +1,283 @@
+"""
+Canonical resource-permission catalog.
+
+Single source of truth for the resource keys and allowed values a session
+permission grant set may carry (permission-simplification effort, see
+``.thoughtmachine/working_docs/impl_plan_permission_simplification.md``).
+
+Session-grant keys are exactly the keys of :data:`RESOURCE_CATALOG` below
+(``git``, ``filesystem``, ``container``, ``network``, ``mcp``, ``host_bash``,
+``ci``, ``credential``, ``visual``) -- every session-grant write AND read goes
+through :func:`coerce_resource_permissions`.  ``host_bash`` is the
+supervised host-shell grain: it is storable at the session level like any
+catalog key, its ``allow`` level doubles as the workspace-ceiling
+vocabulary, and the security gate always caps the session value by the
+workspace ceiling at enforcement time.  ``system`` and ``execution`` are
+deliberately NOT catalog keys -- no
+tool consumer sits above their safe defaults (``system: read``,
+``execution: banned`` on ``SessionPermissions``), which the security gate
+applies.  The workspace ceiling's canonical key for sandboxed execution is
+``container`` (boolean); the legacy alias ``docker`` is accepted by the
+security gate and normalised onto ``container`` at enforcement time (a
+write-level docker ceiling allows the container grant, banned/read/ask
+denies it).  The ceiling surface is exactly the keys of
+:data:`WORKSPACE_CEILING_VOCAB` (``container`` boolean; ``git``,
+``filesystem``, ``network``, ``mcp``, ``host_bash``, ``ci``, ``credential``,
+``visual``); the legacy ceiling grains
+``git_read``/``git_write``/``system``/``execution`` were removed from it
+-- legacy stored values are folded onto ``git`` or dropped by the
+workspace-permission loader, and workspace-permission PUT validation
+rejects the names.  The ceiling is enforced separately by the security
+gate; ``thoughtmachine/permission_store.workspace_ceiling`` is therefore
+NOT coerced by :func:`coerce_resource_permissions`.
+
+One canonical per-resource vocabulary backs both the session-grant
+catalog (:data:`RESOURCE_CATALOG` below) and the workspace-ceiling
+whitelist (:data:`WORKSPACE_CEILING_VOCAB`); the same level string means
+the same thing in either place.  Session-grant values per canonical key::
+
+    git          banned | ask | read | write | write_on_feature_branch
+    filesystem   banned | ask | read | write
+    container    True | False
+    network      banned | ask | write | outbound
+    mcp          banned | connect | full
+    host_bash    banned | ask | allow     (host shell; ceiling-capped by the gate)
+    ci           banned | read
+    credential   banned | read | use
+    visual       banned | ask | view      (visual/render artifacts)
+
+Workspace-ceiling values, validated by the workspace-permission loader
+(``agent/config/resource_catalog.py``) against the same level strings::
+
+    git          banned | ask | read | write_on_feature_branch | write
+    filesystem   banned | ask | read | write
+    network      banned | ask | write | outbound
+    mcp          banned | connect | full
+    host_bash    banned | ask | allow
+    ci           banned | read
+    credential   banned | read | use
+    visual       banned | ask | view
+    container    True | False   (boolean ceiling; no string vocabulary)
+
+Two DERIVED flat rank projections back every comparison helper in this
+package (``security.gate_helpers`` / ``security.security_gate``); both
+project the vocabulary above onto numbers with DIFFERENT orderings
+because each answers a different question:
+
+* :data:`GRANT_LEVEL_RANKS` -- session-grant-vs-grant comparison used by
+  ``_value_satisfies`` / ``_min_permission`` ("does grant A satisfy a
+  request requiring grant B?"):
+
+      banned(0) < read(1) < ask(2) < write(3) == write_on_feature_branch(3)
+          < outbound(3.5) < full(4)
+
+  ``read`` ranks strictly BELOW ``ask`` because read is a strict subset of
+  ask: a read grant performs read-only work silently, while ask additionally
+  authorises interactive approval for the write tier.
+  ``write_on_feature_branch`` is a session git level ranking AT the write
+  tier (the branch-only restriction is enforced tool-side at commit time);
+  ``outbound`` (network outbound-only connectivity) ranks above plain
+  ``write`` as a strict superset grant on network's scale.
+
+* :data:`WORKSPACE_CEILING_LEVELS_RANKS` -- workspace-ceiling-vs-grant
+  comparison used by ``apply_workspace_ceiling`` ("does the workspace
+  ceiling allow this session grant?"):
+
+      banned(0) < read(1) == connect(1) == none(1) < ask(2)
+          < write_on_feature_branch(2.5) < write(3)
+          < outbound(4) == full(4)
+
+  The ask inversion: a session ``read`` grant ranks 1.0, so an ``ask``
+  ceiling (2.0) does NOT cap it -- read-only sessions are never forced
+  into an interactive ask loop.  A session ``write`` grant ranks 3.0, so
+  an ``ask`` ceiling caps it to the read tier (``read`` for the
+  read-capable filesystem/git keys,
+  ``banned`` for the others), and a ``write_on_feature_branch`` *ceiling*
+  (2.5, strictly between ask and write) caps ``write`` down to
+  branch-restricted write -- never unlimited.  Ceilings at rank 4.0
+  (``outbound``/``full``) are unlimited and leave the session grant
+  standing.  :data:`WORKSPACE_CEILING_VOCAB` additionally whitelists,
+  per session key, which ceiling levels may ever apply; a ceiling level
+  outside the key's vocabulary is ignored fail-open by the gate (never
+  coerced).
+
+Legacy-load-normalisation policy: the workspace-permission loader
+normalises legacy stored ceilings onto the canonical vocabularies --
+legacy ``full`` ceilings for ``git``/``filesystem`` are stored as
+``write``, legacy container string ceilings are stored as booleans, and
+the removed legacy grains are folded or dropped (``git_read`` +
+``git_write`` fold onto the single ``git`` ceiling; ``system`` and
+``execution`` are dropped).  Any stray ``full`` ceiling or
+container string that still reaches the gate at runtime is handled
+fail-open: ``full`` ranks 4.0 (unlimited; the session value stands) and
+an out-of-vocab container string is warned about and ignored (no
+ceiling applied).
+
+"""
+
+import logging
+from typing import Any, Dict
+
+logger = logging.getLogger(__name__)
+
+#: Canonical resource name -> allowed values (validated verbatim).
+RESOURCE_CATALOG = {
+    "git": ["banned", "ask", "read", "write", "write_on_feature_branch"],
+    "filesystem": ["banned", "ask", "read", "write"],
+    "container": [True, False],
+    "network": ["banned", "ask", "write", "outbound"],
+    "mcp": ["banned", "connect", "full"],
+    "host_bash": ["banned", "ask", "allow"],
+    "ci": ["banned", "read"],
+    "credential": ["banned", "read", "use"],
+    "visual": ["banned", "ask", "view"],
+}
+
+#: Set of canonical resource keys (for membership checks / introspection).
+canonical_resource_keys = set(RESOURCE_CATALOG)
+
+#: Session-grant level ranks (single flat order used by the comparison
+#: helpers in ``security.gate_helpers`` / ``security.security_gate``).
+#:
+#:     banned(0) < read(1) < ask(2) < view(2.5) < write(3)
+#:         == write_on_feature_branch(3) < outbound(3.5) < full(4)
+#:
+#: ``read`` ranks strictly BELOW ``ask`` because read is a strict subset of
+#: ask (read-only work needs no prompt; ask additionally authorises the write
+#: tier interactively).  ``write_on_feature_branch`` ranks AT the write tier
+#: (branch restriction is enforced tool-side at commit time); ``outbound``
+#: ranks above plain ``write`` because it is a strict superset grant on
+#: network's scale.  ``view`` ranks strictly ABOVE ``ask`` (2.5): a
+#: visual ``view`` grant is a *tier of its own*, not the read tier, so that a
+#: session ``visual: ask`` is not silently satisfied by the ``view`` rank (see
+#: ``security.gate_helpers._ASK_SILENT_MAX_RANK``) and the interactive-ask
+#: branch stays reachable for the grain.
+GRANT_LEVEL_RANKS: Dict[str, float] = {
+    "banned": 0,
+    "read": 1,
+    "view": 2.5,  # visual view grant: above the ask tier, below write
+    "ask": 2,
+    "connect": 1,
+    "write": 3,
+    "write_on_feature_branch": 3,
+    "use": 3,
+    "outbound": 3.5,
+    "full": 4,
+}
+
+#: Workspace-ceiling level ranks (``apply_workspace_ceiling`` ordering).
+#:
+#:     banned(0) < read(1) == connect(1) == none(1) < ask(2)
+#:         < view(2.5) == write_on_feature_branch(2.5) < write(3)
+#:         < outbound(4) == full(4)
+#:
+#: Ceilings at rank 4.0 (``outbound``/``full``) are unlimited.
+#: ``write_on_feature_branch`` as a *ceiling* ranks between ask and write
+#: (2.5): it caps a session ``write`` grant down to branch-restricted write,
+#: never unlimited.  Session-side values are ranked on this same table when
+#: a ceiling comparison needs them (``full``/``outbound`` session values
+#: rank 4.0 and survive any stricter ceiling).
+WORKSPACE_CEILING_LEVELS_RANKS: Dict[str, float] = {
+    "banned": 0.0,
+    "read": 1.0,
+    "view": 2.5,  # visual view grant: mirror of its grant rank (above ask)
+    "connect": 1.0,  # session-side mcp level (below ask/2.0)
+    "none": 1.0,  # alias used by some purpose presets
+    "ask": 2.0,
+    "write_on_feature_branch": 2.5,  # ceiling value: caps write -> branch-write
+    "write": 3.0,
+    "use": 3.0,  # credential value-injection grant: the write tier
+    "outbound": 4.0,  # ceiling value: unlimited (above plain write)
+    "full": 4.0,  # ceiling value: unlimited
+}
+
+#: Per-session-key whitelist of workspace-ceiling levels that may ever be
+#: applied to that key (validation vocab used by ``apply_workspace_ceiling``;
+#: a ceiling level outside the key's vocabulary is ignored fail-open).  The
+#: ceiling surface is exactly the canonical session-grant resources listed
+#: below (every catalog key except the boolean-only ``container``); the
+#: legacy ceiling grains ``git_read``/``git_write``/``system``/``execution``
+#: were removed (legacy stored values are folded/dropped by the loader and
+#: PUT validation rejects the names with a legacy hint).  ``container`` is
+#: NOT a string vocabulary key: its ceiling is boolean-only (dedicated gate
+#: branch), and legacy string ceilings are normalised to booleans by the
+#: workspace-permission loader; a stray string that still reaches the gate is
+#: ranked or warned about fail-open.  ``full`` is likewise not a ceiling
+#: level for ``git``/``filesystem`` -- legacy stored ``full`` ceilings are
+#: loader-normalised to ``write``; a stray runtime ``full`` ceiling ranks
+#: 4.0 (unlimited) so it is behaviourally identical to fail-open (session
+#: value stands).
+WORKSPACE_CEILING_VOCAB: Dict[str, tuple] = {
+    "git": ("banned", "ask", "read", "write_on_feature_branch", "write"),
+    "filesystem": ("banned", "ask", "read", "write"),
+    "network": ("banned", "ask", "write", "outbound"),
+    "mcp": ("banned", "connect", "full"),
+    "host_bash": ("banned", "ask", "allow"),
+    "ci": ("banned", "read"),
+    "credential": ("banned", "read", "use"),
+    "visual": ("banned", "ask", "view"),
+}
+
+#: Git-grain *breadth* ranks (broader grant = SMALLER number), consumed by
+#: ``thoughtmachine.vault_repair`` to fold the legacy ``git_read`` /
+#: ``git_write`` grains onto the canonical ``git`` grain:
+#:
+#:     write(0) < write_on_feature_branch(1) < ask(2) < read(3) < banned(4)
+#:
+#: DERIVED tie-break ordering -- NOT independent truth.  It is the git level
+#: vocabulary sorted by ``WORKSPACE_CEILING_LEVELS_RANKS`` descending (strict
+#: across the git vocab), re-expressed as integer breadth ranks.  The flat
+#: ``GRANT_LEVEL_RANKS`` cannot order these (it ties ``write`` ==
+#: ``write_on_feature_branch``), so this import-backed view exists purely so the
+#: fold order can never drift from the ceiling scale.
+GIT_BREADTH_RANKS: Dict[str, int] = {
+    level: idx
+    for idx, level in enumerate(
+        sorted(
+            WORKSPACE_CEILING_VOCAB["git"],
+            key=lambda lvl: WORKSPACE_CEILING_LEVELS_RANKS[lvl],
+            reverse=True,
+        )
+    )
+}
+
+
+def _value_is_valid(key: str, value: Any) -> bool:
+    """True when *value* is an allowed level for the canonical *key*.
+
+    ``container`` accepts real booleans ONLY: ``0``/``1`` would pass a bare
+    ``value in [True, False]`` membership test through the int/bool equality
+    pitfall, so non-bool ints must be rejected explicitly.
+    """
+    if key == "container":
+        return isinstance(value, bool) and value in RESOURCE_CATALOG[key]
+    return value in RESOURCE_CATALOG[key]
+
+
+def coerce_resource_permissions(raw: dict) -> dict:
+    """Return a clean copy of *raw* holding only valid catalog entries.
+
+    Unknown keys are dropped (one warning each); keys whose value is not a
+    valid level for that resource are dropped too (``container`` accepts only
+    real booleans).  Valid entries are preserved in input order.
+    """
+    clean: Dict[str, Any] = {}
+    for key, value in raw.items():
+        if key not in canonical_resource_keys:
+            logger.warning(
+                "dropping unknown session permission key %r (not in "
+                "RESOURCE_CATALOG)",
+                key,
+            )
+            continue
+        if not _value_is_valid(key, value):
+            logger.warning(
+                "dropping invalid value %r for session permission key %r "
+                "(allowed: %s)",
+                value,
+                key,
+                RESOURCE_CATALOG[key],
+            )
+            continue
+        clean[key] = value
+    return clean

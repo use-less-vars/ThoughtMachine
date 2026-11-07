@@ -80,8 +80,9 @@ class RefactorTool(ToolBase):
         """Return list of Path objects for files to edit based on file_pattern."""
         pattern = self.file_pattern
         # Determine base directory for globbing
-        if self.workspace_path:
-            base_dir = Path(self.workspace_path)
+        ws_path = self._resolve_registry_workspace()
+        if ws_path:
+            base_dir = Path(ws_path)
         else:
             base_dir = Path('.')
         # Use glob recursively if pattern contains **

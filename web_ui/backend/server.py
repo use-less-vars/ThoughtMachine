@@ -22,7 +22,22 @@ Architecture
 
 Startup
 ───────
-    uvicorn web_ui.backend.server:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn web_ui.backend.server:app --host 127.0.0.1 --port 8000 --reload
+
+The bind address defaults to loopback (127.0.0.1; override with ``--host`` or
+the ``HOST`` env var), the server refuses to start on a non-loopback host
+unless ``--allow-remote-bind`` is passed, and the health routes (``GET /health``,
+``/api/health``, ``/api/health/containers``) answer localhost callers only, so a
+server exposed on a non-loopback interface does not publish its health payload.
+
+Passing ``--allow-remote-bind`` is an auth decision, not a deployment
+setting.  This app has no auth layer -- no cookie, no Authorization header --
+so the auth boundary is the network boundary: with the flag off the only
+client is the operator's browser on loopback, and with it on every client
+that can route to the port is treated as the operator, which is false.  The
+loopback refusal exists to make that boundary an explicit decision rather
+than an assumption.  The localhost health gate covers three read-only routes
+only; it is not an auth layer and does not substitute for one.
 
 Or via provided run script:
     python -m web_ui.backend.server
@@ -52,6 +67,7 @@ Client → Server (JSON):
     { "command": "get_open_sessions" }
     { "command": "close_session",          "session_id": "..." (optional) }
     { "command": "new_session" }
+    { "command": "set_project",           "project": "/path/to/project" }
     { "command": "security_response",  "request_id": "...", "approved": true/false, "remember": false }
     { "command": "get_workspace_capabilities", "workspace_id": "..." }
     { "command": "bootstrap_workspace",       "workspace_id": "..." }
@@ -66,10 +82,10 @@ Server → Client (JSON):
     status_message      { "type": "status_message",      "text": "..." }
     sessions_list       { "type": "sessions_list",       "sessions": [...] }
     session_saved       { "type": "session_saved",       "session": {...} }
-    session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int, "workspace_id": "..." }
+    session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int, "workspace_id": "...", "workspace_path": "...", "config": {...} }
     session_deleted     { "type": "session_deleted",     "session_id": "..." }
     session_renamed     { "type": "session_renamed",     "session_id": "...", "new_name": "..." }
-    open_sessions_list  { "type": "open_sessions_list",  "session_ids": ["..."] }
+    open_sessions       { "type": "open_sessions",       "session_ids": ["..."] }
     session_closed      { "type": "session_closed",      "session_id": "..." }
     session_cleared     { "type": "session_cleared" }
     providers_list      { "type": "providers_list",      "providers": [...] }
@@ -77,13 +93,36 @@ Server → Client (JSON):
     provider_deleted    { "type": "provider_deleted",    "provider_id": "..." }
     tools_list          { "type": "tools_list",          "tools": [...] }
     security_prompt     { "type": "security_prompt",     "request_id": "...", "tool_name": "...", "capabilities": [...], "description": "..." }
+    worker_spawned      { "type": "worker:worker_spawned",      "worker_name": "...", "timestamp": "...", "data": {...} }
+    worker_status       { "type": "worker:worker_status",       "worker_name": "...", "timestamp": "...", "data": {...} }
+    worker_completed    { "type": "worker:worker_completed",    "worker_name": "...", "timestamp": "...", "data": {...} }
+    worker_error        { "type": "worker:worker_error",        "worker_name": "...", "timestamp": "...", "data": {...} }
 """
 
 from __future__ import annotations
 
+# ---- Stdio guard -------------------------------------------------------
+# If this process is launched with file descriptors 1/2 closed (e.g. by a
+# headless launcher or service wrapper), CPython sets sys.stdout / sys.stderr
+# to None.  Any print(), warnings emission, or stdlib-logging lastResort
+# fallback then crashes with "'NoneType' object has no attribute 'write'"
+# (this is the DockerCodeRunner crash).  Redirect them to devnull so the
+# whole process is stdio-safe in any launch environment.  This MUST run
+# before any import that could emit warnings (e.g. fastapi, websockets,
+# docker SDK) or the crash would strike during module import.
+import sys as _sys
+import os as _os
+if _sys.stdout is None:
+    _sys.stdout = open(_os.devnull, 'w')
+if _sys.stderr is None:
+    _sys.stderr = open(_os.devnull, 'w')
+del _sys, _os
+
 import argparse
+import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import shutil
@@ -91,22 +130,77 @@ import tempfile
 import time
 import traceback
 import threading
+from datetime import datetime, timezone
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
-from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import (
+    Body,
+    FastAPI,
+    Form,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from agent.logging import log
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from session.store import FileSystemSessionStore
+from session.session_registry import SessionRegistry
+from agent.config.presets import get_tools_for_mode
+from agent.config.session_config import SessionConfig
+from agent.config.config_manager import save_config_defaults, _user_defaults_path
+from thoughtmachine.workspace_registry import (
+    WorkspaceRegistry,
+    WorkspaceRegistryUnavailable,
+)
+import thoughtmachine.vault as _vault
 
 # ── Shared session store singleton ────────────────────────────────────────────
 # All WebSocket connections and bridges share ONE FileSystemSessionStore so that
 # the in-memory list_sessions() cache is coherent across concurrent connections.
 _session_store: Optional[FileSystemSessionStore] = None
 _session_store_lock = threading.Lock()
+
+# ── Pending security escalations ──────────────────────────────────────────────
+# ``thoughtmachine.security`` keeps ONE process-wide pending map keyed by
+# request_id, so without this an approval typed on ANY connection would
+# resolve a prompt raised for a DIFFERENT connection.  The asker is recorded
+# when the forwarded ``security_prompt`` event reaches the socket that owns
+# the asking session (``event_callback`` below closes over ``ws``).
+_pending_escalation_askers: Dict[str, int] = {}
+_pending_escalation_lock = threading.Lock()
+
+
+def _record_escalation_asker(request_id: str, ws_key: int) -> None:
+    """Bind *request_id* to the WebSocket that was asked to answer it."""
+    if not request_id:
+        return
+    with _pending_escalation_lock:
+        _pending_escalation_askers[request_id] = ws_key
+
+
+def _escalation_asker(request_id: str) -> Optional[int]:
+    """The ``id(ws)`` asked to answer *request_id* (None when unknown)."""
+    with _pending_escalation_lock:
+        return _pending_escalation_askers.get(request_id)
+
+
+def _forget_escalation(request_id: str) -> None:
+    with _pending_escalation_lock:
+        _pending_escalation_askers.pop(request_id, None)
+
+
+def _forget_escalations_for(ws_key: int) -> None:
+    """Drop every escalation bound to a socket that has gone away."""
+    with _pending_escalation_lock:
+        for request_id in [
+            rid for rid, key in _pending_escalation_askers.items() if key == ws_key
+        ]:
+            del _pending_escalation_askers[request_id]
 
 def _get_session_store() -> FileSystemSessionStore:
     global _session_store
@@ -117,13 +211,164 @@ def _get_session_store() -> FileSystemSessionStore:
     return _session_store
 
 
+from web_ui.backend.origin_policy import (
+    allowed_origins as _cors_allowed_origins,
+    websocket_origin_allowed,
+)
 from web_ui.backend.workspace_routes import router as workspace_router
+from web_ui.backend.onboarding_routes import router as onboarding_router
 from web_ui.backend.config_routes import router as config_router
+from web_ui.backend.logging_routes import router as logging_router
+from web_ui.backend.health_routes import router as health_router
+from web_ui.backend.local_gate import (
+    LOCAL_CLIENT_HOSTS as _LOCAL_CLIENT_HOSTS,
+    TEST_HARNESS_CLIENT_HOSTS as _TEST_HARNESS_CLIENT_HOSTS,
+)
+from web_ui.backend.auth_boundary import AuthBoundaryMiddleware
+from web_ui.backend import auth_boundary, auth_token
+from web_ui.backend.session_routes import router as session_router
+from web_ui.backend.addendum_routes import router as addendum_router
+from web_ui.backend.prompt_routes import router as prompt_router
+from web_ui.backend.global_routes import router as global_router
+from web_ui.backend.provider_routes import router as provider_router
+from web_ui.backend.vault_repair_routes import router as vault_repair_router
+from web_ui.backend.container_record_routes import router as container_record_router
+from web_ui.backend.container_record_routes import (
+    _compute_drift,
+    _serialise,
+)
+
+# ── ConfigManager (facade for all config operations) ────────────────────────
+from web_ui.backend.config_manager import (
+    ConfigManager,
+    GLOBAL_DEFAULT_KEYS,
+    load_global_defaults,
+)
+
+# Singleton instance used throughout the WebSocket handlers.
+config_manager = ConfigManager()
+
+
+def save_global_defaults(cfg_dict: Dict[str, Any]) -> Path:
+    """Persist a config payload as the global default (Path A of config ownership).
+
+    Extracts only the six session-level keys allowed in the global-default
+    layer (``GLOBAL_DEFAULT_KEYS``: provider_id, model, base_url, temperature,
+    max_turns, system_prompt), merges them into the existing
+    ``~/.thoughtmachine/user/defaults.json`` (preserving unrelated keys), and
+    writes the merged dict back through the canonical writer
+    ``agent.config.config_manager.save_config_defaults(..., global_scope=True)``.
+
+    Returns the path of the file written.  This replaces the legacy write to
+    ``~/.thoughtmachine/agent_config.json``, which is now read-compat only and
+    never written by the server.  See ``docs/architecture/config_ownership.md``.
+    """
+    # Guard (config-ownership Path A): the global-default layer must already be
+    # manifest-seeded on disk before we read it.  If ``user/defaults.json`` is
+    # absent, ``load_global_defaults()`` returns its in-memory 39-key fallback
+    # and we would then persist that fallback as ``existing``.  Re-run the very
+    # same seeder the server lifespan uses at startup (see ``lifespan``) so the
+    # on-disk file holds the manifest ``safe_default`` instead.  Only runs when
+    # the file is missing; never raises (a failed seed just logs a warning and
+    # the save proceeds).
+    if not _user_defaults_path().exists():
+        try:
+            from thoughtmachine.bootstrap import ensure_user_defaults
+            ensure_user_defaults()
+        except Exception as exc:
+            log('WARNING', 'server.config',
+                f'Could not seed user defaults before save: {exc}')
+    subset = {k: v for k, v in cfg_dict.items() if k in GLOBAL_DEFAULT_KEYS}
+    existing = load_global_defaults()
+    merged = dict(existing)
+    merged.update(subset)
+    workspace_id = str(cfg_dict.get("workspace_id") or "")
+    return save_config_defaults(merged, workspace_id, global_scope=True)
+
 
 # Ensure project root is on sys.path
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
+
+# ── Server revision (git HEAD at import time) ─────────────────────────────────────────────────────────
+# Used by the /health endpoint and the startup log for deployment
+# verification.  Falls back to "unknown" when git is unavailable (e.g. a
+# packaged build) or the checkout has no commits yet.
+
+def _get_server_revision() -> str:
+    """Return the git revision this server was built from, or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_project_root,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode == 0:
+            rev = result.stdout.strip()
+            if rev:
+                return rev
+    except Exception:
+        pass
+    return "unknown"
+
+
+_SERVER_REVISION = _get_server_revision()
+
+
+def _get_server_branch() -> str:
+    """Return the git branch this server was built from, or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=_project_root,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode == 0:
+            branch = result.stdout.strip()
+            if branch:
+                return branch
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _get_server_dirty() -> bool:
+    """Return True if the checkout has uncommitted changes, else False."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=_project_root,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode == 0:
+            return bool(result.stdout.strip())
+    except Exception:
+        pass
+    return False
+
+
+# Branch and dirty flag captured at the SAME import-time point as the
+# revision, so all three version fields describe one consistent snapshot.
+_SERVER_BRANCH = _get_server_branch()
+_SERVER_DIRTY = _get_server_dirty()
+
+
+def _session_config_dict(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter a (translated) frontend config dict to SessionConfig fields.
+
+    SessionConfig is strict (``extra='forbid'``), but the frontend payload may
+    carry auxiliary keys (``api_key_configured``, ``top_p``, ``max_tokens``,
+    ``stop_check``, ...) that are consumed elsewhere.  Drop them here so
+    ``SessionConfig(**cfg)`` never raises on unknown keys.
+    """
+    return {k: v for k, v in cfg.items() if k in SessionConfig.model_fields}
 
 # ── Monkey-patch websockets library race condition ──────────────────
 # websockets.legacy.protocol has a race condition: when send_json() is
@@ -157,15 +402,388 @@ try:
 except ImportError:
     pass  # websockets not installed — nothing to patch
 
+# ── Migration helper ───────────────────────────────────────────────────────────
+
+def _migrate_old_workspaces() -> int:
+    """Migrate old-style workspace directories (with ``config.json`` but no
+    ``workspace_identity.json``) into the :class:`WorkspaceRegistry`.
+
+    Scans ``~/.thoughtmachine/workspaces/`` for subdirectories.  For each
+    directory that contains a ``config.json`` with a ``root`` key but does
+    **not** contain a ``workspace_identity.json``, it calls
+    ``WorkspaceRegistry.get_default().register_by_root(root)`` to add it to
+    the registry.
+
+    Returns the number of workspaces migrated.
+    """
+    count = 0
+    base_dir = Path.home() / ".thoughtmachine" / "workspaces"
+    if not base_dir.is_dir():
+        return 0
+
+    registry = WorkspaceRegistry.get_default()
+    for ws_dir in sorted(base_dir.iterdir()):
+        if not ws_dir.is_dir():
+            continue
+        config_path = ws_dir / "config.json"
+        identity_path = ws_dir / "workspace_identity.json"
+        if config_path.exists() and not identity_path.exists():
+            try:
+                cfg = json.loads(config_path.read_text(encoding="utf-8"))
+                root = cfg.get("root")
+                if not root:
+                    continue
+                entry = registry.register_by_root(str(root))
+                log('INFO', 'server',
+                    f"_migrate_old_workspaces: registered {entry.id} for {root} "
+                    f"(was legacy dir {ws_dir.name})")
+                count += 1
+            except Exception as exc:
+                log('WARNING', 'server',
+                    f"_migrate_old_workspaces: error processing {ws_dir.name}: {exc}")
+    return count
+
+
 # ── App + lifespan ──────────────────────────────────────────────────────────
 
 # We import bridge lazily inside the lifespan / endpoint to avoid
 # circular / early import issues.
 
+
+def _sweep_orphan_resource_containers():
+    """Startup sweep: remove resource containers of unregistered workspaces.
+
+    Best-effort and unit-testable; NEVER raises — a broken docker daemon or a
+    failing sweep must not prevent the server from starting.  Removes hidden
+    git resource containers (``thoughtmachine.resource`` label) whose
+    ``thoughtmachine.workspace_id`` is no longer registered, then prunes the
+    shared resource image once no resource container remains anywhere.
+    """
+    try:
+        from infra.resource_container_manager import (
+            prune_unreferenced_resource_images,
+            sweep_stale_resource_containers,
+        )
+
+        try:
+            registry = WorkspaceRegistry.get_default()
+            ids = [e.id for e in registry.list_workspaces()]
+        except Exception as exc:
+            # FAIL-CLOSED: a registry read fault must never be mistaken for
+            # "no workspaces are registered".  An empty id list makes
+            # sweep_stale_resource_containers treat EVERY resource container as
+            # an orphan and force-remove it (its `not in registered` test is
+            # always True against the empty set).  Mirror the sibling sweeps
+            # (_sweep_exited_workspace_containers / _sweep_orphan_container_records)
+            # by never orphan-wiping on a bad registry read.
+            log('WARNING', 'server',
+                f'Startup sweep: could not list registered workspaces: {exc}; '
+                f'skipping orphan resource sweep')
+            return
+
+        result = sweep_stale_resource_containers(ids)
+        detail = result.get("detail") or ""
+        log('INFO', 'server',
+            f'Startup sweep: removed {result.get("removed", 0)} orphan '
+            f'resource container(s), kept {result.get("skipped_in_use", 0)} '
+            f'in use' + (f' — {detail}' if detail else ''))
+
+        prune_result = prune_unreferenced_resource_images()
+        prune_detail = prune_result.get("detail") or ""
+        log('INFO', 'server',
+            f'Startup sweep: pruned images '
+            f'{prune_result.get("removed_images", [])}, '
+            f'{prune_result.get("remaining_containers", 0)} resource '
+            f'container(s) remaining' + (f' — {prune_detail}' if prune_detail else ''))
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup resource sweep skipped: {exc}')
+
+
+# Idle TTL (seconds) after which an EXITED generic workspace container is
+# removed by the container sweep.
+#
+# ABSENT  -> the sweep applies its own PER-CLASS defaults (ephemeral 900 s;
+#            persistent / resource / service 86400 s).
+# PRESENT -> DEBUG KNOB: this single value is forced on EVERY lifecycle class
+#            (it names every class so no per-class default can survive).
+_EXITED_CONTAINER_SWEEP_MAX_AGE_S = os.environ.get(
+    'THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S'
+)
+if _EXITED_CONTAINER_SWEEP_MAX_AGE_S is not None:
+    _EXITED_CONTAINER_SWEEP_MAX_AGE_S = int(_EXITED_CONTAINER_SWEEP_MAX_AGE_S)
+
+# Default retention (seconds) applied to an orphaned container RECORD whose own
+# ``retention_days`` is unset when the record sweeper considers reaping it.
+# Tune via env override if needed.
+_ORPHAN_RECORD_SWEEP_MAX_AGE_S = int(
+    os.environ.get('THOUGHTMACHINE_ORPHAN_RECORD_MAX_AGE_S', '86400')
+)
+
+
+def _sweep_exited_workspace_containers():
+    """Startup sweep: remove EXITED generic workspace containers.
+
+    Two concerns, both best-effort and NEVER raising:
+    - idle/TTL: exited containers of registered workspaces that have been idle
+      past their lifecycle-class TTL are removed (per-class sweep defaults:
+      ephemeral 900 s, persistent/resource/service 86400 s). The env override
+      ``THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S`` is a DEBUG KNOB: when set
+      it forces its single value on EVERY class;
+    - orphan GC: exited containers of UNREGISTERED workspaces are removed too.
+    Resource containers (``thoughtmachine.resource`` label) are excluded.
+    If the workspace registry cannot be read the sweep degrades to TTL-only
+    (``ids=None``) so a failing/empty registry can never trigger a wipe.
+    """
+    try:
+        from infra.container_manager import sweep_exited_workspace_containers
+
+        try:
+            registry = WorkspaceRegistry.get_default()
+            ids = [e.id for e in registry.list_workspaces()]
+        except Exception as exc:
+            log('WARNING', 'server',
+                f'Startup sweep: could not list registered workspaces: {exc}')
+            ids = None  # TTL-only; never orphan-wipe on registry failure
+
+        # THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S is a DEBUG KNOB. PRESENT ->
+        # force its value on EVERY lifecycle class (name them all, because a
+        # bare ``max_age_s`` cannot override the sweep's per-class defaults).
+        # ABSENT -> pass ``None`` so the sweep applies its own class defaults.
+        if _EXITED_CONTAINER_SWEEP_MAX_AGE_S is None:
+            ttl_by_class = None
+        else:
+            from thoughtmachine.container_record import LIFECYCLE_CLASSES
+            ttl_by_class = {
+                cls: _EXITED_CONTAINER_SWEEP_MAX_AGE_S
+                for cls in LIFECYCLE_CLASSES
+            }
+
+        result = sweep_exited_workspace_containers(
+            registered_workspace_ids=ids,
+            max_age_s_by_class=ttl_by_class,
+        )
+        detail = result.get("detail") or ""
+        log('INFO', 'server',
+            f'Startup sweep: removed {result.get("removed", 0)} exited '
+            f'workspace container(s), skipped {result.get("skipped", 0)}'
+            + (f' — {detail}' if detail else ''))
+
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup workspace sweep skipped: {exc}')
+
+
+def _sweep_orphan_container_records():
+    """Startup/periodic sweep: reap orphaned container RECORDS.
+
+    A container record whose bound Docker container is gone is reaped once
+    past its retention window.  The record's workspace registration is NOT a
+    reap condition.
+    Best-effort and NEVER raising.  If the workspace registry cannot be read
+    the sweep degrades to a NO-OP (``ids=None``) so a failing/empty registry
+    can never trigger a record wipe.
+    """
+    try:
+        from infra.container_manager import sweep_orphan_container_records
+
+        try:
+            registry = WorkspaceRegistry.get_default()
+            ids = [e.id for e in registry.list_workspaces()]
+        except Exception as exc:
+            log('WARNING', 'server',
+                f'Startup record sweep: could not list registered workspaces: {exc}')
+            ids = None  # registry failure -> no-op; never wipe on a bad read
+
+        result = sweep_orphan_container_records(
+            registered_workspace_ids=ids,
+            default_max_age_s=_ORPHAN_RECORD_SWEEP_MAX_AGE_S,
+        )
+        detail = result.get("detail") or ""
+        log('INFO', 'server',
+            f'Startup record sweep: reaped {result.get("removed", 0)} orphan '
+            f'record(s), skipped {result.get("skipped", 0)}'
+            + (f' — {detail}' if detail else ''))
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup record sweep skipped: {exc}')
+
+
+# ── Periodic container sweep (Phase 1.1) ───────────────────────────────
+# Startup runs both sweeps once; a background task then re-runs them on a
+# fixed interval so idle/orphan containers are reclaimed during long-lived
+# server sessions. Best-effort: recurring failures are logged, never fatal.
+_CONTAINER_SWEEP_INTERVAL_S = float(
+    os.environ.get('THOUGHTMACHINE_CONTAINER_SWEEP_INTERVAL_S', '300')
+)
+
+
+def _periodic_registry_has_workspaces() -> bool:
+    """Re-read the workspace registry for a periodic tick. NEVER raises.
+
+    Returns ``True`` only when the registry holds at least one workspace.
+    Any read fault (docker-less host, corrupt store, ...) or an empty result
+    returns ``False`` so the caller SKIPS the destructive orphan-resource
+    sweep for this tick.  Unlike the one-shot *startup* pass — which can
+    trust a non-empty registry because the project root is auto-registered
+    immediately before it runs — a periodic tick fires arbitrarily later, so
+    it must re-validate the registry every time before delegating.  (That
+    startup assumption was in fact unsafe: auto-registration is best-effort,
+    so the startup pass re-validates too — see
+    :func:`_startup_registry_has_workspaces`.)
+
+    The guard is deliberately FAIL-CLOSED: an empty/faulting read must never
+    be mistaken for "no workspaces are registered", because
+    ``sweep_stale_resource_containers`` force-removes every resource container
+    whose workspace id is ``not in`` the (possibly empty) registered set.  The
+    registry is re-read on the NEXT tick, so a transiently empty read only
+    defers the sweep — it never wipes live containers.
+    """
+    try:
+        registry = WorkspaceRegistry.get_default()
+        return bool(registry.list_workspaces())
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Periodic sweep: could not list registered workspaces: {exc}; '
+            f'treating registry as empty for this tick')
+        return False
+
+
+def _startup_registry_has_workspaces() -> bool:
+    """Re-read the workspace registry before the startup resource sweep.
+
+    NEVER raises.  Returns ``True`` only when the registry holds at least one
+    workspace.  Any read fault (docker-less host, corrupt store, ...) or an
+    empty result returns ``False`` so the caller SKIPS the destructive
+    orphan-resource sweep for the boot pass.
+
+    The startup pass cannot simply trust a non-empty registry: the project
+    root's auto-registration a few lines earlier is best-effort (its failure is
+    logged and startup continues), so when it fails the registry read can
+    legitimately come back empty.  ``sweep_stale_resource_containers``
+    force-removes every resource container whose workspace id is ``not in`` the
+    (possibly empty) registered set, so an empty read must never be mistaken
+    for "no workspaces are registered".  Mirrors the periodic guard
+    (:func:`_periodic_registry_has_workspaces`).
+    """
+    try:
+        registry = WorkspaceRegistry.get_default()
+        return bool(registry.list_workspaces())
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Startup sweep: could not list registered workspaces: {exc}; '
+            f'skipping orphan resource sweep')
+        return False
+
+
+def _run_container_sweeps():
+    """Run both container sweeps once. Best-effort; NEVER raises.
+
+    Each entry is ``(label, guard, fn)``.  When ``guard`` is set and returns
+    falsy the step is skipped for this tick with a WARNING (the guard already
+    logged the reason); the label names the skipped sweep so the skip is
+    observable.  ``guard=None`` means run unconditionally.
+    """
+    for _label, _guard, _fn in (
+        ('exited-workspace', None, _sweep_exited_workspace_containers),
+        ('orphan-resource', _periodic_registry_has_workspaces,
+         _sweep_orphan_resource_containers),
+        ('orphan-records', None, _sweep_orphan_container_records),
+    ):
+        if _guard is not None and not _guard():
+            # Re-read the registry EVERY tick before the destructive
+            # orphan-resource sweep: a transiently empty/faulting read must not
+            # be treated as "no workspaces registered".  Non-fatal; the next
+            # tick re-reads and resumes the sweep once workspaces reappear.
+            log('WARNING', 'server',
+                f'Periodic container sweep ({_label}) skipped: '
+                f'no registered workspaces')
+            continue
+        try:
+            _fn()
+        except Exception as exc:
+            log('WARNING', 'server',
+                f'Periodic container sweep ({_label}) failed: {exc}')
+        else:
+            log('INFO', 'server',
+                f'Periodic container sweep ({_label}) completed')
+
+
+async def _periodic_container_sweep_loop(
+    interval_s: float = _CONTAINER_SWEEP_INTERVAL_S,
+) -> None:
+    """Run ``_run_container_sweeps`` every ``interval_s`` seconds.
+
+    The blocking (docker-API) sweeps run in a worker thread so the event
+    loop is never stalled. The loop body is fully guarded so the task
+    cannot terminate with an unhandled exception; cancellation propagates.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await asyncio.to_thread(_run_container_sweeps)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log('WARNING', 'server', f'Periodic container sweep error: {exc}')
+
+
+# ── Boot container drift scan ──────────────────────────────────────────────
+# Hard cap on how many container records the boot-time drift scan inspects in
+# a single pass.  Bounds startup work on hosts with many records; when the cap
+# truncates the work the scan logs one WARNING naming inspected + skipped
+# counts (the remainder are picked up on later boots).
+_BOOT_DRIFT_SCAN_LIMIT = 100
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler — registers signal handlers for graceful shutdown."""
     log('INFO', 'server', 'ThoughtMachine Web UI server starting ...')
+    log('INFO', 'server', f'Starting ThoughtMachine server — revision {_SERVER_REVISION}')
+
+    # Stdlib logging console layer (human-readable lifecycle lines)
+    try:
+        from agent.logging.console import configure_console_logging
+        configure_console_logging()
+    except Exception as exc:
+        log('WARNING', 'server', f'Console logging setup skipped: {exc}')
+    # Start EventLogger to persist all events to disk
+    try:
+        from agent.logging.event_logger import EventLogger
+        event_logger = EventLogger()
+        event_logger.start()
+        app.state.event_logger = event_logger
+        log('INFO', 'server', f'EventLogger started: {event_logger.file_path}')
+    except Exception as exc:
+        log('WARNING', 'server', f'EventLogger startup skipped: {exc}')
+        app.state.event_logger = None
+
+    # Register an agent logger with BOTH logging facades so the server process
+    # has the same registered-logger path the agent process has --
+    # agent/core/agent.py calls create_logger(config) and registers the result
+    # with agent.logging.unified (read back via _get_logger()) and
+    # thoughtmachine.security.set_logger.  Best-effort: each step is
+    # independently guarded and a failure must never break startup.
+    try:
+        from agent.config import AgentConfig
+        from agent.logging import create_logger
+
+        agent_logger = create_logger(AgentConfig(enable_file_logging=False))
+    except Exception as exc:
+        agent_logger = None
+        log('WARNING', 'server', f'Agent logger creation skipped: {exc}')
+    if agent_logger is not None:
+        try:
+            from agent.logging.unified import set_logger as unified_set_logger
+
+            unified_set_logger(agent_logger)
+        except Exception as exc:
+            log('WARNING', 'server', f'unified.set_logger skipped: {exc}')
+        try:
+            from thoughtmachine.security import set_logger as security_set_logger
+
+            security_set_logger(agent_logger)
+        except Exception as exc:
+            log('WARNING', 'server', f'security.set_logger skipped: {exc}')
+
     # Ensure user ~/.thoughtmachine/ defaults exist before any connection
     try:
         from thoughtmachine.bootstrap import ensure_user_defaults, get_version
@@ -176,13 +794,82 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log('WARNING', 'server', f'Could not initialise user defaults: {exc}')
 
+    # ── Vault drift check (read-only) ──────────────────────────────────────
+    # Report schema drift at startup without ever mutating the vault or
+    # crashing the server; repairable drift is listed in pending_repairs.
+    try:
+        from agent.config.vault_drift import VaultDriftChecker
+        from thoughtmachine.vault import vault_root
+        drift_report = VaultDriftChecker(vault_root=vault_root()).check()
+        if drift_report.get('status') == 'ok':
+            log('INFO', 'server',
+                f"Vault drift check: OK ({len(drift_report.get('files', {}))} files)")
+        else:
+            log('WARNING', 'server',
+                f"Vault drift check: {drift_report.get('status')} — "
+                f"{len(drift_report.get('pending_repairs', []))} pending repair(s), "
+                f"{len(drift_report.get('warnings', []))} warning(s)")
+    except Exception as exc:
+        log('WARNING', 'server', f'Vault drift check skipped: {exc}')
+
+    # ── Migrate old-style workspaces ──
+    try:
+        migrated = _migrate_old_workspaces()
+        if migrated:
+            log('INFO', 'server',
+                f'Migrated {migrated} old workspace(s) to the registry.')
+    except Exception as exc:
+        log('WARNING', 'server', f'Workspace migration error: {exc}')
+
+    # ── Container-record migration ────────────────────────────────────────
+    # Backfill container records from any pre-existing (legacy) containers so
+    # the record store reflects live containers even for workspaces that never
+    # wrote their own record.  Best-effort: a missing Docker daemon (or any
+    # other failure) is logged and startup continues.  The migration is
+    # idempotent — already-recorded containers are skipped on later runs.
+    try:
+        import docker as _docker
+        from thoughtmachine.container_record import migrate_records
+        summary = migrate_records(docker_source=_docker.from_env())
+        if summary.get('aborted'):
+            log('WARNING', 'server',
+                'Container-record migration: aborted (Docker source '
+                'unavailable); no records written.')
+        elif summary.get('failed'):
+            log('WARNING', 'server',
+                'Container-record migration: '
+                f"{summary.get('created', 0)} created, "
+                f"{summary.get('rematerialised', 0)} rematerialised, "
+                f"{summary.get('skipped', 0)} skipped, "
+                f"{summary.get('failed', 0)} failed.")
+        else:
+            log('INFO', 'server',
+                'Container-record migration: '
+                f"{summary.get('created', 0)} created, "
+                f"{summary.get('rematerialised', 0)} rematerialised, "
+                f"{summary.get('skipped', 0)} skipped.")
+    except Exception as exc:
+        log('WARNING', 'server', f'Container-record migration skipped: {exc}')
+
+    # ── Auto-register project root as a default workspace ──────────────
+    try:
+        from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+
+        registry = WorkspaceRegistry.get_default()
+        entry = registry.register_by_root(str(_project_root))
+        ensure_workspace_dirs(entry.id)
+        log('INFO', 'server',
+            f'Auto-registered default workspace: {entry.id} at {_project_root}')
+    except Exception as exc:
+        log('WARNING', 'server', f'Could not auto-register default workspace: {exc}')
+
     # ── Startup container integrity check ─────────────────────────────────
     # Scan for any existing agent-exec-* containers and verify they match
     # the current restrictive defaults.  Stale containers from a previous
     # run with permissive settings are stopped and removed.
     try:
         import docker
-        from docker_executor import verify_container_integrity
+        from infra.containers.executor import verify_container_integrity
         client = docker.from_env()
         # List all containers with names starting with agent-exec-
         all_containers = client.containers.list(all=True, filters={"name": "agent-exec-"})
@@ -204,16 +891,215 @@ async def lifespan(app: FastAPI):
                     log('WARNING', 'server',
                         f'Startup integrity: error checking container '
                         f'{result["container_name"]}: {result.get("mismatch_reason")}')
+                elif result.get("action_taken") == "refused":
+                    log('WARNING', 'server',
+                        f'Startup integrity: container '
+                        f'{result["container_name"]} for workspace {ws_path} '
+                        f'mismatches current defaults; left intact '
+                        f'(refused to remove): {result.get("mismatch_reason")}')
     except Exception as exc:
         log('DEBUG', 'server', f'Startup container scan skipped: {exc}')
+
+    # ── Startup container drift scan ─────────────────────────────────────
+    # Compare every container record against its live container (read-only
+    # detection; drift findings are appended to the record's own event log by
+    # the sanctioned drift helper).  Bounded by _BOOT_DRIFT_SCAN_LIMIT so a
+    # host with many records cannot stall startup.  Best-effort: any failure
+    # (e.g. no Docker daemon) is logged and startup continues.
+    try:
+        import docker
+        from thoughtmachine.container_record import RECORD_LABEL_KEY
+        from thoughtmachine.container_record import api as _cr_api
+        from thoughtmachine.container_record import storage as _cr_storage
+        from thoughtmachine.container_record.drift import (
+            detect_record_drift,
+            emit_drift_findings,
+            live_state_for_record,
+            record_permissions,
+        )
+        from thoughtmachine.container_record.state import creating_drift_finding
+        from thoughtmachine.workspace_capabilities import (
+            WorkspaceCapabilities,
+            load_workspace_capabilities,
+        )
+
+        client = docker.from_env()
+        # ONE server-side-narrowed list call: only containers owned by the
+        # record system (those carrying the record-owned label).  Resource
+        # containers (tm-res-*) never carry this label, so they are excluded
+        # from the drift scan without any extra filtering.
+        live_containers = client.containers.list(
+            all=True, filters={"label": RECORD_LABEL_KEY}
+        )
+
+        class _BootDriftContainers:
+            """Client-like shim exposing ``list(all=True)`` for detection."""
+
+            def __init__(self, items):
+                self._items = list(items)
+
+            def list(self, all=True, filters=None):  # noqa: A002 - docker sig
+                return list(self._items)
+
+        containers = _BootDriftContainers(live_containers)
+
+        # Every container-bearing record across all workspaces.  The cap
+        # bounds the number of RECORDS scanned (never the resolved live set:
+        # truncating that would fabricate false container_absent findings).
+        pending = []
+        for ws in _cr_storage.iter_workspace_ids():
+            for record in _cr_api.list_records(ws):
+                if getattr(record, "docker_id", ""):
+                    pending.append((ws, record))
+
+        inspected = 0
+        # Capabilities are loaded once per unique workspace (not once per
+        # record): the boot scan can touch many records from the same
+        # workspace, so a small per-boot cache avoids redundant disk reads.
+        caps_cache: dict = {}
+        for ws, record in pending[:_BOOT_DRIFT_SCAN_LIMIT]:
+            if ws not in caps_cache:
+                caps_cache[ws] = (
+                    load_workspace_capabilities(ws)
+                    or WorkspaceCapabilities.default()
+                )
+            caps = caps_cache[ws]
+            # The record's OWN recorded grant (v5 ``permissions`` field) feeds
+            # the policy resolution.  Passing ``{}`` pinned every record to the
+            # framework-default profile, so a record whose recorded intent was
+            # wider than the defaults reported phantom policy drift on every
+            # boot.
+            findings = detect_record_drift(
+                record,
+                containers,
+                permissions=record_permissions(record),
+                capabilities=caps,
+            )
+            # The caller -- NOT detect_record_drift -- owns both the lifecycle
+            # (stuck-creating) axis and the emission gate, so the detector stays
+            # free of emission policy.  A lifecycle finding is appended only
+            # when the record is genuinely stale in ``creating`` (past its
+            # expiry window with no live container, or contradicted by a live
+            # one); its dedup signature differs from the absent-cause digest.
+            # ``live_state_for_record`` serves from the same in-memory container
+            # shim, so this adds NO extra docker-daemon round-trip.
+            lifecycle = creating_drift_finding(
+                record,
+                live_state=live_state_for_record(record, containers),
+                now=None,
+            )
+            if lifecycle is not None:
+                findings.append(lifecycle)
+            emit_drift_findings(ws, record, findings)
+            inspected += 1
+
+        skipped = len(pending) - inspected
+        if skipped:
+            log('WARNING', 'server',
+                f'Startup container drift scan capped at '
+                f'{_BOOT_DRIFT_SCAN_LIMIT}: inspected {inspected} record(s), '
+                f'skipped {skipped} record(s).')
+        else:
+            log('INFO', 'server',
+                f'Startup container drift scan inspected {inspected} record(s).')
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup container drift scan skipped: {exc}')
+
+    # ── Startup orphan resource-container sweep ──────────────────────────
+    # Remove hidden git resource containers (thoughtmachine.resource label)
+    # whose workspace is no longer registered, then prune the shared resource
+    # image once no resource container remains anywhere. Best-effort: a
+    # failing sweep must never break startup.
+    #
+    # FAIL-CLOSED: the project-root auto-registration above is best-effort and
+    # may have failed non-fatally, in which case the registry read can
+    # legitimately come back EMPTY.  An empty id list makes the destructive
+    # callee force-remove EVERY resource container, so re-validate the registry
+    # here (exactly as the periodic tick does) and skip the sweep when it is
+    # empty or faulting.
+    if _startup_registry_has_workspaces():
+        _sweep_orphan_resource_containers()
+    else:
+        log('WARNING', 'server',
+            'Startup container sweep (orphan-resource) skipped: '
+            'no registered workspaces')
+
+    # ── Startup exited-workspace-container sweep ────────────────────────
+    # Remove EXITED generic workspace containers (thoughtmachine.workspace_id
+    # label) idle past the TTL; containers of unregistered workspaces are
+    # treated as orphans and removed too. Resource containers are excluded.
+    # Best-effort: a failing sweep must never break startup.
+    _sweep_exited_workspace_containers()
+
+    # ── Startup orphan container-RECORD sweep ───────────────────────────
+    # Reap container records whose bound Docker container is gone, once past
+    # their retention window.  The record's workspace registration is NOT a
+    # reap condition.  Best-effort: a failing sweep must never break startup.
+    _sweep_orphan_container_records()
+
+    # ── Background periodic container sweep (Phase 1.1) ─────────────────────
+    # Re-run both sweeps on an interval so idle/orphan containers are
+    # reclaimed during long-running sessions (startup is one-shot).
+    sweep_task = asyncio.create_task(
+        _periodic_container_sweep_loop(),
+        name='container-sweep',
+    )
+    app.state.container_sweep_task = sweep_task
+    log('INFO', 'server',
+        f'Periodic container sweep scheduled every '
+        f'{_CONTAINER_SWEEP_INTERVAL_S:.0f}s')
+
+    # ── Stale watchdog (S7c, ANNOUNCE-ONLY) ──────────────────────────────────
+    # The stale machinery existed and never ran: ``start_stale_check`` had no
+    # production caller, so nothing ever scanned for a worker that had gone
+    # quiet. This starts the announce-only watchdog -- it reports a stale worker
+    # and takes no action on it. Best-effort: a watchdog that cannot start must
+    # never break startup.
+    try:
+        from tools.workspace.worker_stale_watchdog import ensure_watchdog
+        watchdog = ensure_watchdog()
+        app.state.worker_stale_watchdog = watchdog
+        from agent.config.defaults import WORKER_STALE_WATCHDOG_INTERVAL_S
+        log('INFO', 'server',
+            f'Stale watchdog started (announce-only, every '
+            f'{WORKER_STALE_WATCHDOG_INTERVAL_S:.0f}s)')
+    except Exception as exc:
+        app.state.worker_stale_watchdog = None
+        log('WARNING', 'server', f'Stale watchdog startup skipped: {exc}')
 
     yield
     log('INFO', 'server', 'Server shutting down.')
 
+    # Stop the announce-only stale watchdog (mirror of the startup above).
+    try:
+        from tools.workspace.worker_stale_watchdog import stop_watchdog
+        if stop_watchdog(timeout=5.0):
+            log('INFO', 'server', 'Stale watchdog stopped.')
+    except Exception as exc:
+        log('WARNING', 'server', f'Stale watchdog shutdown error: {exc}')
 
-# ── Graceful shutdown: save open sessions on Ctrl+C / SIGTERM ───────────────
-# When the server terminates (Ctrl+C / SIGINT / SIGTERM), we need to ensure
-# open sessions are saved before the process exits.
+    # Stop the periodic container sweep task.
+    try:
+        sweep_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweep_task
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Container sweep task shutdown error: {exc}')
+
+    # Stop EventLogger
+    try:
+        el = getattr(app.state, 'event_logger', None)
+        if el is not None:
+            el.stop()
+            log('INFO', 'server', 'EventLogger stopped.')
+    except Exception as exc:
+        log('WARNING', 'server', f'EventLogger shutdown error: {exc}')
+
+
+# ── Graceful shutdown: save open sessions on normal process exit ─────────────
+# When the server terminates, we need to ensure open sessions are saved
+# before the process exits.
 #
 # Approach:
 # 1. _session_bridges — dict mapping session_id → WebAgentBridge (warm cache).
@@ -223,14 +1109,49 @@ async def lifespan(app: FastAPI):
 # 4. asyncio.Event — the WebSocket handler checks this event between
 #    messages and exits promptly, letting its ``finally`` block run.
 #
-# Note: atexit handlers do *not* run on SIGKILL or hard crashes, but they
-# do run on normal Ctrl+C (SIGINT -> KeyboardInterrupt -> sys.exit).
+# IMPORTANT: signal handlers are deliberately NOT installed at import time.
+# uvicorn overwrites the process signal handlers (SIGINT/SIGTERM) when its
+# event loop starts, so handlers registered here would be clobbered before
+# serving begins. The atexit hook is the import-time side effect that
+# survives — uvicorn's Ctrl+C handling leads to a normal interpreter exit.
 
-import signal
 import atexit
 
 _session_bridges: Dict[str, Any] = {}  # session_id → WebAgentBridge (warm cache)
 _shutdown_event: Any = None  # asyncio.Event, set lazily
+_explicitly_closed_sessions: Set[str] = set()  # session_ids closed via close_session command
+
+
+def _cached_bridge_for(
+    session_id: str, expected_workspace_id: Optional[str] = None
+) -> Any:
+    """Return the cached bridge for *session_id*, workspace-scoped.
+
+    A cached bridge may only be re-attached when it belongs to the workspace
+    the caller expects: reusing it otherwise would hand the tab the live
+    session, controller and container of a different workspace — and every
+    subsequent write would land there.  ``expected_workspace_id=None`` means
+    "no expectation" and returns whatever is cached.
+    """
+    cached = _session_bridges.get(session_id)
+    if cached is None:
+        return None
+    # A bridge is put in the cache BEFORE its load_session() runs, so a refused
+    # or failed load leaves an entry that owns a controller but no session.  The
+    # reuse branch never calls load_session(), so handing that entry back would
+    # give the caller an empty session instead of loading from disk — a miss.
+    if cached.session is None:
+        log('WARNING', 'server',
+            f"load_session: cached bridge for {session_id} holds no session "
+            f"(refused or failed load) — ignoring cached bridge")
+        return None
+    cached_ws = cached.workspace_id
+    if expected_workspace_id and cached_ws and cached_ws != expected_workspace_id:
+        log('WARNING', 'server',
+            f"load_session: cached bridge for {session_id} belongs to workspace "
+            f"{cached_ws!r}, not {expected_workspace_id!r} — ignoring cached bridge")
+        return None
+    return cached
 
 
 def _get_shutdown_event() -> Any:
@@ -262,43 +1183,8 @@ def _shutdown_save() -> None:
     _session_bridges.clear()
 
 
-def _trigger_shutdown() -> None:
-    """Called by the signal handler — sets the shutdown event.
-
-    If an asyncio loop is running (uvicorn), sets the event for graceful
-    shutdown.  Otherwise, raises ``KeyboardInterrupt`` so the process
-    actually stops even outside an event loop (e.g. during tests).
-    """
-    event = _get_shutdown_event()
-    no_loop = False
-    try:
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            if loop.is_running():
-                loop.call_soon_threadsafe(event.set)
-                log('INFO', 'server', 'Shutdown signal received — finishing in-flight work...')
-                return
-        except RuntimeError:
-            pass
-        event.set()
-        no_loop = True
-    except Exception:
-        pass
-
-    log('INFO', 'server', 'Shutdown signal received — finishing in-flight work...')
-    if no_loop:
-        # No asyncio loop — likely running outside uvicorn (e.g. tests).
-        # The event set above won't be checked by anyone, so we need to
-        # actually stop execution.
-        raise KeyboardInterrupt()
-
-
 # Register atexit handler to save sessions on normal exit (Ctrl+C etc.)
 atexit.register(_shutdown_save)
-# Signal handlers (also set the asyncio event so the WS loop can detect shutdown)
-_orig_sigint = signal.signal(signal.SIGINT, lambda sig, frame: _trigger_shutdown())
-_orig_sigterm = signal.signal(signal.SIGTERM, lambda sig, frame: _trigger_shutdown())
 
 
 app = FastAPI(
@@ -324,7 +1210,12 @@ else:
     # Normal Python: project root (parent of web_ui/)
     _BUNDLE_DIR = Path(__file__).resolve().parent.parent.parent
 
-_FRONTEND_DIST_DEV = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+# NOTE: deliberately ``absolute()`` and not ``resolve()``.  ``absolute()`` does
+# not follow symlinks, so when this module is imported through a symlinked
+# directory (e.g. the e2e installer smoke test's scratch mirror, which symlinks
+# web_ui/backend back into the real repo) the frontend tree is located next to
+# the *invoked* file rather than next to the symlink target.
+_FRONTEND_DIST_DEV = Path(__file__).absolute().parent.parent / "frontend" / "dist"
 _FRONTEND_DIST_BUNDLE = _BUNDLE_DIR / "frontend_dist"
 
 # Pick the first one that exists
@@ -337,13 +1228,41 @@ else:
 # Whether --serve-frontend was requested (set in main())
 _SERVE_FRONTEND = False
 
-# ── CORS (allow frontend dev server on any port) ────────────────────────────
+# ── Authentication boundary ────────────────────────────────────────────────
+# ONE ingress gate for every HTTP request and WebSocket handshake: Host
+# validation, the exemption set, the origin predicate and the credential live
+# in ``web_ui/backend/auth_boundary.py`` (the policy and the ordering are
+# documented there).  Nothing is added per route, so a new route is protected
+# by construction.
+#
+# ORDER MATTERS.  ``add_middleware`` PREPENDS, so the middleware added LAST is
+# the OUTERMOST one.  This registration is deliberately placed BEFORE the CORS
+# registration below: CORS must stay outermost so that a preflight (which
+# carries no credentials by specification) is answered by CORSMiddleware and
+# never reaches the gate.  Moving this call below the CORS block would make the
+# gate outermost and 401 every cross-origin preflight; the boundary still
+# passes unauthenticated ``OPTIONS`` through as a belt-and-braces measure, but
+# the ordering is the real guarantee.
+app.add_middleware(AuthBoundaryMiddleware)
+
+
+# ── CORS (loopback dev-server origins only, no credentials) ────────────────────────
+# The frontend is either served same-origin by this app or by the vite dev
+# server on TM_FRONTEND_PORT (default 5173).  Only those loopback spellings
+# are allowed: ``allow_origins=["*"]`` + ``allow_credentials=True`` (a) is
+# invalid per the CORS spec and (b) let ANY web page drive the local API.
+# The app now authenticates with a token (see the authentication boundary
+# above), but only on the two mechanisms CORS does not police: the session
+# cookie is ``SameSite=Strict`` and the bearer token is never sent by a
+# browser, so a credentialed CORS grant buys an attacker nothing.  It stays
+# off: ``allow_origins=[...]`` + ``allow_credentials=True`` would let any page
+# on the dev-server origin read responses with the caller's cookie attached.
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_allowed_origins(),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -351,12 +1270,80 @@ app.add_middleware(
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  WebSocket endpoint
+#
+#  Query parameters:
+#    ?project=<path>  — Absolute path to the project directory. Used to
+#                       resolve the correct workspace for this connection.
+#                       When omitted, falls back to _project_root (this file's
+#                       grandparent directory at import-time).
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _ws_origin(ws: WebSocket) -> Optional[str]:
+    """Read the Origin header without assuming the socket has headers.
+
+    A missing/None header container means "no Origin sent", which
+    ``websocket_origin_allowed`` treats as allowed (CLI and integration
+    clients send none).  Never raises: the guard must not be a crash surface.
+    """
+    headers = getattr(ws, "headers", None)
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    return getter("origin")
+
+
+async def _reject_websocket(ws: WebSocket, reason: str) -> None:
+    """Log and close a rejected handshake (BEFORE accept).
+
+    Closing is best-effort: rejecting a connection must never raise, and
+    duck-typed sockets (test stubs) may not implement ``close``.
+    """
+    log('WARNING', 'server.ws', f'WebSocket rejected: {reason}')
+    try:
+        await ws.close(code=1008)
+    except Exception as exc:  # noqa: BLE001 - rejection must never raise
+        log('WARNING', 'server.ws', f'ws.close failed during rejection: {exc}')
+
+
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
+    # ── Handshake guards (BEFORE accept) ────────────────────────────────
+    # Origin: a browser always sends one, so only loopback origins may open a
+    # socket.  Clients that send no Origin (CLI, integration harnesses) are
+    # allowed through.  Closing before accept rejects the handshake.
+    _origin = _ws_origin(ws)
+    if not websocket_origin_allowed(_origin):
+        await _reject_websocket(ws, f'untrusted Origin {_origin!r}')
+        return
+
+    # The ?project= value is client-supplied, so it is confined exactly like
+    # the REST browser endpoints: existing directory outside the vault.
+    _project_path = _project_root
+    if project:
+        try:
+            _project_path = _confine_workspace_path(project, require_dir=True)
+        except ValueError as exc:
+            await _reject_websocket(ws, f'project path {project!r}: {exc}')
+            return
+
+    # D2: resolve the connection's DECLARED workspace once, at handshake, and
+    # pin it for the life of the socket.  Every bridge built for this connection
+    # bootstraps from this id, so a load can never re-derive a different
+    # workspace from the same request (the cross-bind D2 closes).
+    _handshake_ws_id: Optional[str] = None
+    if project:
+        from web_ui.backend.bridge import _resolve_workspace_id
+        try:
+            _handshake_ws_id = _resolve_workspace_id(_project_path)
+        except Exception as exc:  # noqa: BLE001 - unresolvable declaration stays unbound
+            log('WARNING', 'server.ws',
+                f'handshake: could not resolve a workspace for {_project_path}: {exc}')
+
     await ws.accept()
-    log('INFO', 'server.ws', f'WebSocket connected: {ws.client}')
+    # If the frontend provides a project query parameter, use it to resolve
+    # the workspace instead of the default _project_root.  This allows the
+    # web UI to serve sessions for multiple projects from a single server.
+    log('INFO', 'server.ws', f'WebSocket connected: {ws.client} project={_project_path}')
 
     # Import bridge here (after project root is on sys.path)
     from web_ui.backend.bridge import WebAgentBridge
@@ -375,10 +1362,11 @@ async def websocket_endpoint(ws: WebSocket):
         if getattr(ws, '_closed', False):
             return
         try:
+            log('DEBUG', 'server.ws', f'send_event: type={event.get("type","?")!r} state={event.get("state",event.get("text",""))[:60]}')
             await ws.send_json(event)
-        except (RuntimeError, ConnectionError, AssertionError) as exc:
-            # Expected during shutdown or websockets race — mark closed
-            log('DEBUG', 'server.ws', f'send_event skipped (ws closed): {exc}')
+        except (RuntimeError, ConnectionError, AssertionError, WebSocketDisconnect) as exc:
+            # Expected during shutdown, websockets race, or client disconnect — mark closed
+            log('WARNING', 'server.ws', f'send_event skipped (ws closed): {exc} | event_type={event.get("type","?")}')
             ws._closed = True
         except Exception as exc:
             log('ERROR', 'server.ws', f'send_event failed: {exc}\n{traceback.format_exc()}')
@@ -390,7 +1378,13 @@ async def websocket_endpoint(ws: WebSocket):
     def event_callback(event: Dict[str, Any]) -> None:
         """Called from agent thread.  Schedule send on the asyncio loop."""
         nonlocal _shutting_down
+        if event.get("type") == "security_prompt":
+            # This socket is the one that was asked -- remember it so a
+            # security_response from another connection cannot resolve it.
+            _record_escalation_asker(str(event.get("request_id") or ""), id(ws))
+        log('INFO', 'server.ws', f'event_callback ENTRY: type={event.get("type","?")!r}')
         if _shutting_down:
+            log('DEBUG', 'server.ws', f'event_callback: discarding (shutting down) type={event.get("type","?")}')
             return
         try:
             if _loop.is_closed():
@@ -437,7 +1431,8 @@ async def websocket_endpoint(ws: WebSocket):
                     # Translate frontend config format → AgentConfig format.
                     # Global config from agent_config.json provides defaults;
                     # frontend fields become overrides.
-                    config_dict = _translate_frontend_config(config_dict)
+                    config_dict = config_manager.translate_frontend_config(config_dict)
+                    config_dict = _session_config_dict(config_dict)
 
                     # Always create a fresh bridge + controller for start_session.
                     # Stop any existing bridge first to prevent resource leaks.
@@ -449,14 +1444,20 @@ async def websocket_endpoint(ws: WebSocket):
                     bridge.register()
                     bridge.set_controller(controller)
 
+                    log('INFO', 'server.ws',
+                        f'start_session: bridge+controller created, calling start() | '
+                        f'query={query[:80]!r}...')
+
                     try:
-                        bridge.start(query, config_dict)
+                        bridge.start(query, SessionConfig(**config_dict))
                     except RuntimeError as exc:
                         # Controller may be stuck from a prior session; stop and retry
+                        log('WARNING', 'server.ws', f'start_session: controller busy, retrying: {exc}')
                         await ws.send_json({"type": "status_message", "text": f"⚠ Controller busy — resetting: {exc}"})
                         bridge.stop()
-                        bridge.start(query, config_dict)
+                        bridge.start(query, SessionConfig(**config_dict))
                     except Exception as exc:
+                        log('ERROR', 'server.ws', f'start_session: failed: {exc}\n{traceback.format_exc()}')
                         await ws.send_json({
                             "type": "status_message",
                             "text": f"⚠ Failed to start: {exc}",
@@ -470,6 +1471,15 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({"type": "status_message", "text": "⚠ Query cannot be empty."})
                         continue
 
+                    # ── Log full bridge state at entry ──
+                    log('INFO', 'server.ws',
+                        f'continue_session ENTRY: query={query[:80]!r}... | '
+                        f'bridge={bridge is not None} | '
+                        f'_loaded_session={bridge._loaded_session.session_id if bridge and bridge._loaded_session else None} | '
+                        f'agent_is_running={bridge.agent_is_running if bridge else False} | '
+                        f'_controller={bridge._controller is not None if bridge else False} | '
+                        f'_controller.is_running={bridge._controller.is_running if bridge and bridge._controller else False}')
+
                     # Case 1: Bridge has a loaded session (first query for a new session)
                     # Only start if the agent is not already running.
                     if bridge is not None and bridge._loaded_session is not None and not bridge.agent_is_running:
@@ -478,8 +1488,17 @@ async def websocket_endpoint(ws: WebSocket):
                             # Pass the frontend config if available (for first query)
                             config_dict = msg.get("config", {})
                             if config_dict:
-                                config_dict = _translate_frontend_config(config_dict)
-                                bridge.start(query, config_dict)
+                                config_dict = config_manager.translate_frontend_config(config_dict)
+                                config_dict = _session_config_dict(config_dict)
+                                # 🛡️ Preserve mode from loaded session if frontend config doesn't specify it
+                                # Otherwise the frontend config (which may omit mode) would override
+                                # the correct mode loaded from session metadata with None → 'agent' default.
+                                if not config_dict.get('mode') and bridge._session_config and bridge._session_config.mode:
+                                    config_dict['mode'] = bridge._session_config.mode
+                                    log('INFO', 'server.ws',
+                                        f'continue_session: injected mode={bridge._session_config.mode} from loaded session config')
+                                sc = SessionConfig(**config_dict)
+                                bridge.start(query, sc)
                             else:
                                 bridge.start(query)
                         except Exception as exc:
@@ -491,25 +1510,48 @@ async def websocket_endpoint(ws: WebSocket):
 
                     # Case 2: Agent is already running — continue normally
                     if bridge is not None and bridge.agent_is_running:
+                        log('INFO', 'server.ws',
+                            f'continue_session: CASE 2 - bridge is running, calling bridge.continue_session() | '
+                            f'query={query[:80]!r}...')
                         try:
                             config_dict = msg.get("config", {})
                             if config_dict:
-                                config_dict = _translate_frontend_config(config_dict)
+                                config_dict = config_manager.translate_frontend_config(config_dict)
                             bridge.continue_session(query, config_dict)
+                            log('INFO', 'server.ws',
+                                f'continue_session: CASE 2 - bridge.continue_session() returned OK')
                         except Exception as exc:
+                            log('ERROR', 'server.ws',
+                                f'continue_session: CASE 2 - Exception: {exc}\n{traceback.format_exc()}')
                             await ws.send_json({
                                 "type": "status_message",
                                 "text": f"⚠ Failed to continue: {exc}",
                             })
                         continue
 
-                    # Case 3: Nothing to continue
-                    await ws.send_json({"type": "status_message", "text": "No active session — start a new one."})
+                    # Case 3: Nothing to continue (e.g. a cold start where the
+                    # session was not created yet).  Do NOT silently drop the
+                    # query: surface an explicit, actionable notice that echoes
+                    # the operator's text back so it is preserved (the frontend
+                    # clears the input box on send) and can be resent.
+                    log('WARNING', 'server.ws',
+                        f'continue_session: CASE 3 - no active session! | '
+                        f'bridge={bridge is not None} | '
+                        f'_loaded_session={bridge._loaded_session.session_id if bridge and bridge._loaded_session else None} | '
+                        f'agent_is_running={bridge.agent_is_running if bridge else False}')
+                    await ws.send_json({
+                        "type": "status_message",
+                        "text": (
+                            "⚠ No active session — your message was not sent. "
+                            "Start a session, then resend:\n"
+                            f"{query}"
+                        ),
+                    })
 
                 elif command == "pause_session":
                     if bridge is not None:
                         bridge.pause()
-                        await ws.send_json({"type": "status_message", "text": "⏸ Paused."})
+                        await ws.send_json({"type": "status_message", "text": "⏸ Pausing…"})
 
                 elif command == "resume_session":
                     if bridge is not None:
@@ -517,15 +1559,37 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({"type": "status_message", "text": "▶ Resumed."})
 
                 elif command == "stop_session":
+                    # Stop button: truncate the running turn only — the bridge
+                    # thread and the session survive (close_session is what
+                    # tears the bridge down).
                     if bridge is not None:
-                        bridge.stop()
+                        # request_stop()'s return value is deliberately NOT used
+                        # for the ack: acknowledging an IDLE stop with 'Stopped.'
+                        # is a pinned contract (test_state_transitions.py::
+                        # test_ws_stop_session_status_only).
+                        bridge.request_stop()
                         await ws.send_json({"type": "status_message", "text": "⏹ Stopped."})
 
                 elif command == "get_config":
-                    # _frontend_config_from_bridge handles bridge=None and cfg=None gracefully
+                    # frontend_config_from_bridge handles bridge=None and cfg=None gracefully
+                    fe_config = config_manager.get_frontend_config(bridge)
+                    settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                    permissions = config_manager.resolve_effective_permissions(
+                        bridge._session_config,
+                        bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
+                        bridge._session_config.workspace_id or bridge._workspace_id,
+                    ) if bridge._session_config else {}
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": _frontend_config_from_bridge(bridge),
+                        "config": fe_config,
+                        "settings": settings,
+                        "permissions": permissions,
+                        "merged_config": fe_config,
+                        "effective_config": config_manager.get_effective_config(
+                            bridge,
+                            workspace_id=bridge._workspace_id if bridge else None,
+                            workspace_path=bridge._workspace_path if bridge else None,
+                        ),
                     })
 
                 elif command == "get_conversation":
@@ -549,30 +1613,477 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                         continue
 
-                    if bridge is None:
-                        await ws.send_json({
-                            "type": "status_message",
-                            "text": "⚠ No active session to configure",
-                        })
-                        continue
+                    # Detect workspace_path change — the frontend no longer sends
+                    # a separate set_project command; apply_config handles the full
+                    # project switch internally to avoid race conditions.
+                    #
+                    # FIX6: baseline the comparison on the SESSION's own workspace,
+                    # not _project_path. The frontend echoes the session's
+                    # workspace_path in every apply_config payload (ConfigPanel
+                    # getSafeDraft), while _project_path defaults to the server
+                    # root because the tab frontend never sends ?project= — so
+                    # comparing against _project_path would treat EVERY apply on a
+                    # non-default-workspace session as a workspace switch and
+                    # spawn a new session id. Only a genuine difference from the
+                    # session's own workspace should trigger the switch.
+                    raw_workspace_path = config.get("workspace_path", "") or ""
+                    new_workspace_path = os.path.normpath(raw_workspace_path) if raw_workspace_path else ""
+                    # Client-supplied path: confine it before it can become
+                    # _project_path (same anchor as the REST browser).
+                    # require_dir=False: apply_config legitimately accepts a
+                    # not-yet-existing path (it creates the future workspace),
+                    # unlike set_project which requires an existing one.
+                    if new_workspace_path:
+                        try:
+                            new_workspace_path = _confine_workspace_path(
+                                new_workspace_path, require_dir=False)
+                        except ValueError as exc:
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Workspace path rejected: {exc}",
+                            })
+                            continue
+                    session_ws = None
+                    if bridge is not None:
+                        _session_obj = bridge.session  # property: _session or _loaded_session (bridge.py L864-867)
+                        if _session_obj is not None:
+                            session_ws = (_session_obj.metadata or {}).get('agent_config', {}).get('workspace_path') or None
+                        if session_ws is None:
+                            session_ws = bridge._workspace_path or None
+                    # Canonicalise the baseline exactly the way the candidate
+                    # above was canonicalised (_confine_workspace_path ->
+                    # os.path.realpath).  Comparing a normpath'd baseline
+                    # against a realpath'd candidate made an UNCHANGED
+                    # workspace look like a switch whenever the two spellings
+                    # differ -- macOS's ``/var`` -> ``/private/var``
+                    # indirection, or any symlinked workspace root.
+                    _current_raw = session_ws or _project_path or ""
+                    current_path = (
+                        os.path.realpath(os.path.abspath(_current_raw))
+                        if _current_raw else ""
+                    )
+                    workspace_changed = bool(new_workspace_path) and new_workspace_path != current_path
 
-                    # Translate frontend format → backend AgentConfig format
-                    backend_config = _translate_frontend_config(config)
+                    if workspace_changed:
+                        # ── Ownership gate (narrowed operator rule) ────────────
+                        # One shared predicate (bridge._ownership_refusal) drives
+                        # both apply_config and set_project, so the rule cannot
+                        # drift between them.  A connection bound to workspace A
+                        # may move to a brand-new path outside every registered
+                        # workspace root, but never onto another registered
+                        # workspace (nor into its tree).  Roots are
+                        # realpath-normalised, so a symlink into B's root is
+                        # caught as B.
+                        from web_ui.backend.bridge import _ownership_refusal
+                        _ac_bound_ws = bridge.workspace_id if bridge is not None else None
+                        # D3: bootstrap is the transition; it cannot require the
+                        # transition.  An unbound connection may establish scope
+                        # here (that is the only thing allowed on ``None``); a
+                        # bound one is still checked by the path predicate.
+                        if _ac_bound_ws is None:
+                            _ac_refusal = None
+                        else:
+                            _ac_refusal = _ownership_refusal(new_workspace_path, _ac_bound_ws)
+                        if _ac_refusal is not None:
+                            log('WARNING', 'server.config',
+                                "apply_config refused: workspace mismatch — "
+                                f"connection scoped to workspace {_ac_bound_ws} "
+                                f"cannot switch to {new_workspace_path}: {_ac_refusal}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": (
+                                    "⚠ Workspace switch refused: this connection is "
+                                    f"scoped to workspace {_ac_bound_ws} and cannot "
+                                    f"switch to {new_workspace_path}."
+                                ),
+                            })
+                            continue
+                        log('INFO', 'server.config',
+                            "apply_config: workspace_changed=True — switching project workspace")
+                        # ── Full project switch ────────────────────────────────────────────
+                        # The user changed the workspace folder. Save and stop the current
+                        # bridge, resolve the new workspace, then update the EXISTING
+                        # session's workspace_id so the conversation is preserved (no new
+                        # session created, no session_loaded sent to frontend).
 
-                    # Apply via bridge (validates, merges, resolves provider, persists)
-                    result = bridge.apply_config(backend_config)
+                        # 0. Grab reference to the existing session BEFORE stopping the bridge
+                        existing_session = None
+                        if bridge is not None:
+                            existing_session = bridge.session  # may be None if never started
+                            if existing_session is None:
+                                existing_session = bridge._loaded_session
 
-                    if result.get("success"):
-                        await ws.send_json({
-                            "type": "config_changed",
-                            "config": _frontend_config_from_bridge(bridge),
-                        })
-                        log('INFO', 'server.config', "Config applied and persisted via apply_config")
+                        # 1. Save current session and stop the bridge.
+                        #    A failing save/stop must not abort the whole workspace
+                        #    switch — log and proceed with a fresh bridge.
+                        try:
+                            if bridge is not None and bridge.session is not None:
+                                bridge.save_session()
+                            if bridge is not None:
+                                bridge.stop()
+                        except Exception as exc:
+                            log('ERROR', 'server.ws',
+                                f"apply_config: save/stop of previous bridge failed: {exc}")
+                        finally:
+                            # Drop the old bridge from the cache so the new bridge
+                            # created below is the only owner of this session —
+                            # otherwise a later load_session could resurrect a
+                            # stopped bridge.
+                            if bridge is not None:
+                                for _sid, _br in list(_session_bridges.items()):
+                                    if _br is bridge:
+                                        del _session_bridges[_sid]
+                                        break
+
+                        # 2. Update the per-connection project path
+                        _project_path = new_workspace_path
+
+                        # 3. Create fresh bridge + controller
+                        from agent.controller import AgentController
+                        controller = AgentController()
+                        bridge = WebAgentBridge(session_store=session_store)
+                        bridge.set_event_callback(event_callback, key=id(ws))
+                        bridge.register()
+                        bridge.set_controller(controller)
+                        # 4. Resolve or auto-register workspace for the new path
+                        workspace_id = None
+                        try:
+                            from web_ui.backend.bridge import _resolve_workspace_id
+                            resolved = _resolve_workspace_id(_project_path)
+                            if resolved:
+                                workspace_id = resolved
+                                bridge._workspace_id = resolved
+                                bridge._workspace_path = _project_path
+                                log('INFO', 'server',
+                                    f"apply_config: resolved workspace {resolved} for {_project_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"apply_config: resolve error: {exc}")
+
+                        if not workspace_id:
+                            try:
+                                from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+                                entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
+                                workspace_id = entry.id
+                                # D2 (bootstrap binding): registration is the
+                                # workspace-creation transition -- the connection
+                                # adopts the new id through the bind authority.
+                                # bootstrap from unbound: refusal is structurally unreachable today.
+                                _bind_refusal = bridge._bind_workspace(entry.id, "bootstrap")
+                                if _bind_refusal:
+                                    log('WARNING', 'server',
+                                        f"apply_config: binding to workspace {entry.id} refused: {_bind_refusal}")
+                                bridge._workspace_path = _project_path
+                                ensure_workspace_dirs(entry.id)
+                                log('INFO', 'server',
+                                    f"apply_config: registered workspace {entry.id} for {_project_path}")
+                            except Exception as exc:
+                                log('WARNING', 'server',
+                                    f"apply_config: auto-register error: {exc}")
+
+                        # 5. Decide session strategy based on whether the existing session
+                        #    has an actual conversation or not.
+                        #
+                        #    - **Existing session with conversation**: create a NEW session,
+                        #      assign the new workspace, and send session_loaded to the frontend
+                        #      so it opens a fresh tab. The old session+tab stays untouched.
+                        #
+                        #    - **Existing session with NO conversation** (empty/fresh tab):
+                        #      reuse the same tab and perform an owner-initiated rebind of
+                        #      the session's workspace stamp, so the record follows the
+                        #      session into the new workspace (the stale copy in the old
+                        #      one is deleted) — no new tab created.
+                        #
+                        #    - **No existing session**: create a fresh one.
+                        #
+                        #    All session creation goes through the bridge's SessionManager
+                        #    (mirrors the REST /api/session/create path and set_project) so the
+                        #    new session gets the full persisted config.
+                        try:
+                            if existing_session is not None and _session_has_conversation(existing_session):
+                                # Session has real conversation — create new session for new workspace
+                                # (opens a new tab on the frontend via session_loaded)
+                                session_id, _ = bridge._session_manager.create_session(
+                                    mode="custom", workspace_path=_project_path
+                                )
+                                # Reload the persisted session so we can layer workspace
+                                # metadata on top (create_session does not handle workspace_id).
+                                new_session = session_store.load_session(session_id, workspace_id=None)
+                                if workspace_id and new_session:
+                                    new_session.workspace_id = workspace_id
+                                # Wire the reloaded session into the bridge (mirrors
+                                # bridge.create_session) and re-save so the workspace_id
+                                # lands on disk in the workspace-scoped location.
+                                bridge._session = new_session
+                                bridge._loaded_session = new_session
+                                bridge._history_version = new_session.conversation_version
+                                sc = bridge._session_manager.extract_session_config(new_session)
+                                if sc is not None:
+                                    bridge._session_config = sc
+                                session_store.save_session(new_session, workspace_id=workspace_id)
+                                session_store.add_open_session(new_session.session_id)
+                                _session_bridges[new_session.session_id] = bridge
+                                log('INFO', 'server',
+                                    f"apply_config: created new session {new_session.session_id} "
+                                    f"for workspace {workspace_id} (existing session {existing_session.session_id} "
+                                    f"had conversation, preserved intact)")
+
+                                # Send session_loaded to frontend so it opens a new tab
+                                await ws.send_json({
+                                    "type": "session_loaded",
+                                    "session_id": new_session.session_id,
+                                    "session_name": new_session.metadata.get('name', ''),
+                                    "message_count": 0,
+                                    "workspace_id": workspace_id or '',
+                                    "workspace_path": _project_path,
+                                    # Intentional replacement (workspace switch): the frontend
+                                    # adopts this session_loaded silently (no stale-session banner)
+                                    # and rebinds the tab to the new session id.
+                                    "replacement": True,
+                                    # Fix 4a: embed the config the user just submitted so the
+                                    # chat UI renders from the first event; the config_changed
+                                    # sent below (step 7) carries the canonical merged config.
+                                    "config": msg.get("config"),
+                                })
+                            elif existing_session is not None:
+                                # No conversation (empty/fresh tab) — reuse the same tab. The
+                                # workspace switch rebinds the session's workspace stamp (the
+                                # only sanctioned move) and saves the record into the NEW
+                                # workspace, then deletes the copy left behind in the old one
+                                # so no duplicate survives.
+                                bridge._loaded_session = existing_session
+                                _session_bridges[existing_session.session_id] = bridge
+                                old_workspace_id = existing_session.workspace_id
+                                existing_session.rebind_workspace(workspace_id, reason="apply_config workspace switch")
+                                session_store.save_session(existing_session, workspace_id=workspace_id)
+                                if old_workspace_id and old_workspace_id != workspace_id:
+                                    # Move semantics: the record now lives in the new workspace; drop the
+                                    # stale copy (and its _meta_ file) left in the previous one so reads
+                                    # cannot resolve the old location.
+                                    if not session_store.delete_session(existing_session.session_id, workspace_id=old_workspace_id):
+                                        # The previous copy lived in the workspace-agnostic legacy dir.
+                                        session_store.delete_session(existing_session.session_id)
+                                log('INFO', 'server',
+                                    f"apply_config: updated existing session {existing_session.session_id} "
+                                    f"to workspace {workspace_id} (no conversation — kept same tab)")
+                            else:
+                                # No prior session — create one (rare: first config on a new conn)
+                                session_id, _ = bridge._session_manager.create_session(
+                                    mode="custom", workspace_path=_project_path
+                                )
+                                new_session = session_store.load_session(session_id, workspace_id=None)
+                                if workspace_id and new_session:
+                                    new_session.workspace_id = workspace_id
+                                bridge._session = new_session
+                                bridge._loaded_session = new_session
+                                bridge._history_version = new_session.conversation_version
+                                sc = bridge._session_manager.extract_session_config(new_session)
+                                if sc is not None:
+                                    bridge._session_config = sc
+                                session_store.save_session(new_session, workspace_id=workspace_id)
+                                session_store.add_open_session(new_session.session_id)
+                                _session_bridges[new_session.session_id] = bridge
+                                log('INFO', 'server',
+                                    f"apply_config: created new session {new_session.session_id} "
+                                    f"for workspace {workspace_id} (no prior session)")
+
+                                # Mirror site 1: send session_loaded so the frontend opens the
+                                # freshly created session (same payload as the conversation branch).
+                                await ws.send_json({
+                                    "type": "session_loaded",
+                                    "session_id": new_session.session_id,
+                                    "session_name": new_session.metadata.get('name', ''),
+                                    "message_count": 0,
+                                    "workspace_id": workspace_id or '',
+                                    "workspace_path": _project_path,
+                                    # Intentional replacement (workspace switch): the frontend
+                                    # adopts this session_loaded silently and rebinds the tab.
+                                    "replacement": True,
+                                    "config": msg.get("config"),
+                                })
+                        except Exception as exc:
+                            # The old bridge is already stopped at this point; surface the
+                            # error and continue the command loop (the Round C try/except
+                            # below is deliberately NOT entered — the session strategy
+                            # failure left the bridge in an unknown state, but the
+                            # connection stays alive for subsequent commands).
+                            log('ERROR', 'server.ws',
+                                f"apply_config: session strategy failed: {exc}")
+                            try:
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": f"⚠ apply_config: session strategy failed: {exc}",
+                                })
+                            except Exception:
+                                pass
+                            continue
+
+                        # 5b. Seed the permission sidecar (ABSENT-ONLY) for the
+                        #     session now bound to the NEW workspace.  The session
+                        #     record was just re-saved under the new workspace, but
+                        #     no grants sidecar exists there yet, so the gate's disk
+                        #     read would fail CLOSED (all-banned).  Seeding an empty
+                        #     sidecar yields the fail-closed DEFAULTS capped by the
+                        #     new workspace's ceiling.  Absent-only: switching BACK
+                        #     to a workspace that already holds this session's grants
+                        #     must preserve them.  Best-effort: a seed failure must
+                        #     NOT break the switch (the old bridge is already gone).
+                        try:
+                            _switch_sid = bridge._session_id or (
+                                bridge._loaded_session.session_id
+                                if bridge._loaded_session else None
+                            )
+                            if workspace_id and _switch_sid:
+                                bridge._session_manager._seed_permissions_sidecar(
+                                    workspace_id, _switch_sid, {},
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            log('WARNING', 'server',
+                                f"apply_config: permission sidecar seed failed "
+                                f"for workspace {workspace_id}: {exc}")
+
+                        try:
+                            # 6. Now apply the config to the NEW bridge
+                            config = config_manager.translate_frontend_config(config)
+                            result = bridge.apply_config(config)
+
+                            # 7. Send config_changed + status message.
+                            #    session_loaded was already sent above (step 5) if a new session was
+                            #    created for a conversation-bearing session. For empty sessions that
+                            #    were updated in-place, no session_loaded is needed since the tab
+                            #    is reused.
+                            if isinstance(result, dict) and "config" in result:
+                                # Success — result includes config, settings, permissions, merged_config
+                                await ws.send_json({
+                                    "type": "config_changed",
+                                    **result,
+                                })
+                                log('INFO', 'server.config',
+                                    f"Config applied after project switch to {_project_path}")
+                            else:
+                                # Config apply failed — still send a config
+                                # from the bridge so the frontend doesn't hang
+                                # with stale state or wrong workspace_path.
+                                fe_config = config_manager.get_frontend_config(bridge)
+                                settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                                permissions = config_manager.resolve_effective_permissions(
+                                    bridge._session_config,
+                                    bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
+                                    bridge._session_config.workspace_id or bridge._workspace_id,
+                                ) if bridge._session_config else {}
+                                await ws.send_json({
+                                    "type": "config_changed",
+                                    "config": fe_config,
+                                    "settings": settings,
+                                    "permissions": permissions,
+                                    "merged_config": fe_config,
+                                    "effective_config": config_manager.get_effective_config(
+                                        bridge,
+                                        workspace_id=bridge._workspace_id if bridge else None,
+                                        workspace_path=bridge._workspace_path if bridge else None,
+                                    ),
+                                })
+                                err_msg = result.get('error', 'unknown error') if isinstance(result, dict) else 'unknown error'
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": f"⚠ Config apply had issues: {err_msg}",
+                                })
+
+                            # Machine-readable permission-context reset signal
+                            # carried on the EXISTING ``status_message`` channel
+                            # (no new WS event type; no ``session_id`` so the
+                            # frontend's cross-session status filter cannot drop
+                            # it).  The frontend renders ``text``; the extra
+                            # fields let an operator/UI re-read this session's
+                            # effective (capped) permissions.
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": (
+                                    f"✅ Switched to project: {_project_path}\n"
+                                    f"You are now in workspace "
+                                    f"{workspace_id or _project_path}. "
+                                    f"Permission context reset to defaults for "
+                                    f"this workspace, capped by this workspace's "
+                                    f"ceiling."
+                                ),
+                                "permissions_reset": True,
+                                "workspace_id": workspace_id or "",
+                                "permission_context": "defaults_capped_by_ceiling",
+                            })
+                        except Exception as exc:
+                            # Do NOT let a failed apply kill the WS handler — the old
+                            # bridge is already stopped at this point, so surface the
+                            # error to the frontend and let the loop continue.
+                            log('ERROR', 'server.ws',
+                                f"apply_config failed in load_session: {exc}")
+                            session_id = bridge._session_id or (
+                                bridge._loaded_session.session_id if bridge._loaded_session else None
+                            )
+                            try:
+                                await ws.send_json({
+                                    "type": "error",
+                                    "session_id": session_id,
+                                    "message": "Failed to apply config",
+                                })
+                            except Exception:
+                                pass
+
+
                     else:
-                        await ws.send_json({
-                            "type": "status_message",
-                            "text": f"⚠ Failed to apply config: {result.get('error', 'unknown error')}",
-                        })
+                        # ── Normal config apply (no workspace change) ──────────────
+                        if bridge is None:
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "⚠ No active session to configure",
+                            })
+                            continue
+
+                        # Ensure session config is initialised before applying
+                        if bridge._session_config is None:
+                            from agent.config.presets import get_tools_for_mode
+                            _mode = config.get("mode", "agent") if isinstance(config, dict) else "agent"
+                            bridge._session_config = SessionConfig(
+                                mode=_mode,
+                                max_turns=100,
+                                session_permissions={},
+                                enabled_tools=list(get_tools_for_mode(_mode)),
+                            )
+
+                        # Translate frontend tools list → backend enabled_tools, then apply.
+                        # If the controller is busy (agent mid-turn) the config is QUEUED
+                        # on the bridge and applied automatically once the controller
+                        # becomes idle — the frontend is ACKed with config_queued and
+                        # receives the config_changed later (deferred broadcast).
+                        config = config_manager.translate_frontend_config(config)
+                        outcome = bridge.apply_config_queued(config)
+
+                        if isinstance(outcome, dict) and outcome.get("status") == "queued":
+                            await ws.send_json({
+                                "type": "config_queued",
+                                "status": "queued",
+                            })
+                            log('INFO', 'server.config',
+                                "Controller busy — config queued (config_queued sent)")
+                            continue
+
+                        result = outcome
+                        if isinstance(result, dict) and "config" in result:
+                            # Success — result includes config, settings, permissions, merged_config
+                            await ws.send_json({
+                                "type": "config_changed",
+                                **result,
+                            })
+                            log('INFO', 'server.config', "Config applied and persisted via apply_config")
+                        else:
+                            err_msg = result.get('error', 'unknown error') if isinstance(result, dict) else 'unknown error'
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Failed to apply config: {err_msg}",
+                            })
+                            await ws.send_json({
+                                "type": "config_apply_failed",
+                                "text": f"⚠ Failed to apply config: {err_msg}",
+                            })
 
                 elif command == "set_default_config":
                     """Save config as the global default.
@@ -580,39 +2091,69 @@ async def websocket_endpoint(ws: WebSocket):
                     Accepts an optional ``config`` payload (frontend format) so the
                     frontend can send the user's draft directly.  Falls back to
                     ``bridge.get_config()`` when no payload is provided.
+
+                    Persists ONLY the ``GLOBAL_DEFAULT_KEYS`` subset into
+                    ``~/.thoughtmachine/user/defaults.json`` (see
+                    ``docs/architecture/config_ownership.md``) — the legacy
+                    ``~/.thoughtmachine/agent_config.json`` write was removed;
+                    that file is now read-compat only.
                     """
                     try:
+                        saved_keys = []
+                        dropped_keys = []
+                        session_id = None
                         config_dict = msg.get("config")
                         if config_dict:
                             # Frontend sent the draft — translate to backend format
-                            cfg_dict = _translate_frontend_config(config_dict)
+                            cfg_dict = config_manager.translate_frontend_config(config_dict)
                         elif bridge is not None:
-                            # Fallback: use bridge's currently applied config
-                            cfg_dict = bridge.get_config().model_dump(exclude={'api_key', 'stop_check'}, exclude_none=True)
+                            # Fallback: bridge's applied config, else full resolved chain
+                            cfg_dict = bridge.get_config() or config_manager.resolve_full_config(
+                                workspace_id=getattr(bridge, "workspace_id", None),
+                                session_id=getattr(bridge, "_session_id", None)
+                                or (
+                                    bridge._loaded_session.session_id
+                                    if getattr(bridge, "_loaded_session", None) else None
+                                ),
+                                provider_id=(
+                                    bridge._session_config.provider_id
+                                    if getattr(bridge, "_session_config", None) else None
+                                ),
+                            )
                         else:
                             await ws.send_json({
                                 "type": "default_config_saved",
                                 "status": "error",
                                 "message": "No config provided and no active session",
+                                "saved_keys": [],
+                                "dropped_keys": [],
+                                "session_id": None,
                             })
                             continue
 
-                        config_dir = Path.home() / '.thoughtmachine'
-                        config_dir.mkdir(parents=True, exist_ok=True)
-                        config_path = config_dir / 'agent_config.json'
-
-                        # Windows-safe atomic write with retry
-                        _atomic_replace(
-                            data=cfg_dict,
-                            dst=str(config_path),
-                            work_dir=str(config_dir),
+                        saved_keys = sorted(
+                            k for k in cfg_dict if k in GLOBAL_DEFAULT_KEYS
                         )
+                        dropped_keys = sorted(
+                            k for k in cfg_dict if k not in GLOBAL_DEFAULT_KEYS
+                        )
+                        if bridge is not None:
+                            session_id = bridge._session_id or (
+                                bridge._loaded_session.session_id
+                                if bridge._loaded_session else None
+                            )
 
-                        log('INFO', 'server.config', f"Default config saved to {config_path}")
+                        saved_path = save_global_defaults(cfg_dict)
+
+                        log('INFO', 'server.config',
+                            f"Default config saved to {saved_path} (global defaults)")
                         await ws.send_json({
                             "type": "default_config_saved",
                             "status": "ok",
                             "message": "Default config saved successfully",
+                            "saved_keys": saved_keys,
+                            "dropped_keys": dropped_keys,
+                            "session_id": session_id,
                         })
                     except Exception as exc:
                         log('ERROR', 'server.config', f"set_default_config failed: {exc}")
@@ -620,10 +2161,23 @@ async def websocket_endpoint(ws: WebSocket):
                             "type": "default_config_saved",
                             "status": "error",
                             "message": f"Failed to save default config: {exc}",
+                            "saved_keys": saved_keys,
+                            "dropped_keys": dropped_keys,
+                            "session_id": session_id,
                         })
 
                 elif command == "get_providers":
                     # Return list of provider profiles (safe fields only)
+                    # F2: attach the current session id so the reply routes to the
+                    # right tab/store key (provider dropdown). Non-null source:
+                    # bridge._session_id, falling back to the loaded session
+                    # (load_session / create_session set _loaded_session but not
+                    # _session_id). Mirrors the canonical pattern used at Round C.
+                    provider_session_id = None
+                    if bridge is not None:
+                        provider_session_id = bridge._session_id or (
+                            bridge._loaded_session.session_id if bridge._loaded_session else None
+                        )
                     from agent.config.provider_profile import ProviderManager
                     try:
                         manager = ProviderManager()
@@ -642,6 +2196,7 @@ async def websocket_endpoint(ws: WebSocket):
                             })
                         await ws.send_json({
                             "type": "providers_list",
+                            "session_id": provider_session_id,
                             "providers": safe_profiles,
                         })
                         log('INFO', 'server.config', f"Returned {len(safe_profiles)} provider profiles")
@@ -649,6 +2204,7 @@ async def websocket_endpoint(ws: WebSocket):
                         log('ERROR', 'server.config', f"get_providers failed: {exc}")
                         await ws.send_json({
                             "type": "providers_list",
+                            "session_id": provider_session_id,
                             "providers": [],
                         })
 
@@ -761,20 +2317,31 @@ async def websocket_endpoint(ws: WebSocket):
                         })
 
                 elif command == "get_available_tools":
-                    # Return list of available tool definitions
+                    # Return list of available tool definitions, filtered by mode if provided
                     try:
+                        mode = msg.get("mode", "custom")
                         from tools import SIMPLIFIED_TOOL_CLASSES
+                        from agent.config.presets import get_tools_for_mode
+                        if mode != "custom":
+                            mode_tool_names = set(get_tools_for_mode(mode))
+                        else:
+                            mode_tool_names = None
                         tool_defs = []
                         for cls in SIMPLIFIED_TOOL_CLASSES:
-                            tool_defs.append({
-                                "name": cls.__name__,
-                                "description": (cls.__doc__ or "").strip(),
-                            })
+                            if (
+                                mode_tool_names is None
+                                or cls.tool_name() in mode_tool_names
+                                or cls.__name__ in mode_tool_names
+                            ):
+                                tool_defs.append({
+                                    "name": cls.tool_name(),
+                                    "description": (cls.__doc__ or "").strip(),
+                                })
                         await ws.send_json({
                             "type": "tools_list",
                             "tools": tool_defs,
                         })
-                        log('INFO', 'server.config', f"Returned {len(tool_defs)} available tools")
+                        log('INFO', 'server.config', f"Returned {len(tool_defs)} available tools for mode={mode}")
                     except Exception as exc:
                         log('ERROR', 'server.config', f"get_available_tools failed: {exc}\n{traceback.format_exc()}")
                         await ws.send_json({
@@ -784,12 +2351,70 @@ async def websocket_endpoint(ws: WebSocket):
 
                 elif command == "list_sessions":
                     try:
-                        sessions = session_store.list_sessions()
+                        # ATTACK-5: a connection may only enumerate the sessions
+                        # of the workspace it is bound to.  The scope is the
+                        # connection's OWN (bridge.workspace_id) -- never a
+                        # client-supplied value -- and a connection with no scope
+                        # gets nothing at all: the registry is one cross-tenant
+                        # index, so "unscoped" must never degrade into "every
+                        # workspace's sessions".
+                        _ls_scope = bridge.workspace_id if bridge is not None else None
+                        if not _ls_scope:
+                            log('WARNING', 'server.config',
+                                'list_sessions refused: connection has no workspace scope')
+                            await ws.send_json({
+                                "type": "sessions_list",
+                                "sessions": [],
+                            })
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": ("⚠ list_sessions: this connection is not bound "
+                                         "to a workspace yet, so no sessions are listed."),
+                            })
+                            continue
+
+                        registry = SessionRegistry.get_default()
+                        all_sessions = registry.get_all()
+                        sessions = [
+                            entry for entry in all_sessions.values()
+                            if isinstance(entry, dict)
+                            and entry.get("workspace_id") == _ls_scope
+                        ]
+                        # An empty result may just mean this workspace was never
+                        # registered.  Fall back to the STORE's workspace-scoped
+                        # listing -- never the global registry's disk rebuild,
+                        # which indexes every workspace's directory on behalf of
+                        # one caller -- and stamp the scope on each row: the
+                        # frontend learns session->workspace ownership from that
+                        # field (App.jsx, sessions_list).
+                        if not sessions:
+                            try:
+                                for entry in session_store.list_sessions(
+                                        workspace_id=_ls_scope):
+                                    if isinstance(entry, dict):
+                                        row = dict(entry)
+                                        row.setdefault("workspace_id", _ls_scope)
+                                    elif hasattr(entry, "to_dict"):
+                                        # A store may hand back Session model
+                                        # objects instead of row dicts; convert
+                                        # them with the model's own serialiser
+                                        # rather than silently dropping them.
+                                        row = dict(entry.to_dict() or {})
+                                        if not row.get("workspace_id"):
+                                            row["workspace_id"] = _ls_scope
+                                    else:
+                                        continue
+                                    sessions.append(row)
+                            except Exception as exc:
+                                log('WARNING', 'server.config',
+                                    f"list_sessions: scoped store fallback failed: {exc}")
+
                         await ws.send_json({
                             "type": "sessions_list",
                             "sessions": sessions,
                         })
-                        log("INFO", "server.config", f"Listed {len(sessions)} sessions")
+                        log("INFO", "server.config",
+                            f"Listed {len(sessions)} sessions for workspace {_ls_scope}")
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -814,6 +2439,14 @@ async def websocket_endpoint(ws: WebSocket):
                                 "message_count": len(session.user_history) if session.user_history else 0,
                             },
                         })
+                        # Register in global session registry
+                        registry = SessionRegistry.get_default()
+                        registry.register(
+                            session_id=session.session_id,
+                            workspace_id=session.workspace_id or "",
+                            name=session.metadata.get('name', 'Untitled'),
+                            mode=session.mode,
+                        )
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -830,8 +2463,76 @@ async def websocket_endpoint(ws: WebSocket):
                     if bridge is not None and bridge.session is not None:
                         bridge.save_session()
 
+                    # ── Resolve the workspace scope this load must obey ──
+                    # An explicit, validated workspace_id from the client is the
+                    # only authority for a load into another workspace; otherwise
+                    # the connection's current bridge workspace applies.  The
+                    # shared _project_path is deliberately NOT consulted: no caller
+                    # sends ?project=, so it stays at the server root and names the
+                    # wrong (or no) workspace — refusing valid loads, admitting bad ones.
+                    # The connection's own scope is authoritative. A socket that
+                    # already has a workspace may never be re-scoped by a
+                    # client-supplied workspace_id: doing so lets any socket pivot
+                    # into another workspace simply by naming it.
+                    _socket_ws = bridge.workspace_id if bridge is not None else None
+                    _expected_ws: Optional[str] = None
+                    _msg_ws = msg.get("workspace_id") or None
+                    if _msg_ws:
+                        try:
+                            from web_ui.backend.bridge import (
+                                _ownership_refusal_ids,
+                                _validate_workspace_id,
+                            )
+                            _msg_ws = _validate_workspace_id(_msg_ws)
+                        except ValueError as exc:
+                            log('WARNING', 'server',
+                                f"load_session: invalid workspace_id rejected: {exc}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Invalid workspace_id: {exc}",
+                            })
+                            continue
+                        # D3: the id-form primitive owns the comparison. It is
+                        # consulted only when the socket ALREADY has a scope: for
+                        # an unscoped socket a named workspace_id is a first bind,
+                        # not a switch, and a None-fails-closed reading here would
+                        # refuse every open-by-workspace load (caller divergence).
+                        _load_refusal = (
+                            _ownership_refusal_ids(_msg_ws, _socket_ws)
+                            if _socket_ws is not None else None
+                        )
+                        if _load_refusal is not None:
+                            log('WARNING', 'server',
+                                f"load_session refused: workspace mismatch "
+                                f"(socket={_socket_ws}, requested={_msg_ws}, "
+                                f"session={session_id})")
+                            await ws.send_json({
+                                "type": "session_loaded",
+                                "load_error": True,
+                                "workspace_id": None,
+                                "workspace_path": "",
+                            })
+                            continue
+                        _expected_ws = _socket_ws or _msg_ws
+                    else:
+                        _expected_ws = _socket_ws
+
                     # Check if we already have a cached bridge for this session
-                    existing = _session_bridges.get(session_id)
+                    existing = _cached_bridge_for(session_id, _expected_ws)
+                    if (_socket_ws and existing is not None
+                            and existing.workspace_id
+                            and existing.workspace_id != _socket_ws):
+                        log('WARNING', 'server',
+                            f"load_session refused: cached bridge workspace mismatch "
+                            f"(socket={_socket_ws}, cached={existing.workspace_id}, "
+                            f"session={session_id})")
+                        await ws.send_json({
+                            "type": "session_loaded",
+                            "load_error": True,
+                            "workspace_id": None,
+                            "workspace_path": "",
+                        })
+                        continue
                     if existing is not None and existing._controller is not None:
                         # Reuse cached bridge — register the new WS callback but DON'T
                         # call bridge.load_session() (which would reload from disk,
@@ -840,6 +2541,12 @@ async def websocket_endpoint(ws: WebSocket):
                         log('INFO', 'server.ws', f'Reusing cached bridge for session {session_id}')
                         bridge = existing
                         bridge.set_event_callback(event_callback, key=id(ws))
+                        # NOTE: do NOT set _bridge_loaded_session here — the cached
+                        # bridge's session_loaded broadcast predates this tab's
+                        # callback (registered only just now), so the fallback below
+                        # must send the session_loaded payload to THIS websocket
+                        # directly (and report load_error if the cached bridge holds
+                        # no session).
                         # Send current state from live bridge data (not from disk)
                         try:
                             page_limit = msg.get("limit", 50)
@@ -867,11 +2574,76 @@ async def websocket_endpoint(ws: WebSocket):
                             log('WARNING', 'server.ws', f'Cached bridge state sending failed: {exc} — creating fresh bridge')
                             existing = None
 
-                    if existing is None or existing._controller is None:
+                    # _bridge_loaded_session means "this tab's callback already received
+                    # the session_loaded broadcast for this load".
+                    #   - Fresh path: bridge.load_session() broadcasts session_loaded to
+                    #     ALL registered callbacks (including this tab's) and returns
+                    #     True on success — the fallback below is then skipped.
+                    #   - Cached path: the reuse branch above did NOT call
+                    #     bridge.load_session(); the live-state broadcast from a previous
+                    #     connection predates this tab's callback, so it stays False and
+                    #     the fallback below sends session_loaded to THIS websocket.
+                    _bridge_loaded_session = False
+
+                    # Cold load = no cached bridge/controller to re-attach to: create
+                    # a fresh controller + bridge below and load from disk. Re-attaching
+                    # to a cached bridge (tab switch / WS reconnect / repeat
+                    # load_session) reuses it and only replays live state to the new WS.
+                    _cold_load = existing is None or existing._controller is None
+                    if _cold_load:
                         # Create fresh controller and bridge
                         from agent.controller import AgentController
                         controller = AgentController()
                         bridge = WebAgentBridge(session_store=session_store)
+                        # D2: bind the connection's DECLARED workspace first.  A
+                        # fresh bridge is unbound, so this bootstrap always
+                        # succeeds; it exists so the load below cannot resolve a
+                        # DIFFERENT workspace and quietly adopt it.
+                        if _handshake_ws_id:
+                            bridge._bind_workspace(_handshake_ws_id, "bootstrap")
+                        # WebAgentBridge.__init__ takes no workspace argument, so
+                        # the scope must be pinned here; otherwise _workspace_id
+                        # stays None and bridge.py's mismatch guard can never fire.
+                        if _expected_ws is None:
+                            # D3: a scopeless bridge now REFUSES to load anything
+                            # (bridge.load_session). A bare load_session —
+                            # session_id only, no workspace_id — is the frontend's
+                            # open-by-id and the REST-create → WS-load contract,
+                            # so the session's OWN workspace has to be resolved
+                            # here, at the adapter, and pinned before the load.
+                            try:
+                                _probe = session_store.load_session(session_id)
+                            except Exception as exc:  # noqa: BLE001
+                                log('WARNING', 'server.ws',
+                                    f'load_session: could not resolve the workspace '
+                                    f'of session {session_id}: {exc}')
+                                _probe = None
+                            _probe_ws = (
+                                getattr(_probe, 'workspace_id', None)
+                                if _probe is not None else None
+                            )
+                            if _probe_ws:
+                                _expected_ws = _probe_ws
+                        if _expected_ws:
+                            # D2: the load's own workspace is a scope CHANGE for
+                            # this bridge, not a write.  When the probe resolves a
+                            # workspace that differs from the handshake binding,
+                            # the bind authority refuses and the load refuses with
+                            # it -- the cross-bind has nowhere left to hide.
+                            _switch_refusal = bridge._bind_workspace(_expected_ws, "switch")
+                            if _switch_refusal:
+                                log('WARNING', 'server.ws',
+                                    "load_session refused: cannot bind workspace "
+                                    f"{_expected_ws} for session {session_id}: {_switch_refusal}")
+                                bridge._unsubscribe_security_events()
+                                bridge._unsubscribe_worker_events()
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": (
+                                        f"\u26a0 load_session refused: {_switch_refusal}"
+                                    ),
+                                })
+                                continue
                         bridge.set_event_callback(event_callback, key=id(ws))
                         bridge.register()
                         bridge.set_controller(controller)
@@ -879,18 +2651,169 @@ async def websocket_endpoint(ws: WebSocket):
                         # Pagination: limit how many messages are sent initially
                         page_limit = msg.get("limit", 50)
                         page_offset = msg.get("offset", 0)
-                        bridge.load_session(session_id, limit=page_limit, offset=page_offset)
+                        # load_session returns False (no broadcast) when the id is dead —
+                        # fall through to the fallback, which reports load_error instead
+                        # of pretending the session loaded.
+                        _bridge_loaded_session = bool(
+                            bridge.load_session(
+                                session_id,
+                                limit=page_limit,
+                                offset=page_offset,
+                                workspace_id=_expected_ws,
+                            )
+                        )
 
-                    await ws.send_json({
-                        "type": "session_loaded",
-                        "session_id": session_id,
-                        "workspace_id": bridge.workspace_id,
-                    })
-                    await ws.send_json({
-                        "type": "state_changed",
-                        "state": "IDLE",
-                        "is_running": False,
-                    })
+                    # ── Fallback: resolve workspace_id from project path ──
+                    # Old sessions may have been saved without a workspace_id.
+                    if not bridge.workspace_id:
+                        try:
+                            from web_ui.backend.bridge import _resolve_workspace_id
+                            resolved = _resolve_workspace_id(_project_path)
+                            if resolved:
+                                bridge._workspace_id = resolved
+                                log('INFO', 'server',
+                                    f"Resolved workspace_id from project path for loaded session: {resolved}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"Could not resolve workspace_id from project path: {exc}")
+
+                    # ── Auto-switch project path if session belongs to a different workspace ──
+                    # When loading a session from a different project (e.g., Wordle),
+                    # _project_path still points to the old project. Update it so that
+                    # workers, templates, and subsequent operations use the correct workspace.
+                    if bridge.workspace_id:
+                        try:
+                            from pathlib import Path as _Path
+                            import json as _json
+                            ws_config_path = _Path("~").expanduser() / ".thoughtmachine" / "workspaces" / bridge.workspace_id / "config.json"
+                            if ws_config_path.is_file():
+                                ws_data = _json.loads(ws_config_path.read_text(encoding="utf-8"))
+                                ws_project_path = ws_data.get("root", "")
+                                if ws_project_path and os.path.abspath(ws_project_path) != os.path.abspath(_project_path):
+                                    # D2 (site 1, inverted-guard): resolve and BIND
+                                    # first; the path update happens only on success.
+                                    # Both comparisons here used to be assignment
+                                    # triggers, and the path moved before anything
+                                    # was decided -- so a refused bind leaked a
+                                    # half-switched _project_path /
+                                    # bridge._workspace_path.  The reorder closes it.
+                                    from web_ui.backend.bridge import _resolve_workspace_id
+                                    resolved = _resolve_workspace_id(ws_project_path)
+                                    if not resolved:
+                                        log('WARNING', 'server',
+                                            "load_session: cannot resolve a workspace for "
+                                            f"{ws_project_path}; project path left at {_project_path}")
+                                        await ws.send_json({
+                                            "type": "status_message",
+                                            "text": (
+                                                f"\u26a0 load_session: workspace for {ws_project_path} "
+                                                f"could not be resolved; project path unchanged."
+                                            ),
+                                        })
+                                        continue
+                                    _switch_refusal = bridge._bind_workspace(resolved, "switch")
+                                    if _switch_refusal:
+                                        log('WARNING', 'server',
+                                            f"load_session refused: project switch to "
+                                            f"{ws_project_path} ({resolved}): {_switch_refusal}")
+                                        await ws.send_json({
+                                            "type": "status_message",
+                                            "text": (
+                                                f"\u26a0 load_session: project switch refused: "
+                                                f"{_switch_refusal}"
+                                            ),
+                                        })
+                                        continue
+                                    old_path = _project_path
+                                    _project_path = ws_project_path
+                                    log('INFO', 'server',
+                                        f"load_session: auto-switched project path from {old_path} to {_project_path}")
+                                    # Sync workspace_path into bridge config so that
+                                    # frontend_config_from_bridge sends the correct path
+                                    # to the frontend (instead of falling back to _project_root).
+                                    bridge._workspace_path = _project_path
+                                    log('INFO', 'server',
+                                        f"load_session: bound workspace_id {resolved} for {_project_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"load_session: auto-switch project path error: {exc}")
+
+                    # ── Ensure workspace_path is set on bridge config ──
+                    # The auto-switch block above looks for workspace config.json on disk,
+                    # but that file may not exist (only capabilities.json is guaranteed).
+                    # Fall back to the workspace registry which always has root_path.
+                    if bridge.workspace_id and not bridge._workspace_path:
+                        try:
+                            entry = WorkspaceRegistry.get_default().get_workspace(bridge.workspace_id)
+                            if entry and entry.root_path:
+                                root_path = entry.root_path
+                                bridge._workspace_path = root_path
+                                log('INFO', 'server',
+                                    f"load_session: set workspace_path from registry: {root_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"load_session: could not resolve workspace root from registry: {exc}")
+
+                    # Fix 4a: compute the frontend config once so session_loaded carries it
+                    # (chat UI renders from the first event) and config_changed below
+                    # reuses the exact same value.
+                    try:
+                        fe_config = config_manager.get_frontend_config(bridge)
+                    except Exception:
+                        fe_config = None
+
+                    # Cached-bridge path only: the cached bridge skipped
+                    # bridge.load_session(), so its live session config was never
+                    # re-ceiled against the workspace permission ceiling. Re-apply
+                    # the ceiling to session_permissions inside fe_config so the
+                    # session_loaded / config_changed payloads sent to THIS websocket
+                    # match fresh-load behavior (idempotent if already ceiled).
+                    if existing is not None and existing._controller is not None:
+                        if isinstance(fe_config, dict):
+                            try:
+                                _ceiling_ws_id = bridge.workspace_id
+                                if _ceiling_ws_id:
+                                    from web_ui.backend.config_manager import (
+                                        _load_workspace_permission_ceiling as _load_ws_ceiling,
+                                    )
+                                    from security.security_gate import cap
+
+                                    _ceiling = _load_ws_ceiling(_ceiling_ws_id) or {}
+                                    _raw_perms = fe_config.get("session_permissions")
+                                    if isinstance(_raw_perms, dict):
+                                        fe_config["session_permissions"] = cap(
+                                            _raw_perms, _ceiling
+                                        )
+                            except Exception as exc:
+                                log('WARNING', 'server',
+                                    f"load_session: cached-path ceiling re-apply failed: {exc}")
+
+                    if not _bridge_loaded_session:
+                        _loaded_meta = bridge._session or bridge._loaded_session
+                        if _loaded_meta is None:
+                            # Load failure (dead session id, e.g. backend restart):
+                            # report it explicitly so the frontend can show a recovery
+                            # banner instead of rendering a phantom loaded session.
+                            await ws.send_json({
+                                "type": "session_loaded",
+                                "session_id": session_id,
+                                "session_name": '',
+                                "load_error": True,
+                                "workspace_id": bridge.workspace_id,
+                                "workspace_path": bridge._workspace_path or '',
+                                "is_running": False,
+                                "config": fe_config,
+                            })
+                        else:
+                            await ws.send_json({
+                                "type": "session_loaded",
+                                "session_id": session_id,
+                                "session_name": _loaded_meta.metadata.get('name', ''),
+                                "workspace_id": bridge.workspace_id,
+                                "workspace_path": bridge._workspace_path or '',
+                                "is_running": bridge._controller.is_busy if bridge._controller else False,
+                                "config": fe_config,
+                            })
                     # Send tokens_updated so the frontend shows saved token counts
                     loaded = bridge._session or bridge._loaded_session
                     if loaded:
@@ -903,13 +2826,40 @@ async def websocket_endpoint(ws: WebSocket):
                             "type": "context_updated",
                             "context_length": loaded.context_length,
                         })
-                    # Send config_changed so the frontend shows the session's actual config
-                    fe_config = _frontend_config_from_bridge(bridge)
-                    await ws.send_json({
-                        "type": "config_changed",
-                        "config": fe_config,
-                    })
-                    await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
+                        # Send config_changed so the frontend shows the session's actual config
+                        # (fe_config computed above — Fix 4a)
+                        settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                        permissions = config_manager.resolve_effective_permissions(
+                            bridge._session_config,
+                            bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
+                            bridge._session_config.workspace_id or bridge._workspace_id,
+                        ) if bridge._session_config else {}
+                        await ws.send_json({
+                            "type": "config_changed",
+                            "config": fe_config,
+                            "settings": settings,
+                            "permissions": permissions,
+                            "merged_config": fe_config,
+                            "effective_config": config_manager.get_effective_config(
+                                bridge,
+                                workspace_id=bridge._workspace_id if bridge else None,
+                                workspace_path=bridge._workspace_path if bridge else None,
+                            ),
+                        })
+                        # Register/update in global session registry
+                        registry = SessionRegistry.get_default()
+                        registry.register(
+                            session_id=loaded.session_id,
+                            workspace_id=loaded.workspace_id or "",
+                            name=loaded.metadata.get('name', 'Untitled'),
+                            mode=loaded.mode,
+                        )
+                        registry.set_open(loaded.session_id, is_open=True)
+                    else:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Session {session_id} could not be loaded.",
+                        })
 
                 elif command == "load_more_messages":
                     offset = msg.get("offset", 50)
@@ -932,11 +2882,142 @@ async def websocket_endpoint(ws: WebSocket):
 
                 elif command == "delete_session":
                     session_id = msg.get("session_id", "")
+                    workspace_id = msg.get("workspace_id")
                     if not session_id:
                         await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
                         continue
                     try:
-                        session_store.delete_session(session_id)
+                        # Ownership gate: a socket may only delete a session that
+                        # lives inside its own workspace scope. The connection's
+                        # bridge is authoritative; a client-supplied workspace_id
+                        # may bootstrap a scopeless connection but must never
+                        # redirect one that already has a scope.
+                        _del_socket_ws = bridge.workspace_id if bridge is not None else None
+                        _del_scope_ws = _del_socket_ws or workspace_id
+                        if _del_scope_ws:
+                            try:
+                                from web_ui.backend.bridge import _validate_workspace_id
+                                _del_scope_ws = _validate_workspace_id(_del_scope_ws)
+                            except ValueError as exc:
+                                log('WARNING', 'server',
+                                    f"delete_session refused: invalid workspace_id: {exc}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": f"Delete refused: invalid workspace_id: {exc}",
+                                })
+                                continue
+                        if not _del_scope_ws:
+                            log('WARNING', 'server',
+                                f"delete_session refused: no workspace scope on this "
+                                f"connection (session={session_id})")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "Delete refused: no workspace scope on this connection.",
+                            })
+                            continue
+                        # A scoped delete only ever touches the socket's own
+                        # workspace directory, so on its own it can never destroy
+                        # another workspace's copy. Try it first: for a session
+                        # this workspace owns, it is simultaneously the delete and
+                        # the proof of ownership.
+                        _deleted = session_store.delete_session(
+                            session_id, workspace_id=_del_scope_ws
+                        )
+                        if not _deleted:
+                            # Not in this workspace. Two possibilities remain:
+                            # (i) the session belongs to ANOTHER workspace, whose
+                            # copy still sits in workspaces/<other>/sessions/;
+                            # (ii) it is a legacy session saved before workspaces
+                            # existed and carries no owner at all. Only (ii) may
+                            # be deleted here.
+                            _other_owner = None
+                            try:
+                                _base = getattr(session_store, "_base_dir", None)
+                                _ws_root = (_base / "workspaces") if _base else None
+                                if _ws_root is not None and _ws_root.exists():
+                                    _meta_name = f"_meta_{session_id}.json"
+                                    for _ws_dir in _ws_root.iterdir():
+                                        if not _ws_dir.is_dir():
+                                            continue
+                                        if _ws_dir.name == _del_scope_ws:
+                                            continue
+                                        if (_ws_dir / "sessions" / _meta_name).exists():
+                                            _other_owner = _ws_dir.name
+                                            break
+                                        # No sibling meta file. The store locates
+                                        # sessions by CONTENT, not by filename, so a
+                                        # foreign copy may sit here under an arbitrary
+                                        # name. Mirror the store's scan so this probe
+                                        # sees exactly what the unscoped sweep would
+                                        # delete.
+                                        _other_sess_dir = _ws_dir / "sessions"
+                                        if not _other_sess_dir.is_dir():
+                                            continue
+                                        for _other_file in _other_sess_dir.glob("*.json"):
+                                            if _other_file.name.startswith("_meta_"):
+                                                continue
+                                            try:
+                                                with open(_other_file, "r") as _oh:
+                                                    _other_data = json.load(_oh)
+                                            except Exception:
+                                                # Unparsable file: the store skips
+                                                # these too, so skip it here.
+                                                continue
+                                            if isinstance(_other_data, dict) and _other_data.get("session_id") == session_id:
+                                                _other_owner = _ws_dir.name
+                                                break
+                                        if _other_owner:
+                                            break
+                            except Exception as exc:
+                                # Fail CLOSED: if ownership cannot be established,
+                                # the delete must not proceed.
+                                log('WARNING', 'server',
+                                    f"delete_session refused: ownership probe failed "
+                                    f"for {session_id}: {exc}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": "Delete refused: could not verify workspace ownership.",
+                                })
+                                continue
+                            if _other_owner:
+                                log('WARNING', 'server',
+                                    f"delete_session refused: session {session_id} belongs "
+                                    f"to workspace {_other_owner}, not {_del_scope_ws}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": "Delete refused: session belongs to another workspace.",
+                                })
+                                continue
+                            # Legacy session with no owning workspace: keep the
+                            # pre-existing behaviour (unscoped sweep).
+                            _deleted = session_store.delete_session(session_id)
+                        if not _deleted:
+                            log('WARNING', 'server',
+                                f"delete_session refused: session {session_id} not found in "
+                                f"workspace {_del_scope_ws}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "Delete refused: session not found in this workspace.",
+                            })
+                            continue
+                        # Ownership is proven; sweep any duplicate copies of this id
+                        # left in legacy/unscoped locations so it cannot resurrect.
+                        try:
+                            session_store.delete_session(session_id)
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"delete_session: legacy sweep failed for {session_id}: {exc}")
+                        session_store.remove_open_session(session_id)
+                        # Remove from global session registry
+                        registry = SessionRegistry.get_default()
+                        registry.remove(session_id)
+                        # Remove from bridge cache so _shutdown_save doesn't re-save it
+                        cached_bridge = _session_bridges.pop(session_id, None)
+                        if cached_bridge is not None:
+                            cached_bridge._cleanly_closed = True
+                            cached_bridge.stop()
+                        # Track as explicitly closed so WS disconnect handler doesn't re-save it
+                        _explicitly_closed_sessions.add(session_id)
                         await ws.send_json({
                             "type": "session_deleted",
                             "session_id": session_id,
@@ -962,30 +3043,54 @@ async def websocket_endpoint(ws: WebSocket):
                         # access when no bridge is active.
                         # Broadcast the new name to ALL open bridges BEFORE responding,
                         # so no auto-save on another tab can race us and persist the old name.
-                        from web_ui.backend.bridge import _broadcast_rename
-                        _broadcast_rename(session_id, new_name)
+                        from web_ui.backend.event_forwarder import EventForwarder
+                        EventForwarder.broadcast_rename(session_id, new_name)
 
                         if bridge is not None and bridge.rename_session(session_id, new_name):
-                            await ws.send_json({
-                                "type": "session_renamed",
+                            # Broadcast session_renamed to ALL tabs of this session via the
+                            # shared bridge's forwarder (each tab's WS is registered as a
+                            # callback keyed by ws id — see the load_session reuse path).
+                            # The requesting socket is one of them, so this doubles as its
+                            # success ack — no separate reply is needed.
+                            bridge._forwarder.broadcast(session_id, "session_renamed", {
                                 "session_id": session_id,
                                 "new_name": new_name,
                             })
                             log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
                         else:
                             # Fallback: no bridge active, or bridge.rename_session returned False
-                            session = session_store.load_session(session_id)
+                            ws_id_for_load = bridge.workspace_id if bridge else None
+                            session = session_store.load_session(session_id, workspace_id=ws_id_for_load)
                             if session is None:
                                 await ws.send_json({"type": "status_message", "text": f"⚠ Session not found: {session_id}"})
                                 continue
                             session.metadata['name'] = new_name
-                            session_store.save_session(session)
-                            await ws.send_json({
-                                "type": "session_renamed",
-                                "session_id": session_id,
-                                "new_name": new_name,
-                            })
+                            session_store.save_session(session, workspace_id=session.workspace_id)
+                            # Broadcast to all tabs via the shared session bridge when one
+                            # exists; otherwise fall back to acking only the requesting socket.
+                            rename_bridge = bridge if bridge is not None else _session_bridges.get(session_id)
+                            if rename_bridge is not None:
+                                rename_bridge._forwarder.broadcast(session_id, "session_renamed", {
+                                    "session_id": session_id,
+                                    "new_name": new_name,
+                                })
+                            else:
+                                await ws.send_json({
+                                    "type": "session_renamed",
+                                    "session_id": session_id,
+                                    "new_name": new_name,
+                                })
                             log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
+                        # Update name in global session registry
+                        registry = SessionRegistry.get_default()
+                        entry = registry.get(session_id)
+                        if entry:
+                            registry.register(
+                                session_id=session_id,
+                                workspace_id=entry.get('workspace_id', ''),
+                                name=new_name,
+                                mode=entry.get('mode', 'agent'),
+                            )
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -994,10 +3099,8 @@ async def websocket_endpoint(ws: WebSocket):
                         log("ERROR", "server.config", f"rename_session failed: {exc}")
 
                 elif command == "get_open_sessions":
-                    log("INFO", "server.config", "get_open_sessions handler reached")
                     try:
                         open_ids = session_store.get_open_sessions()
-                        log("INFO", "server.config", f"get_open_sessions returned {len(open_ids)} ids: {open_ids}")
                         # Batch-load metadata for all open sessions in a single
                         # directory scan — avoids reading each session file N times.
                         all_meta = session_store.load_sessions_metadata_batch(open_ids)
@@ -1005,24 +3108,95 @@ async def websocket_endpoint(ws: WebSocket):
                         for sid in open_ids:
                             meta = all_meta.get(sid)
                             if meta:
+                                # ``open_ids`` is GLOBAL (open_sessions.json lists
+                                # sessions from every workspace), so each entry
+                                # MUST carry the workspace it belongs to.  Without
+                                # it the UI cannot bucket the tab and dumps the
+                                # whole list into whichever workspace is on
+                                # screen.
                                 open_sessions.append({
                                     "session_id": meta["session_id"],
                                     "name": meta["name"],
                                     "updated_at": meta["updated_at"],
                                     "message_count": meta["message_count"],
+                                    "workspace_id": meta.get("workspace_id") or "",
                                 })
                         response = {"type": "open_sessions", "sessions": open_sessions}
                         await ws.send_json(response)
-                        log("INFO", "server.config", f"Sent open_sessions with {len(open_sessions)} items")
                     except Exception as e:
                         log("ERROR", "server.config", f"get_open_sessions failed: {e}")
                         await ws.send_json({"type": "error", "message": str(e)})
 
                 elif command == "close_session":
                     session_id = msg.get("session_id", "")
+                    # Ownership gate (R8): a socket may only close a session that
+                    # lives inside its own workspace scope. The connection's
+                    # bridge is authoritative. close_session takes its target
+                    # from the CLIENT-SUPPLIED session_id, and
+                    # bridge.close_session -> WorkerRegistry.shutdown_workers()
+                    # sweeps the worker threads of THAT session id only: the sweep
+                    # is session-scoped, not process-wide. This gate is therefore
+                    # what guarantees the id being closed belongs to this socket's
+                    # own workspace, and hence that only this workspace's worker
+                    # threads can be stopped. Nothing with a side effect may run
+                    # before this check. A scopeless connection (bootstrap) keeps
+                    # its previous behaviour.
+                    _close_scope_ws = bridge.workspace_id if bridge is not None else None
+                    if _close_scope_ws:
+                        try:
+                            from web_ui.backend.bridge import _validate_workspace_id
+                            _close_scope_ws = _validate_workspace_id(_close_scope_ws)
+                        except ValueError as exc:
+                            log('WARNING', 'server',
+                                f"close_session refused: invalid workspace_id: {exc}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"Close refused: invalid workspace_id: {exc}",
+                            })
+                            continue
+                    if _close_scope_ws and session_id:
+                        # The socket's own session is in scope by construction
+                        # (load_session already refused any cross-workspace bind),
+                        # even when it has not been persisted yet. For any other
+                        # id, a NON-DESTRUCTIVE scoped metadata lookup is the
+                        # proof of ownership: close_session must not delete
+                        # anything on the way to deciding.
+                        _close_own_sids = set()
+                        if bridge is not None:
+                            if getattr(bridge, "_session_id", None):
+                                _close_own_sids.add(bridge._session_id)
+                            for _own in (
+                                getattr(bridge, "_session", None),
+                                getattr(bridge, "_loaded_session", None),
+                            ):
+                                _own_sid = getattr(_own, "session_id", None)
+                                if _own_sid:
+                                    _close_own_sids.add(_own_sid)
+                        if session_id not in _close_own_sids:
+                            if session_store.load_session_metadata(
+                                session_id, workspace_id=_close_scope_ws
+                            ) is None:
+                                log('WARNING', 'server',
+                                    f"close_session refused: session {session_id} is not "
+                                    f"in workspace {_close_scope_ws}")
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": (
+                                        f"Close refused: session {session_id} does not "
+                                        f"belong to this workspace."
+                                    ),
+                                })
+                                continue
                     try:
                         if bridge is not None:
                             bridge.close_session(session_id if session_id else None)
+                            # Track explicitly closed sessions so the disconnect
+                            # handler doesn't re-add them to open_sessions.json
+                            resolved_id = session_id or bridge._session_id or (
+                                bridge._loaded_session.session_id if bridge._loaded_session else None
+                            )
+                            if resolved_id:
+                                _explicitly_closed_sessions.add(resolved_id)
                             # If session_id was empty, the bridge resolved it internally.
                             # Remove the bridge from _session_bridges by value (since the key
                             # might differ from the empty session_id).
@@ -1054,6 +3228,10 @@ async def websocket_endpoint(ws: WebSocket):
                             "state": "IDLE",
                             "is_running": False,
                         })
+                        # Mark session as closed in global registry
+                        if session_id:
+                            registry = SessionRegistry.get_default()
+                            registry.set_open(session_id, is_open=False)
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -1061,6 +3239,43 @@ async def websocket_endpoint(ws: WebSocket):
                         })
 
                 elif command == "new_session":
+                    # Ownership gate (Attack 6 / R8): a connection that already has
+                    # a workspace scope must not be re-scoped by client input. The
+                    # handler below assigns bridge._workspace_id from
+                    # msg["workspace_id"], so without this check one command would
+                    # let a socket bound to workspace A adopt workspace B's
+                    # identity and then pivot onto B's sessions through every
+                    # other gate. Nothing with a side effect may run before the
+                    # check (notably not bridge.save_session() / bridge.stop()).
+                    # A scopeless connection (bootstrap) keeps its previous
+                    # behaviour: the REST create flow and the contract tests
+                    # rely on it.
+                    from web_ui.backend.bridge import _ownership_refusal_ids
+                    _ns_cur_ws = bridge.workspace_id if bridge is not None else None
+                    _ns_req_ws = msg.get("workspace_id") or None
+                    # D3: the id-form primitive owns the comparison, consulted
+                    # when both ids exist. Absent means "bootstrap" (both None)
+                    # or "bare new_session" (the frontend sends no workspace_id),
+                    # not "unowned", so None-fails-closed would refuse the UI's
+                    # own New Chat (caller divergence).
+                    _ns_refusal = (
+                        _ownership_refusal_ids(_ns_req_ws, _ns_cur_ws)
+                        if _ns_cur_ws is not None and _ns_req_ws is not None
+                        else None
+                    )
+                    if _ns_refusal is not None:
+                        log('WARNING', 'server',
+                            f"new_session refused: connection is scoped to workspace "
+                            f"{_ns_cur_ws} and cannot switch to {_ns_req_ws}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": (
+                                f"New session refused: this connection is scoped to "
+                                f"workspace {_ns_cur_ws} and cannot switch to "
+                                f"{_ns_req_ws}."
+                            ),
+                        })
+                        continue
                     # Save current session before switching
                     if bridge is not None and bridge.session is not None:
                         bridge.save_session()
@@ -1082,35 +3297,120 @@ async def websocket_endpoint(ws: WebSocket):
                     # Extract optional workspace_id from the request
                     workspace_id = msg.get("workspace_id") or None
                     if workspace_id:
+                        try:
+                            from web_ui.backend.bridge import _validate_workspace_id
+                            workspace_id = _validate_workspace_id(workspace_id)
+                        except ValueError as exc:
+                            log('WARNING', 'server',
+                                f"new_session: invalid workspace_id rejected: {exc}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Invalid workspace_id: {exc}",
+                            })
+                            continue
                         bridge._workspace_id = workspace_id
 
-                    # Create a new empty session
-                    from session.models import Session
-                    new_session = Session()
-                    new_session.metadata['source'] = 'web_ui'
-                    if workspace_id:
-                        new_session.workspace_id = workspace_id
-                    new_session.ensure_name()
+                    # ATTACK-6 (b): a connection already bound to a workspace is
+                    # sticky -- omitting workspace_id must NOT let the project
+                    # path (which the client controls via ?project= / set_project)
+                    # re-derive a different scope for it.
+                    if _ns_cur_ws:
+                        workspace_id = _ns_cur_ws
+                        bridge._workspace_id = _ns_cur_ws
 
-                    # Store as the loaded session so continue_session picks it up
-                    bridge._loaded_session = new_session
+                    # ── Fallback: resolve workspace_id from the project path ──
+                    # The frontend can pass a project query param to select
+                    # which workspace to use.  Fall back to _project_root.
+                    if not workspace_id:
+                        try:
+                            from web_ui.backend.bridge import _resolve_workspace_id
+                            resolved = _resolve_workspace_id(_project_path)
+                            if resolved:
+                                workspace_id = resolved
+                                bridge._workspace_id = resolved
+                                log('INFO', 'server',
+                                    f"Resolved workspace_id from project path: {resolved}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"Could not resolve workspace_id from project path: {exc}")
+
+                    # ── Auto-register new workspace if no registration exists ──
+                    # When the frontend opens a folder that has never been
+                    # registered, there is no workspace_id on disk.  We create
+                    # one on the fly so the workspace panel and workers work.
+                    if not workspace_id:
+                        try:
+                            from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+                            entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
+                            workspace_id = entry.id
+                            # D2 (bootstrap binding): registration is the
+                            # workspace-creation transition -- the connection
+                            # adopts the new id through the bind authority.
+                            # bootstrap from unbound: refusal is structurally unreachable today.
+                            _bind_refusal = bridge._bind_workspace(entry.id, "bootstrap")
+                            if _bind_refusal:
+                                log('WARNING', 'server',
+                                    f"new_session: binding to workspace {entry.id} refused: {_bind_refusal}")
+                            ensure_workspace_dirs(entry.id)
+                            log('INFO', 'server',
+                                f"Auto-registered workspace {entry.id} for {_project_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"Could not auto-register workspace: {exc}")
+
+                    # Ensure workspace directories are bootstrapped for this workspace
+                    if workspace_id:
+                        try:
+                            from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+                            ensure_workspace_dirs(workspace_id)
+                        except Exception:
+                            pass
+
+                    # Create a new empty session via SessionManager
+                    # Use mode from the frontend payload if provided, fall back to 'custom'
+                    mode = msg.get('mode', 'custom')
+                    session_id, frontend_config = bridge.create_session(mode=mode, workspace_id=workspace_id)
+                    new_session = bridge._session
+                    if workspace_id and new_session:
+                        new_session.workspace_id = workspace_id
+                        bridge._workspace_id = workspace_id
+
+                    # ── Set workspace_path on bridge config from registry ──
+                    if workspace_id and not bridge._workspace_path:
+                        try:
+                            entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
+                            if entry and entry.root_path:
+                                root_path = entry.root_path
+                                bridge._workspace_path = root_path
+                                log('INFO', 'server',
+                                    f"new_session: set workspace_path from registry: {root_path}")
+
+                                # ── Persist workspace_path in session metadata for reload ──
+                                if new_session and 'agent_config' not in new_session.metadata:
+                                    new_session.metadata['agent_config'] = {}
+                                if new_session and isinstance(new_session.metadata['agent_config'], dict):
+                                    new_session.metadata['agent_config']['workspace_path'] = root_path
+                                    log('INFO', 'server',
+                                        f"new_session: persisted workspace_path in session metadata: {root_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"new_session: could not resolve workspace root from registry: {exc}")
+
+                    log('INFO', 'server.ws',
+                        f'new_session: bridge created, session_id={session_id}, '
+                        f'bridge._session set')
 
                     # Cache bridge by the new session ID so reconnects reuse it
-                    _session_bridges[new_session.session_id] = bridge
-                    # Persist to session store so the SessionTab can load it
-                    # via load_session on its own WS connection.
-                    session_store.save_session(new_session)
+                    _session_bridges[session_id] = bridge
 
                     await ws.send_json({
                         "type": "session_loaded",
                         "session_id": new_session.session_id,
                         "session_name": new_session.metadata.get('name', ''),
                         "workspace_id": bridge._workspace_id,
-                    })
-                    await ws.send_json({
-                        "type": "state_changed",
-                        "state": "IDLE",
-                        "is_running": False,
+                        "workspace_path": bridge._workspace_path or '',
+                        "is_running": bridge._controller.is_busy if bridge._controller else False,
+                        "config": frontend_config if isinstance(frontend_config, dict) else None,
                     })
                     # Reset token display for a fresh session
                     await ws.send_json({
@@ -1122,12 +3422,268 @@ async def websocket_endpoint(ws: WebSocket):
                         "type": "context_updated",
                         "context_length": 0,
                     })
-                    # Send default config so the frontend shows proper defaults
+                    # Send config from bridge so frontend gets workspace path etc.
+                    fe_config = config_manager.get_frontend_config(bridge)
+                    settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                    permissions = config_manager.resolve_effective_permissions(
+                        bridge._session_config,
+                        bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
+                        bridge._session_config.workspace_id or bridge._workspace_id,
+                    ) if bridge._session_config else {}
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": _default_frontend_config(),
+                        "config": fe_config,
+                        "settings": settings,
+                        "permissions": permissions,
+                        "merged_config": fe_config,
+                        "effective_config": config_manager.get_effective_config(
+                            bridge,
+                            workspace_id=bridge._workspace_id if bridge else None,
+                            workspace_path=bridge._workspace_path if bridge else None,
+                        ),
                     })
                     await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
+
+                elif command == "set_project":
+                    """Switch the connection to a different project directory.
+
+                    The Config Panel sends this when the user changes the workspace
+                    folder and presses Apply.  The server tears down the current
+                    session, registers (or resolves) the workspace for the new path,
+                    creates a fresh session, and sends session_loaded back.
+                    """
+                    new_project = msg.get("project", "")
+                    if not new_project:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ set_project: project path is required",
+                        })
+                        continue
+
+                    # Validate the client-supplied path: it must resolve to an
+                    # existing directory OUTSIDE the vault trust anchor (same
+                    # confinement as the REST browser/container endpoints).
+                    # require_dir=True: set_project requires an existing
+                    # directory, unlike apply_config which accepts a future one.
+                    try:
+                        new_project = _confine_workspace_path(
+                            new_project, require_dir=True)
+                    except ValueError as exc:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Project path rejected: {exc}",
+                        })
+                        continue
+
+                    # ATTACK-6 (a): a connection already bound to a workspace
+                    # must not be able to re-scope itself by switching project
+                    # to a DIFFERENT workspace.  The path confinement above only
+                    # proves the target exists and is outside the vault; it says
+                    # nothing about which workspace this socket belongs to.
+                    #
+                    # Narrowed operator rule \u2014 the SAME shared predicate
+                    # (bridge._ownership_refusal) also gates apply_config:
+                    #   * target resolves to the bound workspace        \u2192 ALLOW
+                    #   * target resolves to a DIFFERENT workspace      \u2192 REFUSE
+                    #   * target is unregistered                        \u2192 ALLOW only
+                    #     when it is neither equal to nor inside another
+                    #     registered workspace's realpath'd root
+                    # An unscoped socket (no binding) is unrestricted.
+                    _sp_cur_ws = bridge.workspace_id if bridge is not None else None
+                    try:
+                        from web_ui.backend.bridge import (
+                            _ownership_refusal, _resolve_workspace_id,
+                        )
+                        # D3: bootstrap is the transition; it cannot require the
+                        # transition.  An unbound connection may establish scope
+                        # here and nowhere else; the resolution below still runs
+                        # so the binding can happen on this path.
+                        _sp_refusal = (
+                            None if _sp_cur_ws is None
+                            else _ownership_refusal(new_project, _sp_cur_ws)
+                        )
+                        _sp_req_ws = _resolve_workspace_id(new_project)
+                    except Exception as exc:
+                        _sp_refusal = f"ownership check failed: {exc}"
+                        _sp_req_ws = None
+                    if _sp_refusal is not None:
+                        log('WARNING', 'server',
+                            f"set_project refused: connection is scoped to workspace "
+                            f"{_sp_cur_ws} and cannot switch to {new_project} "
+                            f"(workspace {_sp_req_ws}): {_sp_refusal}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": (
+                                f"\u26a0 Project switch refused: this connection is "
+                                f"scoped to workspace {_sp_cur_ws} and cannot switch "
+                                f"to {_sp_req_ws or new_project}."
+                            ),
+                        })
+                        continue
+
+                    log('INFO', 'server', f"Switching project to {new_project}")
+
+                    # 1. Save current session and stop the bridge
+                    if bridge is not None and bridge.session is not None:
+                        bridge.save_session()
+                    if bridge is not None:
+                        bridge.stop()
+
+                    # 2. Update the per-connection project path
+                    _project_path = new_project
+
+                    # 3. Create fresh bridge + controller
+                    from agent.controller import AgentController
+                    controller = AgentController()
+                    bridge = WebAgentBridge(session_store=session_store)
+                    bridge.set_event_callback(event_callback, key=id(ws))
+                    bridge.register()
+                    bridge.set_controller(controller)
+
+                    # 4. Resolve or auto-register workspace for the new path
+                    workspace_id = None
+                    try:
+                        from web_ui.backend.bridge import _resolve_workspace_id
+                        resolved = _resolve_workspace_id(_project_path)
+                        if resolved:
+                            workspace_id = resolved
+                            bridge._workspace_id = resolved
+                            log('INFO', 'server',
+                                f"set_project: resolved workspace {resolved} for {_project_path}")
+                    except Exception as exc:
+                        log('WARNING', 'server',
+                            f"set_project: resolve error: {exc}")
+
+                    if not workspace_id:
+                        try:
+                            from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+                            entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
+                            workspace_id = entry.id
+                            # D2 (bootstrap binding): registration is the
+                            # workspace-creation transition -- the connection
+                            # adopts the new id through the bind authority.
+                            # bootstrap from unbound: refusal is structurally unreachable today.
+                            _bind_refusal = bridge._bind_workspace(entry.id, "bootstrap")
+                            if _bind_refusal:
+                                log('WARNING', 'server',
+                                    f"set_project: binding to workspace {entry.id} refused: {_bind_refusal}")
+                            ensure_workspace_dirs(entry.id)
+                            log('INFO', 'server',
+                                f"set_project: registered workspace {entry.id} for {_project_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"set_project: auto-register error: {exc}")
+
+                    # 5. Create a new empty session for the new workspace via SessionManager
+                    # The bridge already owns a SessionManager built from the same
+                    # session_store (mirrors the REST /api/session/create pattern).
+                    session_id, _ = bridge._session_manager.create_session(
+                        mode="custom", workspace_path=_project_path
+                    )
+
+                    # Reload the persisted session so we can layer workspace metadata
+                    # on top (create_session does not handle workspace_id itself).
+                    new_session = session_store.load_session(session_id, workspace_id=None)
+                    if workspace_id and new_session:
+                        new_session.workspace_id = workspace_id
+
+                    # Wire the reloaded session into the bridge (mirrors bridge.create_session)
+                    # and re-save so the workspace_id lands on disk in the
+                    # workspace-scoped location.
+                    bridge._session = new_session
+                    bridge._loaded_session = new_session
+                    bridge._history_version = new_session.conversation_version
+                    sc = bridge._session_manager.extract_session_config(new_session)
+                    if sc is not None:
+                        bridge._session_config = sc
+                    session_store.save_session(new_session, workspace_id=workspace_id)
+                    session_store.add_open_session(new_session.session_id)
+                    _session_bridges[new_session.session_id] = bridge
+
+                    # 5b. Seed the permission sidecar (ABSENT-ONLY) for the newly
+                    #     created session now bound to the NEW workspace.  The record
+                    #     was just re-saved under the new workspace, but no grants
+                    #     sidecar exists there yet, so the gate's disk read would fail
+                    #     CLOSED (all-banned).  Seeding an empty sidecar yields the
+                    #     fail-closed DEFAULTS capped by the new workspace's ceiling.
+                    #     Absent-only: re-selecting a workspace that already holds
+                    #     this session's grants must preserve them.  Best-effort: a
+                    #     seed failure must NOT break the project switch.
+                    try:
+                        if workspace_id and new_session:
+                            bridge._session_manager._seed_permissions_sidecar(
+                                workspace_id, new_session.session_id, {},
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log('WARNING', 'server',
+                            f"set_project: permission sidecar seed failed "
+                            f"for workspace {workspace_id}: {exc}")
+
+                    # 6. Send session_loaded and state messages
+                    # Fix 4a: embed config (bridge._session_config is already set above, so
+                    # get_frontend_config is canonical) so the chat UI renders immediately.
+                    try:
+                        fe_config = config_manager.get_frontend_config(bridge)
+                    except Exception:
+                        fe_config = None
+                    await ws.send_json({
+                        "type": "session_loaded",
+                        "session_id": new_session.session_id,
+                        "session_name": new_session.metadata.get('name', ''),
+                        "workspace_id": bridge._workspace_id,
+                        "workspace_path": _project_path,
+                        "is_running": bridge._controller.is_busy if bridge._controller else False,
+                        # Intentional replacement (legacy set_project): the frontend adopts
+                        # this session_loaded silently and rebinds the tab (parity with the
+                        # apply_config workspace-switch branch).
+                        "replacement": True,
+                        "config": fe_config,
+                    })
+                    await ws.send_json({
+                        "type": "tokens_updated",
+                        "input": 0,
+                        "output": 0,
+                    })
+                    await ws.send_json({
+                        "type": "context_updated",
+                        "context_length": 0,
+                    })
+                    fe_config = config_manager.get_frontend_config(bridge)
+                    settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                    permissions = config_manager.resolve_effective_permissions(
+                        bridge._session_config,
+                        bridge._session_id or (bridge._loaded_session.session_id if bridge._loaded_session else None),
+                        bridge._session_config.workspace_id or bridge._workspace_id,
+                    ) if bridge._session_config else {}
+                    await ws.send_json({
+                        "type": "config_changed",
+                        "config": fe_config,
+                        "settings": settings,
+                        "permissions": permissions,
+                        "merged_config": fe_config,
+                        "effective_config": config_manager.get_effective_config(
+                            bridge,
+                            workspace_id=bridge._workspace_id if bridge else None,
+                            workspace_path=bridge._workspace_path if bridge else None,
+                        ),
+                    })
+                    # Machine-readable permission-context reset signal carried
+                    # on the EXISTING ``status_message`` channel (parity with the
+                    # apply_config workspace-switch branch; no new WS event type).
+                    await ws.send_json({
+                        "type": "status_message",
+                        "text": (
+                            f"✅ Switched to project: {_project_path}\n"
+                            f"You are now in workspace "
+                            f"{bridge._workspace_id or _project_path}. "
+                            f"Permission context reset to defaults for "
+                            f"this workspace, capped by this workspace's "
+                            f"ceiling."
+                        ),
+                        "permissions_reset": True,
+                        "workspace_id": bridge._workspace_id or "",
+                        "permission_context": "defaults_capped_by_ceiling",
+                    })
 
                 elif command == "security_response":
                     """Handle user response to a security prompt."""
@@ -1142,9 +3698,27 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                         continue
 
+                    # A prompt may only be answered by the connection it was
+                    # raised on, and only if this server actually forwarded it to
+                    # a connection at all.  An unknown request_id is default-DENY:
+                    # nothing was ever asked of any socket, so no socket is
+                    # entitled to answer it (resolve_security_prompt would
+                    # otherwise honour the decision blindly).
+                    _asker = _escalation_asker(request_id)
+                    if _asker != id(ws):
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ security_response: this prompt was raised "
+                                    "for a different connection (or was never "
+                                    "issued to this connection) and cannot be "
+                                    "answered here.",
+                        })
+                        continue
+
                     try:
                         from thoughtmachine.security import resolve_security_prompt
                         resolve_security_prompt(request_id, approved, remember)
+                        _forget_escalation(request_id)
                         log('INFO', 'server.ws',
                             f'Security prompt resolved: request_id={request_id} '
                             f'approved={approved} remember={remember}')
@@ -1218,7 +3792,7 @@ async def websocket_endpoint(ws: WebSocket):
                     if not workspace:
                         await ws.send_json({"type": "rebuild_result", "status": "error", "build_log": "No workspace path provided."})
                     else:
-                        from docker_executor import rebuild_container
+                        from infra.containers.executor import rebuild_container
                         try:
                             result = rebuild_container(workspace)
                             await ws.send_json({"type": "rebuild_result", "status": result.get("status", "unknown"), "build_log": result.get("build_log", "")})
@@ -1230,6 +3804,10 @@ async def websocket_endpoint(ws: WebSocket):
                         "type": "status_message",
                         "text": f"⚠ Unknown command: {command}",
                     })
+            except WebSocketDisconnect:
+                # Client disconnected mid-handling — let outer handler clean up
+                ws._closed = True
+                raise
             except Exception as exc:
                 log('ERROR', 'server.ws', f'FATAL WebSocket error: {exc}')
                 traceback.print_exc()
@@ -1248,6 +3826,8 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         # Mark closed so pending send_event calls are silently dropped
         ws._closed = True
+        # Drop any security escalation bound to this (now dead) connection.
+        _forget_escalations_for(id(ws))
         # Unregister this WebSocket's callback so stale connections
         # don't linger (fixes multi-tab / tab-reconnect bug).
         if bridge is not None:
@@ -1260,29 +3840,125 @@ async def websocket_endpoint(ws: WebSocket):
         # network blip, etc.). The bridge will be stopped either on
         # close_session or during server shutdown.
         if bridge is not None:
-            if not bridge._cleanly_closed:
+            # Check if this session was explicitly closed — if so, skip re-saving
+            sid = bridge._session_id or (
+                bridge._loaded_session.session_id if bridge._loaded_session else None
+            )
+            if sid and sid in _explicitly_closed_sessions:
+                _explicitly_closed_sessions.discard(sid)
+            elif not bridge._cleanly_closed:
                 try:
                     bridge.save_open_session()
-                except Exception:
+                    # Verify after save
+                    after_ids = session_store.get_open_sessions()
+                except Exception as e:
                     pass
             bridge.unregister()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Register workspace REST router ────────────────────────────────────────
+# ── Register REST routers ────────────────────────────────────────────────
 app.include_router(workspace_router)
+app.include_router(onboarding_router)
 app.include_router(config_router)
+app.include_router(health_router)
+
+app.include_router(logging_router)
+
+app.include_router(session_router)
+app.include_router(addendum_router)
+app.include_router(prompt_router)
+app.include_router(global_router)
+app.include_router(provider_router)
+app.include_router(vault_repair_router)
+app.include_router(container_record_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  REST endpoints (health, information)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/api/browse")
-async def browse_directory(path: str = ""):
-    """List directory contents for the workspace path browser."""
+# ── Host path confinement (path browser + container lifecycle) ──────────────
+# The browser, create-directory and container lifecycle endpoints accept
+# arbitrary host paths. They must resolve to an ABSOLUTE path OUTSIDE the
+# vault root (~/.thoughtmachine) — the trust anchor holding credentials,
+# config and session state. The old "must stay under $HOME" confinement was
+# a Unix-centric assumption that blocked legitimate workspaces on other
+# drives (e.g. D:\Coding on Windows), so paths anywhere else on the machine
+# are now allowed.
+
+def _path_is_within(path: str, prefix: str) -> bool:
+    """True when *path* equals *prefix* or lies beneath it (component-aware)."""
+    path = os.path.normpath(path)
+    prefix = os.path.normpath(prefix)
+    return path == prefix or path.startswith(prefix + os.sep)
+
+
+def _confine_to_home(path: str) -> str:
+    """Resolve *path* (empty → $HOME) to an absolute path outside the vault.
+
+    TRUST ANCHOR: ``~/.thoughtmachine`` holds the workspace registry,
+    credentials, config and session state, so user-reachable endpoints
+    (browse, create, container lifecycle) must never resolve INTO it. Paths
+    may live anywhere else on the machine (e.g. ``D:\\Coding`` on Windows) —
+    the legacy $HOME-only confinement wrongly blocked other drives.
+
+    Returns the absolute, normalized, symlink-resolved path. Raises ValueError
+    when the path is not absolute (including drive-relative forms such as
+    ``C:``) or resolves into the vault root.  The function name is retained
+    for backwards compatibility (tests patch it by name); the $HOME-only
+    confinement has been removed.
+    """
+    raw = os.path.expanduser(path or "~")
+    resolved = os.path.realpath(os.path.abspath(raw))
+    if not os.path.isabs(resolved):
+        raise ValueError(
+            f"Path '{path}' resolves to '{resolved}', which is not an "
+            f"absolute path"
+        )
+    raw = str(_vault.vault_root())
     try:
-        base_path = path or os.path.expanduser("~")
+        vault = os.path.realpath(raw)
+    except Exception:
+        vault = raw
+    if _path_is_within(resolved, vault):
+        raise ValueError(
+            f"Path '{path}' resolves into the protected vault directory '{vault}'"
+        )
+    return resolved
+
+
+def _confine_workspace_path(path: str, *, require_dir: bool = True) -> str:
+    """Validate a client-supplied project/workspace path.
+
+    Always applies the same trust anchor as the REST browser and
+    container-lifecycle endpoints (absolute path outside the vault root).
+
+    ``require_dir`` selects between the two distinct contracts callers need:
+    ``True`` additionally requires the resolved path to already be an
+    existing directory (``set_project``, ``?project=``); ``False`` confines
+    only and accepts a path that does not exist yet (``apply_config``, whose
+    documented behaviour is to switch to -- and create -- a future
+    workspace).  Returns the confined path; raises ``ValueError`` otherwise.
+    """
+    resolved = _confine_to_home(path)
+    if require_dir and not os.path.isdir(resolved):
+        raise ValueError(
+            f"Path '{path}' does not exist or is not a directory"
+        )
+    return resolved
+
+
+@app.get("/api/browse")
+async def browse_directory(request: Request, path: str = ""):
+    """List directory contents for the workspace path browser.
+
+    The path must resolve to an absolute directory outside the vault root
+    (~/.thoughtmachine); paths that resolve into the vault are rejected.
+    Directories on other drives (e.g. ``D:\\`` on Windows) are allowed.
+    """
+    try:
+        base_path = _confine_to_home(path)
         if not os.path.isdir(base_path):
             return {"success": False, "error": f"Not a directory: {base_path}", "entries": []}
         entries = []
@@ -1310,15 +3986,79 @@ async def browse_directory(path: str = ""):
         return {"success": False, "error": str(exc), "entries": []}
 
 
+@app.get("/api/tools")
+async def api_get_tools():
+    """Return the complete list of all available tools with UI metadata.
+
+    Each entry carries the tool's canonical name plus UI hints:
+    ``disabled_reason`` (why a tool may be gated) and
+    ``permission_level`` (the configured session-permission grain for
+    gated tools).
+    """
+    try:
+        from session.tool_presets import _ALL_TOOLS
+    except ImportError:
+        # Fallback: try alternate import path
+        try:
+            from agent.config.presets import _ALL_TOOLS
+        except ImportError:
+            return {"tools": [], "error": "Could not load tool list"}
+    defaults = load_global_defaults()
+    session_perms = defaults.get("session_permissions") or {}
+    if hasattr(session_perms, "model_dump"):
+        session_perms = session_perms.model_dump()
+    elif not isinstance(session_perms, dict):
+        session_perms = {}
+    tools = [
+        {
+            "name": name,
+            "enabled": True,
+            "disabled_reason": (
+                "requires host_bash permission ask or allow"
+                if name == "host_bash"
+                and session_perms.get("host_bash") not in ("ask", "allow")
+                else None
+            ),
+            "permission_level": (
+                session_perms.get("host_bash") if name == "host_bash" else None
+            ),
+        }
+        for name in _ALL_TOOLS
+    ]
+    return {"tools": tools}
+
+
 @app.post("/api/browse/create")
-async def create_directory(body: dict):
-    """Create a new directory for the workspace path browser."""
+async def create_directory(request: Request, body: dict):
+    """Create a new directory for the workspace path browser.
+
+    The parent path may be any absolute directory outside the vault root
+    (~/.thoughtmachine). A relative ``name`` is joined to the parent and must
+    stay inside it (blocking ``../`` traversal). An absolute ``name`` (e.g.
+    ``D:\\Coding`` pasted into the New Folder prompt when the browser cannot
+    navigate to another drive) is treated as the full target path and is
+    validated like any other host path: absolute and outside the vault.
+    """
     try:
         parent_path = body.get("parent_path", "")
         dir_name = body.get("name", "")
         if not dir_name:
             return {"success": False, "error": "Directory name is required"}
-        new_path = os.path.join(parent_path, dir_name)
+        parent = _confine_to_home(parent_path)
+        if not os.path.isdir(parent):
+            return {"success": False, "error": f"Not a directory: {parent}"}
+        if os.path.isabs(dir_name):
+            # Full absolute path (e.g. a Windows path pasted into the new
+            # folder prompt) — use it directly as the target. Confinement
+            # (absolute + outside the vault) is enforced by _confine_to_home.
+            try:
+                new_path = _confine_to_home(dir_name)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}
+        else:
+            new_path = os.path.normpath(os.path.join(parent, dir_name))
+            if not _path_is_within(new_path, parent):
+                return {"success": False, "error": f"Invalid directory name: {dir_name}"}
         if os.path.exists(new_path):
             return {"success": False, "error": f"Already exists: {dir_name}"}
         os.makedirs(new_path, exist_ok=True)
@@ -1329,9 +4069,221 @@ async def create_directory(body: dict):
         return {"success": False, "error": str(exc)}
 
 
+@app.get("/api/user-home")
+async def user_home():
+    """Return the user's home directory path."""
+    return {"home": str(Path.home())}
+
+
+# --- Loopback-only notion, shared with the ingress gate ----------------------
+# The server binds 127.0.0.1 by default (see the ``--host`` default in main()),
+# but the bind can be overridden (``--host``/``HOST``) and a reverse proxy in
+# front of the process would forward a remote caller as a local one.  The
+# peer-address check itself is no longer made per route: it is step 0 of
+# ``auth_boundary.AuthBoundaryMiddleware``, which every route sits behind.
+#
+# What stays here is the shared *definition* of "local".  It lives in
+# ``web_ui/backend/local_gate.py`` and is imported at the top of this module, so
+# the bind-host check below cannot disagree with the gate about which literals
+# mean this machine.
+
+
+def _validate_bind_host(host: Optional[str], *, allow_remote: bool = False) -> Optional[str]:
+    """Return the refusal message for a bind *host*, or ``None`` when it is safe.
+
+    Accepted values are exactly the local-caller literals in
+    ``_LOCAL_CLIENT_HOSTS`` — one notion of "local", shared with the ingress
+    gate — plus their bracketed IPv6 CLI spelling (``[::1]``), which is how a
+    scoped IPv6 host is written on a command line.
+
+    An empty or whitespace-only host is refused even when *allow_remote* is set:
+    uvicorn reads ``""`` as "all interfaces", the exact exposure this check
+    exists to prevent, and nobody types it on purpose.
+
+    *allow_remote* is the ``--allow-remote-bind`` escape hatch; it waives the
+    loopback requirement and nothing else.  Waiving it is an auth decision
+    rather than a deployment convenience: with the flag on there is no auth
+    layer, so every client that can route to the port is treated as the
+    operator, which is false.  Pure function: no printing, no exiting, no
+    argparse — the caller decides how loud to be and how to fail.
+    """
+    raw = "" if host is None else str(host).strip()
+    if not raw:
+        return ("Refusing to start: the bind host is empty, and an empty host means "
+                "'all interfaces'. Use --host or the HOST env var to name a loopback "
+                "address (127.0.0.1, ::1, localhost).")
+    if allow_remote:
+        return None
+    literal = raw[1:-1] if raw.startswith("[") and raw.endswith("]") else raw
+    if literal in _LOCAL_CLIENT_HOSTS:
+        return None
+    return (f"Refusing to start: bind host {raw} is not a loopback address. Use a "
+            f"loopback host (127.0.0.1, ::1, localhost) via --host or the HOST env "
+            f"var, or pass --allow-remote-bind to expose the unauthenticated API "
+            f"knowingly.")
+
+
 @app.get("/health")
-async def health():
-    return {"status": "ok", "service": "thoughtmachine-web-ui"}
+async def health(request: Request):
+    return {
+        "status": "ok",
+        "service": "thoughtmachine-web-ui",
+        "revision": _SERVER_REVISION,
+    }
+
+
+@app.get("/api/health")
+async def api_health(request: Request):
+    """Liveness mirror of GET /health -- and only the liveness bit.
+
+    Deliberately NOT ``return await health(request)``.  This path is exempt from
+    the credential (``auth_boundary.EXEMPT_PATHS``), so everything it returns is
+    readable by any unauthenticated caller on loopback -- and ``/health`` also
+    carries the build revision, which is a fact about this deployment rather than
+    a liveness bit.  A probe needs one field; the alias is narrowed to it, and
+    ``/health`` itself keeps its payload because it is not the exempt question.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/api/auth/session")
+async def auth_session(request: Request):
+    """Report whether *this* request carries a usable credential.
+
+    Exempt at the boundary (see ``auth_boundary.EXEMPT_PATHS``) precisely so it
+    can answer -- because the question is about a credential the caller may not
+    have yet, and a refusal from the boundary is indistinguishable from "server
+    down" to a client that never got a response body.  The credential check is
+    therefore repeated here, on the same helper the middleware uses
+    (``auth_boundary.credential_kind``), so there is one policy with two callers
+    rather than a second, drift-prone implementation.
+
+    What it may say is bounded on purpose: the credential *kind* and nothing
+    else.  The token, its length, its file path and the failure reason are all
+    facts about the secret, and a caller who presented no credential must not
+    learn any of them from an unauthenticated endpoint.
+    """
+    try:
+        token = auth_token.ensure_token()
+    except RuntimeError as exc:
+        # A broken credential store is "not authenticated", not a 500: this
+        # route's whole job is to answer, and every other route already fails
+        # closed on the same error inside the middleware.
+        log("ERROR", "server.auth_session",
+            f"credential store unusable: {exc}")
+        return JSONResponse(
+            {"authenticated": False}, status_code=auth_boundary.UNAUTHORIZED
+        )
+    kind = auth_boundary.credential_kind(request.scope, token)
+    if kind is None:
+        return JSONResponse(
+            {"authenticated": False}, status_code=auth_boundary.UNAUTHORIZED
+        )
+    return {"authenticated": True, "credential": kind}
+
+
+@app.get("/api/vault/status")
+def vault_status_endpoint():
+    """Run the vault drift check (read-only) and return a structured report.
+
+    Severity mapping: ``error``/``warning`` issues flip ``ok`` to False;
+    unknown files in the vault root are reported as warnings. ``info``
+    issues (e.g. pending safe-default backfills) do not flip ``ok``.
+    On abort or unexpected failure the endpoint returns
+    ``ok: False, status: "error"``.
+    """
+    checker = None
+    try:
+        from agent.config.vault_drift import VaultDriftChecker, DriftAbortError
+        from thoughtmachine.vault import vault_root
+
+        checker = VaultDriftChecker(vault_root=vault_root())
+        report = checker.check(apply_repairs=False)
+    except DriftAbortError as exc:
+        # The checker records a partial report (with the abort issue
+        # populated) before re-raising; surface those issues so the client
+        # sees WHY the check aborted instead of an empty list.
+        issues = []
+        try:
+            partial = checker.report()
+            if isinstance(partial, dict) and isinstance(partial.get("issues"), list):
+                issues = partial["issues"]
+        except Exception:
+            issues = []
+        if not issues:
+            issues = [{
+                "file": None,
+                "severity": "error",
+                "message": "Drift check aborted due to critical drift",
+                "action": "inspect the vault and fix the critical drift",
+            }]
+        return {"ok": False, "status": "error", "error": str(exc), "issues": issues}
+    except Exception as exc:
+        return {"ok": False, "status": "error", "error": str(exc), "issues": []}
+    issues = report.get("issues", [])
+    ok = all(i.get("severity") not in ("error", "warning") for i in issues)
+    return {
+        "ok": ok,
+        "status": report.get("status"),
+        "issues": issues,
+        "checked_at": report.get("checked_at"),
+        "vault_root": report.get("vault_root"),
+        "summary": {
+            "error": sum(1 for i in issues if i.get("severity") == "error"),
+            "warning": sum(1 for i in issues if i.get("severity") == "warning"),
+            "info": sum(1 for i in issues if i.get("severity") == "info"),
+        },
+    }
+
+
+# Source of truth for the resource catalog (repo-relative).
+_RESOURCE_CATALOG_PATH = Path(_project_root) / "agent" / "config" / "resource_catalog.json"
+
+
+@app.get("/api/resource-catalog")
+def resource_catalog_endpoint():
+    """Return the resource catalog as a bare JSON array.
+
+    Source of truth: ``agent/config/resource_catalog.json`` at the repo root
+    (the same file seeded into ``~/.thoughtmachine/system/resource_catalog.json``
+    by ``thoughtmachine.vault.ensure_vault_defaults``).  The response body IS
+    the array (no ``{items: [...]}`` wrapper): the frontend store only consumes
+    responses shaped ``{items: [...]}`` and otherwise falls back to its bundled
+    placeholder catalog, so the bare array keeps old clients safe while
+    exposing the repo source of truth to new consumers.  If the file cannot be
+    read (packaged build / partial checkout) an empty in-memory fallback is
+    returned instead of failing.
+    """
+    try:
+        data = json.loads(_RESOURCE_CATALOG_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+
+@app.get("/api/permission-defaults")
+def permission_defaults_endpoint():
+    """Return the single-owner permission safe defaults as a JSON object.
+
+    Source of truth: ``thoughtmachine.security.SAFE_DEFAULTS`` -- the ONE
+    owner of the out-of-the-box session grants.  This DEDICATED endpoint
+    publishes it across the Py/JS boundary so the frontend never keeps a
+    divergent hand-written default (the JS literal in
+    ``frontend/src/store/useStore.js`` is only a documented BOOT fallback
+    for the window before this fetch resolves).  ``network`` is ``"banned"``
+    (fail-closed).  The response body IS the mapping (no ``{items: ...}``
+    wrapper); if the import fails (partial checkout) an empty object is
+    returned instead of failing.
+    """
+    try:
+        from thoughtmachine.security import SAFE_DEFAULTS
+
+        return dict(SAFE_DEFAULTS)
+    except Exception:
+        return {}
+
 
 @app.get("/api/container/integrity")
 def container_integrity(workspace: str = "", permissions: str = ""):
@@ -1339,8 +4291,9 @@ def container_integrity(workspace: str = "", permissions: str = ""):
 
     Calls ``get_integrity_status()`` which wraps ``verify_container_integrity()``
     to check the existing container against the expected security config.
-    If permissions have been tightened since the container was created,
-    it is removed so it will be recreated with the new settings.
+    This endpoint is READ-ONLY: it reports the verdict and never mutates the
+    container.  A permissions-tightening mismatch is refused (the container is
+    left intact) and reported as ``"mismatch"``.
 
     Query params:
         workspace: Absolute path to the workspace.
@@ -1360,7 +4313,7 @@ def container_integrity(workspace: str = "", permissions: str = ""):
                 "desired": {}, "actual": None,
                 "mismatch_reason": "No workspace path provided."}
 
-    from docker_executor import get_integrity_status
+    from infra.containers.executor import get_integrity_status
 
     sp = None
     if permissions:
@@ -1388,7 +4341,7 @@ def container_status(workspace: str = ""):
         return {"status": "unavailable", "capabilities": {}, "build_log": ""}
 
     # Import lazily to avoid circular imports at module level
-    from docker_executor import get_container_status
+    from infra.containers.executor import get_container_status
 
     try:
         result = get_container_status(workspace)
@@ -1396,6 +4349,1745 @@ def container_status(workspace: str = ""):
     except Exception as exc:
         log("ERROR", "server.container_status", f"Container status failed: {exc}")
         return {"status": "error", "capabilities": {}, "build_log": str(exc)}
+
+
+# --- Phase 7: per-workspace container lifecycle API ---
+# Lifecycle endpoints (list/status/start/stop/delete) address containers by
+# NAME (stable, human-meaningful) and resolve them to container IDs via
+# ContainerManager.list_containers(). Workspace resolution: the explicit
+# `workspace_path` query param wins; otherwise the workspace registry is used.
+# All endpoints mirror the JSON-error style of the existing /api/container/*.
+
+class WorkspacePathError(ValueError):
+    """Raised when an explicit ``workspace_path`` fails host-side validation."""
+
+
+class WorkspacePathForbiddenError(WorkspacePathError):
+    """Raised when an explicit ``workspace_path`` is valid but lies outside the
+    registered workspace root for the requested workspace id (HTTP 403)."""
+
+
+def _validate_workspace_path(workspace_path: str, workspace_id: str) -> str:
+    """Validate an explicit container ``workspace_path`` query parameter.
+
+    The path must resolve (after ~ expansion and symlink resolution) to an
+    existing ABSOLUTE directory outside the vault root (~/.thoughtmachine),
+    AND it must lie within the registered workspace root for *workspace_id*.
+    This keeps the container lifecycle endpoints from mounting arbitrary host
+    paths (e.g. /etc, another user's home, the vault, or any non-registered
+    directory) into a container — workspaces registered on other drives
+    (e.g. ``D:\\Coding`` on Windows) are legitimate.
+
+    Returns the resolved absolute path. Raises WorkspacePathError (HTTP 400)
+    for invalid input or an unregistered workspace, and
+    WorkspacePathForbiddenError (HTTP 403) when the path escapes the
+    registered workspace root.
+    """
+    if not workspace_path:
+        raise WorkspacePathError("workspace_path is required")
+    try:
+        resolved = _confine_to_home(workspace_path)
+    except ValueError as exc:
+        raise WorkspacePathError(str(exc)) from exc
+    if not os.path.isdir(resolved):
+        raise WorkspacePathError(
+            f"workspace_path '{workspace_path}' resolves to '{resolved}', "
+            f"which is not an existing directory"
+        )
+    # The explicit path must stay within the registered workspace root so a
+    # container cannot bind-mount arbitrary (even in-home) directories.
+    try:
+        entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
+    except WorkspaceRegistryUnavailable:
+        # Registry file corrupt/unreadable -> server-side fault: propagate so
+        # the route answers 503, not a bogus "'<id>' is not registered" 400.
+        raise
+    except Exception as exc:
+        raise WorkspacePathError(
+            f"workspace '{workspace_id}' is not registered"
+        ) from exc
+    if entry is None:
+        raise WorkspacePathError(f"workspace '{workspace_id}' is not registered")
+    root = os.path.realpath(entry.root_path)
+    if not _path_is_within(resolved, root):
+        raise WorkspacePathForbiddenError(
+            f"workspace_path '{workspace_path}' resolves to '{resolved}', "
+            f"which is outside the registered workspace root '{root}' "
+            f"for workspace '{workspace_id}'"
+        )
+    return resolved
+
+
+def _resolve_workspace_path(workspace_id: str, workspace_path: str = ""):
+    """Resolve the workspace root path for a container manager.
+
+    Both branches are validated.  The explicit ``workspace_path`` query param
+    wins when supplied; otherwise the workspace registry is consulted and its
+    ``root_path`` is validated the same way, because either value ends up as a
+    container bind-mount source.  Either branch raises WorkspacePathError
+    (HTTP 400) / WorkspacePathForbiddenError (HTTP 403) for a path that is
+    missing, inside the vault, or otherwise unusable.  Returns None when the
+    workspace is unknown or the path cannot be resolved.
+    """
+    if workspace_path:
+        return _validate_workspace_path(workspace_path, workspace_id)
+    try:
+        entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
+    except WorkspaceRegistryUnavailable:
+        # The registry FILE is corrupt/unreadable: a server-side
+        # "registry unavailable" fault, NOT a missing workspace.  Re-raise so
+        # the route handler answers 503 (naming the registry fault) rather than
+        # swallowing the fault into the misleading 404
+        # "workspace '<id>' not found or path unresolvable".
+        raise
+    if entry is None:
+        return None
+    if not entry.root_path:
+        # A registered entry with no root is unresolvable rather than
+        # forbidden: fall through to the caller's None -> 404 handling.
+        return None
+    # ``entry.root_path`` is server-owned but not server-chosen -- it is
+    # whatever path was registered, and the container layer bind-mounts it at
+    # /workspace verbatim.  Returning it raw let a vault-rooted (or otherwise
+    # unusable) entry reach ContainerManager without ever passing the guard
+    # that the explicit ``workspace_path`` branch already runs, so the
+    # registry fallback gets the same validation before it can become a
+    # mount source.
+    return _validate_workspace_path(entry.root_path, workspace_id)
+
+
+def _make_container_manager(workspace_id: str, workspace_path: str = ""):
+    """Build a ContainerManager for the workspace.
+
+    Returns None when the workspace path cannot be resolved; raises when the
+    manager itself cannot be constructed. Lazy import avoids circular imports.
+    """
+    path = _resolve_workspace_path(workspace_id, workspace_path)
+    if not path:
+        return None
+    from agent.config.defaults import DEFAULT_CPU_QUOTA, DEFAULT_MEM_LIMIT
+    from infra.container_manager import ContainerManager
+    return ContainerManager(
+        workspace_path=path,
+        workspace_id=workspace_id,
+        session_id=None,
+        session_permissions=None,
+        mem_limit=DEFAULT_MEM_LIMIT,
+        cpu_quota=DEFAULT_CPU_QUOTA,
+    )
+
+
+def _find_container_id(manager, name: str):
+    """Resolve a container name to its container_id via list_containers().
+
+    Raises when list_containers() fails; callers translate that into an error
+    response.
+    """
+    for entry in manager.list_containers() or []:
+        if entry.get("name") == name:
+            return entry.get("container_id")
+    return None
+
+
+def _json_error(message: str, status_code: int = 500):
+    """JSON error response mirroring the existing API error style."""
+    return JSONResponse({"error": message}, status_code=status_code)
+
+
+def _hardening_json(container) -> dict:
+    """Three-state hardening-conformance verdict for a status response.
+
+    Mirrors ``infra.container_create._hardening_conformance`` -- a pure
+    predicate over ``container.attrs`` -- onto the workspace
+    container-status route.  Returns:
+
+    * ``{"status": "conformant", "failed": []}`` when every present
+      hardening axis is satisfied;
+    * ``{"status": "drifted", "failed": [<axes>]}`` when one or more REAL
+      axes are weak (the failing-axis names from the predicate);
+    * ``{"status": "unverified", "failed": []}`` when the container object
+      could not be obtained (``None``), its ``attrs`` could not be read (the
+      ``"attrs_unreadable"`` sentinel), or any other error occurred.
+
+    Fail-closed: the unverifiable case is NEVER reported as ``conformant``.
+    Infra is imported lazily -- matching the module's function-local
+    infra-import convention -- and the whole computation is wrapped so this
+    helper can never raise (it must not turn a working status into a 5xx).
+    """
+    try:
+        if container is None:
+            return {"status": "unverified", "failed": []}
+        from infra.container_create import (
+            _hardening_conformance, _expected_hardening_recipe)
+        failures = _hardening_conformance(
+            container, _expected_hardening_recipe())
+    except Exception:
+        return {"status": "unverified", "failed": []}
+    if failures == ["attrs_unreadable"]:
+        return {"status": "unverified", "failed": []}
+    if failures:
+        return {"status": "drifted", "failed": list(failures)}
+    return {"status": "conformant", "failed": []}
+
+
+# Raw Docker container status -> container-view entry ``state`` mapping.
+_CONTAINER_VIEW_RAW_STATE = {
+    "running": "running",
+    "restarting": "running",
+    "paused": "paused",
+    "exited": "exited",
+    "dead": "exited",
+    "created": "stopped",
+    "stopped": "stopped",
+    "removing": "stopped",
+    "missing": "stopped",
+    "error": "stopped",
+}
+
+def _map_container_view_state(status, record_state):
+    """Map (raw status dict-or-None, record.state) -> entry ``state`` value.
+
+    OOMKilled True overrides everything -> ``oom``; otherwise the raw Docker
+    status is mapped; when no usable live status exists the record's last
+    observed state is decided by the pure container-record resolver
+    (``thoughtmachine.container_record.state.resolve_container_state``), which
+    returns the record's OWN effective state (``running`` / ``creating`` /
+    ``""`` for unset/unknown).  This DISPLAY layer then renders that
+    vocabulary: an unset/unknown record state (``""``) renders as the
+    fail-safe ``stopped``.
+    """
+    raw = status.get("status") if isinstance(status, dict) else None
+    if isinstance(status, dict):
+        if status.get("oom_killed"):
+            return "oom"
+        if raw in _CONTAINER_VIEW_RAW_STATE:
+            return _CONTAINER_VIEW_RAW_STATE[raw]
+    # No usable live status: the record-state decision belongs to the pure
+    # resolver -- the sole reader of the record's ``state`` field.  The caller
+    # passes ONLY the state string (``getattr(record, "state", "")``), so the
+    # carrier below deliberately has no ``created_at``: this render is
+    # age-independent BY CONSTRUCTION.  A stuck-``creating`` record still
+    # renders ``creating`` here -- this path is NOT a staleness detector (the
+    # freshness verdict is carried by ``creating_drift_finding``; this display
+    # path reads only the resolved state and ignores freshness).  The two local
+    # imports match this module's deliberately lazy
+    # ``thoughtmachine.container_record`` import style (see the startup scans).
+    from types import SimpleNamespace
+
+    from thoughtmachine.container_record import state as _cr_state
+
+    # A present live container is reported by its raw Docker state; an empty /
+    # unreadable one becomes the resolver's unknown sentinel, and only a wholly
+    # absent status (``None``) signals no live container.
+    live_state = (
+        raw
+        if isinstance(raw, str) and raw
+        else (_cr_state.LIVE_STATE_UNKNOWN if isinstance(status, dict) else None)
+    )
+    resolved, _fresh = _cr_state.resolve_container_state(
+        SimpleNamespace(state=record_state, created_at=""),
+        live_state=live_state,
+        now=None,
+    )
+    # The resolver yields the record's own vocabulary; render an unset/unknown
+    # (``""``) record state as the fail-safe ``stopped`` for the view.
+    return resolved or "stopped"
+
+
+# PC4/PC5: lifecycle_class -> view ``kind``. The retired ``runtime`` kind is
+# replaced by an explicit three-class split: ``ephemeral`` | ``persistent`` |
+# ``resource``. ``service`` is a persistent-class container in intent; it has no
+# producers today, so it renders in the persistent section rather than inventing
+# a UI section with no writers. Unknown classes fall back to ``persistent``.
+_CONTAINER_KIND_BY_LIFECYCLE = {
+    "ephemeral": "ephemeral",
+    "persistent": "persistent",
+    "service": "persistent",
+    "resource": "resource",
+}
+
+
+#: Workspace-ownership label Docker containers carry (mirrors
+#: ``infra.container_manager`` / the record store).
+_CONTAINER_VIEW_WORKSPACE_LABEL = "thoughtmachine.workspace_id"
+
+
+def _list_workspace_live_containers(manager, workspace_id):
+    """Best-effort LIVE-container enumeration for *workspace_id* (GET view).
+
+    Returns a list of live container objects, or ``None`` when enumeration is
+    unavailable (no manager client / Docker error).  ``None`` means
+    "unverified", never "empty".
+
+    ``ContainerManager.list_containers()`` is unusable here: it deliberately
+    hides resource containers (see ``_build_container_view_entries``), which is
+    exactly the class the panel must surface.  This enumerates through the
+    manager's already-used Docker client handle (``manager.client`` -- the same
+    handle ``workspace_container_status`` reads) narrowed by the workspace
+    ownership label.  It is the single owner of the "workspace live set" fact.
+    """
+    try:
+        client = getattr(manager, "client", None)
+        if client is None:
+            return None
+        containers = client.containers.list(
+            all=True,
+            filters={
+                "label":
+                    f"{_CONTAINER_VIEW_WORKSPACE_LABEL}={workspace_id}",
+            },
+        )
+    except Exception:
+        return None
+    return list(containers or [])
+
+
+def _container_view_match_keys(container):
+    """Identity keys a live container can be matched to a record by.
+
+    Mirrors the identity the record store writes: the Docker container id, the
+    container name, and the record-owned ``RECORD_LABEL_KEY`` label.
+    """
+    from thoughtmachine.container_record import RECORD_LABEL_KEY
+
+    keys = set()
+    container_id = getattr(container, "id", None)
+    if container_id:
+        keys.add(("id", str(container_id)))
+    name = getattr(container, "name", None)
+    if name:
+        keys.add(("name", str(name).lstrip("/")))
+    labels = getattr(container, "labels", None)
+    if isinstance(labels, dict):
+        record_id = labels.get(RECORD_LABEL_KEY)
+        if record_id:
+            keys.add(("record", str(record_id)))
+    return keys
+
+
+def _record_view_match_keys(record):
+    """Identity keys a record can be matched to a live container by."""
+    keys = set()
+    docker_id = getattr(record, "docker_id", None)
+    if docker_id:
+        keys.add(("id", str(docker_id)))
+    record_id = getattr(record, "id", None)
+    if record_id:
+        keys.add(("record", str(record_id)))
+    name = getattr(record, "name", None)
+    if name:
+        keys.add(("name", str(name).lstrip("/")))
+    return keys
+
+
+def _live_envelope_from_container(container):
+    """Derive the LIVE permission envelope from a running container's attrs.
+
+    Returns a *partial* ``{network, filesystem, mem_limit}`` mapping carrying
+    ONLY the axes the live inspect payload can witness, or ``None`` when none
+    can be read (no attrs / unreadable payload).  ``network`` is a bool
+    (``True`` unless the live network mode is ``"none"``), ``filesystem`` is
+    ``"write"`` / ``"read"`` (from the ``/workspace`` mount's ``RW`` flag), and
+    ``mem_limit`` is the raw byte string.  The field names mirror the record's
+    ``permissions`` dict closely enough for the badge text, but the values are
+    sourced from the CONTAINER ITSELF (live), never from the record's frozen
+    creation intent -- which is the whole point of the panel.
+    """
+    from thoughtmachine.container_record.snapshot import snapshot_from_attrs
+
+    try:
+        snapshot = snapshot_from_attrs(getattr(container, "attrs", None))
+    except Exception:
+        return None
+
+    envelope = {}
+    network_mode = snapshot.get("network_mode")
+    if isinstance(network_mode, str) and network_mode:
+        envelope["network"] = network_mode != "none"
+    workspace_mode = snapshot.get("workspace_mode")
+    if workspace_mode == "rw":
+        envelope["filesystem"] = "write"
+    elif workspace_mode == "ro":
+        envelope["filesystem"] = "read"
+    mem_limit = snapshot.get("mem_limit")
+    if isinstance(mem_limit, str) and mem_limit:
+        envelope["mem_limit"] = mem_limit
+    return envelope or None
+
+
+def _recordless_view_entry(container, manager, workspace_id):
+    """Build a view entry for a LIVE container that has NO record.
+
+    ``kind`` comes from the canonical classifier (``manager.class_of``); every
+    entry key the record-derived shape carries is present, so the frontend
+    renders the row unchanged.  ``live`` is ``True`` (it *is* live);
+    ``unrecorded`` marks it as having no backing record (its ``id`` is the
+    Docker handle, not a record id -- the record-keyed action routes cannot
+    address it).
+    """
+    container_id = (getattr(container, "id", None)
+                    or getattr(container, "name", ""))
+    name = getattr(container, "name", "") or str(container_id)
+    try:
+        lifecycle = manager.class_of(container)
+    except Exception:
+        lifecycle = ""
+    kind = _CONTAINER_KIND_BY_LIFECYCLE.get(lifecycle, "persistent")
+    status = None
+    try:
+        status = manager.status(container_id)
+    except Exception:
+        status = None
+    return {
+        "id": container_id,
+        "name": name,
+        "note": "",
+        "kind": kind,
+        "state": _map_container_view_state(status, ""),
+        "intent_snapshot": None,
+        "permissions": None,
+        "permission_drift": None,
+        "shared": kind in ("persistent", "resource"),
+        "live": True,
+        "unrecorded": True,
+        "live_envelope": _live_envelope_from_container(container),
+    }
+
+
+def _container_view_entry(record, manager, workspace_id, live=None, live_envelope=None):
+    """Build one container-view entry dict from a record (+ its live status).
+
+    Entry keys: ``id, name, note, kind, state, intent_snapshot, permissions,
+    permission_drift, shared, live, unrecorded, live_envelope``.  ``note`` is
+    the record's sticky note (``notes`` field; ``""`` when unset), surfaced
+    verbatim so the UI can show whose work a shared container is doing.
+    ``live`` is ``True`` when the
+    record has a matching live container, ``False`` when it has none (the UI
+    renders it distinctly, it is never hidden), and ``None`` when the live set
+    could not be enumerated (unverified -- not rendered as missing).
+    ``unrecorded`` is always ``False`` on this record-derived shape.  ``kind``
+    is one of ``ephemeral`` |
+    ``persistent`` | ``resource`` (PC5; see ``_CONTAINER_KIND_BY_LIFECYCLE``).
+    ``shared`` = ``kind in ('persistent', 'resource')``.
+    ``permission_drift`` is ``None`` when either side is unknown (an unwired /
+    pre-v5 record has no ``permissions``) -- the underlying drift helper is
+    already fail-safe and returns ``None`` when Docker is unavailable.
+    ``live_envelope`` is the live permission envelope derived from the matching
+    running container (``None`` when there is none / it is unreadable); it is
+    declared here so the record shape and the recordless shape agree.
+    """
+    lifecycle = getattr(record, "lifecycle_class", "") or ""
+    kind = _CONTAINER_KIND_BY_LIFECYCLE.get(lifecycle, "persistent")
+    permissions = getattr(record, "permissions", None)
+    if permissions is None:
+        permission_drift = None
+    else:
+        try:
+            permission_drift = _compute_drift(record, workspace_id)
+        except Exception:
+            permission_drift = None
+    docker_id = getattr(record, "docker_id", None)
+    status = None
+    if docker_id:
+        try:
+            status = manager.status(docker_id)
+        except Exception:
+            status = None
+    state = _map_container_view_state(status, getattr(record, "state", ""))
+    return {
+        "id": record.id,
+        "name": getattr(record, "name", "") or "",
+        "note": getattr(record, "notes", "") or "",
+        "kind": kind,
+        "state": state,
+        "intent_snapshot": getattr(record, "intent_snapshot", None),
+        "permissions": permissions,
+        "permission_drift": permission_drift,
+        "shared": kind in ("persistent", "resource"),
+        "live": live,
+        "unrecorded": False,
+        "live_envelope": live_envelope,
+    }
+
+
+def _build_container_view_entries(manager, workspace_id):
+    """Return the FLAT list of container-view entries for the GET (PC3).
+
+    LIVE containers are the primary set; records are attached to them as
+    metadata.  A record with a matching live container is emitted with
+    ``live=True``; a record with none is still emitted, marked ``live=False``
+    (visibly distinct, never hidden silently).  A live container with no record
+    is emitted with ``unrecorded=True`` (and ``live=True``).
+
+    Records come from the durable store (``api.list_records``); the live set
+    comes from ``_list_workspace_live_containers`` (``None`` = unverified, in
+    which case no liveness marker is asserted).  ``ContainerManager.
+    list_containers()`` hides resource containers, so it cannot enumerate the
+    full set.  Each entry carries the three-class ``kind``
+    (``ephemeral``|``persistent``|``resource``); the UI splits them.
+    """
+    from thoughtmachine.container_record import api as _cr_api
+
+    records = _cr_api.list_records(workspace_id) or []
+    live_containers = _list_workspace_live_containers(manager, workspace_id)
+
+    record_keys = [(record, _record_view_match_keys(record))
+                   for record in records]
+    record_key_union = set()
+    for _, keys in record_keys:
+        record_key_union |= keys
+    live_key_union = set()
+    live_by_key = {}
+    if live_containers is not None:
+        for container in live_containers:
+            for key in _container_view_match_keys(container):
+                live_key_union.add(key)
+                live_by_key.setdefault(key, container)
+
+    entries = []
+    for record, keys in record_keys:
+        matched_container = None
+        if live_containers is None:
+            live_marker = None
+        else:
+            live_marker = bool(keys & live_key_union)
+            for key in keys:
+                if key in live_by_key:
+                    matched_container = live_by_key[key]
+                    break
+        live_envelope = (
+            _live_envelope_from_container(matched_container)
+            if matched_container is not None else None)
+        entries.append(
+            _container_view_entry(record, manager, workspace_id,
+                                  live=live_marker, live_envelope=live_envelope))
+
+    if live_containers is not None:
+        for container in live_containers:
+            if _container_view_match_keys(container) & record_key_union:
+                continue  # already represented by its record
+            entries.append(
+                _recordless_view_entry(container, manager, workspace_id))
+    return entries
+
+
+def _view_action_container_id(manager, record):
+    """Resolve a record's container handle via the name index, then docker_id."""
+    try:
+        container_id = _find_container_id(manager, record.name) if record.name else None
+    except Exception:
+        container_id = None
+    return container_id or record.docker_id or None
+
+
+def _recorded_envelope(snapshot_source):
+    """Return the RECORDED isolation envelope of *snapshot_source*.
+
+    A rebuild below recreates the container from the record's persisted
+    intent, not from the current policy: the route's ContainerManager
+    carries no session (``session_permissions=None``), so a policy-computed
+    envelope resolves to the most restrictive pair and would silently
+    downgrade the rebuilt container.  Only recorded, non-empty axes are
+    returned -- an unrecorded envelope yields ``{}`` (no override), which
+    keeps the fail-closed policy apply untouched.
+    """
+    from thoughtmachine.container_record import rebuild_config_from_snapshot
+
+    try:
+        cfg = rebuild_config_from_snapshot(snapshot_source)
+    except Exception:
+        return {}
+    return {key: cfg[key] for key in ("network_mode", "workspace_mode")
+            if cfg.get(key)}
+
+
+def _original_created_by(manager, container_id, actor):
+    """Attribution to stamp on the REBUILT container: its origin.
+
+    ``thoughtmachine.created_by`` is the single source of truth for who
+    created a container (the record deliberately carries no creator field),
+    and it lives ONLY on the live container -- so it must be read from the
+    container that is about to be destroyed, not re-derived from whoever is
+    performing the resize/rebuild.  Otherwise one resize or recreate relabels
+    an agent-created container (``agent:session:<id>``) as the operator, and
+    the origin is lost for good (``remove`` copies no label back).  Only a
+    genuinely absent/unreadable label falls back to the acting operator.
+
+    The caller MUST call this BEFORE the destroy: ``remove()`` drops the handle
+    to the live container, after which the label is unreadable.
+    """
+    from thoughtmachine.container_record.hook import (
+        CREATED_BY_LABEL,
+        operator_created_by,
+    )
+
+    if container_id:
+        try:
+            container = manager.client.containers.get(container_id)
+            label = (getattr(container, "labels", None) or {}).get(
+                CREATED_BY_LABEL)
+        except Exception:
+            label = None
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    return operator_created_by(actor)
+
+
+@app.get("/api/workspace/{workspace_id}/containers")
+def workspace_containers(workspace_id: str, workspace_path: str = ""):
+    """List containers for the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.workspace_containers",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        # ``containers_in_use`` / ``containers_available`` stay manager-derived
+        # and are DEFINED over the session/agent-visible set only:
+        # ``ContainerManager.list_containers()`` deliberately hides resource
+        # containers, so these two numbers are NOT the panel's row count.  The
+        # separate entries-derived ``containers_listed`` (in the return below)
+        # is the count of the reconciled entries the panel actually renders.
+        live = manager.list_containers() or []
+        containers_in_use = len(live)
+        # Session container cap: ContainerManager.max_containers (workspace
+        # config.json, default 6; clamped >= 1, mirroring
+        # ContainerManager._get_max_containers()).
+        raw_cap = getattr(manager, "max_containers", 6)
+        try:
+            cap = max(1, int(raw_cap))
+        except (TypeError, ValueError):
+            cap = 6
+        # Best-effort extension: a record-store failure must never sink the
+        # legacy keys -- they are always returned and the flat entry list
+        # degrades to [].
+        try:
+            containers = _build_container_view_entries(manager, workspace_id)
+        except Exception as exc:
+            log("ERROR", "server.workspace_containers",
+                f"Container-view entries failed: {exc}")
+            containers = []
+        return {
+            "containers": containers,
+            # Entries-derived: how many rows the panel renders (record-derived
+            # entries + recordless live containers).  Distinct from the
+            # manager-derived pair above; the two intentionally differ whenever
+            # a resource container (hidden by ``list_containers()``) is listed.
+            "containers_listed": len(containers),
+            "containers_in_use": containers_in_use,
+            "containers_available": max(0, cap - containers_in_use),
+        }
+    except Exception as exc:
+        log("ERROR", "server.workspace_containers", f"List failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+
+@app.get("/api/workspace/{workspace_id}/containers/{container_name}/status")
+def workspace_container_status(workspace_id: str, container_name: str,
+                               workspace_path: str = ""):
+    """Report status for a single named container in the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_status",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        container_id = _find_container_id(manager, container_name)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_status",
+            f"Container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if container_id is None:
+        return _json_error(f"container '{container_name}' not found",
+                           status_code=404)
+    try:
+        data = manager.status(container_id)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_status",
+            f"Status failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    # Three-state hardening-conformance verdict (read-only).  If the container
+    # object cannot be obtained the verdict is "unverified" -- fail-closed,
+    # never "conformant" -- and the status response is never turned into 5xx.
+    try:
+        container = manager.client.containers.get(container_id)
+    except Exception:
+        container = None
+    data["hardening"] = _hardening_json(container)
+    return data
+
+
+@app.post("/api/workspace/{workspace_id}/containers/{container_name}/start")
+def workspace_container_start(request: Request, workspace_id: str,
+                              container_name: str,
+                              workspace_path: str = "",
+                              body: Optional[dict] = Body(default=None)):
+    """Start (or reuse) the named container in the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_start",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    note = (body or {}).get("note") if isinstance(body, dict) else None
+    try:
+        result = manager.start(name=container_name, note=note)
+        if isinstance(result, dict) and result.get("error"):
+            return _json_error(result["error"], status_code=409)
+        return result
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_start",
+            f"Start failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+
+@app.post("/api/workspace/{workspace_id}/containers/{container_name}/stop")
+def workspace_container_stop(request: Request, workspace_id: str,
+                             container_name: str,
+                             workspace_path: str = ""):
+    """Stop the named container in the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_stop",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        container_id = _find_container_id(manager, container_name)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_stop",
+            f"Container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if container_id is None:
+        return _json_error(f"container '{container_name}' not found",
+                           status_code=404)
+    try:
+        result = manager.stop(container_id)
+        if result.get("status") == "missing":
+            return _json_error(result.get("error", "container not found"),
+                               status_code=404)
+        if result.get("status") == "error":
+            return _json_error(result.get("error", "stop failed"),
+                               status_code=503)
+        return result
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_stop",
+            f"Stop failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+
+@app.delete("/api/workspace/{workspace_id}/containers/{container_name}")
+def workspace_container_delete(request: Request, workspace_id: str,
+                               container_name: str,
+                               workspace_path: str = ""):
+    """Remove the named container in the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_delete",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        container_id = _find_container_id(manager, container_name)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_delete",
+            f"Container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if container_id is None:
+        return _json_error(f"container '{container_name}' not found",
+                           status_code=404)
+    try:
+        result = manager.remove(container_id)
+        if result.get("status") == "missing":
+            return _json_error(result.get("error", "container not found"),
+                               status_code=404)
+        if result.get("status") == "error":
+            return _json_error(result.get("error", "remove failed"),
+                               status_code=503)
+        return result
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_delete",
+            f"Remove failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Container-record user actions (RECORD-keyed): kill / restart / recreate
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# These routes act on a durable container *record* keyed by its stable
+# ``record_id`` within a workspace -- NOT on a container *name*. They are
+# purely additive: the name-keyed start/stop/delete routes above are untouched.
+#
+# Every action is attributed (``X-Actor`` header; a body ``actor`` wins),
+# gated by the workspace permission ceiling (fail-closed) and audited as
+# ``RECORD_USER_ACTION`` on both the container-manager audit channel and the
+# record's own event log. All guards run BEFORE any Docker call.
+
+#: Request header carrying the acting principal; a body ``actor`` overrides it.
+USER_ACTION_ACTOR_HEADER = "X-Actor"
+
+#: Actor token grammar. ``actor`` is attribution, not authentication -- it
+#: names the caller for the audit trail and never authorises anything.
+_USER_ACTION_ACTOR_RE = re.compile(r"^[A-Za-z0-9._@:-]+$")
+_USER_ACTION_ACTOR_MAX = 64
+
+
+def _resolve_actor(request: Request, body: Optional[dict]):
+    """Resolve the acting principal (fail-closed): attribution, not authentication.
+
+    A non-empty body ``actor`` OVERRIDES the ``X-Actor`` header. Returns
+    ``(actor, None)`` or ``(None, <JSONResponse>)`` on a missing (401) /
+    malformed (400) token.
+    """
+    raw = None
+    if isinstance(body, dict):
+        candidate = body.get("actor")
+        if isinstance(candidate, str) and candidate.strip():
+            raw = candidate.strip()
+    if raw is None:
+        header = request.headers.get(USER_ACTION_ACTOR_HEADER)
+        if header and header.strip():
+            raw = header.strip()
+    if raw is None:
+        return None, _json_error(
+            f"actor required (body 'actor' or '{USER_ACTION_ACTOR_HEADER}' header)",
+            status_code=401)
+    if len(raw) > _USER_ACTION_ACTOR_MAX or not _USER_ACTION_ACTOR_RE.match(raw):
+        return None, _json_error(
+            "actor malformed (allowed [A-Za-z0-9._@:-], max 64 chars)",
+            status_code=400)
+    return raw, None
+
+
+def _container_write_allowed(workspace_id: str):
+    """Return ``(allowed, reason)`` for a container write in *workspace_id*.
+
+    HTTP carries no session object, so the workspace permission ceiling
+    (``config.json['permissions']['container']``, purpose preset as fallback)
+    is the sole positive authority and the session profile is the SAFE default
+    (``container=False``). An unset/malformed ceiling therefore DENIES, and any
+    error resolving it also denies (fail-closed).
+    """
+    try:
+        from security.security_gate import check_atomic_operation
+        from web_ui.backend.config_manager import _load_workspace_permission_ceiling
+
+        ceiling = _load_workspace_permission_ceiling(workspace_id) or {}
+        effective = {"container": ceiling.get("container", False)}
+        if check_atomic_operation(
+            "container:write", effective, "container_records_user_action"
+        ):
+            return True, "allowed"
+        return False, "workspace does not grant the container category"
+    except Exception as exc:
+        return False, f"permission check failed: {exc}"
+
+
+#: The closed vocabulary of ``decision`` values the record-user-action handler
+#: may emit (on BOTH audit channels). Single source of truth so a stray literal
+#: is a review-time/typo signal rather than silent drift.
+VALID_DECISIONS = frozenset({"applied", "denied", "conflict", "error"})
+
+
+def _audit_record_user_action(workspace_id, record_id, actor, action, decision,
+                              reason, previous_docker_id, new_docker_id):
+    """Emit ``RECORD_USER_ACTION`` on BOTH audit channels for one attempt.
+
+    (i) the container-manager audit channel, best-effort (a failure here never
+    fails the request); (ii) the record's own event log via
+    ``container_record.api.append_event`` -- MANDATORY, so a failure raises to
+    the caller, which turns a persistent-store failure into a 500.
+    """
+    if decision not in VALID_DECISIONS:
+        raise ValueError(
+            f"invalid record-user-action decision {decision!r}; expected one "
+            f"of {sorted(VALID_DECISIONS)}")
+    detail = (f"actor={actor} action={action} decision={decision} "
+              f"workspace_id={workspace_id} record_id={record_id} "
+              f"previous_docker_id={previous_docker_id!r} "
+              f"new_docker_id={new_docker_id!r} reason={reason!r}")
+    try:
+        from infra import container_manager as _container_manager_module
+
+        _container_manager_module._audit("RECORD_USER_ACTION", detail)
+    except Exception:
+        pass
+
+    from thoughtmachine.container_record import api as _cr_api
+    from thoughtmachine.container_record.models import iso_now
+
+    return _cr_api.append_event(
+        workspace_id, record_id, "RECORD_USER_ACTION", actor,
+        action=action, decision=decision, reason=reason,
+        previous_docker_id=previous_docker_id, new_docker_id=new_docker_id,
+        at=iso_now(),
+    )
+
+
+def _record_user_action(record_id: str, action: str, request: Request,
+                        workspace_id: Optional[str], body: Optional[dict]):
+    """Shared handler for the record-keyed kill/restart/recreate endpoints."""
+    # Guard 1 -- workspace_id is required.
+    if not workspace_id or not workspace_id.strip():
+        return _json_error("workspace_id query parameter is required",
+                           status_code=400)
+
+    # Guard 2 -- attribution (fail-closed).
+    actor, actor_error = _resolve_actor(request, body)
+    if actor_error is not None:
+        return actor_error
+    reason = ""
+    if isinstance(body, dict) and isinstance(body.get("reason"), str):
+        reason = body["reason"]
+
+    from thoughtmachine.container_record import api as _cr_api
+
+    # Guard 3 -- resolve the record. Wrong workspace -> 403, unknown -> 404.
+    try:
+        record = _cr_api.load_record(workspace_id, record_id)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action", f"record load failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if record is None:
+        try:
+            elsewhere = _cr_api.find_by_docker_label(record_id)
+        except Exception:
+            elsewhere = None
+        if elsewhere is not None:
+            return _json_error(
+                f"record '{record_id}' does not belong to workspace "
+                f"'{workspace_id}'", status_code=403)
+        return _json_error(f"record '{record_id}' not found", status_code=404)
+
+    # Guard 4 -- permission gate (fail-closed). Denied attempts are audited.
+    allowed, deny_reason = _container_write_allowed(workspace_id)
+    if not allowed:
+        try:
+            _audit_record_user_action(workspace_id, record_id, actor, action,
+                                      "denied", deny_reason, record.docker_id,
+                                      record.docker_id)
+        except Exception as exc:
+            log("ERROR", "server.record_user_action",
+                f"denied-attempt audit failed: {exc}")
+            return _json_error(f"audit write failed: {exc}", status_code=500)
+        return JSONResponse({"error": deny_reason, "code": "permission_denied"},
+                            status_code=403)
+
+    # Guard 5 -- build the container manager.
+    try:
+        manager = _make_container_manager(workspace_id)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+
+    # Guard 6 -- resolve the container handle + record identity (state conflict).
+    if not record.name:
+        return _json_error("record has no container name", status_code=409)
+    try:
+        container_id = _find_container_id(manager, record.name)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action",
+            f"container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    container_id = container_id or record.docker_id or None
+    if not container_id:
+        return _json_error("record has no bound container", status_code=409)
+
+    previous_docker_id = container_id
+
+    def _audit(decision, new_id):
+        return _audit_record_user_action(workspace_id, record_id, actor, action,
+                                         decision, reason, previous_docker_id,
+                                         new_id)
+
+    def _fail(result, default_msg):
+        """Map a manager 'error' result to a 503 (audited); else ``None``."""
+        if isinstance(result, dict) and result.get("status") == "error":
+            try:
+                _audit("error", previous_docker_id)
+            except Exception as exc:
+                return _json_error(f"audit write failed: {exc}", status_code=500)
+            return _json_error(result.get("error", default_msg), status_code=503)
+        return None
+
+    # Guard 7 -- Docker action (all guards complete).
+    try:
+        if action == "kill":
+            # kill = stop with kill fallback (ContainerManager.stop escalates
+            # to container.kill() when a graceful stop does not take).
+            stop_result = manager.stop(container_id)
+            conflict = _fail(stop_result, "kill failed")
+            if conflict is not None:
+                return conflict
+            if isinstance(stop_result, dict) and stop_result.get("status") == "missing":
+                return _json_error(stop_result.get("error", "container not found"),
+                                   status_code=409)
+            new_docker_id = previous_docker_id
+        else:
+            # Origin attribution, read ONCE and BEFORE the pre-step below: the
+            # pre-step destroys the container handle this rebuild replaces
+            # (``restart`` stops it, ``recreate`` removes it), and
+            # ``thoughtmachine.created_by`` lives ONLY on the live container --
+            # so re-deriving it afterwards would stamp the acting operator on
+            # an agent-created container and lose its origin for good.
+            preserved_created_by = _original_created_by(manager, container_id,
+                                                        actor)
+            if action == "restart":
+                pre_result = manager.stop(container_id)
+            else:  # recreate
+                # Recreate = remove + start: the SAME record is rebound to the
+                # fresh container below, so the removal must NOT reap it.
+                pre_result = manager.remove(container_id, keep_record=True)
+            conflict = _fail(pre_result, f"{action} failed")
+            if conflict is not None:
+                return conflict
+            # restart/recreate start through the REAL name-index path; the
+            # record_id stays stable across the whole operation.
+            start_result = manager.start(
+                name=record.name, note=record.notes,
+                allow_fresh=(action == "recreate"),
+                created_by=preserved_created_by,
+                **_recorded_envelope(getattr(record, "intent_snapshot", None)))
+            if isinstance(start_result, dict) and start_result.get("error"):
+                try:
+                    _audit("conflict", None)
+                except Exception as exc:
+                    return _json_error(f"audit write failed: {exc}",
+                                       status_code=500)
+                return _json_error(start_result["error"], status_code=409)
+            rebuilt_id = (start_result or {}).get("id")
+            if not rebuilt_id:
+                # The previous container is already gone: falling back to
+                # previous_docker_id would rebind the record to a dead handle
+                # and audit the operation as applied.
+                try:
+                    _audit("error", previous_docker_id)
+                except Exception as exc:
+                    return _json_error(f"audit write failed: {exc}",
+                                       status_code=500)
+                return _json_error(
+                    f"{action} did not return a container id", status_code=503)
+            new_docker_id = rebuilt_id
+            # Rebind the record's container handle + observed state.
+            try:
+                _cr_api.update_record(workspace_id, record_id,
+                                      docker_id=new_docker_id, state="running")
+            except Exception as exc:
+                log("ERROR", "server.record_user_action",
+                    f"record rebind failed: {exc}")
+                return _json_error(str(exc), status_code=503)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action", f"{action} failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+    # MANDATORY audit on the record's event log (raises -> 500).
+    try:
+        _audit("applied", new_docker_id)
+    except Exception as exc:
+        log("ERROR", "server.record_user_action",
+            f"applied-attempt audit failed: {exc}")
+        return _json_error(f"audit write failed: {exc}", status_code=500)
+
+    # Read-back: same shape as GET /api/container-records/{record_id}.
+    from thoughtmachine.container_record import api as _cr_api
+
+    record_after = _cr_api.load_record(workspace_id, record_id)
+    if record_after is None:
+        return _json_error("record disappeared during action", status_code=500)
+    try:
+        _cr_api.read_event_log(workspace_id, record_id)
+    except Exception:
+        pass
+    return JSONResponse(_serialise(record_after, workspace_id))
+
+
+@app.post("/api/container-records/{record_id}/kill")
+def container_record_kill(record_id: str, request: Request,
+                          workspace_id: Optional[str] = None,
+                          body: Optional[dict] = Body(default=None)):
+    """Kill the record's container (stop; escalates to Docker kill)."""
+    return _record_user_action(record_id, "kill", request, workspace_id, body)
+
+
+@app.post("/api/container-records/{record_id}/restart")
+def container_record_restart(record_id: str, request: Request,
+                             workspace_id: Optional[str] = None,
+                             body: Optional[dict] = Body(default=None)):
+    """Restart the record's container (stop then start via the name index)."""
+    return _record_user_action(record_id, "restart", request, workspace_id, body)
+
+
+@app.post("/api/container-records/{record_id}/recreate")
+def container_record_recreate(record_id: str, request: Request,
+                              workspace_id: Optional[str] = None,
+                              body: Optional[dict] = Body(default=None)):
+    """Recreate the record's container (remove then start via the name index)."""
+    return _record_user_action(record_id, "recreate", request, workspace_id, body)
+
+
+#: Accepted container-view action verbs, mapped to their canonical operation.
+#: ``start`` is an alias of ``restart`` (there is no distinct "create" verb).
+_CONTAINER_VIEW_ACTIONS = {
+    "stop": "stop",
+    "start": "restart",
+    "restart": "restart",
+    "remove": "remove",
+}
+
+#: Lifecycle classes the container-view ``remove`` action may reap. An
+#: ALLOW-list, not a deny-list: ``resource`` is operator-managed outside this
+#: route, ``service`` has no producers yet, and an unknown / blank class is
+#: refused rather than guessed at. Anything absent from this set is refused
+#: BEFORE a manager is built, so no Docker verb is ever reached.
+_CONTAINER_REMOVE_ALLOWED_CLASSES = frozenset({"ephemeral", "persistent"})
+
+
+def _delete_container_record_if_present(cr_api, workspace_id: str,
+                                        record_id: str) -> None:
+    """Delete a container record, tolerating one the manager already reaped.
+
+    ``ContainerManager.remove`` reaps the bound record itself
+    (``_reap_bound_record`` does not gate on ``own_lifecycle`` for the
+    ``ephemeral`` / ``persistent`` classes), so by the time this route deletes
+    the record it may already be gone. ``api.delete_record`` raises
+    :class:`RecordNotFound` in that case, which is NOT an error for a removal
+    that just succeeded -- swallowing it keeps a successful remove from being
+    reported as a 503. Every other failure still propagates.
+    """
+    try:
+        cr_api.delete_record(workspace_id, record_id)
+    except cr_api.RecordNotFound:
+        return
+
+
+@app.post("/api/workspace/{workspace_id}/containers/{record_id}/action")
+def workspace_container_action(workspace_id: str, record_id: str,
+                               request: Request,
+                               body: Optional[dict] = Body(default=None)):
+    """Apply a lifecycle action to a workspace container record.
+
+    Body ``{"action": "stop"|"start"|"restart"|"remove"}``. ``start`` is an
+    alias of ``restart`` (reported as such). ``remove`` is an ALLOW-list
+    decision: only ``ephemeral`` and ``persistent`` records may be removed;
+    every other class (``resource``, ``service``, or an unknown / blank one)
+    is refused with 403 ``permission_denied``. The response is the same entry
+    shape the container-view GET emits.
+
+    restart semantics: ephemeral -> stop then start (``allow_fresh=False``);
+    every other class -> remove then start (``allow_fresh=True``, i.e. a
+    recreate).
+
+    acting identity: ``_resolve_actor`` is ATTRIBUTION, not authentication.
+    It only requires a present, well-formed token (401 when absent, 400 when
+    malformed) and never compares the name against anything, so there is no
+    caller-name gate on this route. The operator-only property of a
+    ``persistent`` record therefore comes from surface separation, not from a
+    check here: agent sessions do not reach this HTTP API at all, and the
+    agent's own remove path (``ContainerRemoveTool``) refuses ``persistent``
+    containers outright under the interim rule ("Persistent containers can
+    only be removed by the operator"). The ``actor`` value labels who to
+    blame in the audit trail; it authorises nothing.
+    """
+    actor, actor_error = _resolve_actor(request, body)
+    if actor_error is not None:
+        return actor_error
+    raw_action = body.get("action") if isinstance(body, dict) else None
+    if raw_action not in _CONTAINER_VIEW_ACTIONS:
+        return _json_error(
+            "action must be one of stop, start, restart, remove",
+            status_code=400)
+    action = _CONTAINER_VIEW_ACTIONS[raw_action]
+
+    from thoughtmachine.container_record import api as _cr_api
+
+    try:
+        record = _cr_api.load_record(workspace_id, record_id)
+    except Exception as exc:
+        return _json_error(str(exc), status_code=503)
+    if record is None:
+        return _json_error(f"record '{record_id}' not found", status_code=404)
+
+    lifecycle = getattr(record, "lifecycle_class", "") or ""
+    is_runtime = lifecycle != "ephemeral"
+
+    # remove is an ALLOW-list decision: only the classes this surface knows how
+    # to reap (ephemeral session containers and persistent workspace
+    # containers) may be removed. ``resource`` is operator-managed outside this
+    # route, ``service`` has no producers yet, and an unknown / blank class is
+    # refused rather than guessed at. Refuse BEFORE building the manager so no
+    # Docker verb is ever reached for a forbidden action.
+    if action == "remove" and lifecycle not in _CONTAINER_REMOVE_ALLOWED_CLASSES:
+        return JSONResponse(
+            {"error": "removing a container with lifecycle class "
+                      f"'{lifecycle or 'unclassified'}' is not permitted",
+             "code": "permission_denied"},
+            status_code=403)
+
+    allowed, deny_reason = _container_write_allowed(workspace_id)
+    if not allowed:
+        return JSONResponse({"error": deny_reason, "code": "permission_denied"},
+                            status_code=403)
+
+    try:
+        manager = _make_container_manager(workspace_id)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_action",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+
+    container_id = _view_action_container_id(manager, record)
+
+    try:
+        if action == "stop":
+            if container_id:
+                manager.stop(container_id)
+            _cr_api.update_record(workspace_id, record_id, state="stopped")
+        elif action == "remove":
+            if container_id:
+                # ``ContainerManager.remove`` reaps the bound record as part of
+                # the removal, so the delete below is a no-op safety net rather
+                # than the primary one.
+                manager.remove(container_id)
+            _delete_container_record_if_present(_cr_api, workspace_id,
+                                               record_id)
+            return JSONResponse({"id": record_id, "removed": True})
+        else:  # restart (start is an alias)
+            # Delegate the Docker verb to the record-keyed handler
+            # (kill/restart/recreate) so the two surfaces cannot drift: a
+            # non-ephemeral container is recreated (allow_fresh=True), an
+            # ephemeral one is restarted (stop + start, allow_fresh=False).
+            # The delegated response is discarded -- this route emits the
+            # container-view entry shape below.
+            delegate_action = "recreate" if is_runtime else "restart"
+            resp = _record_user_action(record_id, delegate_action, request,
+                                       workspace_id, body)
+            if getattr(resp, "status_code", 200) >= 400:
+                return resp
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_action",
+            f"{action} failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+    record_after = _cr_api.load_record(workspace_id, record_id)
+    if record_after is None:
+        return _json_error("record disappeared during action", status_code=500)
+    return JSONResponse(
+        _container_view_entry(record_after, manager, workspace_id))
+
+
+#: Units accepted by :func:`_parse_mem_limit` -> byte multiplier.  This is
+#: Docker's own ``mem_limit`` grammar; the trailing ``b`` is optional
+#: (``512m`` and ``512mb`` are the same limit).
+_MEM_LIMIT_UNITS = {
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "m": 1024 ** 2,
+    "mb": 1024 ** 2,
+    "g": 1024 ** 3,
+    "gb": 1024 ** 3,
+}
+
+#: Explicit digit set: ``str.isdigit`` also accepts non-ASCII digits, which the
+#: daemon does not.
+_MEM_LIMIT_DIGITS = "0123456789"
+
+#: Docker's hard minimum container memory.  The daemon refuses anything smaller
+#: with ``APIError 400 "Minimum memory limit allowed is 6MB"`` -- and it only
+#: says so at ``containers.run()``, i.e. AFTER the resize route has already
+#: destroyed the previous container.  Rejecting the value here keeps that
+#: failure on the request side of the destroy.
+_MIN_MEM_LIMIT_BYTES = 6 * 1024 * 1024          # 6_291_456
+
+
+def _parse_mem_limit(value):
+    """Normalise a ``mem_limit`` string to a byte count, or ``None`` if invalid.
+
+    Accepted (case-insensitive, surrounding whitespace ignored): a plain integer
+    byte count (``"1073741824"``), or a number with a unit -- ``b``/``k``/``m``/
+    ``g``, optionally followed by ``b`` (``"512m"``, ``"1g"``, ``"2gb"``,
+    ``"512MB"``).  A unit accepts ONE optional decimal fraction (``"1.5g"``).
+    Rejected: an empty string, a negative value, prose (``"banana"``), trailing
+    junk (``"1g extra"``), and a bare fraction with no unit (``"1.5"``).
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if not text:
+        return None
+    # Split the numeric prefix from the unit suffix without regex guesswork:
+    # scan the explicit digit set and allow at most one '.'.
+    end = 0
+    seen_dot = False
+    for ch in text:
+        if ch in _MEM_LIMIT_DIGITS:
+            end += 1
+        elif ch == "." and not seen_dot:
+            seen_dot = True
+            end += 1
+        else:
+            break
+    number = text[:end]
+    unit = text[end:]
+    if unit and unit not in _MEM_LIMIT_UNITS:
+        return None
+    multiplier = _MEM_LIMIT_UNITS.get(unit, 1)
+    if "." in number:
+        # A fraction is only meaningful with a unit (``1.5g``); bytes must be
+        # integral, and both sides of the '.' must be present.
+        if not unit:
+            return None
+        whole, _, frac = number.partition(".")
+        if not whole or not frac:
+            return None
+        return (int(whole) * multiplier
+                + int(frac) * multiplier // (10 ** len(frac)))
+    if not number:
+        return None
+    return int(number) * multiplier
+
+
+@app.patch("/api/workspace/{workspace_id}/containers/{record_id}/resources")
+def workspace_container_resources(workspace_id: str, record_id: str,
+                                  request: Request,
+                                  body: Optional[dict] = Body(default=None)):
+    """Edit a record's resource limits by recreating the container.
+
+    Body ``{"mem_limit"?: str, "cpu_quota"?: int}`` -- at least one required.
+    Applies to BOTH ephemeral and persistent containers (an ephemeral edit is
+    NOT refused): the record's ``intent_snapshot`` is updated, then the
+    container is removed and started fresh (``allow_fresh=True``). The record
+    ``id`` stays stable across the recreate; the response is the same entry
+    shape the container-view GET emits.
+    """
+    actor, actor_error = _resolve_actor(request, body)
+    if actor_error is not None:
+        return actor_error
+    if not isinstance(body, dict):
+        return _json_error("request body must be a JSON object", status_code=400)
+
+    updates = {}
+    if "mem_limit" in body:
+        updates["mem_limit"] = body["mem_limit"]
+    if "cpu_quota" in body:
+        updates["cpu_quota"] = body["cpu_quota"]
+    if not updates:
+        return _json_error(
+            "at least one of mem_limit, cpu_quota is required",
+            status_code=400)
+
+    from thoughtmachine.container_record import api as _cr_api
+    from thoughtmachine.container_record import rebuild_config_from_snapshot
+
+    try:
+        record = _cr_api.load_record(workspace_id, record_id)
+    except Exception as exc:
+        return _json_error(str(exc), status_code=503)
+    if record is None:
+        return _json_error(f"record '{record_id}' not found", status_code=404)
+
+    allowed, deny_reason = _container_write_allowed(workspace_id)
+    if not allowed:
+        return JSONResponse({"error": deny_reason, "code": "permission_denied"},
+                            status_code=403)
+
+    try:
+        manager = _make_container_manager(workspace_id)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_resources",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+
+    # Validate the requested limits BEFORE anything is persisted and before the
+    # old container is destroyed: the record is updated and the container removed
+    # below, so an invalid value would otherwise reach Docker only AFTER the
+    # container was already gone (leaving a record claiming limits never applied).
+    if "cpu_quota" in updates:
+        cpu_quota = updates["cpu_quota"]
+        if (isinstance(cpu_quota, bool) or not isinstance(cpu_quota, int)
+                or cpu_quota < 0):
+            return _json_error("cpu_quota must be a non-negative integer",
+                               status_code=400)
+    if "mem_limit" in updates:
+        # Parse ONCE and compare with ``is None``: ``_parse_mem_limit("0")``
+        # legitimately returns 0, so a truthiness test would let "0" through.
+        _mem_bytes = _parse_mem_limit(updates["mem_limit"])
+        if _mem_bytes is None:
+            return _json_error(
+                f"invalid mem_limit {updates['mem_limit']!r}: expected an "
+                "integer byte count (e.g. '1073741824') or a number with a "
+                "unit b/k/m/g (e.g. '512m', '1g', '2gb')",
+                status_code=400)
+        if _mem_bytes < _MIN_MEM_LIMIT_BYTES:
+            return _json_error(
+                f"mem_limit {updates['mem_limit']!r} "
+                f"({_mem_bytes} bytes) is below the Docker minimum of 6MB "
+                f"({_MIN_MEM_LIMIT_BYTES} bytes); use e.g. '6m' or '64m'",
+                status_code=400)
+
+    container_id = _view_action_container_id(manager, record)
+
+    # Recovered ONCE, and BEFORE the destroy below: ``remove()`` drops the handle
+    # to the live container, after which the label is unreadable.  Both recreate
+    # attempts (the edit and the ``_resize_failed`` recovery) stamp this value.
+    original_created_by = _original_created_by(manager, container_id, actor)
+
+    prev_snapshot = dict(getattr(record, "intent_snapshot", None) or {})
+    prev_docker_id = getattr(record, "docker_id", "") or ""
+    snapshot = dict(prev_snapshot)
+    snapshot.update(updates)
+
+    def _resize_failed(cause, status_code):
+        """Restore the record to its pre-edit intent, then try to rebuild.
+
+        Called only AFTER step 1 (persist) may have run, so the restore is
+        unconditional: rewriting ``prev_snapshot`` is a no-op when the write
+        never happened.  Never raises -- the caller's error response matters
+        more than the recovery.
+        """
+        try:
+            _cr_api.update_record(workspace_id, record_id,
+                                  intent_snapshot=prev_snapshot)
+        except Exception as exc:
+            log("ERROR", "server.workspace_container_resources",
+                f"could not restore intent_snapshot on record {record_id}: {exc}")
+
+        # One best-effort rebuild with the PREVIOUS limits.  `start` re-reads
+        # intent_snapshot from the record, so the restore above is what makes
+        # this start use the old values.  The container this rollback replaces
+        # was created by ``original_created_by`` (recovered before the destroy),
+        # so the rebuild keeps that origin rather than the acting operator.
+        try:
+            restored = manager.start(name=record.name, note=record.notes,
+                                     allow_fresh=True,
+                                     created_by=original_created_by,
+                                     **_recorded_envelope(prev_snapshot))
+        except Exception as exc:
+            restored = {"error": str(exc)}
+        restored_id = ((restored or {}).get("id")
+                       if isinstance(restored, dict) else None)
+        if restored_id:
+            try:
+                _cr_api.update_record(workspace_id, record_id,
+                                      docker_id=restored_id, state="running")
+            except Exception as exc:
+                log("ERROR", "server.workspace_container_resources",
+                    f"rebound record {record_id} could not be updated: {exc}")
+            outcome = "previous limits restored"
+        else:
+            err = ((restored or {}).get("error")
+                   if isinstance(restored, dict) else restored)
+            try:
+                # Unbind rather than point at a destroyed container: the record
+                # then reads as "no container" instead of "container that
+                # vanished", which the orphan sweeper treats far more kindly.
+                _cr_api.update_record(workspace_id, record_id,
+                                      docker_id=None, state="error")
+            except Exception:
+                pass
+            outcome = f"container NOT restored: {err}"
+
+        try:
+            from infra import container_manager as _container_manager_module
+
+            _container_manager_module._audit(
+                "CONTAINER_RESIZE_FAILED",
+                f"workspace_id={workspace_id} record_id={record_id} "
+                f"name={record.name!r} requested={updates!r} "
+                f"previous={prev_snapshot!r} previous_docker_id={prev_docker_id!r} "
+                f"cause={cause!r} outcome={outcome}")
+        except Exception:
+            pass
+
+        return _json_error(f"resource edit failed: {cause}; {outcome}",
+                           status_code=status_code)
+
+    try:
+        # Ordering matters: persist the new intent FIRST so a container that
+        # starts below reads the updated limits from its record. Removing the
+        # old container and rebinding the record's docker_id happen afterwards.
+        _cr_api.update_record(workspace_id, record_id, intent_snapshot=snapshot)
+        if container_id:
+            # keep_record=True: the record (and the intent just written) must
+            # survive the remove -- a bare remove() reaps a non-resource record.
+            # audit_reason/audit_source: a resize destroy is NOT a user removal.
+            pre = manager.remove(
+                container_id, keep_record=True,
+                audit_reason="resize_recreate",
+                audit_source="server.workspace_container_resources")
+            if isinstance(pre, dict) and pre.get("status") == "error":
+                return _resize_failed(pre.get("error", "remove failed"), 503)
+        start_result = manager.start(name=record.name, note=record.notes,
+                                     allow_fresh=True,
+                                     created_by=original_created_by,
+                                     **_recorded_envelope(snapshot))
+        if isinstance(start_result, dict) and start_result.get("error"):
+            return _resize_failed(start_result["error"], 400)
+        new_docker_id = (start_result or {}).get("id") or container_id
+        _cr_api.update_record(workspace_id, record_id,
+                              docker_id=new_docker_id, state="running")
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_resources",
+            f"resource edit failed: {exc}")
+        # A daemon-side rejection (docker APIError 400) is a bad REQUEST, not a
+        # server fault: report 400 so clients stop retrying the same value.
+        _sc = 400 if getattr(exc, "status_code", None) == 400 else 503
+        return _resize_failed(str(exc), _sc)
+
+    record_after = _cr_api.load_record(workspace_id, record_id)
+    if record_after is None:
+        return _json_error("record disappeared during action", status_code=500)
+    return JSONResponse(
+        _container_view_entry(record_after, manager, workspace_id))
+
+
+# Container logs: upper bound on ``tail`` accepted by the REST route. The
+# ContainerLogsTool imposes no upper bound, so the route clamps defensively
+# to keep a single request from streaming an unbounded number of lines.
+_CONTAINER_LOGS_MAX_TAIL = 10000
+
+
+@app.get("/api/workspace/{workspace_id}/containers/{container_name}/logs")
+def workspace_container_logs(workspace_id: str, container_name: str,
+                             workspace_path: str = "",
+                             tail: int = 200):
+    """Fetch the stdout/stderr logs of a single named container.
+
+    Mirrors the ContainerLogsTool payload shape
+    (``success``/``stdout``/``stderr``/``duration``) and adds the requested
+    ``container`` name. ``tail`` defaults to 200 and is clamped to
+    ``_CONTAINER_LOGS_MAX_TAIL``; negative values are rejected.
+    """
+    if tail < 0:
+        return _json_error("tail must be >= 0", status_code=400)
+    if tail > _CONTAINER_LOGS_MAX_TAIL:
+        tail = _CONTAINER_LOGS_MAX_TAIL
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_logs",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        container_id = _find_container_id(manager, container_name)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_logs",
+            f"Container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if container_id is None:
+        return _json_error(f"container '{container_name}' not found",
+                           status_code=404)
+    start_time = time.time()
+    try:
+        result = manager.get_logs(container_id=container_id, tail=tail,
+                                  since=None)
+    except RuntimeError as exc:
+        log("ERROR", "server.workspace_container_logs", f"Logs failed: {exc}")
+        status_code = 404 if "not found" in str(exc) else 503
+        return _json_error(str(exc), status_code=status_code)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_logs", f"Logs failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    return {
+        "container": container_name,
+        "success": True,
+        "stdout": result.get("stdout", ""),
+        "stderr": result.get("stderr", ""),
+        "duration": time.time() - start_time,
+    }
+
+
+@app.get("/api/health/containers")
+def health_containers(request: Request):
+    """Report whether the Docker daemon is reachable from the server.
+
+    Returns a structured payload so callers can surface degraded Docker
+    access with an actionable hint instead of a bare status string.
+    The "status" key stays backward compatible ("ok"/"degraded"); the
+    "docker" key carries the dispatch spec:
+      {"available": bool, "reason": str-or-null, "hint": str-or-null,
+       "version": str-or-null, "error": str-or-null}
+    where reason is exactly one of daemon_down | permission_denied |
+    lib_missing | import_failed | docker_host_unreachable, or null when
+    Docker is available.
+    """
+    checked_at = datetime.now(timezone.utc).isoformat()
+    client = None
+    try:
+        import docker as _docker
+        client = _docker.from_env()
+        # Log exactly what endpoint the SDK resolved so CI/doctor runs can
+        # prove DOCKER_HOST was honored (no silent socket fallback).
+        log("INFO", "server.health_containers",
+            f"docker client resolved base_url={client.api.base_url} "
+            f"(DOCKER_HOST={os.environ.get('DOCKER_HOST')!r})")
+        client.ping()
+        version = None
+        try:
+            version = client.version().get("Version")
+        except Exception:
+            version = None
+        log("INFO", "server.health_containers",
+            "Docker daemon reachable"
+            + (f" (version {version})" if version else ""))
+        return {
+            "status": "ok",
+            "docker": {
+                "available": True,
+                "reason": None,
+                "hint": None,
+                "version": version,
+                "error": None,
+            },
+            "checked_at": checked_at,
+        }
+    except ImportError as exc:
+        # Docker SDK missing, or a docker-backed tool failed to import.
+        # Distinguish via the import-failure registry tools/__init__ keeps.
+        reason = "lib_missing"
+        hint = "Install the Docker SDK: .venv/bin/pip install docker"
+        try:
+            import tools
+            failed = [
+                f for f in getattr(tools, "IMPORT_FAILURES", [])
+                if f.get("tool") in ("DockerCodeRunner", "container_control")
+            ]
+            if failed:
+                reason = "import_failed"
+                hint = (
+                    "The Docker tool failed to load: "
+                    f"{failed[0].get('error')} — check the server logs"
+                )
+        except Exception:
+            pass
+        log("ERROR", "server.health_containers",
+            f"Docker SDK unavailable: {exc}")
+        return {
+            "status": "degraded",
+            "docker": {
+                "available": False,
+                "reason": reason,
+                "hint": hint,
+                "version": None,
+                "error": str(exc),
+            },
+            "checked_at": checked_at,
+        }
+    except Exception as exc:
+        msg = str(exc).lower()
+        if isinstance(exc, PermissionError) or "permission denied" in msg:
+            reason = "permission_denied"
+            hint = (
+                "Add your user to the docker group (sudo usermod -aG docker $USER) "
+                "and re-login, or run the server as a docker-group user."
+            )
+        elif any(token in msg for token in (
+                "connection refused", "cannot connect", "socket",
+                "connect", "timeout", "daemon")):
+            reason = "daemon_down"
+            hint = "Start the Docker daemon: sudo systemctl enable --now docker"
+        else:
+            reason = "docker_host_unreachable"
+            hint = (
+                f"Docker host unreachable: {str(exc)[:200]} — "
+                "check DOCKER_HOST and docker context."
+            )
+        log("ERROR", "server.health_containers",
+            f"Docker daemon unreachable: {exc}")
+        return {
+            "status": "degraded",
+            "docker": {
+                "available": False,
+                "reason": reason,
+                "hint": hint,
+                "version": None,
+                "error": str(exc),
+            },
+            "checked_at": checked_at,
+        }
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
 
 @app.get("/")
 async def root():
@@ -1420,269 +6112,25 @@ async def root():
 #  Helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
+def _session_has_conversation(session) -> bool:
+    """Check if a session has an actual conversation (user or assistant messages).
+
+    Returns True if any message in user_history has a 'role' of 'user' or 'assistant'.
+    System notifications (role='system') alone do NOT count as a conversation.
     """
-    Translate frontend config format to AgentConfig format.
-
-    Frontend sends:
-        provider: 'openai' | 'anthropic' | 'local'
-        tools: [{name, enabled}, ...]
-        temperature, max_turns, etc.
-
-    AgentConfig expects:
-        provider_type: 'openai_compatible' | 'anthropic' | 'openai'
-        enabled_tools: ['name1', 'name2', ...]
-    """
-    cfg = dict(fe_config)
-
-    # Map provider names
-    provider_map = {
-        "openai": "openai",
-        "anthropic": "anthropic",
-        "local": "openai_compatible",
-        "openai_compatible": "openai_compatible",
-    }
-    provider = cfg.pop("provider", None)
-    if provider:
-        cfg["provider_type"] = provider_map.get(provider, provider)
-
-    # Translate frontend tools list → backend enabled_tools
-    # Frontend: [{name: "bash", enabled: true}, {name: "file_read", enabled: false}, ...]
-    # Backend:  ["bash", ...]  (only enabled tools)
-    tools_list = cfg.pop("tools", None)
-    if isinstance(tools_list, list):
-        enabled = [t["name"] for t in tools_list if isinstance(t, dict) and t.get("enabled")]
-        if enabled:
-            cfg["enabled_tools"] = enabled
-
-    # Remove any keys that start with _
-    cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
-
-    # ── Whitelist validation for session_permissions ────────────────────
-    # Delegated to coerce_session_permissions() in thoughtmachine/security.py
-    # which rejects any unknown category or invalid level to prevent a
-    # compromised (or malformed) WebSocket message from injecting dangerous
-    # values such as filesystem="full", container=True, network="write".
-    from thoughtmachine.security import coerce_session_permissions
-    cfg["session_permissions"] = coerce_session_permissions(
-        cfg.get("session_permissions", {}),
-    )
-
-    # ── Translate diagnostic log ──────────────────────────────────────
-    log('INFO', 'server.config',
-        f"[TRANSLATE] frontend config: provider={fe_config.get('provider')}, "
-        f"model={fe_config.get('model')}, keys={list(fe_config.keys())}")
-    log('DEBUG', 'server.config',
-        f"[TRANSLATE] full dump: tools_field={fe_config.get('tools')}, "
-        f"enabled_tools_after={cfg.get('enabled_tools')}")
-
-    return cfg
-
-
-def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
-    """Convert bridge's AgentConfig back to frontend config format."""
-    if bridge is None:
-        return _default_frontend_config()
-    from web_ui.backend.bridge import WebAgentBridge
-    cfg = bridge.get_config()
-    if cfg is None:
-        return _default_frontend_config()
-    # Check if API key is configured before stripping it
-    api_key = getattr(cfg, 'api_key', '') or ''
-    if not api_key:
-        import os
-        api_key = os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_COMPATIBLE_API_KEY') or ''
-    api_key_configured = bool(api_key)
-    raw = _config_to_dict(cfg)
-    result = _backend_to_frontend_config(raw)
-    result['api_key_configured'] = api_key_configured
-    return result
-
-
-
-_FALLBACK_FRONTEND_CONFIG = {
-    "base_url": "https://api.deepseek.com/v1/",
-    "model": "deepseek-v4-flash",
-    "provider_type": "openai_compatible",
-    "provider_config": {},
-    "provider_id": "v4_flash",
-    "model_override": None,
-    "temperature": 1.0,
-    "max_turns": 200,
-    "stop_check": None,
-    "system_prompt": None,
-    "api_key_configured": False,
-    "token_monitor_warning_threshold": 60000,
-    "token_monitor_critical_threshold": 75000,
-    "turn_monitor_enabled": True,
-    "enable_logging": True,
-    "log_dir": "./logs",
-    "log_level": "INFO",
-    "enable_file_logging": True,
-    "jsonl_format": True,
-    "log_categories": ["SESSION", "LLM", "TOOLS"],
-    "max_file_size_mb": 10,
-    "max_backup_files": 5,
-    "workspace_path": _project_root,
-    # Auto-detected from server.py location at module load time (see line 102)
-    "rag_enabled": False,
-    "rag_embedding_model": "BAAI/bge-small-en-v1.5",
-    "rag_vector_store_path": None,
-    "rag_chunk_size": 1500,
-    "rag_chunk_overlap": 200,
-    "rag_batch_size": 16,
-    "rag_truncate_dim": 256,
-    "kb_enabled": True,
-    "kb_path": None,
-    "tool_output_token_limit": 10000,
-    "detail": "normal",
-    "session_permissions": {
-        "container": False,
-        "network": "banned",
-        "filesystem": "read",
-        "system": "read",
-        "git": "read",
-        "execution": "banned",
-    },
-    "enabled_tools": [
-        "FileEditor",
-        "FilePreviewTool",
-        "DirectoryTreeTool",
-        "GlobTool",
-        "FileSearchTool",
-        "ApplyEdits",
-        "CodeModifier",
-        "RefactorTool",
-        "DateTimeTool",
-        "DirectoryCreator",
-        "DockerCodeRunner",
-        "FieldViewer",
-        "FileMover",
-        "FileSummaryTool",
-        "Final",
-        "FinalReport",
-        "GitInfoTool",
-        "KnowledgeBaseTool",
-        "MCPValidator",
-        "PaginateTool",
-        "ProgressReport",
-        "RequestUserInteraction",
-        "SummarizeTool",
-        "Thought"
-    ],
-}
-
-
-def _load_global_defaults() -> Dict[str, Any]:
-    """Load global defaults from ~/.thoughtmachine/agent_config.json.
-    Auto-creates the file with sensible defaults on first run."""
-    import json
-    from pathlib import Path
-    config_dir = Path.home() / '.thoughtmachine'
-    config_path = config_dir / 'agent_config.json'
-
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    if config_path.exists():
-        try:
-            with open(config_path) as f:
-                return json.load(f)
-        except Exception:
-            log('ERROR', 'server.config', f'Could not parse {config_path}, using fallback')
-            return dict(_FALLBACK_FRONTEND_CONFIG)
-    else:
-        log('INFO', 'server.config', f'Creating default config at {config_path}')
-        with open(config_path, 'w') as f:
-            json.dump(_FALLBACK_FRONTEND_CONFIG, f, indent=2)
-        return dict(_FALLBACK_FRONTEND_CONFIG)
-
-
-def _backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert backend AgentConfig format to frontend format for WS messages."""
-    cfg = dict(backend)
-    # Map provider_type → provider
-    provider_reverse = {
-        "openai": "openai",
-        "anthropic": "anthropic",
-        "openai_compatible": "local",
-    }
-    provider_type = cfg.pop("provider_type", None)
-    cfg["provider"] = provider_reverse.get(provider_type, "local")
-    # Map enabled_tools → tools list
-    # If the key is missing, leave tools alone (frontend defaults apply).
-    # If it's an explicit empty list, all tools are disabled.
-    if "enabled_tools" in cfg:
-        enabled = cfg.pop("enabled_tools")
-        cfg["tools"] = [{"name": t, "enabled": True} for t in enabled]
-    # Ensure workspace_path is always present.
-    # The bridge config may have workspace_path=None (default), and
-    # _config_to_dict uses exclude_none=True which strips it. Without
-    # this fallback the frontend never receives workspace_path, the
-    # ContainerPanel sends an empty workspace param, and the backend
-    # returns "Container status unavailable".
-    cfg.setdefault("workspace_path", _project_root)
-    return cfg
-
-
-def _default_frontend_config() -> Dict[str, Any]:
-    """Return config in frontend format, merged with global defaults."""
-    defaults = dict(_FALLBACK_FRONTEND_CONFIG)
-    global_defaults = _load_global_defaults()
-    defaults.update(global_defaults)
-    return _backend_to_frontend_config(defaults)
-
-
-def _config_to_dict(cfg) -> Dict[str, Any]:
-    """Convert an AgentConfig to a plain dict for JSON serialization."""
-    if hasattr(cfg, "model_dump"):
-        return cfg.model_dump(exclude={'api_key', 'stop_check'}, exclude_none=True)
-    if hasattr(cfg, "dict"):
-        return cfg.dict()
-    return {k: str(v) for k, v in vars(cfg).items() if not k.startswith("_")}
-
-
-def _atomic_replace(data: dict, dst: str, work_dir: str, retries: int = 3) -> None:
-    """Atomically write *data* as JSON to *dst*, with Windows-safe retries.
-
-    Writes to a temporary file in *work_dir*, then replaces the destination.
-    Retries up to *retries* times on OSError (covers Windows sharing
-    violations from antivirus / file locks).  Falls back to ``shutil.move``
-    if ``os.replace`` fails after all retries.
-    """
-    for attempt in range(1, retries + 2):
-        with tempfile.NamedTemporaryFile(
-            mode='w', delete=False,
-            dir=work_dir,
-            suffix='.tmp',
-            prefix='agent_config_',
-        ) as tmp:
-            json.dump(data, tmp, indent=2, default=str)
-            tmp.flush()
-            tmp_path = tmp.name
-
-        try:
-            os.replace(tmp_path, dst)
-            return  # success
-        except OSError:
-            # Clean up orphaned temp file
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-            if attempt > retries:
-                # Final fallback: try shutil.move (more resilient on Windows)
-                try:
-                    shutil.move(tmp_path, dst)
-                    log('WARNING', 'server.config',
-                        f'_atomic_replace: os.replace failed after {retries} retries, '
-                        f'used shutil.move as fallback')
-                    return
-                except OSError as exc:
-                    raise exc
-
-            # Back off before retrying
-            time.sleep(0.2 * attempt)
+    if session is None:
+        return False
+    try:
+        history = session.user_history
+        if not history:
+            return False
+        for msg in history:
+            role = msg.get('role', '') if isinstance(msg, dict) else ''
+            if role in ('user', 'assistant'):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1690,7 +6138,7 @@ def _atomic_replace(data: dict, dst: str, work_dir: str, retries: int = 3) -> No
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_frontend() -> bool:
-    """Run `npm run build` in the frontend directory.
+    """Run the frontend build (local vite binary when present, else npm).
 
     Returns True if the build succeeded, False otherwise.
     """
@@ -1700,14 +6148,29 @@ def _build_frontend() -> bool:
         return False
 
     log('INFO', 'server', f'Building frontend in {frontend_dir}...')
-    npm_cmd = os.environ.get('TM_NPM_CMD') or 'npm'
+    node_bin_dir = frontend_dir / "node_modules" / ".bin"
+    vite_bin = node_bin_dir / "vite"
+    # Prepend node_modules/.bin so that npm scripts (``sh -c vite``) and any
+    # transitively spawned binaries resolve the project-local executables.
+    build_env = os.environ.copy()
+    build_env["PATH"] = str(node_bin_dir) + os.pathsep + build_env.get("PATH", "")
+    if vite_bin.exists() and os.access(str(vite_bin), os.X_OK):
+        # Invoke the project-local vite binary by absolute path, mirroring
+        # start_thoughtmachine.sh: neither npm nor a PATH lookup is needed.
+        cmd = [str(vite_bin), "build"]
+        log('INFO', 'server', f'Using local vite binary at {vite_bin}')
+    else:
+        npm_cmd = os.environ.get('TM_NPM_CMD') or 'npm'
+        cmd = [npm_cmd, "run", "build"]
+        log('INFO', 'server', f'Using npm build ({npm_cmd} run build)')
     try:
         result = subprocess.run(
-            [npm_cmd, "run", "build"],
+            cmd,
             cwd=str(frontend_dir),
             capture_output=True,
             text=True,
             timeout=120,
+            env=build_env,
         )
         if result.returncode != 0:
             log('ERROR', 'server', f'Frontend build failed:\n{result.stderr}')
@@ -1737,7 +6200,22 @@ def _setup_frontend_serving() -> bool:
     # Always rebuild to prevent stale dist/ from serving old code
     # Vite/Rollup use incremental caching, so subsequent builds are fast.
     dist = _FRONTEND_DIST
-    if not _build_frontend():
+    frontend_dir = dist.parent
+    node_bin_dir = frontend_dir / "node_modules" / ".bin"
+    has_deps = (node_bin_dir / "vite").exists() or node_bin_dir.is_dir()
+    has_dist = (dist / "index.html").exists()
+
+    if os.environ.get("TM_SKIP_FRONTEND_BUILD") == "1":
+        # Explicit kill-switch: never rebuild, serve whatever dist is present.
+        log('INFO', 'server',
+            f'TM_SKIP_FRONTEND_BUILD=1 — skipping frontend rebuild (dist={dist})')
+    elif not has_deps and has_dist:
+        # Dependencies were never installed, but a valid dist already exists:
+        # serve it instead of degrading to the build-error page.
+        log('WARNING', 'server',
+            f'Frontend dependencies not installed in {frontend_dir} — skipping '
+            f'rebuild and serving existing dist at {dist}')
+    elif not _build_frontend():
         log('WARNING', 'server',
             'Frontend build failed — will show build-error page on /')
         return False
@@ -1756,16 +6234,12 @@ def _setup_frontend_serving() -> bool:
     return False
 
 
-def main():
-    """Run the server via `python -m web_ui.backend.server`.
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser (extracted for testability).
 
-    Usage:
-        python -m web_ui.backend.server
-        python -m web_ui.backend.server --serve-frontend
-        python -m web_ui.backend.server --serve-frontend --host 127.0.0.1 --port 8080
+    The default bind host is 127.0.0.1 (loopback only); override with the
+    HOST environment variable or ``--host``.
     """
-    import uvicorn
-
     parser = argparse.ArgumentParser(description="ThoughtMachine Web UI Server")
     parser.add_argument(
         "--serve-frontend",
@@ -1774,8 +6248,17 @@ def main():
     )
     parser.add_argument(
         "--host",
-        default=os.environ.get("HOST", "0.0.0.0"),
-        help="Host to bind to (default: 0.0.0.0)",
+        default=os.environ.get("HOST", "127.0.0.1"),
+        help="Host to bind to (default: 127.0.0.1; override with HOST env var)",
+    )
+    parser.add_argument(
+        "--allow-remote-bind",
+        action="store_true",
+        help=(
+            "INSECURE: accept a non-loopback --host/HOST. The Web UI API is "
+            "unauthenticated, so anything that can reach the port can drive this "
+            "machine's agent. Use only on a network you already trust."
+        ),
     )
     parser.add_argument(
         "--port",
@@ -1789,14 +6272,59 @@ def main():
         default=os.environ.get("RELOAD", "false").lower() == "true",
         help="Enable auto-reload (default: from RELOAD env var)",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    """Run the server via `python -m web_ui.backend.server`.
+
+    Usage:
+        python -m web_ui.backend.server
+        python -m web_ui.backend.server --serve-frontend
+        python -m web_ui.backend.server --serve-frontend --host 127.0.0.1 --port 8080
+
+    The frontend can pass ?project=<path> as a URL query param to select
+    which workspace/project to use (each tab's WebSocket sends it).
+    """
+    import uvicorn
+
+    args = build_parser().parse_args()
+
+    # F30(d): refuse to publish an unauthenticated API on a non-loopback
+    # interface.  Flipping the flag is an auth decision, not a deployment
+    # convenience: the auth boundary is the network boundary, and with the flag
+    # on there is no auth layer, so every client that can route to the port is
+    # treated as the operator, which is false.  The hatch exists anyway because
+    # a blanket refusal with no exception gets deleted the first time someone
+    # needs a LAN demo; an explicit, greppable, loudly announced opt-in keeps
+    # that decision visible in the source and on stderr.
+    host_error = _validate_bind_host(args.host, allow_remote=args.allow_remote_bind)
+    if host_error is not None:
+        print(host_error, file=sys.stderr)
+        print(
+            "ThoughtMachine serves an unauthenticated local API; binding to a "
+            "non-loopback address is refused by default.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if args.allow_remote_bind:
+        print(
+            f"WARNING: --allow-remote-bind is set — binding to {args.host}, so the "
+            f"unauthenticated Web UI API is reachable from every host that can "
+            f"route to this port.",
+            file=sys.stderr,
+        )
+
+    # Rebuild global session registry from disk
+    registry = SessionRegistry.get_default()
+    count = registry.rebuild_from_disk()
+    log('INFO', 'server', f'Rebuilt session registry from disk: {count} sessions found')
 
     if args.serve_frontend:
         _setup_frontend_serving()
 
     log('INFO', 'server',
-        f'Starting ThoughtMachine Web UI on {args.host}:{args.port}')
+        f'Starting ThoughtMachine Web UI on {args.host}:{args.port} — revision {_SERVER_REVISION}')
     # Pass the app OBJECT directly — using the string form would
     # double-import this module, creating a second copy where _SERVE_FRONTEND
     # is still False and the StaticFiles mount is missing.

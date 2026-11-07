@@ -11,8 +11,14 @@ The algorithm:
 2. If count < min_summaries_before_pruning → return copy unchanged.
 3. Find the second-last summary index → this is cut_idx.
 4. Partition: old = user_history[:cut_idx], safe = user_history[cut_idx:].
-5. Walk 'old' and compact turns (user→final or user→last assistant).
+5. Walk 'old' and compact turns (text-only semantics, see _compact_turn).
 6. Return compacted + safe.
+
+Old-region compaction is TEXT-ONLY: assistant messages are kept without
+tool_calls/reasoning_content, and tool results are kept only when their
+call id maps to a Respond-family tool (converted to assistant-style text).
+All messages keep their original in-turn order, which guarantees no
+orphaned tool_call_ids survive into the compacted region.
 """
 
 from __future__ import annotations
@@ -30,6 +36,10 @@ logger = logging.getLogger(__name__)
 FINAL_TOOL_NAMES: Set[str] = {'Final', 'FinalReport', 'RequestUserInteraction'}
 """Tool names that signal the end of a logical turn."""
 
+RESPOND_FAMILY_NAMES: Set[str] = FINAL_TOOL_NAMES | {'Respond'}
+"""Tool names whose outputs are preserved as assistant-style text
+(Respond plus the Final-family tools)."""
+
 # ──────────────────────────────────────────────────────────────────────
 # Policy
 # ──────────────────────────────────────────────────────────────────────
@@ -41,10 +51,12 @@ class PruningPolicy:
 
     Attributes:
         keep_reasoning: If True, keep assistant reasoning_content if present.
-        keep_all_final_turns: If True, keep the full turn that ends with a Final tool.
-        keep_plain_answer_only: If True, for turns without a final tool, keep only
-            the last assistant with content and no tool_calls (plain answer).
-            If False, keep the last assistant with any content (may have tool_calls).
+        keep_all_final_turns: API-compatibility only. The old-region compactor
+            always strips tool_calls from assistant messages, so this flag no
+            longer affects the output.
+        keep_plain_answer_only: API-compatibility only. The old-region compactor
+            always keeps assistant messages as text without tool_calls, so this
+            flag no longer affects the output.
         keep_system_notifications: If True, keep system notification messages in
             the pruned region. If False, drop them entirely.
         min_summaries_before_pruning: Minimum number of summary messages that
@@ -260,7 +272,19 @@ def _compact_turn(
     turn: List[Dict[str, Any]],
     policy: PruningPolicy,
 ) -> List[Dict[str, Any]]:
-    """Compact a single turn, returning only the messages to keep.
+    """Compact a single turn into plain text only.
+
+    Deterministic semantics for the old (pre-second-last-summary) region:
+
+    - The first user message (if the turn starts with one) is kept as-is.
+    - Assistant messages are kept as TEXT ONLY: ``tool_calls`` and
+      ``reasoning_content`` are stripped, so no orphaned tool call IDs can
+      survive and no assistant is ever preserved with a full tool_calls
+      array (regardless of keep_all_final_turns / keep_plain_answer_only).
+    - Tool results whose call id maps to a Respond-family tool name
+      (Respond/Final/FinalReport/RequestUserInteraction) are CONVERTED to
+      assistant-style text messages; all other tool results are dropped.
+    - Messages keep their original in-turn order.
 
     A turn is a list starting with a user message OR an assistant with
     tool_calls (the latter occurs when pruning has cut off the user).
@@ -270,118 +294,49 @@ def _compact_turn(
 
     first_msg = turn[0]
     first_role = first_msg.get('role')
-
-    # Determine if we have a user message to keep
     keep_user: bool = (first_role == 'user')
+
+    # Map tool call ids -> tool names across every assistant in the turn.
+    name_map: Dict[str, str] = {}
+    for msg in turn:
+        if msg.get('role') != 'assistant':
+            continue
+        tool_calls = msg.get('tool_calls', [])
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get('function', {})
+            if isinstance(func, dict) and tc.get('id'):
+                name_map[tc['id']] = func.get('name', '')
+
     result: List[Dict[str, Any]] = []
-    if keep_user:
-        result.append(first_msg)  # always keep the user message
-
-    # Collect all assistant messages in this turn
-    assistant_msgs: List[Dict[str, Any]] = [
-        msg for msg in turn if msg.get('role') == 'assistant'
-    ]
-
-    if not assistant_msgs:
-        return result
-
-    # Search for a final tool call among all assistants
-    final_call: Optional[Dict[str, Any]] = None
-    final_assistant: Optional[Dict[str, Any]] = None
-    final_call_id: Optional[str] = None
-
-    for asst in assistant_msgs:
-        tool_calls = asst.get('tool_calls', [])
-        if isinstance(tool_calls, list):
-            for tc in tool_calls:
-                func = tc.get('function', {})
-                name = func.get('name', '') if isinstance(func, dict) else ''
-                if isinstance(tc.get('function'), str):
-                    # Handle legacy string format if any
-                    pass
-                if name in FINAL_TOOL_NAMES:
-                    final_call = tc
-                    final_assistant = asst
-                    final_call_id = tc.get('id', '')
-                    break
-        if final_call:
-            break
-
-    if final_call is not None and final_assistant is not None:
-        # Turn ends with a final tool call
-        if policy.keep_all_final_turns:
-            # Keep the assistant that has the final call
-            result.append(final_assistant)
-
-            # Find and keep the tool result matching the final call's id
-            found_result = False
-            for msg in turn:
-                if (msg.get('role') == 'tool'
-                        and msg.get('tool_call_id') == final_call_id):
-                    result.append(msg)
-                    found_result = True
-                    break
-
-            if not found_result:
-                logger.warning(
-                    'Compact turn: final tool call %s has no matching tool result',
-                    final_call_id,
-                )
-        return result
-
-    # No final tool found — find the last assistant to keep
-    if policy.keep_plain_answer_only:
-        # Keep only the LAST assistant with content AND no tool_calls
-        # (a plain text answer, not a tool-calling intermediate)
-        last_plain_assistant: Optional[Dict[str, Any]] = None
-        for asst in reversed(assistant_msgs):
-            content = asst.get('content', '')
-            tool_calls = asst.get('tool_calls', [])
-            has_content = bool(content and isinstance(content, str) and content.strip())
-            has_tool_calls = bool(tool_calls)
-            if has_content and not has_tool_calls:
-                last_plain_assistant = asst
-                break
-        if last_plain_assistant is not None:
-            result.append(last_plain_assistant)
-        else:
-            # Fallback: no plain assistant found (all had tool_calls).
-            # Keep the last assistant with any content (content or tool_calls).
-            last_content_assistant: Optional[Dict[str, Any]] = None
-            for asst in reversed(assistant_msgs):
-                content = asst.get('content', '')
-                if content and isinstance(content, str) and content.strip():
-                    last_content_assistant = asst
-                    break
-
-                # Also check tool_calls — an assistant without content
-                # but with tool_calls is meaningful
-                tool_calls = asst.get('tool_calls', [])
-                if tool_calls:
-                    last_content_assistant = asst
-                    break
-
-            if last_content_assistant is not None:
-                result.append(last_content_assistant)
-    else:
-        # Legacy behavior: keep last assistant with content
-        last_content_assistant: Optional[Dict[str, Any]] = None
-        for asst in reversed(assistant_msgs):
-            content = asst.get('content', '')
-            if content and isinstance(content, str) and content.strip():
-                last_content_assistant = asst
-                break
-
-            # Also check tool_calls — an assistant without content
-            # but with tool_calls is meaningful
-            tool_calls = asst.get('tool_calls', [])
-            if tool_calls:
-                last_content_assistant = asst
-                break
-
-        if last_content_assistant is not None:
-            result.append(last_content_assistant)
+    for msg in turn:
+        role = msg.get('role', '')
+        if role == 'user':
+            if keep_user:
+                result.append(msg)
+            continue
+        if role == 'assistant':
+            content = msg.get('content', '')
+            if not (isinstance(content, str) and content.strip()):
+                # Tool-call carrier with no text -> dropped
+                continue
+            kept = dict(msg)
+            kept.pop('tool_calls', None)
+            kept.pop('reasoning_content', None)
+            result.append(kept)
+            continue
+        if role == 'tool':
+            call_id = msg.get('tool_call_id', '')
+            if name_map.get(call_id) in RESPOND_FAMILY_NAMES:
+                converted = dict(msg)
+                converted['role'] = 'assistant'
+                converted.pop('tool_call_id', None)
+                converted.pop('name', None)
+                result.append(converted)
+            continue
+        # Any other role inside the turn is dropped.
 
     return result
-
-

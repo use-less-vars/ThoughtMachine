@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ThoughtMachine — Architecture Map</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 1100px; margin: 0 auto; padding: 24px; color: #1f2328; background: #ffffff; line-height: 1.5; }
+  h1 { border-bottom: 2px solid #0969da; padding-bottom: 8px; }
+  h2 { margin-top: 8px; margin-bottom: 4px; font-size: 1.15em; }
+  .lede { color: #57606a; font-size: 14px; }
+  details { border: 1px solid #d0d7de; border-radius: 8px; margin: 16px 0; background: #f6f8fa; }
+  summary { cursor: pointer; padding: 12px 16px; font-weight: 600; font-size: 15px; user-select: none; }
+  details[open] summary { border-bottom: 1px solid #d0d7de; }
+  .inner { padding: 8px 16px 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+  th, td { border: 1px solid #d0d7de; padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #0969da; color: #fff; }
+  tr:nth-child(even) td { background: #f6f8fa; }
+  code { background: #eff1f3; padding: 1px 4px; border-radius: 4px; font-size: 13px; }
+  pre.mermaid { background: #ffffff; border: 1px solid #d0d7de; border-radius: 8px; padding: 12px; margin: 12px 0; overflow-x: auto; }
+  pre.plain { background: #eff1f3; border: 1px solid #d0d7de; border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 13px; }
+  .note { background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: 8px 12px; font-size: 13px; margin: 12px 0; }
+  .toc a { color: #0969da; text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  footer { margin-top: 48px; color: #57606a; font-size: 12px; border-top: 1px solid #d0d7de; padding-top: 12px; }
+</style>
+</head>
+<body>
+<h1>ThoughtMachine — Architecture Map</h1>
+<p class="lede">A relational map of the machine: sub-machines, ownership, communication channels, and main pipelines. Produced from a full source audit (branch <code>feat/workspace-panel</code>). Line references are approximate to the audited revision and will drift. All sections are collapsible; the diagrams render via mermaid.js from a CDN (internet required on first load).</p>
+
+<div class="toc">
+<h2>Contents</h2>
+<ol>
+<li><a href="#sec1">System context</a></li>
+<li><a href="#sec2">Sub-machines and ownership</a></li>
+<li><a href="#sec3">Backend internals (server, bridge, session/config, event forwarder)</a></li>
+<li><a href="#sec4">Agent core internals</a></li>
+<li><a href="#sec5">Event flow (two buses, publishers, subscribers)</a></li>
+<li><a href="#sec6">Worker farm lifecycle</a></li>
+<li><a href="#sec7">Container stack</a></li>
+<li><a href="#sec8">Frontend anatomy</a></li>
+<li><a href="#sec9">Communication channels</a></li>
+<li><a href="#sec10">Main pipelines</a></li>
+<li><a href="#sec11">Vault layout</a></li>
+<li><a href="#sec12">Known gaps and flagged items</a></li>
+</ol>
+</div>
+
+<details id="sec1" open><summary>1 · System context</summary><div class="inner">
+<pre class="mermaid">
+flowchart LR
+    U[User]
+    U <--> FE[Frontend React SPA]
+    FE <-->|"WS /ws · 27 commands / ~24 event types"| SRV[Backend Server&lt;br/&gt;server.py · FastAPI · uvicorn]
+    FE <-->|"REST /api/* · 6 routers"| SRV
+    SRV <--> BR[WebAgentBridge]
+    BR <--> CTRL[AgentController]
+    CTRL <--> AGT[Agent Core&lt;br/&gt;Agent + ToolExecutor]
+    AGT <-->|"LLMClient / ProviderFactory"| LLM[(LLM Providers&lt;br/&gt;Anthropic / OpenAI-compatible)]
+    TE[ToolExecutor] --> TOOLS[Tool layer · 34 tools]
+    TOOLS --> WF[Worker Farm]
+    TOOLS --> CS[Container Stack]
+    TOOLS --> VLT[(Vault · ~/.thoughtmachine)]
+    VLT --> LOG[Logging · 4 layers + EventLogger]
+    EV[EventBus · global + per-worker] --- BR
+    EV --- CTRL
+    EV --- LOG
+</pre>
+</div></details>
+
+<details id="sec2" open><summary>2 · Sub-machines and ownership</summary><div class="inner">
+<table>
+<tr><th>#</th><th>Sub-machine</th><th>Owns</th><th>Key files</th></tr>
+<tr><td>S1</td><td><b>Backend Core</b></td><td>HTTP + WS transport, session/config lifecycle, event fan-out to clients</td><td><code>web_ui/backend/server.py</code>, <code>bridge.py</code>, <code>session_manager.py</code>, <code>config_manager.py</code>, <code>event_forwarder.py</code></td></tr>
+<tr><td>S2</td><td><b>Agent Core</b></td><td>Conversation loop, tool dispatch, turn transaction, hot-swap, token accounting</td><td><code>agent/core/agent.py</code> (1578 L), <code>agent/controller/__init__.py</code>, <code>agent/core/tool_executor.py</code>, <code>agent/core/llm_client.py</code>, <code>presenter/</code></td></tr>
+<tr><td>S3</td><td><b>Worker Farm</b></td><td>Worker threads, per-worker event bus, status/context files, lifecycle</td><td><code>tools/workspace/worker.py</code>, <code>worker_registry.py</code>, <code>worker_thread.py</code>, <code>worker_context.py</code>, <code>worker_bus_adapter.py</code>, <code>worker_session_lifecycle.py</code></td></tr>
+<tr><td>S4</td><td><b>Container Stack</b></td><td>Container build/exec/status/logs, resource containers, profiles</td><td><code>infra/container_manager.py</code>, <code>infra/container_registry.py</code>, <code>infra/resource_container_manager.py</code>, <code>tools/container_control.py</code>, <code>tools/docker_code_runner.py</code></td></tr>
+<tr><td>S5</td><td><b>Security Gate</b></td><td>Capability checks, permission model, security-prompt round-trip</td><td><code>thoughtmachine/security.py</code>, <code>thoughtmachine/workspace_capabilities.py</code>, <code>security/security_gate.py</code>, <code>security/sandboxed_execution.py</code></td></tr>
+<tr><td>S6</td><td><b>Tool Layer</b></td><td>34 tools incl. introspection, KB, MCP clients, git</td><td><code>tools/base.py</code> + subclasses; <code>tools/workspace/check_system.py</code>, <code>tools/knowledge_base.py</code>, <code>tools/mcp_*.py</code></td></tr>
+<tr><td>S7</td><td><b>Logging and Events</b></td><td>4 logging layers + EventLogger to event_log.jsonl</td><td><code>agent/logging/</code> (unified.py, lifecycle.py, streams.py, console.py, event_logger.py, debug_log_adapter.py), <code>agent/events.py</code></td></tr>
+<tr><td>S8</td><td><b>Vault</b></td><td>Host-side state: logs, sessions, workspaces, registries</td><td><code>~/.thoughtmachine/**</code> (never mounted into containers)</td></tr>
+<tr><td>S9</td><td><b>Frontend</b></td><td>React SPA: chat, workspace panel, stores</td><td><code>web_ui/frontend/src/</code> (App.jsx, stores, components)</td></tr>
+</table>
+</div></details>
+
+<details id="sec3" open><summary>3 · Backend internals</summary><div class="inner">
+<pre class="mermaid">
+flowchart TD
+    FE[Frontend] -->|"27 WS commands&lt;br/&gt;start_session · continue_session · apply_config · security_response · ..."| WSE["websocket_endpoint · /ws (server.py L524)"]
+    WSE --> CMD[command dispatch]
+    CMD --> BR[WebAgentBridge]
+    BR --> CTRL[AgentController]
+    BR --> SM[SessionManager]
+    BR --> CM[ConfigManager]
+    BR --> EF[EventForwarder]
+    EF -->|"broadcast(session_id, type, data)"| WSE
+    SRV[server.py] --> R1[workspace_routes]
+    SRV --> R2[config_routes]
+    SRV --> R3[health_routes · /api/system/health]
+    SRV --> R4[logging_routes]
+    SRV --> R5[session_routes]
+    SRV --> R6[prompt_routes]
+</pre>
+<ul>
+<li><b>WS</b> (<code>server.py:523</code>): one endpoint <code>/ws?project=</code>, 27 client-to-server commands, ~24 server-to-client event types (full list in section 9).</li>
+<li><b>Bridge</b> (<code>bridge.py:203</code>): translates WS commands into controller/session/config calls; subscribes global bus (security L337, worker_* L391-406) and per-worker buses (L746); re-emits via <code>EventForwarder</code>; also publishes its own events (~L2234).</li>
+<li><b>EventForwarder</b> (<code>event_forwarder.py:28</code>): pure callback registry — register/unregister websockets, <code>send_personal</code>, <code>broadcast</code> per session, static <code>broadcast_rename</code>, <code>broadcast_logging_config</code>.</li>
+<li><b>REST</b> (<code>server.py:2229-2235</code>): 6 routers for workspace/config/health/logging/session/prompt.</li>
+</ul>
+</div></details>
+
+<details id="sec4" open><summary>4 · Agent core internals</summary><div class="inner">
+<pre class="mermaid">
+flowchart TD
+    CTRL[AgentController] --> AGT[Agent · agent.py]
+    AGT -->|process_query · hot-swap 153-455| TURN[TurnTransaction]
+    AGT --> TOK[TokenCounter]
+    AGT --> LLM[LLMClient → ProviderFactory]
+    LLM --> P1[AnthropicProvider]
+    LLM --> P2[OpenAICompatibleProvider]
+    AGT --> TE[ToolExecutor]
+    TE --> SG[Security Gate&lt;br/&gt;check_required_categories]
+    TE --> TOOLS[34 tools]
+    AGT --> PRES[Presenter · RefactoredAgentPresenter]
+    PRES --> EP[EventProcessor → GUIIntegration → StateBridge / SessionLifecycle]
+    CTRL -->|_emit_event L516-547| GB[global_event_bus]
+</pre>
+<ul>
+<li><b>Agent</b> (<code>agent/core/agent.py</code>, 1578 L): the conversation loop. Hot-swap of configuration/context at L153-455; <code>process_query</code> at L835; <code>{{credential:key}}</code> resolution at L418-442 via <code>credentials/</code>.</li>
+<li><b>AgentController</b> (<code>agent/controller/__init__.py</code>): drives Agent; publishes to the global bus via <code>_emit_event</code> (~L516-547); 4 output sinks (bus, presenter, logs, frontend via bridge).</li>
+<li><b>Session model</b> (<code>session/models.py</code>): Session L135, RuntimeParams L101, ObservableList L20; event schemas in <code>session/event_schema.py</code> (15 data classes); context assembly via <code>ContextBuilder</code>/<code>SummaryBuilder</code>; persistence via <code>SessionStore</code> (FileSystemSessionStore L87) + <code>SessionRegistry</code>.</li>
+</ul>
+</div></details>
+
+<details id="sec5" open><summary>5 · Event flow — two buses</summary><div class="inner">
+<pre class="mermaid">
+flowchart LR
+    A[AgentController._emit_event] -->|60 EventTypes · 16 classes| GB{global_event_bus L571}
+    B[bridge.py publishers ~L2234] --> GB
+    GB --> E1[EventLogger → event_log.jsonl]
+    GB --> E2[bridge security sub L337]
+    GB --> E3[bridge worker_* sub L391-406]
+    GB --> E4[security.py L808 _handle_security_response]
+    W[WorkerBusAdapter · per worker] -->|17 event types| PB{per-worker EventBus}
+    PB --> E5[bridge sub L746 → worker:worker_*]
+    PB --> E6[WorkerRegistry]
+    PB --> E7[EventLogger global sub]
+</pre>
+<ul>
+<li><b>Global bus</b>: <code>agent/events.py</code> — EventType enum L23 (60 members), 16 event classes (AgentStart/End, ToolCall/Result, Token/TurnWarning, Error, Turn, SecurityPrompt/Response, WorkerSpawned/Status/Completed/Message/Error, AssistantMessage), EventBus L373, global singleton L571.</li>
+<li><b>Per-worker bus</b>: created in <code>worker.py</code> L1257, registered via <code>worker_registry</code> L1258; publishes 17 types (tokens_updated, context_updated, status_message, error_occurred, config_changed, conversation_changed, worker_message, tool_call, tool_result, token_warning, turn_warning, time_warning, assistant_message, system_notification, context_summarized, token_recovery) — <code>WorkerBusAdapter</code> L120.</li>
+<li><b>Subscribers</b>: EventLogger (all, event_logger.py L95/L102); bridge global (security L337, worker_* L391-406) and per-worker (L746); <code>thoughtmachine/security.py</code> L808.</li>
+<li><code>EventLogger.attach_worker_bus</code> is dead code (no production callers) — events land in <code>event_log.jsonl</code> exactly once.</li>
+</ul>
+</div></details>
+
+<details id="sec6" open><summary>6 · Worker farm lifecycle</summary><div class="inner">
+<pre class="mermaid">
+sequenceDiagram
+    participant A as Agent (tool call Worker)
+    participant R as WorkerRegistry
+    participant W as WorkerThread
+    participant B as WorkerBusAdapter
+    participant E as per-worker EventBus
+    participant BR as WebAgentBridge
+    participant F as Frontend
+    A->>R: spawn(definition)
+    R->>W: start thread
+    W->>B: status / tool events
+    B->>E: publish
+    E->>BR: bridge sub L746
+    BR->>F: worker:worker_spawned / _status / _completed / _error
+    W-->>W: run until stop / complete
+    W->>R: completion
+    R->>A: result envelope
+</pre>
+<ul>
+<li>Worker state mirrored to disk: <code>vault/workspaces/&lt;ws_id&gt;/workers/&lt;name&gt;/{context,status,command}.json</code>.</li>
+<li>Supervisor: <code>infra/workspace_lifecycle_manager.py</code> (WLM) — <b>flag <code>use_workspace_lifecycle_manager</code> defaults OFF</b>; production wiring passes <code>container_manager=None</code> (worker.py L760-763).</li>
+</ul>
+</div></details>
+
+<details id="sec7" open><summary>7 · Container stack</summary><div class="inner">
+<pre class="mermaid">
+flowchart LR
+    T[Container tools + DockerCodeRunner] --> CM[ContainerManager L192]
+    T --> RCM[ResourceContainerManager L358]
+    T --> CR[ContainerRegistry L186]
+    CM --> D[Docker daemon]
+    RCM --> D
+    CR -->|rejects resource containers L344-352| T
+    D --> C1["/workspace container&lt;br/&gt;bind /workspace ro|rw + tm-packages volume + tmpfs&lt;br/&gt;cap_drop ALL · no-new-privileges · read_only · user 1000:1000"]
+    VLT[(Vault)] -. "never mounted into containers" .-> C1
+</pre>
+</div></details>
+
+<details id="sec8" open><summary>8 · Frontend anatomy</summary><div class="inner">
+<pre class="mermaid">
+flowchart LR
+    FE[Frontend src] --> ST[Zustand stores]
+    ST --> US[useStore.js · sessions / messages / workerEvents dedup]
+    ST --> WSS[workspaceStore.js · workspaces / containers / workers / tools]
+    US --> TAB[SessionTab · ChatPanel · QueryBar · StatusBar]
+    US --> WP[WorkerManagementPanel · WorkerOutputPanel]
+    WSS --> WSP[WorkspacePanel + tabs: Containers / Credentials / Permissions / Resources / SessionDefaults / Tools / Workers]
+    WSS --> CFG[ConfigPanel · LoggingPanel · ContainerPanel · DockerfileEditor · DomainAllowlistEditor]
+    WSS --> MOD[Modals: ContainerLogs / CredentialPicker / NewSession / ResourceCatalog / WorkerEditor]
+    WSS --> SEL[WorkspaceSelector · SessionSidebar · WorkspaceSessionList]
+</pre>
+</div></details>
+
+<details id="sec9" open><summary>9 · Communication channels</summary><div class="inner">
+<table>
+<tr><th>Channel</th><th>Direction</th><th>Payload</th><th>Owner</th></tr>
+<tr><td>WS <code>/ws</code></td><td>Frontend ⇄ server</td><td>27 commands; ~24 event types (state_changed, tokens_updated, context_updated, conversation_changed, more_messages, config_changed, status_message, sessions_list, session_saved, session_loaded, session_deleted, session_renamed, open_sessions_list, session_closed, session_cleared, providers_list, provider_saved, provider_deleted, tools_list, security_prompt, worker:worker_spawned, worker:worker_status, worker:worker_completed, worker:worker_error)</td><td>server.py</td></tr>
+<tr><td>Global EventBus</td><td>controllers/agents → subscribers</td><td>60 EventTypes, 16 classes</td><td>agent/events.py</td></tr>
+<tr><td>Per-worker EventBus</td><td>WorkerBusAdapter → bridge/registry</td><td>17 worker event types</td><td>worker.py L1257</td></tr>
+<tr><td>REST <code>/api/*</code></td><td>Frontend ⇄ server</td><td>workspace/config/health/logging/session/prompt routers</td><td>server.py L2229</td></tr>
+<tr><td>Files (JSON)</td><td>disk ⇄ modules</td><td>sessions, open-session state, workers.json, capabilities, container_notes</td><td>vault</td></tr>
+<tr><td>Vault</td><td>host-only</td><td>logs, sessions, workspace state — never mounted in containers</td><td>~/.thoughtmachine</td></tr>
+</table>
+</div></details>
+
+<details id="sec10" open><summary>10 · Main pipelines</summary><div class="inner">
+<p><b>P1 — Session ask/tell.</b> Frontend <code>continue_session</code> → WS → bridge → AgentController → Agent.process_query → LLM → presenter events → global bus → bridge → WS <code>assistant_message</code>/<code>tokens_updated</code> → frontend store.</p>
+<p><b>P2 — Worker spawn/run/event.</b> Agent tool-call <code>Worker</code> → WorkerRegistry → WorkerThread → WorkerBusAdapter → per-worker bus → bridge L746 → WS <code>worker:*</code> events; completion envelope back to Agent.</p>
+<p><b>P3 — Events to log.</b> All publishers → global bus (and per-worker buses) → EventLogger → <code>event_log.jsonl</code> (redacted, 5 MB rotate, async ≤0.5 s lag).</p>
+<p><b>P4 — Persistence.</b> Session model changes → FileSystemSessionStore → <code>vault/sessions/&lt;id&gt;.json</code> + <code>state/session_registry.json</code>; open sessions saved on WS close (unless explicitly closed); session save/load/rename/delete via WS commands.</p>
+<p><b>P5 — Containers.</b> Tool calls (ContainerStart/Exec/Stop/Status/List/Build/Logs, DockerCodeRunner) → ContainerManager / ResourceContainerManager / ContainerRegistry → Docker daemon → hardened container (read-only FS, no caps, no vault).</p>
+<p><b>P6 — Config.</b> <code>apply_config</code> / <code>set_default_config</code> / <code>save_provider</code> / REST config routes → ConfigManager → AgentConfig/ProviderManager/SessionConfig → hot-swap into running Agent (agent.py L153-455) → <code>config_changed</code> events.</p>
+<p><b>P7 — Introspection and security loop.</b> <code>check_system</code> / <code>get_workspace_capabilities</code> / <code>effective_permissions</code> (mixed live/disk/external) — and the security gate: tool_executor L259 → <code>security_gate.check_required_categories</code> → SecurityPromptEvent → bridge L337 → WS <code>security_prompt</code> → user <code>security_response</code> → SecurityResponseEvent → security.py L808 → <code>resolve_prompt</code> → tool proceeds or is denied.</p>
+</div></details>
+
+<details id="sec11" open><summary>11 · Vault layout (~/.thoughtmachine)</summary><div class="inner">
+<pre class="plain">
+~/.thoughtmachine/
+├── logs/                          # 4 logging layers, event_log.jsonl, agent_&lt;sid&gt;.jsonl
+├── sessions/&lt;session_id&gt;.json     # session persistence (FileSystemSessionStore)
+├── state/session_registry.json    # session index
+└── workspaces/&lt;ws_id&gt;/
+    ├── config.json                # workspace config
+    ├── workers/&lt;name&gt;/{context,status,command}.json
+    ├── container_notes.json       # container notes (NOT in safeguard allow-set — logged warning)
+    ├── capabilities.json          # workspace capabilities
+    ├── workers.json               # worker definitions (disk truth for check_system)
+    ├── mcp_servers.json · domain_allowlist.json · workspace_identity.json
+    ├── Dockerfile · sessions/
+</pre>
+</div></details>
+
+<details id="sec12" open><summary>12 · Known gaps and flagged items</summary><div class="inner">
+<ul>
+<li>AgentLogger <code>agent_&lt;sid&gt;.jsonl</code> is <b>unredacted</b> (security item).</li>
+<li><code>container_notes.json</code> missing from <code>_safeguard_workspace_dir</code> allow-set → spurious <code>WARNING:root</code> per workers listing (one-line fix).</li>
+<li><code>EventLogger.attach_worker_bus</code> is dead code.</li>
+<li>Duplicate <code>components/WorkspacePanel.jsx</code> vs <code>components/workspace/WorkspacePanel.jsx</code> (G8).</li>
+<li>WLM (<code>use_workspace_lifecycle_manager</code>) defaults OFF.</li>
+<li>uvicorn access log lacks timestamp; console formats not unified; runtime summaries absent (proposed, unapproved).</li>
+</ul>
+</div></details>
+
+<footer>Generated from a full source audit of branch <code>feat/workspace-panel</code>. Diagrams render with mermaid.js (CDN). Line numbers are approximate to the audited revision.</footer>
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: "default" });
+</script>
+</body>
+</html>

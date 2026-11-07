@@ -1,0 +1,707 @@
+"""Read-only container drift detection (container-record subsystem).
+
+This module compares a record's *recorded intent* (its ``intent_snapshot``)
+plus the *policy* resolved from the caller's permissions/capabilities against
+a live Docker container, and reports the differences as
+:class:`DriftFinding` values.  It is deliberately **read-only**: it never
+mutates Docker or the vault beyond appending drift events to the record's own
+event log via the sanctioned :func:`api.append_event` helper.
+
+Layering
+--------
+* :func:`classify_drift` -- **pure**, total and side-effect free.  Given a
+  record, an optional ``live`` mapping and an optional ``config``, it returns
+  the list of findings.  It performs no IO and never raises.
+* :func:`detect_record_drift` -- inspects a duck-typed Docker client to build
+  the ``live`` mapping, resolves the policy config (fail-closed) and delegates
+  to :func:`classify_drift`.  Finding a container is a read; nothing else is
+  touched.
+* :func:`emit_drift_findings` -- appends a drift event per (deduplicated)
+  finding to the record's event log.
+* :func:`scan_record` -- the detect-then-emit convenience.
+
+Axis semantics
+--------------
+Every axis is only compared when its *expected* value is present **and**
+non-empty in the snapshot, so an empty/unrecorded axis is never reported as
+drift.  Axes are emitted in a fixed order: identity, policy, runtime, image,
+hardening, restart policy.
+
+* **identity** -- the record's ``docker_id`` vs. the live container id.
+* **policy** -- the record's RECORDED network/workspace mode (``expected``) vs.
+  the currently RESOLVED ``config`` value (``actual``) -- the same record-vs-now
+  direction as the permission axis.  Evaluated even when the live container
+  could not be inspected (it depends only on the snapshot and the resolved
+  config).
+* **runtime / image / hardening** -- the recorded snapshot value vs. the live
+  container's current value.  These require a live container; when the live
+  inspection failed they are skipped.
+* **restart policy** -- the restart policy *intended* for the record (its own
+  ``restart_policy`` field, falling back to the lifecycle-class default for
+  records that predate the field) vs. the live container's
+  ``HostConfig.RestartPolicy.Name``.  Docker reports an unset policy as
+  ``""``, which is normalised to ``"no"`` before comparison.
+
+Read-only guarantee
+-------------------
+This module performs no Docker mutation and imports no ``docker`` package; the
+client is accepted duck-typed, so a caller can supply a non-mutating fake.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from security.security_gate import (
+    ContainerConfig,
+    ContainerConfigError,
+    resolve_container_config,
+)
+from thoughtmachine.security import FRESH_WORKSPACE_DEFAULT_PERMISSIONS
+
+from .api import RECORD_LABEL_KEY, append_event, read_event_log
+from .lifecycle_policy import normalise_restart_policy, policy_for
+from .models import iso_now
+from .snapshot import mem_limit_bytes, snapshot_from_attrs
+
+logger = logging.getLogger(__name__)
+
+#: ``actor`` recorded on every drift event appended to a record's log.
+ACTOR = "thoughtmachine.container_record.drift"
+
+#: Drift classes.
+CLASS_IDENTITY = "identity"
+CLASS_POLICY = "policy"
+CLASS_RUNTIME = "runtime"
+CLASS_IMAGE = "image"
+CLASS_HARDENING = "hardening"
+CLASS_RESTART_POLICY = "restart_policy"
+CLASS_PERMISSION = "permission"
+CLASS_INTENT = "intent"
+#: Lifecycle drift: a record's recorded lifecycle state no longer matches
+#: reality (e.g. it is stuck in ``creating``).  Built by ``state.py``.
+CLASS_LIFECYCLE = "lifecycle"
+
+#: Drift event types.
+EVENT_IDENTITY_CHANGED = "drift.identity_changed"
+EVENT_CONTAINER_ABSENT = "drift.container_absent"
+EVENT_POLICY_CONFIG_CHANGED = "drift.policy_config_changed"
+EVENT_RUNTIME_MISMATCH = "drift.runtime_mismatch"
+EVENT_IMAGE_CHANGED = "drift.image_changed"
+EVENT_HARDENING_LOST = "drift.hardening_lost"
+EVENT_RESTART_POLICY_MISMATCH = "drift.restart_policy_mismatch"
+EVENT_PERMISSION_CHANGED = "drift.permission_changed"
+EVENT_INTENT_SNAPSHOT_MISSING = "drift.intent_snapshot_missing"
+EVENT_CONTAINER_STUCK_CREATING = "drift.container_stuck_creating"
+
+#: Auto-heal lifecycle events.  Deliberate DEVIATION from the ``drift.*``
+#: convention above: these are emitted by the container MANAGER
+#: (``infra.container_manager.start``), not by drift detection, so a ``drift.``
+#: prefix would be a lie.  The block above is a convention, not a contract; the
+#: ``EVENT_*`` naming still holds.
+EVENT_CONTAINER_RECORD_AUTO_RECREATED = "container_record_auto_recreated"
+EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED = "container_record_auto_recreated_refused"
+
+#: Axis sets, in the order axes within a class are compared.
+_POLICY_AXES = ("network_mode", "workspace_mode")
+#: ``pids_limit`` is deliberately ABSENT: container snapshots do not record it
+#: yet, so listing it here would report permanent false drift (recorded=None vs
+#: live=512) on every single container.  Add it only once snapshots carry it.
+_RUNTIME_AXES = ("network_mode", "workspace_mode", "mem_limit", "cpu_quota", "oom_score_adj")
+_IMAGE_AXES = ("image_ref", "image_hash")
+
+#: Key under which the live container id is stored in the ``live`` mapping.
+_LIVE_ID_KEY = "id"
+
+#: The framework-default grant the seeder writes for a FRESH workspace
+#: (``thoughtmachine.workspace_capabilities.ensure_workspace_dirs`` writes
+#: ``config.json['permissions']`` from :data:`FRESH_WORKSPACE_DEFAULT_PERMISSIONS`).
+#: A recorded grant equal to this carries no information beyond the framework
+#: default and is never reported as drift.  One fact, one owner: this
+#: REFERENCES ``thoughtmachine.security.FRESH_WORKSPACE_DEFAULT_PERMISSIONS``
+#: rather than hand-copying the map (it is no longer a description of what
+#: ``permissions={}`` resolves to -- an absent/explicit-empty ceiling now fails
+#: closed in the gate).
+_FRAMEWORK_DEFAULT_PERMISSIONS: dict = dict(FRESH_WORKSPACE_DEFAULT_PERMISSIONS)
+
+
+@dataclass(frozen=True)
+class DriftFinding:
+    """A single, immutable drift observation.
+
+    ``expected`` is the recorded/policy intent; ``actual`` is the live (or
+    absent) value.  ``signature`` is a stable digest of ``(event_type,
+    expected, actual)`` used to deduplicate repeated findings.
+
+    ``fresh`` is the freshness verdict of the record's ``state`` reading for a
+    LIFECYCLE finding (``True``/``False``); it is ``None`` -- the default,
+    meaning "freshness not applicable" -- for every other drift class.  It is
+    the LAST field and carries a default so the original five-field positional
+    construction of a finding still works.
+    """
+
+    drift_class: str
+    event_type: str
+    expected: Any
+    actual: Any
+    signature: str
+    fresh: bool | None = None
+
+
+def signature_for(event_type: str, expected: Any, actual: Any) -> str:
+    """Return a stable 16-char digest for an (event_type, expected, actual) triple.
+
+    ``expected``/``actual`` are JSON-serialised with ``sort_keys=True`` and
+    ``default=str`` so unusual values (ints, nested dicts, ...) never raise.
+
+    :attr:`DriftFinding.fresh` is deliberately NOT part of the digest: the
+    digest is the dedup key over ``(event_type, expected, actual)`` and the two
+    lifecycle causes are already distinguished by ``actual`` (``""`` for the
+    absent cause vs the live state for the contradiction cause).
+    """
+    blob = json.dumps(
+        {"event_type": event_type, "expected": expected, "actual": actual},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _nonempty(value: Any) -> bool:
+    """Return True when *value* is present and not an empty container/string."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value != ""
+    if isinstance(value, (dict, list, tuple, set)):
+        return len(value) > 0
+    return True
+
+
+def _lookup(obj: Any, name: str) -> Any:
+    """Return ``obj[name]`` for a mapping or ``obj.name`` for an object.
+
+    Returns ``None`` when neither is available; never raises.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def record_permissions(record: Any) -> dict[str, Any]:
+    """Return the record's recorded create-time grants (``{}`` when unset).
+
+    ``Record.permissions`` is the v5 resolved-grant snapshot and is ``None`` for
+    records that predate the field.  :func:`detect_record_drift` resolves the
+    policy from this mapping, so the record's *own* grant is the only correct
+    input: an unknown grant passes through as ``{}`` (framework defaults) rather
+    than silently substituting defaults for a grant the record really carries.
+
+    Accepts either a record-like object (``record.permissions``) or a plain
+    mapping (``record['permissions']``), so a caller holding a serialised record
+    dict still gets the real grants instead of a silent ``{}``.
+    """
+    if isinstance(record, Mapping):
+        perms = record.get("permissions")
+    else:
+        perms = getattr(record, "permissions", None)
+    return dict(perms) if isinstance(perms, Mapping) else {}
+
+
+def _runtime_axis_matches(axis: str, expected: Any, actual: Any) -> bool:
+    """Return True when the record's *expected* runtime value IS the live one.
+
+    Only ``mem_limit`` needs normalisation: the record stores the
+    operator-AUTHORED spelling (``'1g'``, written by the resources route) while
+    the live inspect payload reports ``str(HostConfig.Memory)``
+    (``'1073741824'``).  Comparing those two strings verbatim reported a
+    permanent, unfixable runtime drift for every non-byte-authored limit, so
+    ``mem_limit`` compares by BYTES whenever BOTH sides parse.  When either side
+    is unparseable it falls back to raw equality, so junk never equals a real
+    limit and two different junks still differ (pre-existing semantics).
+
+    Every other runtime axis is compared verbatim: ``network_mode`` /
+    ``workspace_mode`` are ``str`` on both sides (both produced by the same
+    derivations) and ``cpu_quota`` / ``oom_score_adj`` are raw ``int`` on both
+    sides (``snapshot_from_attrs`` emits the ``HostConfig`` int and the web
+    route validates ``isinstance(cpu_quota, int)``), so no genuine spelling or
+    type mismatch exists to normalise.
+    """
+    if axis == "mem_limit":
+        expected_bytes = mem_limit_bytes(expected)
+        actual_bytes = mem_limit_bytes(actual)
+        if expected_bytes is not None and actual_bytes is not None:
+            return expected_bytes == actual_bytes
+    return expected == actual
+
+
+def _make_finding(
+    drift_class: str, event_type: str, expected: Any, actual: Any
+) -> DriftFinding:
+    """Build a finding, computing its signature."""
+    return DriftFinding(
+        drift_class=drift_class,
+        event_type=event_type,
+        expected=expected,
+        actual=actual,
+        signature=signature_for(event_type, expected, actual),
+    )
+
+
+def _permission_drift_finding(record: Any, config: Any) -> DriftFinding | None:
+    """Return a permission finding when the recorded grant no longer matches.
+
+    Silent (``None``) when the record carries no recorded grant (``None``), the
+    effective grant is unknown/non-mapping/empty, the effective grant equals
+    the framework default, or the two agree on every key the record recorded.
+    ``expected`` is the grant recorded on the record; ``actual`` is the
+    currently effective grant.
+
+    Tolerant read -- why this is an INTERSECTION and not a whole-dict ``==``
+    -----------------------------------------------------------------------
+    ``Record.permissions`` is a SNAPSHOT of the permission grains that existed
+    when the record was written.  When the framework later GAINS a grain, every
+    record written before that release carries a profile with FEWER keys than
+    ``resolve_container_config(...).effective`` now yields (``credential`` was
+    added after ``ci``, so pre-``credential`` records hold seven keys against
+    today's eight).  Comparing the two mappings whole reported
+    ``drift.permission_changed`` on every such record forever -- an alarm that
+    cannot be cleared, because the stored profile only changes when the record
+    is re-written.
+
+    So only keys present on BOTH sides are compared
+    (``set(recorded) & set(effective)``): drift is reported for a difference on
+    a grain the record actually recorded, and nothing else.  An ABSENT key
+    means "this profile predates the grain" -- it is NOT read as ``banned`` and
+    is deliberately NOT padded from the defaults: padding would FABRICATE a
+    finding on every legacy record whose current level for that grain sits
+    above the assumed level, which is the very spurious alarm this read exists
+    to remove.  ``expected``/``actual`` still carry the two mappings verbatim,
+    so the finding payload is unchanged.
+
+    Known, deliberately bounded blind spot: a grain the record predates cannot
+    report drift until the record is re-written.  It self-heals -- every
+    create/update path persists the CURRENT full effective profile
+    (``record_permissions`` returns the record's stored profile; the create path
+    writes ``resolve_container_config(...).effective``), so the next container
+    start or any re-save stores all canonical keys and coverage of the new
+    grain resumes from that write onward.  Contract pinned by
+    ``tests/test_container_record_permission_drift.py``'s legacy-profile live /
+    legacy-profile-narrowed / self-heal-after-rewrite trio.
+    """
+    recorded = getattr(record, "permissions", None)
+    if recorded is None or not isinstance(recorded, dict):
+        return None
+    effective = getattr(config, "effective", None)
+    if (
+        not isinstance(effective, dict)
+        or not effective
+        or effective == _FRAMEWORK_DEFAULT_PERMISSIONS
+    ):
+        return None
+    # INTERSECTION comparison: only a grain the record recorded can drift.
+    if all(recorded[key] == effective[key] for key in set(recorded) & set(effective)):
+        return None
+    return _make_finding(
+        CLASS_PERMISSION, EVENT_PERMISSION_CHANGED, recorded, effective
+    )
+
+
+def classify_drift(record: Any, live: Any, config: Any) -> list[DriftFinding]:
+    """Classify drift for *record* against the ``live`` state and *config*.
+
+    Pure, total and side-effect free: it reads only its arguments and never
+    raises (an unexpected failure degrades to the findings collected so far).
+
+    Args:
+        record: a :class:`~thoughtmachine.container_record.models.Record`-like
+            object exposing ``docker_id``, ``id`` and ``intent_snapshot``.
+        live: a mapping of live snapshot values (as built by
+            :func:`detect_record_drift`), or ``None`` when the live container
+            could not be inspected.  Axes needing live data are skipped when
+            this is ``None``.
+        config: a resolved
+            :class:`~security.security_gate.ContainerConfig` (or a mapping with
+            ``network_mode``/``workspace_mode``), or ``None`` when the policy
+            could not be resolved.
+
+    Returns:
+        The list of :class:`DriftFinding` values, ordered identity, policy,
+        runtime, image, hardening, restart policy.
+    """
+    findings: list[DriftFinding] = []
+    try:
+        snapshot = getattr(record, "intent_snapshot", None)
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        live_map = live if isinstance(live, dict) else {}
+        live_present = isinstance(live, dict)
+
+        # ── identity ────────────────────────────────────────────────────
+        if live_present:
+            expected_id = getattr(record, "docker_id", "") or ""
+            actual_id = live_map.get(_LIVE_ID_KEY)
+            if (
+                _nonempty(expected_id)
+                and _nonempty(actual_id)
+                and expected_id != actual_id
+            ):
+                findings.append(
+                    _make_finding(
+                        CLASS_IDENTITY,
+                        EVENT_IDENTITY_CHANGED,
+                        expected_id,
+                        actual_id,
+                    )
+                )
+
+        # ── policy (snapshot + config only; no live container required) ──
+        if config is not None:
+            for axis in _POLICY_AXES:
+                expected = snapshot.get(axis)  # recorded intent
+                actual = _lookup(config, axis)  # resolved policy, now
+                if _nonempty(expected) and _nonempty(actual) and expected != actual:
+                    findings.append(
+                        _make_finding(
+                            CLASS_POLICY,
+                            EVENT_POLICY_CONFIG_CHANGED,
+                            expected,
+                            actual,
+                        )
+                    )
+
+        # ── runtime ─────────────────────────────────────────────────────
+        if live_present:
+            for axis in _RUNTIME_AXES:
+                expected = snapshot.get(axis)
+                actual = live_map.get(axis)
+                if _nonempty(expected) and not _runtime_axis_matches(
+                    axis, expected, actual
+                ):
+                    findings.append(
+                        _make_finding(
+                            CLASS_RUNTIME,
+                            EVENT_RUNTIME_MISMATCH,
+                            expected,
+                            actual,
+                        )
+                    )
+
+        # ── image ───────────────────────────────────────────────────────
+        if live_present:
+            for axis in _IMAGE_AXES:
+                expected = snapshot.get(axis)
+                actual = live_map.get(axis)
+                if _nonempty(expected) and expected != actual:
+                    findings.append(
+                        _make_finding(
+                            CLASS_IMAGE,
+                            EVENT_IMAGE_CHANGED,
+                            expected,
+                            actual,
+                        )
+                    )
+
+        # ── hardening ───────────────────────────────────────────────────
+        if live_present:
+            expected = snapshot.get("hardening")
+            actual = live_map.get("hardening")
+            if isinstance(expected, dict) and expected and expected != actual:
+                findings.append(
+                    _make_finding(
+                        CLASS_HARDENING,
+                        EVENT_HARDENING_LOST,
+                        expected,
+                        actual,
+                    )
+                )
+
+        # ── restart policy ───────────────────────────────
+        # Only evaluated when the live mapping actually carries the axis: a
+        # partial or hand-built mapping is not evidence of a missing policy.
+        if live_present and CLASS_RESTART_POLICY in live_map:
+            expected = getattr(record, "restart_policy", None)
+            if not _nonempty(expected):
+                # A record predating the field falls back to the default for
+                # its lifecycle class: that is the *class default* value, not
+                # a fail-open "no drift" verdict.
+                try:
+                    expected = policy_for(
+                        getattr(record, "lifecycle_class", "")
+                    ).restart_policy
+                except Exception:  # noqa: BLE001 - unknown class -> skip axis
+                    expected = None
+            if _nonempty(expected):
+                expected_name = normalise_restart_policy(expected)
+                actual_name = normalise_restart_policy(
+                    live_map.get(CLASS_RESTART_POLICY)
+                )
+                if expected_name != actual_name:
+                    findings.append(
+                        _make_finding(
+                            CLASS_RESTART_POLICY,
+                            EVENT_RESTART_POLICY_MISMATCH,
+                            expected_name,
+                            actual_name,
+                        )
+                    )
+    except Exception:  # pragma: no cover - defensive; classify must never raise
+        logger.warning("classify_drift encountered an unexpected error", exc_info=True)
+    return findings
+
+
+def _matches_record(record: Any, container: Any) -> bool:
+    """Return True when *container* is the one attached to *record*."""
+    docker_id = getattr(record, "docker_id", "") or ""
+    record_id = getattr(record, "id", None)
+    if _nonempty(docker_id) and getattr(container, "id", None) == docker_id:
+        return True
+    labels = getattr(container, "labels", None)
+    if isinstance(labels, dict) and labels.get(RECORD_LABEL_KEY) == record_id:
+        return True
+    return False
+
+
+def live_state_for_record(
+    record: Any, containers: Any, *, state_key: str = "status"
+) -> str | None:
+    """Return the live Docker state of *record*'s container, or ``None``.
+
+    Read-only and never-raising.  Locates the container attached to *record*
+    using the same :func:`_matches_record` rule the detector uses, then reports
+    its Docker state: ``attrs["State"]["Status"]`` when readable, else
+    ``getattr(container, state_key, None)`` (default ``"status"``), else ``""``
+    -- an existing container whose state could not be read (the resolver
+    normalises ``""`` to its own unknown sentinel).  ``None`` is returned ONLY
+    when no container matches the record.  Nothing is mutated.
+    """
+    try:
+        listed = containers.list(all=True)
+    except Exception:
+        logger.warning("container listing failed; reporting no live container")
+        return None
+    for candidate in listed or []:
+        if not _matches_record(record, candidate):
+            continue
+        attrs = getattr(candidate, "attrs", None)
+        if isinstance(attrs, dict):
+            state = attrs.get("State")
+            if isinstance(state, dict):
+                value = state.get("Status")
+                if isinstance(value, str) and value:
+                    return value
+        value = getattr(candidate, state_key, None)
+        if isinstance(value, str) and value:
+            return value
+        return ""
+    return None
+
+
+def detect_record_drift(
+    record: Any,
+    containers: Any,
+    *,
+    permissions: Any = None,
+    capabilities: Any = None,
+) -> list[DriftFinding]:
+    """Detect drift for *record* against the containers visible via *containers*.
+
+    *containers* is a duck-typed Docker client exposing ``list(all=True)``.
+    The record's container is matched by ``docker_id`` or by the record-owned
+    label (:data:`api.RECORD_LABEL_KEY`).  A container that cannot be found is
+    reported as :data:`EVENT_CONTAINER_ABSENT`.
+
+    Policy resolution is fail-closed: a :class:`ContainerConfigError` (or any
+    resolution failure) yields ``config=None`` and is logged; the live
+    inspection is guarded so a failure yields ``live=None``.  This function
+    never mutates anything.
+    """
+    # ── resolve policy config (fail-closed) ─────────────────────────────
+    config: Any = None
+    try:
+        resolved = resolve_container_config(
+            permissions, capabilities, getattr(record, "lifecycle_class", "")
+        )
+    except Exception:
+        logger.warning("container config resolution raised; treating as unresolved")
+        resolved = None
+    if isinstance(resolved, ContainerConfigError):
+        logger.warning(
+            "container config unresolved (%s); policy drift suppressed",
+            getattr(resolved, "code", "unknown"),
+        )
+        config = None
+    elif isinstance(resolved, ContainerConfig):
+        config = resolved
+    else:
+        config = None
+
+    # ── locate the container (read-only) ────────────────────────────────
+    container = None
+    try:
+        listed = containers.list(all=True)
+    except Exception:
+        logger.warning("container listing failed; assuming no container present")
+        listed = []
+    for candidate in listed or []:
+        if _matches_record(record, candidate):
+            container = candidate
+            break
+
+    if container is None:
+        expected = getattr(record, "docker_id", "") or getattr(record, "id", "")
+        return [
+            _make_finding(
+                CLASS_IDENTITY,
+                EVENT_CONTAINER_ABSENT,
+                expected,
+                None,
+            )
+        ]
+
+    # ── build the live mapping (guard the inspection) ───────────────────
+    live: Any
+    try:
+        live = {
+            **snapshot_from_attrs(getattr(container, "attrs")),
+            _LIVE_ID_KEY: getattr(container, "id", None),
+        }
+    except Exception:
+        logger.warning("live container inspection failed; live axes skipped")
+        live = None
+
+    findings = classify_drift(record, live, config)
+    permission = _permission_drift_finding(record, config)
+    if permission is not None:
+        findings.append(permission)
+    return findings
+
+
+def emit_drift_findings(
+    workspace_id: str,
+    record: Any,
+    findings: list[DriftFinding],
+    *,
+    vault_root: Any = None,
+) -> list[DriftFinding]:
+    """Append a drift event per finding to *record*'s log; return those emitted.
+
+    Inferred (migration-synthesised) records emit nothing.  A finding is
+    skipped when the most recent existing event of the same ``event_type``
+    carries the same ``signature`` -- so repeated scans do not duplicate
+    entries.
+
+    The appended event payload contains exactly: ``class``, ``expected``,
+    ``actual``, ``signature`` and ``detected_at``.  A finding whose ``fresh``
+    verdict is set (non-``None`` -- lifecycle findings) additionally carries a
+    ``fresh`` key; every other finding keeps the five-key legacy payload.
+    """
+    if getattr(record, "inferred", False):
+        return []
+
+    record_id = getattr(record, "id", None)
+    emitted: list[DriftFinding] = []
+    for finding in findings or []:
+        try:
+            log = read_event_log(workspace_id, record_id, vault_root=vault_root)
+        except Exception:
+            logger.warning("could not read event log for drift dedup; emitting")
+            log = []
+
+        prior = [
+            entry
+            for entry in log
+            if isinstance(entry, dict) and entry.get("event_type") == finding.event_type
+        ]
+        if prior:
+            # ``read_event_log`` returns entries OLDEST-FIRST (verified
+            # empirically for both the embedded log and the ``.events.jsonl``
+            # sidecar), so ``prior[-1]`` is the MOST RECENT event of this type.
+            # The spec rule is: skip only when the LAST event of that type
+            # already carries the same signature.
+            last_payload = prior[-1].get("payload")
+            if (
+                isinstance(last_payload, dict)
+                and last_payload.get("signature") == finding.signature
+            ):
+                continue
+
+        payload = {
+            "class": finding.drift_class,
+            "expected": finding.expected,
+            "actual": finding.actual,
+            "signature": finding.signature,
+            "detected_at": iso_now(),
+        }
+        # ``fresh`` is carried ONLY when the finding has a freshness verdict
+        # (lifecycle findings); legacy findings keep the five-key payload.
+        if finding.fresh is not None:
+            payload["fresh"] = finding.fresh
+        append_event(
+            workspace_id,
+            record_id,
+            finding.event_type,
+            ACTOR,
+            vault_root=vault_root,
+            **payload,
+        )
+        emitted.append(finding)
+    return emitted
+
+
+def scan_record(
+    record: Any,
+    containers: Any,
+    *,
+    workspace_id: str,
+    permissions: Any = None,
+    capabilities: Any = None,
+    vault_root: Any = None,
+) -> list[DriftFinding]:
+    """Detect drift for *record*, then emit the findings; return those emitted."""
+    findings = detect_record_drift(
+        record,
+        containers,
+        permissions=permissions,
+        capabilities=capabilities,
+    )
+    return emit_drift_findings(workspace_id, record, findings, vault_root=vault_root)
+
+
+__all__ = [
+    "ACTOR",
+    "CLASS_IDENTITY",
+    "CLASS_POLICY",
+    "CLASS_RUNTIME",
+    "CLASS_IMAGE",
+    "CLASS_HARDENING",
+    "CLASS_RESTART_POLICY",
+    "CLASS_PERMISSION",
+    "CLASS_INTENT",
+    "CLASS_LIFECYCLE",
+    "EVENT_IDENTITY_CHANGED",
+    "EVENT_CONTAINER_ABSENT",
+    "EVENT_POLICY_CONFIG_CHANGED",
+    "EVENT_RUNTIME_MISMATCH",
+    "EVENT_IMAGE_CHANGED",
+    "EVENT_HARDENING_LOST",
+    "EVENT_RESTART_POLICY_MISMATCH",
+    "EVENT_PERMISSION_CHANGED",
+    "EVENT_INTENT_SNAPSHOT_MISSING",
+    "EVENT_CONTAINER_STUCK_CREATING",
+    "DriftFinding",
+    "signature_for",
+    "record_permissions",
+    "classify_drift",
+    "detect_record_drift",
+    "live_state_for_record",
+    "emit_drift_findings",
+    "scan_record",
+]

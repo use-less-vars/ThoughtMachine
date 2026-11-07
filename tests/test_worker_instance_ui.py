@@ -1,0 +1,870 @@
+"""Worker instance-awareness UI tests (backend layer).
+
+Covers the instance-aware worker UI upgrade end to end at the backend
+boundary:
+
+* ``GET /api/workspace/{ws_id}/workers`` returns the raw worker config
+  templates only (one row per template, no runtime fields); live worker
+  threads are exposed separately via ``GET .../workers/active``. The
+  ``?name=`` filter narrows to a single template.
+* ``POST .../workers/{name}/stop|pause|resume`` accept an optional
+  ``instance_id`` query param: with it, the command.json / status.json files
+  are written to the instance directory (``<name>#<N>``) and the registry
+  fast-path touches only that instance's thread; without it, legacy by-name
+  behavior is preserved (no instance fields in the response).
+* ``Worker._action_query`` resolves instances and reports
+  ``instance_id``/``instance_label`` in its envelope; a manually paused
+  instance returns the paused envelope without disturbing other instances.
+* ``WebAgentBridge`` keys per-worker EventBus subscriptions by instance
+  label (``<name>#<N>``) and stamps forwarded worker events with
+  ``instance_id``/``instance_label``.
+* Label helpers ``_worker_instance_label`` / ``_worker_instance_parts``.
+
+All registry mutations are cleaned up by the autouse ``_registry_teardown``
+fixture (same pattern as test_worker_sync_query_timeout_containment.py).
+"""
+
+import asyncio
+import json
+import queue
+import time
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi import HTTPException
+from starlette.requests import Request as StarletteRequest
+
+from agent.events import EventBus, EventType, create_event
+
+from tests.test_worker_sync_query_timeout_containment import (
+    _FakeContainerManager,
+    _owned_container,
+    _spawn_worker,
+    _wait_until,
+)
+
+from thoughtmachine.container_record import LIFECYCLE_EPHEMERAL
+
+import tools.workspace.worker_container as worker_container
+from tools.workspace import worker as worker_module
+from tools.workspace.worker import (
+    Worker,
+    WorkerThread,
+    register_worker_event_bus,
+    unregister_worker_event_bus,
+)
+
+from web_ui.backend import workspace_routes
+from web_ui.backend.bridge import (
+    WebAgentBridge,
+    _worker_instance_label,
+    _worker_instance_parts,
+)
+
+
+# ── fixtures / helpers ──────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _registry_teardown():
+    """Pop registry entries added during a test and stop/join any stragglers
+    so nothing leaks into later tests (mirrors the containment-test harness)."""
+    with worker_module._registry_lock:
+        preexisting = set(worker_module._worker_registry.keys())
+    yield
+    with worker_module._registry_lock:
+        added = [k for k in worker_module._worker_registry.keys() if k not in preexisting]
+        threads = [worker_module._worker_registry.pop(k, None) for k in added]
+    for t in threads:
+        if t is None:
+            continue
+        try:
+            t.stop()
+        except Exception:
+            pass
+        try:
+            t.join(timeout=5)
+        except Exception:
+            pass
+
+
+def _no_origin_request() -> StarletteRequest:
+    """A real Starlette Request with no Origin header."""
+    return StarletteRequest(
+        {"type": "http", "method": "POST", "path": "/", "headers": []}
+    )
+
+
+def _use_tmp_workspace(monkeypatch, tmp_path):
+    """Point workspace_routes at the pytest tmp_path."""
+    monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: tmp_path)
+    monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
+
+
+def _write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+#: Epoch seeded into every fixture worker directory.  Deliberately not 1: a
+#: fence that defaulted or dropped its epoch must fail these tests, not pass by
+#: accident.
+_SEEDED_GENERATION = 7
+
+
+def _seed_worker_dir(worker_dir, generation=_SEEDED_GENERATION):
+    """Create *worker_dir* and give it the ``generation`` sidecar that
+    ``WorkerThread.__init__`` allocates, so routed commands take the FENCED
+    path; the bare-action write is only the degraded fallback for a directory
+    that never hosted a thread."""
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    (worker_dir / "generation").write_text(str(generation), encoding="utf-8")
+    return worker_dir
+
+
+def _assert_fenced_command(
+    worker_dir, action, *, session_id, worker_name, instance_id, epoch=_SEEDED_GENERATION
+):
+    """Assert ``command.json`` carries *action* and a complete, correct fence."""
+    payload = json.loads((worker_dir / "command.json").read_text(encoding="utf-8"))
+    assert payload["action"] == action, payload
+    assert payload["session_id"] == session_id, payload
+    assert payload["worker_name"] == worker_name, payload
+    assert payload["instance_id"] == instance_id, payload
+    assert payload["epoch"] == epoch, payload
+    assert set(payload) == {
+        "action",
+        "session_id",
+        "worker_name",
+        "instance_id",
+        "epoch",
+    }, payload
+
+
+# ── GET /api/workspace/{ws_id}/workers ──────────────────────────────────────
+
+
+def test_get_workers_returns_templates_only(tmp_path, monkeypatch):
+    """GET /workers returns raw config templates only: one row per
+    workers.json entry, with NO runtime/instance fields merged in even when
+    per-instance status dirs exist (runtime state lives on
+    ``/workers/active``). Legacy bare-string entries become {"name": ...}."""
+    now = datetime.now(timezone.utc)
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    _write_json(tmp_path / "workers.json", [
+        {"name": "w1", "system_prompt": "p1"},
+        {"name": "w2", "system_prompt": "p2"},
+        {"name": "w3", "system_prompt": "p3"},
+    ])
+    # Per-instance status/context dirs that the old merged endpoint would
+    # have folded into the rows - they must now be ignored entirely.
+    _write_json(tmp_path / "workers" / "w1" / "status.json", {
+        "runtime_status": "busy",
+        "current_task": "task",
+        "last_heartbeat": (now - timedelta(seconds=5)).isoformat(),
+        "error": None,
+        "session_id": None,
+        "current_context_tokens": 123,
+        "max_context_tokens": 456,
+    })
+    _write_json(tmp_path / "workers" / "w1" / "context.json", {
+        "pruned_since_last_query": 2,
+    })
+    _write_json(tmp_path / "workers" / "w2" / "status.json", {
+        "runtime_status": "ready",
+        "current_task": None,
+        "last_heartbeat": now.isoformat(),
+        "error": None,
+        "session_id": None,
+        "current_context_tokens": 10,
+        "max_context_tokens": 20,
+    })
+    _write_json(tmp_path / "workers" / "w2#2" / "status.json", {
+        "runtime_status": "busy",
+        "current_task": "t2",
+        "last_heartbeat": now.isoformat(),
+        "error": None,
+        "session_id": None,
+        "current_context_tokens": 30,
+        "max_context_tokens": 40,
+    })
+
+    rows = asyncio.run(workspace_routes.get_workers("ws-1"))
+    assert len(rows) == 3, f"expected 3 template rows, got {len(rows)}: {rows}"
+    by_name = {e["name"]: e for e in rows}
+
+    w1 = by_name["w1"]
+    assert w1 == {"name": "w1", "system_prompt": "p1"}
+    # No instance/runtime fields are merged into templates.
+    assert "instance_id" not in w1
+    assert "instance_label" not in w1
+    assert "runtime_status" not in w1
+    assert "current_context_tokens" not in w1
+    assert "has_persisted_context" not in w1
+
+    assert by_name["w2"] == {"name": "w2", "system_prompt": "p2"}
+    assert by_name["w3"] == {"name": "w3", "system_prompt": "p3"}
+
+    # Legacy bare-string entry -> {"name": ...}.
+    _write_json(tmp_path / "workers.json", ["legacy-w"])
+    rows = asyncio.run(workspace_routes.get_workers("ws-1"))
+    assert rows == [{"name": "legacy-w"}]
+
+
+def test_get_workers_name_filter(tmp_path, monkeypatch):
+    """?name= returns the single raw template dict for a matching worker
+    (no instance fields) and 404s for an unknown name."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    _write_json(tmp_path / "workers.json", [
+        {"name": "w1", "system_prompt": "p1"},
+        {"name": "w2", "system_prompt": "p2"},
+    ])
+    entry = asyncio.run(workspace_routes.get_workers("ws-1", name="w1"))
+    assert isinstance(entry, dict)
+    assert entry == {"name": "w1", "system_prompt": "p1"}
+    assert "instance_id" not in entry
+    assert "instance_label" not in entry
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(workspace_routes.get_workers("ws-1", name="nope"))
+    assert exc.value.status_code == 404
+    assert "nope" in str(exc.value.detail)
+
+
+# ── POST .../workers/{name}/stop|pause|resume (instance targeting) ──────────
+
+
+def test_stop_worker_with_instance_id_targets_only_that_instance(tmp_path, monkeypatch):
+    """stop_worker(instance_id=2) writes command.json/status.json into the
+    <name>#2 dir and fast-paths stop() only on the instance-2 thread."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    with workspace_routes._registry_lock:
+        workspace_routes._worker_registry[("sess-x", "default", 1)] = t1 = MagicMock()
+        workspace_routes._worker_registry[("sess-x", "default", 2)] = t2 = MagicMock()
+    _seed_worker_dir(tmp_path / "workers" / "default#2", generation=11)
+    _write_json(tmp_path / "workers" / "default#2" / "status.json", {})
+
+    resp = asyncio.run(
+        workspace_routes.stop_worker(
+            ws_id="ws-1", name="default", instance_id=2, request=_no_origin_request()
+        )
+    )
+    assert resp["status"] == "ok"
+    assert resp["name"] == "default"
+    assert resp["instance_id"] == 2
+    assert resp["instance_label"] == "default#2"
+
+    # PHASE 2.1a: the ``stop`` route DETACHES (termination moved to ``kill``),
+    # so the optimistic status.json vocabulary is "detached", not "completed".
+    _assert_fenced_command(
+        tmp_path / "workers" / "default#2",
+        "stop",
+        session_id="",
+        worker_name="default",
+        instance_id=2,
+        epoch=11,
+    )
+    status = json.loads((tmp_path / "workers" / "default#2" / "status.json").read_text())
+    assert status["runtime_status"] == "detached"
+
+    t2.stop.assert_called_once()
+    t1.stop.assert_not_called()
+
+
+def test_pause_resume_bare_name_legacy_behavior(tmp_path, monkeypatch):
+    """Without instance_id the endpoints keep legacy by-name behavior: no
+    instance fields in the response, command files in the bare <name> dir,
+    and every registered instance of that name is fast-pathed."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    _seed_worker_dir(tmp_path / "workers" / "default")
+    with workspace_routes._registry_lock:
+        workspace_routes._worker_registry[("sess-x", "default", 1)] = t1 = MagicMock()
+
+    resp = asyncio.run(
+        workspace_routes.pause_worker(
+            ws_id="ws-1", name="default", request=_no_origin_request()
+        )
+    )
+    assert resp["status"] == "pausing"
+    assert resp["name"] == "default"
+    assert "instance_id" not in resp
+    assert "instance_label" not in resp
+    _assert_fenced_command(
+        tmp_path / "workers" / "default",
+        "pause",
+        session_id="",
+        worker_name="default",
+        instance_id=1,
+    )
+    status = json.loads((tmp_path / "workers" / "default" / "status.json").read_text())
+    assert status["runtime_status"] == "pausing"
+    t1.pause.assert_called_once()
+
+    resp2 = asyncio.run(
+        workspace_routes.resume_worker(
+            ws_id="ws-1", name="default", request=_no_origin_request()
+        )
+    )
+    assert resp2["status"] == "resumed"
+    assert resp2["name"] == "default"
+    assert "instance_id" not in resp2
+    _assert_fenced_command(
+        tmp_path / "workers" / "default",
+        "resume",
+        session_id="",
+        worker_name="default",
+        instance_id=1,
+    )
+    t1.resume.assert_called_once()
+
+
+def test_stop_unknown_worker_404(tmp_path, monkeypatch):
+    """No workers dir at all -> 404 with a not_found detail naming the
+    worker."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            workspace_routes.stop_worker(
+                ws_id="ws-1", name="default", request=_no_origin_request()
+            )
+        )
+    assert exc.value.status_code == 404
+    assert "default" in str(exc.value.detail)
+
+
+def test_pause_with_instance_id_resolves_instance_dir(tmp_path, monkeypatch):
+    """pause_worker(instance_id=2) resolves the <name>#2 directory (no
+    status file needed) and returns the instance fields."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    _seed_worker_dir(tmp_path / "workers" / "default#2")
+
+    resp = asyncio.run(
+        workspace_routes.pause_worker(
+            ws_id="ws-1", name="default", instance_id=2, request=_no_origin_request()
+        )
+    )
+    assert resp["status"] == "pausing"
+    assert resp["name"] == "default"
+    assert resp["instance_id"] == 2
+    assert resp["instance_label"] == "default#2"
+    _assert_fenced_command(
+        tmp_path / "workers" / "default#2",
+        "pause",
+        session_id="",
+        worker_name="default",
+        instance_id=2,
+    )
+
+
+# ── Worker tool: instance-aware pause/query semantics ───────────────────────
+
+
+def test_real_thread_pause_resume_and_query_envelope(tmp_path, monkeypatch):
+    """A live instance: pause via the route drives the thread to 'paused',
+    a query against the paused instance returns the manual-pause envelope,
+    resume restores it, and a subsequent query envelope carries
+    instance_id/instance_label.  The tail then exercises the PHASE 2.1a verb
+    split on the same live thread: ``stop`` only DETACHES (thread alive,
+    registry entry intact, containers untouched) while ``kill`` is what
+    terminates and reclaims."""
+    # The worker owns one reclaimable (ephemeral) container, so the detach
+    # assertions below are meaningful: ``stop`` must leave it untouched while
+    # ``kill`` reclaims exactly this container through the normal teardown path.
+    cm = _FakeContainerManager([
+        _owned_container("c-w1", "tm-sess-7-w1", "sess-7:w1"),
+    ])
+    thread = _spawn_worker(
+        tmp_path,
+        monkeypatch,
+        name="w1",
+        session_id="sess-7",
+        container_manager=cm,
+    )
+    # Ownership is an EXACT match on ``<session id>:<worker name>``; the label
+    # above is that identity (asserted so the container claims cannot drift).
+    assert thread.owner_identity == "sess-7:w1"
+    _use_tmp_workspace(monkeypatch, tmp_path)
+
+    thread._manual_only_pause = True
+    resp = asyncio.run(
+        workspace_routes.pause_worker(
+            ws_id="ws-1", name="w1", request=_no_origin_request()
+        )
+    )
+    assert resp["status"] == "pausing"
+    assert resp["name"] == "w1"
+    # The route writes command.json synchronously (proven by the response
+    # above; its content is covered deterministically by the fake-thread
+    # tests), but the live thread consumes and DELETES it on pickup, so
+    # asserting the file after pause_worker returns is inherently racy.
+    # status.json is route-written and never deleted — the durable artifact;
+    # poll briefly for the pausing/paused write instead of reading it once
+    # (the registry fast-path may let the thread advance between the route
+    # write and this read on a loaded runner).
+    def _pause_visible():
+        try:
+            payload = json.loads(
+                (tmp_path / "workers" / "w1" / "status.json").read_text()
+            )
+        except (OSError, json.JSONDecodeError):
+            return False
+        return payload.get("runtime_status") in ("pausing", "paused")
+
+    assert _wait_until(_pause_visible, timeout=5.0), (
+        "status.json never showed pausing/paused after pause_worker"
+    )
+    assert _wait_until(lambda: thread.status == "paused", timeout=10.0), (
+        f"worker did not reach paused (status={thread.status}, error={thread.error})"
+    )
+
+    paused = Worker(
+        action="query", worker_name="w1", worker_query="hi", session_id="sess-7"
+    )._action_query([])
+    assert paused["status"] == "paused"
+    assert "manually paused" in paused["message"]
+
+    resp2 = asyncio.run(
+        workspace_routes.resume_worker(
+            ws_id="ws-1", name="w1", request=_no_origin_request()
+        )
+    )
+    assert resp2["status"] == "resumed"
+    assert thread._manual_only_pause is False
+    assert _wait_until(lambda: thread.status == "ready", timeout=10.0), (
+        f"worker did not reach ready after resume (status={thread.status})"
+    )
+
+    def _fake_tool_loop(self, query):
+        self._last_elapsed_val = 0.0
+        return json.dumps({"response": "done"})
+
+    monkeypatch.setattr(WorkerThread, "_run_tool_loop", _fake_tool_loop)
+    thread._agent = object()
+    envelope = Worker(
+        action="query", worker_name="w1", worker_query="hi", session_id="sess-7"
+    )._action_query([])
+    assert envelope["worker_name"] == "w1"
+    assert envelope["instance_id"] == 1
+    assert envelope["instance_label"] == "w1"
+    assert "response" in envelope
+    assert "done" in json.dumps(envelope)
+
+    # The worker-owned container must resolve to an EPHEMERAL lifecycle class
+    # for teardown to reclaim it (the predicate is fail-closed otherwise, which
+    # would make the "stop must not reclaim" claim vacuous); the real record
+    # store has no record for the fake id, so patch the record seam.
+    monkeypatch.setattr(
+        worker_container,
+        "find_by_docker_label",
+        lambda record_id, vault_root=None: SimpleNamespace(
+            lifecycle_class=LIFECYCLE_EPHEMERAL,
+        ),
+    )
+
+    # ── stop = DETACH (PHASE 2.1a): no termination, no reclaim ──
+    resp3 = asyncio.run(
+        workspace_routes.stop_worker(
+            ws_id="ws-1", name="w1", request=_no_origin_request()
+        )
+    )
+    assert resp3["status"] == "ok"
+    assert resp3["name"] == "w1"
+    assert _wait_until(lambda: thread.status == "detached", timeout=10.0), (
+        f"worker did not detach (status={thread.status}, error={thread.error})"
+    )
+    # Detached means parked, not dead: the thread stays alive, the stop event
+    # stays clear and the registry entry survives so it can be resumed.
+    assert thread.is_alive(), "stop() must not terminate the worker thread"
+    assert not thread._stop_event.is_set(), "stop() must not set _stop_event"
+    with worker_module._registry_lock:
+        assert worker_module._worker_registry.get(("sess-7", "w1", 1)) is thread
+    # ...and its containers are left alone (no stop/remove on the detach path).
+    assert cm.stopped == []
+    assert cm.removed == []
+    assert [c.id for c in cm.list_containers()] == ["c-w1"]
+
+    # ── kill = TERMINATE: the sibling route is the only terminating verb ──
+    # (Killed while the _save_context monkeypatch is still active, so run()'s
+    # finally-block save doesn't touch the real implementation after teardown
+    # reverts the patch — same hygiene as the containment suite.)
+    resp4 = asyncio.run(
+        workspace_routes.kill_worker(
+            ws_id="ws-1", name="w1", request=_no_origin_request()
+        )
+    )
+    assert resp4["status"] == "ok"
+    assert resp4["name"] == "w1"
+    assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), (
+        "worker thread still alive after kill"
+    )
+    assert thread.status == "killed"
+    assert thread._stop_event.is_set()
+    # run()'s finally block reclaimed the worker-owned container via the same
+    # teardown path, which is what makes the detach-time emptiness above real.
+    assert [c.id for c in cm.stopped] == ["c-w1"]
+    assert [c.id for c in cm.removed] == ["c-w1"]
+    assert cm.list_containers() == []
+
+
+# ── Bridge: per-instance event bus subscriptions and event stamping ─────────
+
+
+def test_bridge_subscribes_per_instance_bus_and_stamps_events():
+    """_on_worker_spawned keys the per-worker bus subscription by instance
+    label (w2#2) and forwards both the spawned event and per-bus events with
+    instance_id/instance_label."""
+    bus2 = EventBus()
+    register_worker_event_bus("test-session-123", "w2", bus2, instance_id=2)
+    received = []
+    bridge = WebAgentBridge(event_callback=lambda ev: received.append(ev))
+    bridge._session_id = "test-session-123"
+    try:
+        evt = SimpleNamespace(
+            type=SimpleNamespace(value="worker_spawned"),
+            data={
+                "session_id": "test-session-123",
+                "worker_name": "w2",
+                "instance_id": 2,
+            },
+            metadata=SimpleNamespace(timestamp=datetime.now(timezone.utc)),
+        )
+        bridge._on_worker_spawned(evt)
+
+        assert "w2#2" in bridge._worker_bus_subs, (
+            f"expected per-instance subscription under 'w2#2', got "
+            f"{sorted(bridge._worker_bus_subs.keys())}"
+        )
+        assert any(
+            e.get("type") == "worker:worker_spawned"
+            and e.get("instance_id") == 2
+            and e.get("instance_label") == "w2#2"
+            for e in received
+        ), received
+
+        received.clear()
+        bus2.publish(create_event(
+            EventType.SYSTEM_NOTIFICATION,
+            data={
+                "session_id": "test-session-123",
+                "worker_name": "w2",
+                "instance_id": 2,
+                "instance_label": "w2#2",
+            },
+            source="worker",
+            session_id="test-session-123",
+        ))
+        assert any(
+            e.get("type") == "worker:system_notification"
+            and e.get("instance_id") == 2
+            and e.get("instance_label") == "w2#2"
+            for e in received
+        ), received
+    finally:
+        try:
+            unregister_worker_event_bus("test-session-123", "w2", instance_id=2)
+        except Exception:
+            pass
+        try:
+            bridge.unregister()
+        except Exception:
+            pass
+
+
+def test_bridge_forward_worker_event_passthrough():
+    """_forward_worker_event passes worker lifecycle events through with the
+    instance fields intact."""
+    received2 = []
+    bridge2 = WebAgentBridge(event_callback=lambda ev: received2.append(ev))
+    bridge2._session_id = "test-session-123"
+    try:
+        evt2 = SimpleNamespace(
+            type=SimpleNamespace(value="worker_completed"),
+            data={
+                "session_id": "test-session-123",
+                "worker_name": "w2",
+                "instance_id": 2,
+                "instance_label": "w2#2",
+            },
+            metadata=SimpleNamespace(timestamp=datetime.now(timezone.utc)),
+        )
+        bridge2._forward_worker_event(evt2)
+        assert any(
+            e.get("type") == "worker:worker_completed"
+            and e.get("worker_name") == "w2"
+            and e.get("instance_id") == 2
+            and e.get("instance_label") == "w2#2"
+            for e in received2
+        ), received2
+    finally:
+        try:
+            bridge2.unregister()
+        except Exception:
+            pass
+
+
+# ── Bridge pause/resume worker-loop guards ─────────────────────────────────
+
+
+SESSION_T = "sess-pause-loop"
+
+
+def _fake_worker(status="ready", query_id=None, reply_queue=None):
+    """WorkerThread stand-in carrying the attributes bridge.pause()/resume()
+    inspect: ``status`` plus the sticky ``_current_query_id`` /
+    ``_current_reply_queue`` pair the run loop sets at dequeue (never reset)."""
+    t = MagicMock()
+    t.status = status
+    t._current_query_id = query_id
+    t._current_reply_queue = reply_queue
+    t._manual_only_pause = False
+    return t
+
+
+def _running_bridge(session_id):
+    """A bridge with a live-looking thread so pause() reaches its worker loop."""
+    b = WebAgentBridge(event_callback=lambda ev: None)
+    b._session_id = session_id
+    b._running = True
+    b._thread = MagicMock()
+    b._thread.is_alive.return_value = True
+    return b
+
+
+def _seed_worker(key, thread):
+    with worker_module._registry_lock:
+        worker_module._worker_registry[key] = thread
+
+
+def test_bridge_pause_reaches_every_worker_of_the_session():
+    """bridge.pause() pauses EVERY worker of this session, mid-async-job too.
+
+    The old contract skipped workers running a submit_query async job (busy +
+    ``_current_query_id`` set + no reply queue) because pausing them would cut
+    a turn short. Reading mode makes that unnecessary: the worker's agent is
+    restricted to Respond and concludes the turn itself, so a busy async-job
+    worker is paused exactly like a sync-blocked (reply queue set), idle (even
+    with sticky async attrs), plain-string-spawned or already-paused one — and
+    still only for this session.
+    """
+    async_busy = _fake_worker(status="busy", query_id="job-1", reply_queue=None)
+    sync_busy = _fake_worker(status="busy", query_id="q-1", reply_queue=queue.Queue())
+    idle_sticky = _fake_worker(status="ready", query_id="job-2", reply_queue=None)
+    idle_plain = _fake_worker(status="ready")
+    sync_spawn = _fake_worker(status="busy", query_id=None, reply_queue=None)
+    paused = _fake_worker(status="paused")
+    foreign = _fake_worker(status="busy", query_id="job-9", reply_queue=None)
+    threads = {
+        (SESSION_T, "w1", 1): async_busy,
+        (SESSION_T, "w1", 2): sync_busy,
+        (SESSION_T, "w2", 1): idle_sticky,
+        (SESSION_T, "w3", 1): idle_plain,
+        (SESSION_T, "w4", 1): sync_spawn,
+        (SESSION_T, "w5", 1): paused,
+        ("other-session", "w9", 1): foreign,
+    }
+    for key, t in threads.items():
+        _seed_worker(key, t)
+
+    bridge = _running_bridge(SESSION_T)
+    try:
+        bridge.pause()
+    finally:
+        try:
+            bridge.unregister()
+        except Exception:
+            pass
+
+    async_busy.pause.assert_called_once()
+    foreign.pause.assert_not_called()
+    sync_busy.pause.assert_called_once()
+    idle_sticky.pause.assert_called_once()
+    idle_plain.pause.assert_called_once()
+    sync_spawn.pause.assert_called_once()
+    paused.pause.assert_called_once()
+
+
+def test_bridge_resume_resumes_only_paused_workers():
+    """bridge.resume() must only call thread.resume() on workers that are
+    actually paused (status == 'paused'); running/ready/error workers and
+    other sessions are left alone."""
+    paused_w = _fake_worker(status="paused")
+    async_busy = _fake_worker(status="busy", query_id="job-1", reply_queue=None)
+    ready = _fake_worker(status="ready")
+    errored = _fake_worker(status="error")
+    foreign_paused = _fake_worker(status="paused")
+    threads = {
+        (SESSION_T, "w1", 1): paused_w,
+        (SESSION_T, "w1", 2): async_busy,
+        (SESSION_T, "w2", 1): ready,
+        (SESSION_T, "w3", 1): errored,
+        ("other-session", "w9", 1): foreign_paused,
+    }
+    for key, t in threads.items():
+        _seed_worker(key, t)
+
+    bridge = _running_bridge(SESSION_T)
+    try:
+        bridge.resume()
+    finally:
+        try:
+            bridge.unregister()
+        except Exception:
+            pass
+
+    paused_w.resume.assert_called_once()
+    async_busy.resume.assert_not_called()
+    ready.resume.assert_not_called()
+    errored.resume.assert_not_called()
+    foreign_paused.resume.assert_not_called()
+
+
+# ── Label helpers ───────────────────────────────────────────────────────────
+
+
+def test_instance_label_helpers():
+    assert _worker_instance_label("w2", 2) == "w2#2"
+    assert _worker_instance_label("w2", 1) == "w2"
+    assert _worker_instance_label("w2", None) == "w2"
+    assert _worker_instance_parts("w2#2") == ("w2", 2)
+    assert _worker_instance_parts("w2") == ("w2", 1)
+    assert _worker_instance_parts("w2#x") == ("w2#x", 1)
+
+
+# ── POST .../workers/stop_all ──────────────────────────────────────────────
+
+
+def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
+    """stop_all_workers() stops every instance (legacy + session-scoped):
+    one per-worker result each, command.json/status.json written per
+    directory, and every matching in-memory thread fast-pathed.  A
+    session_id filter narrows the stop to that session only."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    with workspace_routes._registry_lock:
+        workspace_routes._worker_registry[("sess-x", "default", 1)] = t1 = MagicMock()
+        workspace_routes._worker_registry[("sess-x", "default", 2)] = t2 = MagicMock()
+        workspace_routes._worker_registry[("sess-a", "alpha", 1)] = t3 = MagicMock()
+        workspace_routes._worker_registry[("sess-b", "beta", 1)] = t4 = MagicMock()
+    for sub in ("default", "default#2", "sess-a/alpha", "sess-b/beta"):
+        _seed_worker_dir(tmp_path / "workers" / sub)
+        _write_json(tmp_path / "workers" / sub / "status.json", {})
+
+    results = asyncio.run(
+        workspace_routes.stop_all_workers(ws_id="ws-1", request=_no_origin_request())
+    )
+    assert isinstance(results, list)
+    assert len(results) == 4
+    for res in results:
+        assert set(res.keys()) == {"worker_name", "instance_id", "status", "error"}
+        assert res["status"] == "ok"
+        assert res["error"] is None
+    assert sorted(r["instance_id"] for r in results if r["worker_name"] == "default") == [1, 2]
+    assert sorted(r["worker_name"] for r in results) == ["alpha", "beta", "default", "default"]
+
+    # The fence names the session the directory sits under: a session-scoped
+    # target carries its real session id, a legacy one carries "".
+    stop_fences = {
+        "default": ("", "default", 1),
+        "default#2": ("", "default", 2),
+        "sess-a/alpha": ("sess-a", "alpha", 1),
+        "sess-b/beta": ("sess-b", "beta", 1),
+    }
+    for sub, (session_id, worker_name, instance_id) in stop_fences.items():
+        _assert_fenced_command(
+            tmp_path / "workers" / sub,
+            "stop",
+            session_id=session_id,
+            worker_name=worker_name,
+            instance_id=instance_id,
+        )
+        status = json.loads((tmp_path / "workers" / sub / "status.json").read_text())
+        # PHASE 2.1a: stop_all detaches, so the optimistic vocabulary is "detached".
+        assert status["runtime_status"] == "detached"
+    t1.stop.assert_called_once()
+    t2.stop.assert_called_once()
+    t3.stop.assert_called_once()
+    t4.stop.assert_called_once()
+
+    # Session filter: only sess-a's workers are touched; other sessions
+    # (existing and a freshly added one) are left alone.
+    _seed_worker_dir(tmp_path / "workers" / "sess-c" / "gamma")
+    _write_json(tmp_path / "workers" / "sess-c" / "gamma" / "status.json", {})
+    results = asyncio.run(
+        workspace_routes.stop_all_workers(
+            ws_id="ws-1",
+            body=workspace_routes.StopAllWorkersBody(session_id="sess-a"),
+            request=_no_origin_request(),
+        )
+    )
+    assert len(results) == 1
+    assert results[0]["worker_name"] == "alpha"
+    assert results[0]["instance_id"] == 1
+    assert results[0]["status"] == "ok"
+    assert results[0]["error"] is None
+    assert t3.stop.call_count == 2
+    assert t1.stop.call_count == 1
+    assert t2.stop.call_count == 1
+    assert t4.stop.call_count == 1
+    assert not (tmp_path / "workers" / "sess-c" / "gamma" / "command.json").exists()
+
+
+def test_stop_all_returns_per_worker_results_and_continues_on_failure(tmp_path, monkeypatch):
+    """stop_all_workers() records per-worker results: a failing worker is
+    reported with status/error while the remaining workers are still
+    processed and reported ok.  With no workers dir at all it returns an
+    empty list."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    with workspace_routes._registry_lock:
+        workspace_routes._worker_registry[("sess-x", "good", 1)] = tg = MagicMock()
+    _seed_worker_dir(tmp_path / "workers" / "good")
+    _write_json(tmp_path / "workers" / "good" / "status.json", {})
+    _seed_worker_dir(tmp_path / "workers" / "ghost")
+    _write_json(tmp_path / "workers" / "ghost" / "status.json", {})
+
+    real_stop = workspace_routes._stop_worker_instance
+
+    def fake_stop(ws_dir, name, instance_id=None, session_id=None):
+        if name == "ghost":
+            raise HTTPException(status_code=404, detail={"status": "not_found", "name": name})
+        return real_stop(ws_dir, name, instance_id, session_id=session_id)
+
+    monkeypatch.setattr(workspace_routes, "_stop_worker_instance", fake_stop)
+
+    results = asyncio.run(
+        workspace_routes.stop_all_workers(ws_id="ws-1", request=_no_origin_request())
+    )
+    assert isinstance(results, list)
+    assert len(results) == 2
+    by_name = {r["worker_name"]: r for r in results}
+    assert set(by_name.keys()) == {"good", "ghost"}
+
+    good = by_name["good"]
+    assert good["instance_id"] == 1
+    assert good["status"] == "ok"
+    assert good["error"] is None
+    _assert_fenced_command(
+        tmp_path / "workers" / "good",
+        "stop",
+        session_id="",
+        worker_name="good",
+        instance_id=1,
+    )
+    tg.stop.assert_called_once()
+
+    ghost = by_name["ghost"]
+    assert ghost["instance_id"] == 1
+    assert ghost["status"] == "not_found"
+    assert ghost["error"] is not None
+    # The helper raised before touching disk for the failing worker.
+    assert not (tmp_path / "workers" / "ghost" / "command.json").exists()
+
+    # No workers dir at all -> empty list, no error.
+    monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: tmp_path / "empty")
+    assert (
+        asyncio.run(
+            workspace_routes.stop_all_workers(ws_id="ws-1", request=_no_origin_request())
+        )
+        == []
+    )
+

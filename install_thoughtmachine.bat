@@ -5,8 +5,10 @@ REM  Windows installer for ThoughtMachine.
 REM  Checks prerequisites, then creates venv, installs deps, builds frontend.
 REM
 REM  Prerequisites (install manually if missing):
-REM    - Python 3.11-3.13 from https://www.python.org/downloads/
-REM    - Node.js LTS from https://nodejs.org/
+REM    - Python 3.11+ (3.14 supported) from https://www.python.org/downloads/
+REM    - Node.js 18+ (LTS) from https://nodejs.org/
+REM    - Docker Desktop from https://www.docker.com/products/docker-desktop/
+REM      Docker Desktop is required for full functionality. Some features will be disabled.
 REM ---------------------------------------------------------------------------
 
 setlocal enabledelayedexpansion
@@ -70,46 +72,47 @@ set PYTHON_CMD=
 set PYTHON_VER=
 set PYTHON_OK=0
 
-REM Try py launcher first, then python, then python3
-py -c "import sys;exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)" >nul 2>&1
-if not errorlevel 1 (
-    set PYTHON_CMD=py
-    set PYTHON_OK=1
-)
+REM Try py launcher first, then python, then python3. Every probe below is a
+REM single top-level line: cmd.exe mis-parses parentheses inside multi-line IF
+REM blocks, so this section deliberately uses NO parenthesized blocks at all.
+REM GOTO/labels replace the nested IF/ELSE structure that crashed cmd.exe here.
+py --version >nul 2>&1
+if not errorlevel 1 set PYTHON_CMD=py
+if not defined PYTHON_CMD python --version >nul 2>&1
+if not defined PYTHON_CMD if not errorlevel 1 set PYTHON_CMD=python
+if not defined PYTHON_CMD python3 --version >nul 2>&1
+if not defined PYTHON_CMD if not errorlevel 1 set PYTHON_CMD=python3
 
-if not defined PYTHON_CMD (
-    python -c "import sys;exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)" >nul 2>&1
-    if not errorlevel 1 (
-        set PYTHON_CMD=python
-        set PYTHON_OK=1
-    )
-)
+if not defined PYTHON_CMD goto :python_missing
 
-if not defined PYTHON_CMD (
-    python3 -c "import sys;exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)" >nul 2>&1
-    if not errorlevel 1 (
-        set PYTHON_CMD=python3
-        set PYTHON_OK=1
-    )
-)
+REM Capture the version banner for display, e.g. "Python 3.13.2"
+%PYTHON_CMD% --version > "%TEMP%\tm_pyver.txt" 2>&1
+set /p PYTHON_VER=<"%TEMP%\tm_pyver.txt"
+del "%TEMP%\tm_pyver.txt" 2>nul
 
-REM Get version string for display
-if defined PYTHON_CMD (
-    %PYTHON_CMD% --version > "%TEMP%\tm_pyver.txt" 2>&1
-    set /p PYTHON_VER=<"%TEMP%\tm_pyver.txt"
-    del "%TEMP%\tm_pyver.txt" 2>nul
-)
+REM Gate: need Python 3.11 or newer; 3.14 is the newest supported line
+%PYTHON_CMD% -c "import sys;exit(0 if (3,11)<=sys.version_info[:2] else 1)" >nul 2>&1
+if not errorlevel 1 goto :python_ok
 
-if !PYTHON_OK!==1 (
-    echo   [+] !PYTHON_CMD! -- version !PYTHON_VER!
-) else (
-    if defined PYTHON_VER (
-        echo   [x] Python !PYTHON_VER! found but not supported.
-        echo       Need Python 3.11, 3.12, or 3.13.
-    ) else (
-        echo   [x] Python not found.
-    )
-)
+echo   [x] Python %PYTHON_VER% found but not supported.
+echo       Need Python 3.11 or newer ^(3.14 supported^).
+goto :python_done
+
+:python_missing
+echo   [x] Python not found.
+echo       Install Python 3.11+ from https://www.python.org/downloads/ and re-run.
+goto :python_done
+
+:python_ok
+set PYTHON_OK=1
+echo   [+] %PYTHON_CMD% -- version %PYTHON_VER%
+
+REM Very new interpreters (3.15+) usually work, but wheels may lag behind.
+%PYTHON_CMD% -c "import sys;sys.exit(0 if sys.version_info[:2]>=(3,15) else 1)" >nul 2>&1
+if not errorlevel 1 echo   [!] Python %PYTHON_VER% is very new ^(3.15+^). If pip install fails,
+if not errorlevel 1 echo       install Python 3.14 or 3.13 and re-run this installer.
+
+:python_done
 
 echo(
 echo   --- Node.js ---
@@ -120,8 +123,19 @@ where node >nul 2>nul
 if not errorlevel 1 (
     for /f "tokens=*" %%v in ('node --version') do set NODE_VER=%%v
     if defined NODE_VER (
-        echo   [+] Node.js ^(!NODE_VER!^)
-        set NODE_OK=1
+        set "NODE_MAJOR=!NODE_VER:v=!"
+        for /f "tokens=1 delims=." %%m in ("!NODE_MAJOR!") do set "NODE_MAJOR=%%m"
+        if defined NODE_MAJOR (
+            if !NODE_MAJOR! GEQ 18 (
+                echo   [+] Node.js ^(!NODE_VER!^)
+                set NODE_OK=1
+            ) else (
+                echo   [x] Node.js !NODE_VER! found but too old.
+                echo       Need Node.js 18 or newer.
+            )
+        ) else (
+            echo   [x] Could not parse node version: !NODE_VER!
+        )
     )
 ) else (
     echo   [x] Node.js not found. Install Node.js LTS from:
@@ -151,12 +165,25 @@ if !NODE_OK!==1 (
 )
 
 echo(
+echo   --- Docker Desktop ---
+
+set DOCKER_OK=0
+docker info >nul 2>&1
+if not errorlevel 1 (
+    set DOCKER_OK=1
+    echo   [+] Docker Desktop is running
+) else (
+    echo Docker Desktop is required for full functionality. Some features will be disabled.
+    echo       Install from https://www.docker.com/products/docker-desktop/
+    echo       The app will still run; RAG/vector features need Docker.
+)
+echo(
 echo   --- Summary ---
 
 set ALL_OK=1
 if !PYTHON_OK!==0 (
     set ALL_OK=0
-    echo   [FAIL] Python 3.11-3.13 required - install or upgrade
+    echo   [FAIL] Python 3.11+ required - install or upgrade
 )
 if !NODE_OK!==0 (
     set ALL_OK=0
@@ -294,10 +321,11 @@ echo   [+] Install complete!
 echo(
 echo   Next steps:
 echo(
-echo     1. Double-click: start_thoughtmachine.bat
+echo     1. Start the app (dev mode, hot-reload):
+echo        python start_windows.py
 echo(
 echo     2. Or for production mode (serves from dist/):
-echo        start_thoughtmachine.bat --prod
+echo        python start_windows.py --prod
 echo(
 echo     3. Open http://127.0.0.1:8000 in your browser
 echo(

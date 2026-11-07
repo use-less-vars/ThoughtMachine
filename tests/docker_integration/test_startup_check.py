@@ -6,7 +6,8 @@ during:
 
   1. **Server startup** — the FastAPI ``lifespan`` handler in
      ``web_ui/backend/server.py`` scans all ``agent-exec-*`` containers
-     and verifies each one.
+     and verifies each one, then prunes containers whose
+     ``thoughtmachine.session_id`` label is not in the session registry.
 
   2. **Session load** — ``session_lifecycle.py`` verifies the session's
      container when a session is loaded (two code paths:
@@ -293,6 +294,97 @@ class TestServerLifespanScan:
 
         # Both containers processed (second one succeeded)
         assert mock_verify.call_count == 2
+
+
+# ===================================================================
+# Server lifespan stale-session prune
+# ===================================================================
+
+def _make_labeled_container(
+    *,
+    sid: str,
+    name: str = "agent-exec-abc123",
+) -> MagicMock:
+    """Build a container mock carrying a ``thoughtmachine.session_id`` label."""
+    c = MagicMock(name=f"Container({name})")
+    c.name = name
+    c.attrs = {
+        "Config": {"Labels": {"thoughtmachine.session_id": sid}},
+    }
+    return c
+
+
+def _run_startup_prune(mock_client, active_session_ids):
+    """Replicate the stale-session container prune from server.py's lifespan
+    handler (added after the integrity scan).
+
+    Uses a passed-in ``mock_client`` and ``active_session_ids`` set so we
+    don't need to import ``web_ui.backend.server`` (which has side effects
+    — creating a FastAPI app).
+    """
+    if not active_session_ids:
+        return  # Registry unavailable/empty -> nothing is removed
+    labeled_containers = mock_client.containers.list(
+        all=True, filters={"label": "thoughtmachine.session_id"}
+    )
+    for c in labeled_containers:
+        labels = (c.attrs.get("Config") or {}).get("Labels") or {}
+        sid = labels.get("thoughtmachine.session_id")
+        if sid and sid not in active_session_ids:
+            try:
+                c.remove()
+            except Exception:
+                try:
+                    c.remove(force=True)
+                except Exception:
+                    continue
+
+
+class TestServerLifespanPrune:
+    """The ``lifespan`` handler in ``server.py`` removes containers whose
+    ``thoughtmachine.session_id`` label is not in the session registry."""
+
+    def test_orphan_container_removed(self):
+        """A container labelled with an unregistered session id is removed."""
+        container = _make_labeled_container(sid="deleted-session")
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = [container]
+
+        _run_startup_prune(mock_client, active_session_ids={"active-1"})
+
+        mock_client.containers.list.assert_called_once_with(
+            all=True, filters={"label": "thoughtmachine.session_id"}
+        )
+        container.remove.assert_called_once()
+
+    def test_active_session_container_kept(self):
+        """A container labelled with a registered session id is kept."""
+        container = _make_labeled_container(sid="active-1")
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = [container]
+
+        _run_startup_prune(mock_client, active_session_ids={"active-1"})
+
+        container.remove.assert_not_called()
+
+    def test_empty_registry_skips_prune(self):
+        """If the registry yields no active ids, nothing is enumerated/removed."""
+        mock_client = MagicMock()
+        _run_startup_prune(mock_client, active_session_ids=set())
+
+        mock_client.containers.list.assert_not_called()
+
+    def test_remove_falls_back_to_force(self):
+        """If plain ``remove()`` fails, ``remove(force=True)`` is attempted."""
+        container = _make_labeled_container(sid="deleted-session")
+        container.remove.side_effect = RuntimeError("running container")
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = [container]
+
+        _run_startup_prune(mock_client, active_session_ids={"active-1"})
+
+        container.remove.assert_any_call()
+        container.remove.assert_any_call(force=True)
 
 
 # ===================================================================

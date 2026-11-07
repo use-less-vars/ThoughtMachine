@@ -1,0 +1,530 @@
+// @vitest-environment jsdom
+/*
+ * ConfigPanel.test.jsx — Phase 0 Frontend Truthfulness Sprint
+ *
+ * jsdom + @testing-library/react.  Covers:
+ *   - loading placeholder (config === null)
+ *   - header / save-as-default button
+ *   - all 8 tab buttons
+ *   - /api/tools fetch on mount (global fetch is mocked)
+ *   - Permissions tab: 5 selects in order (Git, Filesystem, Network, MCP, Host
+ *     Bash), canonical safe defaults when session_permissions is missing,
+ *     container checkbox, legacy boolean network normalization (true → 'write',
+ *     false → 'banned')
+ *   - set_default_config flow + pending/saved button states
+ *   - apply_config flow + disabled state when ws is disconnected
+ *   - mode badge with (locked) hint
+ *   - Tools tab: tool count, checkbox checked state, empty list placeholder
+ *
+ * Note: ConfigPanel has no `test` config in vite.config.js, so the jsdom
+ * environment is declared per-file via the docblock above; RTL cleanup and
+ * jest-dom matchers are imported explicitly (no globals).
+ */
+
+import React from 'react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react';
+import '@testing-library/jest-dom/vitest';
+import ConfigPanel from '../ConfigPanel';
+import useStore from '../../store/useStore';
+
+// The store's permissionDefaults slice is hydrated from the backend single
+// owner (GET /api/permission-defaults) and starts {} (fail-closed), so these
+// tests seed it directly to exercise the "no session permissions" fallbacks.
+const TEST_PERMISSION_DEFAULTS = {
+  git: 'read',
+  filesystem: 'read',
+  container: false,
+  network: 'banned',
+  mcp: 'banned',
+  host_bash: 'banned',
+};
+
+const baseConfig = {
+  mode: 'custom',
+  temperature: 0.7,
+  max_turns: 10,
+  provider: 'openai',
+  provider_id: 'p1',
+  model: 'gpt-4o',
+  system_prompt: 'Be nice',
+  tools: [{ name: 'read_file', enabled: true }],
+  session_permissions: { filesystem: 'write' },
+  workspace_path: '/home/jojo/work',
+};
+
+function renderPanel(props = {}) {
+  const sendCommand = vi.fn();
+  const onClearDefaultSaveStatus = vi.fn();
+  const utils = render(
+    <ConfigPanel
+      config={baseConfig}
+      sendCommand={sendCommand}
+      providers={[]}
+      availableTools={[]}
+      wsConnected
+      defaultConfigSaveStatus={null}
+      onClearDefaultSaveStatus={onClearDefaultSaveStatus}
+      {...props}
+    />
+  );
+  return { sendCommand, onClearDefaultSaveStatus, ...utils };
+}
+
+beforeEach(() => {
+  useStore.setState({ permissionDefaults: { ...TEST_PERMISSION_DEFAULTS } });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ tools: [] }),
+      text: async () => '',
+    }))
+  );
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+// ==========================================================================
+// Loading placeholder
+// ==========================================================================
+describe('loading placeholder', () => {
+  it('renders "Loading config..." when config is null', () => {
+    render(
+      <ConfigPanel
+        config={null}
+        sendCommand={vi.fn()}
+        providers={[]}
+        availableTools={[]}
+        wsConnected
+        defaultConfigSaveStatus={null}
+      />
+    );
+    expect(screen.getByText('Loading config...')).toBeInTheDocument();
+  });
+});
+
+// ==========================================================================
+// Header & save-as-default
+// ==========================================================================
+describe('header', () => {
+  it('renders the Config heading and Save as Default button', () => {
+    renderPanel();
+    expect(screen.getByRole('heading', { name: 'Session Panel' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save as Default' })).toBeInTheDocument();
+  }, 20000);
+
+  it('renders all 8 tab buttons', () => {
+    renderPanel();
+    const labels = ['Live View', 'Permissions', 'Prompt', 'General', 'Model', 'Tools', 'Container', 'Advanced'];
+    for (const label of labels) {
+      expect(screen.getByRole('button', { name: label })).toBeInTheDocument();
+    }
+  }, 20000);
+});
+
+// ==========================================================================
+// Backend tool fetch
+// ==========================================================================
+describe('backend tool fetch', () => {
+  it('fetches the tool list from /api/tools on mount', async () => {
+    renderPanel();
+    await waitFor(() => {
+      expect(globalThis.fetch).toHaveBeenCalled();
+    });
+    const url = String(globalThis.fetch.mock.calls[0][0]);
+    expect(url).toEqual(expect.stringContaining('/api/tools'));
+  });
+});
+
+// ==========================================================================
+// Permissions tab
+// ==========================================================================
+describe('Permissions tab', () => {
+  it('shows canonical safe-default values when session_permissions is missing', () => {
+    const { container } = renderPanel({ config: { ...baseConfig, session_permissions: undefined } });
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const selects = container.querySelectorAll('select');
+    expect(selects).toHaveLength(5);
+    // Order must be: Git, Filesystem, Network, MCP, Host Bash
+    expect(selects[0].value).toBe(TEST_PERMISSION_DEFAULTS.git);        // 'read'
+    expect(selects[1].value).toBe(TEST_PERMISSION_DEFAULTS.filesystem); // 'read'
+    expect(selects[2].value).toBe(TEST_PERMISSION_DEFAULTS.network);    // 'banned'
+    expect(selects[3].value).toBe(TEST_PERMISSION_DEFAULTS.mcp);        // 'banned'
+    expect(selects[4].value).toBe(TEST_PERMISSION_DEFAULTS.host_bash);  // 'banned'
+    const checkbox = container.querySelector('input[type="checkbox"]');
+    expect(checkbox).not.toBeChecked();
+  });
+
+  it('keeps explicit session_permissions values (filesystem write)', () => {
+    const { container } = renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const selects = container.querySelectorAll('select');
+    expect(selects[1].value).toBe('write'); // filesystem select (index 0 is now Git)
+  });
+
+  it('normalizes legacy boolean network permission true → write', () => {
+    const { container } = renderPanel({ config: { ...baseConfig, session_permissions: { network: true } } });
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const selects = container.querySelectorAll('select');
+    expect(selects[2].value).toBe('write');
+  });
+
+  it('normalizes legacy boolean network permission false → banned', () => {
+    const { container } = renderPanel({ config: { ...baseConfig, session_permissions: { network: false } } });
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const selects = container.querySelectorAll('select');
+    expect(selects[2].value).toBe('banned');
+  });
+
+  it('keeps the panel defaults in lockstep with the store permissionDefaults', () => {
+    // Equivalence pin: ConfigPanel reads its canonical defaults from the store's
+    // permissionDefaults slice (single owner: the backend). The rendered panel
+    // must mirror the seeded store values exactly.
+    // Select order is Git, Filesystem, Network, MCP, Host Bash; container is a
+    // checkbox.
+    const { container } = renderPanel({ config: { ...baseConfig, session_permissions: undefined } });
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const selects = container.querySelectorAll('select');
+    expect(selects).toHaveLength(5);
+    const selectKeys = ['git', 'filesystem', 'network', 'mcp', 'host_bash'];
+    selectKeys.forEach((key, i) => {
+      expect(selects[i].value).toBe(TEST_PERMISSION_DEFAULTS[key]);
+    });
+    const checkbox = container.querySelector('input[type="checkbox"]');
+    expect(checkbox.checked).toBe(TEST_PERMISSION_DEFAULTS.container);
+  });
+});
+
+// ==========================================================================
+// Save as Default flow
+// ==========================================================================
+describe('Save as Default', () => {
+  it('sends set_default_config and shows the pending state', () => {
+    const { sendCommand } = renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Save as Default' }));
+    expect(sendCommand).toHaveBeenCalledWith(
+      'set_default_config',
+      expect.objectContaining({ config: expect.any(Object) })
+    );
+    expect(screen.getByRole('button', { name: 'Saving…' })).toBeInTheDocument();
+  });
+
+  it('shows the success state when the backend confirms', () => {
+    renderPanel({ defaultConfigSaveStatus: 'ok' });
+    expect(screen.getByRole('button', { name: '✓ Default saved!' })).toBeInTheDocument();
+  });
+
+  it('shows the error state when the backend reports an error', () => {
+    renderPanel({ defaultConfigSaveStatus: 'error' });
+    expect(screen.getByRole('button', { name: '✗ Save failed' })).toBeInTheDocument();
+  });
+
+  // GUARD (characterization): the payload already strips session_permissions and
+  // carries all 12 safe-draft keys — expected GREEN pre-change.
+  it('sends set_default_config with the full defaults payload (session_permissions stripped)', () => {
+    const { sendCommand } = renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Save as Default' }));
+    const [command, payload] = sendCommand.mock.calls[0];
+    expect(command).toBe('set_default_config');
+    expect(payload.config.session_permissions).toBeUndefined();
+    expect(Object.keys(payload.config).sort()).toEqual([
+      'max_turns',
+      'mode',
+      'model',
+      'provider',
+      'provider_id',
+      'system_prompt',
+      'temperature',
+      'token_monitor_critical_threshold',
+      'token_monitor_warning_threshold',
+      'tool_output_token_limit',
+      'tools',
+      'workspace_path',
+    ]);
+  });
+
+  it('renders the saved/dropped notice on backend confirmation', () => {
+    renderPanel({
+      defaultConfigSaveStatus: {
+        status: 'ok',
+        saved_keys: ['provider_id', 'model'],
+        dropped_keys: ['mode', 'provider_type'],
+      },
+    });
+    const notice = screen.getByRole('status');
+    expect(notice.textContent).toContain('Saved 2 settings');
+    expect(notice.textContent).toContain('Not global defaults: Mode, Provider');
+  });
+
+  it('shows the stale-session timeout message when no confirmation arrives', () => {
+    vi.useFakeTimers();
+    try {
+      renderPanel();
+      fireEvent.click(screen.getByRole('button', { name: 'Save as Default' }));
+      act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+      expect(screen.getByRole('alert').textContent).toBe(
+        'Not saved — session may be stale. Try Start New Session.'
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ==========================================================================
+// Apply button
+// ==========================================================================
+describe('Apply button', () => {
+  it('is disabled with a reconnecting hint when the ws is disconnected', () => {
+    renderPanel({ wsConnected: false });
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled();
+    expect(screen.getByText(/Reconnecting/)).toBeInTheDocument();
+  });
+
+  it('sends apply_config and shows the applying state when connected', () => {
+    const { sendCommand } = renderPanel();
+    const applyButton = screen.getByRole('button', { name: 'Apply' });
+    expect(applyButton).toBeEnabled();
+    fireEvent.click(applyButton);
+    expect(sendCommand).toHaveBeenCalledWith(
+      'apply_config',
+      expect.objectContaining({ config: expect.any(Object) })
+    );
+    expect(screen.getByRole('button', { name: 'Applying…' })).toBeInTheDocument();
+  });
+
+  it('shows the queued label and disarms the 6s timeout while the apply is queued', () => {
+    vi.useFakeTimers();
+    try {
+      const utils = renderPanel();
+      fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+      expect(utils.sendCommand).toHaveBeenCalledWith('apply_config', expect.anything());
+      // Backend ACKs config_queued → queued label, timeout effect disarmed.
+      utils.rerender(
+        <ConfigPanel
+          config={baseConfig}
+          sendCommand={utils.sendCommand}
+          providers={[]}
+          availableTools={[]}
+          wsConnected
+          defaultConfigSaveStatus={null}
+          onClearDefaultSaveStatus={utils.onClearDefaultSaveStatus}
+          configQueued
+        />
+      );
+      expect(
+        screen.getByRole('button', { name: 'Queued — applying when idle…' })
+      ).toBeInTheDocument();
+      // 7s pass — NO false 'Apply timed out' error while queued.
+      act(() => {
+        vi.advanceTimersByTime(7000);
+      });
+      expect(screen.queryByText(/Apply timed out/)).not.toBeInTheDocument();
+      expect(
+        screen.getByRole('button', { name: 'Queued — applying when idle…' })
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('surfaces a server-reported apply failure immediately', () => {
+    renderPanel({ applyFailed: '⚠ Failed to apply config: boom' });
+    expect(screen.getByText(/Failed to apply config: boom/)).toBeInTheDocument();
+    // Applying state is cleared → the button is enabled again.
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled();
+  });
+});
+
+// ==========================================================================
+// Mode badge
+// ==========================================================================
+describe('mode badge', () => {
+  it('shows the mode badge with the locked hint for agent mode', () => {
+    renderPanel({ mode: 'agent', config: { ...baseConfig, mode: 'agent' } });
+    expect(screen.getByText('Agent')).toBeInTheDocument();
+    expect(screen.getByText('(locked)')).toBeInTheDocument();
+  });
+
+  it('shows the mode badge without the locked hint for custom mode', () => {
+    renderPanel();
+    expect(screen.getByText('Custom')).toBeInTheDocument();
+    expect(screen.queryByText('(locked)')).not.toBeInTheDocument();
+  });
+});
+
+// ==========================================================================
+// Tools tab
+// ==========================================================================
+describe('Tools tab', () => {
+  it('renders available tools with the correct checked state', () => {
+    renderPanel({ availableTools: ['read_file', 'write_file'] });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    expect(screen.getByText('Tools (2 total)')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'read_file' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'write_file' })).not.toBeChecked();
+  });
+
+  it('shows the loading placeholder when no tools are available', () => {
+    renderPanel({ availableTools: [] });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    expect(screen.getByText('Loading tool list...')).toBeInTheDocument();
+  });
+});
+
+// ==========================================================================
+// Config reset (Wave 4a)
+// POST /api/config/reset — destructive, global. Confirm-gated, one POST.
+// ==========================================================================
+describe('Config reset', () => {
+  function resetPostCalls() {
+    return globalThis.fetch.mock.calls.filter(([, init]) => init && init.method === 'POST');
+  }
+
+  it('renders a Reset button in the header', () => {
+    renderPanel();
+    expect(screen.getByRole('button', { name: 'Reset' })).toBeInTheDocument();
+  });
+
+  it('reveals a confirmation without POSTing when Reset is clicked', () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Confirm reset' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+    expect(resetPostCalls()).toHaveLength(0);
+  });
+
+  it('fires exactly one POST to /api/config/reset when confirmed', async () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' }));
+    await waitFor(() => {
+      expect(resetPostCalls()).toHaveLength(1);
+    });
+    const url = String(resetPostCalls()[0][0]);
+    expect(url).toEqual(expect.stringContaining('/api/config/reset'));
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('fires no POST when Cancel is clicked', () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    expect(resetPostCalls()).toHaveLength(0);
+  });
+
+  it('surfaces a role="status" notice on success', async () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' }));
+    const notice = await screen.findByRole('status');
+    expect(notice.textContent).toMatch(/reset/i);
+  });
+
+  it('surfaces a role="alert" notice on failure', async () => {
+    globalThis.fetch.mockImplementation(async (url, init) => {
+      if (init && init.method === 'POST') {
+        return {
+          ok: false,
+          status: 500,
+          json: async () => ({ detail: 'Failed to reset config' }),
+          text: async () => '',
+        };
+      }
+      return { ok: true, json: async () => ({ tools: [] }), text: async () => '' };
+    });
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Reset failed');
+  });
+});
+
+// ==========================================================================
+// Permissions tab — host_bash quick action
+// One PUT of the MERGED canonical grant map to /api/session/{id}/permissions.
+// ==========================================================================
+describe('Permissions tab — grant host_bash quick action', () => {
+  const SESSION_RAW = {
+    git: 'write',
+    filesystem: 'read',
+    container: false,
+    network: 'ask',
+    mcp: 'connect',
+    host_bash: 'banned',
+  };
+
+  function stubSessionPerms(raw = SESSION_RAW) {
+    const calls = [];
+    globalThis.fetch.mockImplementation(async (url, init = {}) => {
+      const text = String(url);
+      if (text.includes('/api/session/s1/permissions')) {
+        const body = init.body ? JSON.parse(init.body) : null;
+        calls.push({ url: text, method: init.method || 'GET', body });
+        if (init.method === 'PUT') {
+          // Echo the stored sidecar back (full replace semantics).
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ raw: body, effective: { ...body }, resolved_at: '2024-01-01T00:00:00Z' }),
+            text: async () => '',
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ raw: { ...raw }, effective: { ...raw }, resolved_at: '2024-01-01T00:00:00Z' }),
+          text: async () => '',
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ tools: [] }), text: async () => '' };
+    });
+    return calls;
+  }
+
+  it('PUTs host_bash allow while preserving every other session grant', async () => {
+    const calls = stubSessionPerms();
+    renderPanel({ sessionId: 's1' });
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const grantButton = await screen.findByRole('button', {
+      name: 'Grant host_bash: allow to this session',
+    });
+    // GET has not landed yet → the display fallback still says 'banned' → enabled.
+    expect(grantButton).toBeEnabled();
+    fireEvent.click(grantButton);
+    await waitFor(() => {
+      expect(calls.filter((c) => c.method === 'PUT')).toHaveLength(1);
+    });
+    const put = calls.find((c) => c.method === 'PUT');
+    expect(put.url).toEqual(expect.stringContaining('/api/session/s1/permissions'));
+    // FULL REPLACE, merged: host_bash flipped, no other grant dropped.
+    expect(put.body).toEqual({ ...SESSION_RAW, host_bash: 'allow' });
+    // Once adopted, the action is a no-op and disables itself.
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: 'Grant host_bash: allow to this session' })
+      ).toBeDisabled();
+    });
+  });
+
+  it('is disabled when the session already grants host_bash allow', async () => {
+    stubSessionPerms({ host_bash: 'allow' });
+    renderPanel({ sessionId: 's1' });
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
+    const grantButton = screen.getByRole('button', {
+      name: 'Grant host_bash: allow to this session',
+    });
+    await waitFor(() => expect(grantButton).toBeDisabled());
+  });
+});
+

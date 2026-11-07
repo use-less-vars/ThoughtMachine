@@ -2,15 +2,37 @@
 OpenAI-compatible provider implementation.
 Works with OpenAI, DeepSeek, OpenCode/Big Pickle, and any OpenAI-compatible API.
 """
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, AsyncIterator
+import asyncio
+import json
 import time
 import os
 import sys
-from openai import OpenAI, APIError, RateLimitError, APIConnectionError
+from openai import OpenAI, AsyncOpenAI, APIError, RateLimitError, APIConnectionError
+try:
+    from openai import APITimeoutError
+except ImportError:  # pragma: no cover - SDK < 1.0
+    class APITimeoutError(APIError):  # never raised by old SDKs
+        pass
 import tiktoken
-from .base import LLMProvider, ProviderConfig, LLMResponse
-from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
+from .base import LLMProvider, ProviderConfig, LLMResponse, _redact_headers
+from agent.config.secret import reveal_secret
+from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
+from agent.core.ir import CanonicalToolCall
+from agent.core.stream_events import TextDelta, ReasoningDelta, ToolCallStart, ToolCallArgumentsDelta, ToolCallComplete, UsageUpdate, Interrupted, Done, StreamEvent
 from agent.logging import log
+
+# Streaming retry policy. The provider owns streaming retries so that a
+# single budget covers them; the SDK clients are pinned at max_retries=0
+# for the same reason (otherwise one attempt can be retried twice, once by
+# each layer). Waits are 1s, 2s, 4s, ... capped at
+# _RETRY_BACKOFF_MAX_SECONDS, and the whole retry sequence is additionally
+# bounded by _RETRY_TOTAL_BUDGET_SECONDS so that a provider which hangs on
+# every attempt cannot pin the turn for minutes.
+_RETRY_BACKOFF_BASE_SECONDS = 1.0
+_RETRY_BACKOFF_MAX_SECONDS = 8.0
+_RETRY_TOTAL_BUDGET_SECONDS = 30.0
+
 
 class OpenAICompatibleProvider(LLMProvider):
     """
@@ -21,13 +43,15 @@ class OpenAICompatibleProvider(LLMProvider):
 
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
-        client_kwargs = {'api_key': config.api_key, 'timeout': config.timeout, 'max_retries': config.max_retries}
-        log('DEBUG', 'llm.openai', f'client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}')
+        # REVEAL SITE: the raw key crosses into the OpenAI SDK here (it becomes
+        # the ``Authorization: Bearer ...`` header inside the SDK).
+        client_kwargs = {'api_key': reveal_secret(config.api_key), 'timeout': config.timeout, 'max_retries': config.max_retries}
+        log('DEBUG', 'llm.openai', f'client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={_redact_headers(config.extra_headers)}')
         if config.base_url:
             client_kwargs['base_url'] = config.base_url
         if config.extra_headers:
             client_kwargs['default_headers'] = config.extra_headers
-        log('DEBUG', 'llm.openai', f"client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}")
+        log('DEBUG', 'llm.openai', f"client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={_redact_headers(client_kwargs.get('default_headers'))}")
         self.client = OpenAI(**client_kwargs)
         log('DEBUG', 'llm.openai', f"client created with base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}")
         self.encoding = None
@@ -103,13 +127,13 @@ class OpenAICompatibleProvider(LLMProvider):
                 if 'tool_call_id' not in msg_copy:
                     msg_copy['tool_call_id'] = msg_copy.get('id', f'tool_{i}')
             messages_with_ids.append(msg_copy)
-        log('DEBUG', 'debug.unknown', f'Processed {len(messages)} messages')
+        log('DEBUG', 'llm.openai', f'Processed {len(messages)} messages')
         for i, msg in enumerate(messages_with_ids):
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
                 for tc in msg['tool_calls']:
-                    log('DEBUG', 'debug.unknown', f"Assistant tool call id={tc.get('id')}")
+                    log('DEBUG', 'llm.openai', f"Assistant tool call id={tc.get('id')}")
             if msg.get('role') == 'tool':
-                log('DEBUG', 'debug.unknown', f"Tool message tool_call_id={msg.get('tool_call_id')}")
+                log('DEBUG', 'llm.openai', f"Tool message tool_call_id={msg.get('tool_call_id')}")
         return messages_with_ids
 
     def _normalize_stepfun_tool_calls(self, messages, is_openrouter=False):
@@ -122,12 +146,10 @@ class OpenAICompatibleProvider(LLMProvider):
         When is_openrouter=True, convert to standard OpenAI format (type='function' with 'function' field)
         since OpenRouter expects that format.
         """
-        log('DEBUG', 'llm.stepfun', f'Normalizing with is_openrouter={is_openrouter}')
         messages_normalized = []
-        log('DEBUG', 'llm.stepfun', f'Starting normalization of {len(messages)} messages')
         for idx, msg in enumerate(messages):
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
-                log('DEBUG', 'llm.stepfun', f"Message {idx} has tool_calls: {msg['tool_calls']}")
+                pass
         for i, msg in enumerate(messages):
             msg_copy = msg.copy()
             if msg_copy.get('role') == 'assistant' and 'tool_calls' in msg_copy:
@@ -138,7 +160,7 @@ class OpenAICompatibleProvider(LLMProvider):
                         if not isinstance(tc, dict):
                             tc = dict(tc) if hasattr(tc, '__dict__') else {}
                         tc_copy = tc.copy() if isinstance(tc, dict) else {}
-                        log('DEBUG', 'llm.stepfun', f'Tool call {j} before: {tc_copy}')
+
                         if 'type' not in tc_copy:
                             tc_copy['type'] = 'function'
                         current_type = tc_copy.get('type', 'function')
@@ -219,20 +241,17 @@ class OpenAICompatibleProvider(LLMProvider):
                                     tc_copy['custom'] = tc_copy.pop('function')
                                 else:
                                     tc_copy['custom'] = {'name': '', 'arguments': {}}
-                        log('DEBUG', 'llm.stepfun', f'Tool call {j} after: {tc_copy}')
+
                         normalized_tool_calls.append(tc_copy)
                     msg_copy['tool_calls'] = normalized_tool_calls
             messages_normalized.append(msg_copy)
-        log('DEBUG', 'llm.stepfun', f'Processed {len(messages)} messages')
         for i, msg in enumerate(messages_normalized):
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
                 for tc in msg['tool_calls']:
-                    log('DEBUG', 'llm.stepfun', f"Assistant tool call id={tc.get('id')}, type={tc.get('type')}, has_function={'function' in tc}, has_custom={'custom' in tc}, index={tc.get('index')}")
-        log('DEBUG', 'llm.stepfun', f'Final normalized messages:')
+                    pass
         for idx, msg in enumerate(messages_normalized):
-            log('DEBUG', 'llm.stepfun', f"Message {idx}: role={msg.get('role')}")
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
-                log('DEBUG', 'llm.stepfun', f"  tool_calls: {msg['tool_calls']}")
+                pass
         return messages_normalized
 
     def chat_completion(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]]=None, **kwargs) -> LLMResponse:
@@ -288,7 +307,7 @@ class OpenAICompatibleProvider(LLMProvider):
             _log_payload = {
                 'model': completion_kwargs.get('model'),
                 'base_url': str(self.client.base_url) if hasattr(self.client, 'base_url') else 'N/A',
-                'api_key_prefix': (self.config.api_key[:8] + '...') if self.config.api_key else 'NONE',
+                'api_key_present': bool(self.config.api_key),
                 'temperature': completion_kwargs.get('temperature'),
                 'max_tokens': completion_kwargs.get('max_tokens'),
                 'tool_choice': completion_kwargs.get('tool_choice'),
@@ -363,6 +382,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 rate_limit_error.raw_response = e.response
             raise rate_limit_error
         except APIError as e:
+            if isinstance(e, APITimeoutError):
+                raise ProviderTimeoutError(f'Request timed out: {e}')
             import os
             if os.environ.get('DEBUG_OPENAI'):
                 log('DEBUG', 'llm.openai', f'APIError caught: {e}')
@@ -390,6 +411,15 @@ class OpenAICompatibleProvider(LLMProvider):
                     raise auth_error
                 elif os.environ.get('DEBUG_OPENAI'):
                     log('DEBUG', 'llm.openai', f'Not DeepSeek, passing through as API error')
+            # Detect context-length exceeded errors (OpenAI returns 400 with code context_length_exceeded)
+            error_str = str(e)
+            has_context_length_error = 'context_length_exceeded' in error_str.lower() or 'maximum context length' in error_str.lower() or 'context length' in error_str.lower()
+            if has_context_length_error:
+                log('WARNING', 'llm.openai', f'Token limit exceeded detected: {error_str[:200]}')
+                token_error = TokenLimitExceededError(f'Token limit exceeded: {error_str[:500]}')
+                if hasattr(e, 'response'):
+                    token_error.raw_response = e.response
+                raise token_error
             if 'authentication' in str(e).lower() or 'api key' in str(e).lower():
                 auth_error = AuthenticationError(f'Authentication failed: {e}')
                 if hasattr(e, 'response'):
@@ -400,6 +430,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 api_error.raw_response = e.response
             raise api_error
         except Exception as e:
+            if isinstance(e, APITimeoutError):
+                raise ProviderTimeoutError(f'Request timed out: {e}')
             import os
             if os.environ.get('DEBUG_OPENAI'):
                 log('DEBUG', 'llm.openai', f'Exception type: {type(e)}')
@@ -420,6 +452,275 @@ class OpenAICompatibleProvider(LLMProvider):
             if 'response' in locals():
                 provider_error.raw_response = response
             raise provider_error
+
+    def _ensure_async_client(self) -> Any:
+        """Return the async SDK client, creating it on first use.
+
+        ``__init__`` is deliberately left untouched: a provider that never
+        streams should not pay for a second HTTP client. This client is closed
+        by :meth:`aclose` - which must be driven by the loop that owns it, see
+        ``agent.core.agent._close_stream_resources``.
+        """
+        if getattr(self, '_async_client', None) is None:
+            # The provider owns streaming retries (see ``stream_completion``): the
+            # SDK's own retry must stay at 0 so one attempt is never retried twice.
+            client_kwargs = {'api_key': reveal_secret(self.config.api_key), 'timeout': self.config.timeout, 'max_retries': 0}
+            if self.config.base_url:
+                client_kwargs['base_url'] = self.config.base_url
+            if self.config.extra_headers:
+                client_kwargs['default_headers'] = self.config.extra_headers
+            self._async_client = AsyncOpenAI(**client_kwargs)
+            log('DEBUG', 'llm.openai', f"async client created with base_url={(self._async_client.base_url if hasattr(self._async_client, 'base_url') else 'default')}")
+        return self._async_client
+
+    async def aclose(self) -> None:
+        """Close the async SDK client on the loop that owns it.
+
+        ``AsyncOpenAI`` holds an ``httpx.AsyncClient`` whose connection pool is
+        bound to the loop it was first used on, so it can only be closed *by*
+        that loop: awaiting this from another loop - or from a thread with no
+        loop - does not release the transport and can raise. The caller that
+        owns the loop drives this coroutine with ``run_until_complete()`` and
+        only then closes the loop; see ``agent.core.agent._close_stream_resources``.
+
+        The reference is dropped before awaiting, so a later turn rebuilds a
+        client bound to whatever loop it runs on instead of reusing one whose
+        pool is attached to a loop that no longer exists. Never raises.
+        """
+        client = getattr(self, '_async_client', None)
+        self._async_client = None
+        if client is None:
+            return
+        try:
+            await client.close()
+        except Exception as exc:
+            log('WARNING', 'llm.openai', f'Closing async client failed: {exc}')
+
+    def close(self) -> None:
+        """Release the synchronous SDK client; the async one needs ``aclose``.
+
+        Safe from any thread: ``self.client`` is an ``httpx.Client``, whose pool
+        is thread-safe, so closing it here is enough. The async client is
+        deliberately left alone - :meth:`aclose` explains why it can only be
+        closed by its own loop, and this method is called from threads that do
+        not own that loop (``LLMClient.close()`` on a config restart).
+        """
+        client = getattr(self, 'client', None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as exc:
+            log('WARNING', 'llm.openai', f'Closing client failed: {exc}')
+
+    async def stream_completion(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]]=None, **kwargs) -> AsyncIterator[StreamEvent]:
+        """Stream a chat completion as provider-neutral events.
+
+        The terminal event is exactly one of ``Done`` (normal end) or
+        ``Interrupted`` (the provider failed mid-stream); each tool call is
+        reported as ``ToolCallStart`` / ``ToolCallArgumentsDelta`` /
+        ``ToolCallComplete``, and at most one ``UsageUpdate`` is emitted before
+        ``Done`` when the provider reports token counts.
+        """
+        # Message normalisation is deliberately the same as chat_completion's:
+        # the same providers need the same fixups on the streaming path.
+        if 'deepseek' in self.config.model.lower() or (self.config.base_url and 'deepseek' in self.config.base_url.lower()):
+            messages_with_ids = []
+            for i, msg in enumerate(messages):
+                msg_copy = msg.copy()
+                if 'id' not in msg_copy or msg_copy['id'] is None or (not isinstance(msg_copy['id'], str)):
+                    msg_copy['id'] = str(i)
+                messages_with_ids.append(msg_copy)
+            messages = self._normalize_deepseek_tool_calls(messages_with_ids)
+        is_stepfun = 'stepfun' in self.config.model.lower()
+        is_openrouter = self.config.base_url and 'openrouter' in self.config.base_url.lower()
+        if is_stepfun or (is_openrouter and is_stepfun):
+            messages = self._normalize_stepfun_tool_calls(messages, is_openrouter=is_openrouter)
+        # Same request shape as chat_completion, plus streaming.
+        completion_kwargs = {'model': self.config.model, 'messages': messages}
+        completion_kwargs.update(kwargs)
+        if 'temperature' not in completion_kwargs:
+            completion_kwargs['temperature'] = self.config.temperature
+        if 'top_p' not in completion_kwargs and getattr(self.config, 'top_p', None) is not None:
+            completion_kwargs['top_p'] = self.config.top_p
+        if tools:
+            completion_kwargs['tools'] = self.format_tools(tools)
+            completion_kwargs['tool_choice'] = kwargs.get('tool_choice', 'auto')
+        completion_kwargs['stream'] = True
+        # include_usage is what makes the provider send the final usage-only
+        # chunk; set only when the caller has not chosen stream_options itself,
+        # so an explicit opt-out (or a provider that rejects the field) is not
+        # silently overridden.
+        if 'stream_options' not in kwargs:
+            completion_kwargs['stream_options'] = {'include_usage': True}
+        log('DEBUG', 'llm.openai', f"[STREAM REQUEST] model={self.config.model}, tools_count={len(tools) if tools else 0}, tool_choice={completion_kwargs.get('tool_choice', 'NOT SET')}, base_url={self.config.base_url}")
+
+        # index -> {'id': str|None, 'name': str|None, 'raw': str,
+        #           'emitted': int, 'started': bool}
+        pending: Dict[int, Dict[str, Any]] = {}
+
+        def _state(index: int) -> Dict[str, Any]:
+            if index not in pending:
+                pending[index] = {'id': None, 'name': None, 'raw': '', 'emitted': 0, 'started': False}
+            return pending[index]
+
+        def _start_events(state: Dict[str, Any]) -> List[StreamEvent]:
+            # A ToolCallStart needs both id and name. Arguments that arrive
+            # before both are known are buffered and flushed here, never emitted
+            # against an empty id.
+            if state['started'] or not state['id'] or not state['name']:
+                return []
+            state['started'] = True
+            events: List[StreamEvent] = [ToolCallStart(id=state['id'], name=state['name'])]
+            buffered = state['raw'][state['emitted']:]
+            if buffered:
+                state['emitted'] = len(state['raw'])
+                events.append(ToolCallArgumentsDelta(id=state['id'], arguments_delta=buffered))
+            return events
+
+        def _complete_event(state: Dict[str, Any]) -> StreamEvent:
+            raw = state['raw']
+            arguments: Dict[str, Any] = {}
+            parse_error: Optional[str] = None
+            if not state['name']:
+                parse_error = 'incomplete tool call: no function name received'
+            elif raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                except ValueError as exc:
+                    parse_error = str(exc)
+                else:
+                    if isinstance(parsed, dict):
+                        arguments = parsed
+                    else:
+                        parse_error = f'tool call arguments are {type(parsed).__name__}, not an object'
+            # §2 inv 6: a malformed call carries no partial arguments. The error
+            # is reported both on the IR object and on the event, so the turn
+            # loop can read whichever it looks at first.
+            return ToolCallComplete(
+                tool_call=CanonicalToolCall(id=state['id'] or '', name=state['name'] or '', arguments=arguments, raw_arguments=(raw or None), parse_error=parse_error),
+                parse_error=parse_error,
+            )
+
+        # Retry budget: ``max_retries`` counts retries, not attempts.
+        max_attempts = 1 + max(0, int(self.config.max_retries or 0))
+        attempt = 0
+        total_wait = 0.0
+        stream = None
+        # Set immediately before every payload delta reaches the caller. Once
+        # true the retry window is closed: a second stream would duplicate
+        # text the operator has already seen.
+        emitted = False
+        try:
+            while True:
+                # Every per-attempt accumulator is reset here: a retry that
+                # reused ``pending`` would splice argument fragments from two
+                # different streams into one malformed tool call.
+                pending.clear()
+                try:
+                    stream = await self._ensure_async_client().chat.completions.create(**completion_kwargs)
+                    async for chunk in stream:
+                        usage = getattr(chunk, 'usage', None)
+                        if usage is not None:
+                            yield UsageUpdate(input_tokens=getattr(usage, 'prompt_tokens', 0) or 0, output_tokens=getattr(usage, 'completion_tokens', 0) or 0)
+                        choices = getattr(chunk, 'choices', None) or []
+                        if not choices:
+                            # usage-only chunk
+                            continue
+                        choice = choices[0]
+                        delta = getattr(choice, 'delta', None)
+                        if delta is not None:
+                            reasoning = getattr(delta, 'reasoning_content', None)
+                            if reasoning:
+                                emitted = True
+                                yield ReasoningDelta(text=reasoning)
+                            content = getattr(delta, 'content', None)
+                            if content:
+                                emitted = True
+                                yield TextDelta(text=content)
+                            for fragment in getattr(delta, 'tool_calls', None) or []:
+                                state = _state(getattr(fragment, 'index', 0) or 0)
+                                fragment_id = getattr(fragment, 'id', None)
+                                if fragment_id:
+                                    state['id'] = fragment_id
+                                function = getattr(fragment, 'function', None)
+                                if function is not None:
+                                    name = getattr(function, 'name', None)
+                                    if name:
+                                        state['name'] = name
+                                    arguments_delta = getattr(function, 'arguments', None)
+                                    if arguments_delta:
+                                        state['raw'] += arguments_delta
+                                        if state['started']:
+                                            state['emitted'] = len(state['raw'])
+                                            emitted = True
+                                            yield ToolCallArgumentsDelta(id=state['id'], arguments_delta=arguments_delta)
+                                for event in _start_events(state):
+                                    emitted = True
+                                    yield event
+                        if getattr(choice, 'finish_reason', None) == 'tool_calls':
+                            for index in sorted(pending):
+                                state = pending[index]
+                                for event in _start_events(state):
+                                    emitted = True
+                                    yield event
+                                emitted = True
+                                yield _complete_event(state)
+                            pending.clear()
+                    # The stream can end without finish_reason == 'tool_calls' (some
+                    # providers report 'stop' for tool calls), so finalise anything left.
+                    for index in sorted(pending):
+                        state = pending[index]
+                        for event in _start_events(state):
+                            emitted = True
+                            yield event
+                        emitted = True
+                        yield _complete_event(state)
+                    pending.clear()
+                    yield Done()
+                    break
+                except (GeneratorExit, asyncio.CancelledError):
+                    # Cancellation is never retried; it must win over any
+                    # timeout handling below.
+                    raise
+                except APITimeoutError as exc:
+                    wait = min(_RETRY_BACKOFF_MAX_SECONDS, _RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
+                    # Not retryable once anything reached the caller, once the
+                    # attempts are spent, or once the next wait would breach the
+                    # total budget; ``raise`` falls through to the Interrupted
+                    # path below, which is today's behaviour unchanged.
+                    if emitted or attempt + 1 >= max_attempts or total_wait + wait > _RETRY_TOTAL_BUDGET_SECONDS:
+                        raise
+                    if stream is not None:
+                        try:
+                            await stream.close()
+                        except Exception as close_exc:
+                            log('DEBUG', 'llm.openai', f'Closing stream failed: {close_exc}')
+                        # Never reuse a dead stream: the retry re-issues create().
+                        stream = None
+                    attempt += 1
+                    total_wait += wait
+                    log('WARNING', 'llm.openai', f'Stream timed out before the first token (attempt {attempt} of {max_attempts} used); retrying in {wait:.1f}s: {type(exc).__name__}: {exc}')
+                    await asyncio.sleep(wait)
+        except (GeneratorExit, asyncio.CancelledError):
+            # Both derive from BaseException, so the clause below cannot swallow
+            # them; spelled out so a future widening of that clause cannot turn a
+            # cancellation into an Interrupted event. Never retried.
+            raise
+        except Exception as exc:
+            # Broad by design, mirroring chat_completion's own final except:
+            # the event carries only the failure's type and the turn loop
+            # classifies it, so a provider that answers with a non-stream object
+            # (AttributeError/TypeError here) must not escape as a crash.
+            log('WARNING', 'llm.openai', f'Stream failed mid-flight: {type(exc).__name__}: {exc}')
+            yield Interrupted(reason=f'provider_error: {type(exc).__name__}')
+            return
+        finally:
+            if stream is not None:
+                try:
+                    await stream.close()
+                except Exception as exc:
+                    log('DEBUG', 'llm.openai', f'Closing stream failed: {exc}')
 
     def parse_response(self, raw_response: Any, start_time: float) -> LLMResponse:
         """Parse OpenAI-compatible response"""

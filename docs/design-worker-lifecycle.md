@@ -1,0 +1,1877 @@
+# Design: Worker Lifecycle (Q1–Q5)
+
+Scope: five questions about worker sub-agent lifecycle — stop semantics, timeout
+semantics, config propagation into a live worker, job-handle (async) tool calls, and
+the tools UI surface. Every factual claim below carries `path:LINE` plus a verbatim
+quote of at most two lines. Where the codebase does not answer a question, the entry
+reads `NOT FOUND — searched <patterns>`.
+
+This revision applies three operator rulings: **R1** Stop means *detach* (Q1), **R2**
+Docker SDK calls need *hard per-call deadlines* (extends Q2), **R3** the agent needs a
+*visual* capability, not merely a read-only tool listing (Q5). Q3 is unchanged; **Q4 is
+amended by R3** — the `visual` tool is the one bounded exception to synchronous tools
+(operator decision), recorded in Q4 itself.
+
+| # | Question (short) | Recommendation | Risk |
+|---|---|---|---|
+| Q1 | Does Stop/stop detach a worker or terminate it? | **Stop = detach** (park the loop, save state, keep thread + registry); terminate becomes a separate `kill` verb; queries arriving while detached are **queued FIFO**, never rejected | high |
+| Q2 | What happens when a worker exceeds its timeout — is the work continued? | Keep timeout terminal, add a **hard deadline on every blocking Docker SDK call**, and delete the dead retry knob — see **Q2A–Q2D** | high |
+| Q3 | Does a config/addendum write reach an already-running worker? | Declare spawn-time snapshot as the contract; do not attempt write-through into worker agents | medium |
+| Q4 | Should tool calls return a job handle instead of blocking the turn? | No for v1: keep tools synchronous — the default for **every** tool; the `visual` tool (Q5) is the single, bounded exception and carries its own timeout + cancellation protocol; reuse the existing `submit_query`/`job_status` shape if async ever arrives | high |
+| Q5 | Is there a UI surface for tools / tool authoring? | Keep authoring rejected; add **one** sandboxed, permission-gated `visual` tool so the agent can *see* | medium |
+
+---
+
+## Premise verification report
+
+> **SUPERSEDED (Stop is turn-scoped).** The row "Session Stop cascades to children" below no longer holds: `_stop_session_workers` was deleted and Stop never touches session workers. See docs/design-pause-reading-mode.md.
+
+| Premise (as stated in the rulings / prior draft) | Verdict | Evidence | Action |
+|---|---|---|---|
+| `Worker` tool routes `action='stop'` to a terminate path | verified | `tools/workspace/worker_thread.py:3582` — `"stop": lambda: self._action_stop(workers),`; `:5243` — `def _action_stop(self, workers: list) -> dict:` | rewritten (Q1) |
+| `_action_stop` blocks on a join, saves context, reclaims containers, pops the registry | verified | `:5362` — `_join_budget = max(30, thread._timeout_seconds)`; `:5389-5390` — `thread._save_context()` / `thread._cleanup_worker_containers()`; `:5398` — `_worker_registry.pop((sid, self.worker_name, iid), None)` | rewritten (Q1) |
+| `stop()` is cooperative and writes `command.json` | verified | `:1445` — `"""Signal the worker to stop after completing its current task."""`; `:1468` — `cmd_path.write_text(json.dumps({"action": "stop"}), encoding="utf-8")` | rewritten (Q1) |
+| `resume()` refuses a stopped instance | verified | `:1524` — `if self._stop_event.is_set() or self.status in ("stopping", "stopped"):`; `:1521-1522` — `Callers that need a query to run` / `after a stop must spawn a fresh instance instead.` | rewritten (Q1) |
+| A pause/detach primitive already exists (event pair + park loop) | verified | `:1123-1124` — `self._park_event = threading.Event()` / `self._resume_event = threading.Event()`; `:2436` and `:2685` — `while self._park_event.is_set() and not self._stop_event.is_set():`; `:2438`/`:2687` — `self._resume_event.wait(1.0)` | reused as the detach mechanism (Q1) |
+| Session Stop cascades to children | verified | `web_ui/backend/bridge.py:1881` — `workers_stopped = self._stop_session_workers()`; `:1790-1791` — `Worker sub-agents are children of the session, not of the parent's` / `current turn: unless something stops them here they outlive the Stop` | kept as `kill` (Q1) |
+| Frontend `QueryBar` sends `stop_session` | verified | `web_ui/frontend/src/components/QueryBar.jsx:74` — `sendCommand('stop_session', {})` | unaffected (Q1) |
+| Per-worker stop REST route is fire-and-forget | verified | `web_ui/backend/workspace_routes.py:1266` — `@router.post("/{ws_id}/workers/{name}/stop")`; `:1291` — `registry.  Returns immediately — the worker will transition to ``stopped``` | migrated to detach + new `/kill` (Q1) |
+| `test_ws_stop_session_status_only` pins session Stop → `stop_session` | verified | `web_ui/backend/server.py:1540-1541` cites the pinned contract; test defined at `tests/integration/test_state_transitions.py:617` | unaffected if the *session* cascade stays terminate; per-worker state names migrate |
+| Main agent can only pass a soft timeout to a worker | verified | `tools/workspace/worker_thread.py:4763-4765` — `wait = _worker_query_wait_timeout(` / `getattr(thread, "_timeout_seconds", None),` / `fallback=300.0,`; `agent/config/defaults.py:37` — `QUERY_WAIT_GRACE_SECONDS = 60` | extended (Q2 / R2) |
+| `_wait_for_worker_exit` knowingly returns with the thread still running | verified | `:4660` docstring names `(e.g. stuck inside a` / `DockerCodeRunner call)` and `never Thread.kill`; warning `"Worker '%s' did not stop within %ds budget after query "` | extended (Q2 / R2) |
+| `container_manager.exec()` is the only hard-timeout pattern in the Docker layer | verified | `infra/container_manager.py:2561-2570` — `thread.start()` / `thread.join(timeout)` / `container.kill()` / `raise TimeoutError(f"Command timed out after {timeout} seconds")` | generalised (Q2 / R2) |
+| Docker SDK calls outside `exec()` have no deadline | verified | `:2498` `self.client.containers.get(container_id)`; `:2533` `container.exec_run(` (mkdir pre-step); `:3531` `container.reload()`; `:4437` `raw = container.logs(` | enumerated + deadline proposed (Q2 / R2) |
+| `_worker_max_retries` is resolved and never read | verified | `:1006` — `_retries = _session_cfg.get("worker_max_retries")`; `:1009` — `self._worker_max_retries: int = _retries`; exactly one occurrence repo-wide | deleted (Q2) |
+| Old Q2 quote of `agent/core/state.py:247-248` | **drifted** | actual `:247-248` — `self.last_time_warning_state = TimeState.LOW` / `# Time returned to LOW — this monitor clears its own restrictions`; the quoted "mirrors the turn/token LOW branches" text is not there | quote replaced (Q2, Corrections) |
+| `agent/core/docker_executor.py` (named in the prior draft) | **false** | file does not exist; docker execution is `tools/docker_code_runner.py` | path corrected (Q2, Corrections) |
+| Q1 recommendation "keep stop = terminate, add detach as a separate verb" | **false by ruling (R1)** | operator ruling: Stop *is* detach; Kill is the separate verb | recommendation reversed (Q1) |
+| Q5 recommendation "read-only `/api/tools` suffices" | **false by ruling (R3)** | operator wants the *agent* to view, not the operator to list; `/api/tools` is `web_ui/backend/server.py:3951-3952` — `@app.get("/api/tools")` / `async def api_get_tools():` | recommendation replaced (Q5) |
+| Tool *authoring* from the UI is correctly rejected | verified (ruling upholds it) | `tools/base.py:50-60` injects `session_permissions` / `effective_permissions` from the executor: `:57` — `effective_permissions: Optional[Dict[str, Any]] = Field(` / `:59` — `description='Effective merged permissions (session × workspace) for atomic checks.',` | retained in Q5 |
+| `ImageBlock` exists but has no producer and no provider adapter | verified | `agent/core/ir.py:57` — `class ImageBlock:`; `:67` — `media_type: str  # e.g. "image/png"`; referenced only in `ir.py` + `tests/core/test_ir.py` | prerequisite named (Q5) |
+| `ToolResultBlock.content` is a `str` | verified | `agent/core/ir.py:80` — `class ToolResultBlock:` (`content` = "the flattened result the executor already produces") | constrains return shape (Q5) |
+| Permission vocabulary is a per-resource allow-list | verified | `security/resource_catalog.py:124-134` — `RESOURCE_CATALOG = {` … `"host_bash": ["banned", "ask", "allow"],`; ranks at `:155` — `GRANT_LEVEL_RANKS: Dict[str, float] = {` | shipped: `"visual": ["banned", "ask", "view"]` at `security/resource_catalog.py:133` |
+| Only `host_bash` executes on the host | verified | `docs/ARCHITECTURE_MACHINE_MODEL.md:28` — `**`host_bash` is the one true host-execution grain.** Every other tool either runs in a container or is bounded in-process.` | visual tool ⇒ container (Q5) |
+
+No premise required a STOP: every ruling is implementable against the current code.
+
+---
+
+## Q1 — Stop semantics: terminate or detach?
+
+### Question as understood
+
+When a user or parent agent "stops" a worker (the `Worker` tool's `action='stop'`, the
+per-worker REST route, or the session Stop cascade), does the worker survive as a
+detached thread that a later query can resume, or is it torn down terminally? Per
+Ruling 1 the answer is now **detach**: stop parks the agent loop, saves state, and the
+next query resumes where it left off. Termination stays available, but as a *separate*
+verb (`kill`, working name).
+
+### Current behaviour
+
+Stop is **terminate**, cooperatively, and it is irreversible for that instance —
+i.e. today's `stop` is what Ruling 1 calls `kill`.
+
+- The signal itself is cooperative, not a kill:
+  `tools/workspace/worker_thread.py:1445` — `"""Signal the worker to stop after completing its current task."""`
+- `stop()` sets the stop event, writes `command.json`, and marks `stopping`:
+  `tools/workspace/worker_thread.py:1448` — `self.status = "stopping"`
+  `tools/workspace/worker_thread.py:1467` — `cmd_path = self._worker_dir / "command.json"`
+- The dispatch table exposes exactly one stop verb:
+  `tools/workspace/worker_thread.py:3582` — `"stop": lambda: self._action_stop(workers),`
+- The `action='stop'` handler does a bounded join, persists, reclaims containers, and
+  always pops the registry:
+  `tools/workspace/worker_thread.py:5362` — `_join_budget = max(30, thread._timeout_seconds)`
+  `tools/workspace/worker_thread.py:5389-5390` — `thread._save_context()` /
+  `thread._cleanup_worker_containers()`
+  `tools/workspace/worker_thread.py:5398` — `_worker_registry.pop((sid, self.worker_name, iid), None)`
+- A worker that ignores the budget is *still* dropped from the registry:
+  `tools/workspace/worker_thread.py:5377-5378` —
+  `"Worker '%s' did not stop within %ds budget. "` /
+  `"Popping from registry anyway (daemon thread).",`
+- Terminal state is written as `stopped`, not `completed`:
+  `tools/workspace/worker_thread.py:5394-5395` — `if thread.status != "error":` /
+  `thread.status = "stopped"`.
+- `resume()` explicitly refuses a stopped instance:
+  `tools/workspace/worker_thread.py:1524` —
+  `if self._stop_event.is_set() or self.status in ("stopping", "stopped"):`
+  and `tools/workspace/worker_thread.py:1521-1522` — `Callers that need a query to run` /
+  `after a stop must spawn a fresh instance instead.`
+- A *detach* primitive already exists one door down, unused for stop:
+  `tools/workspace/worker_thread.py:1123-1124` — `self._park_event = threading.Event()` /
+  `self._resume_event = threading.Event()`
+  parked at `tools/workspace/worker_thread.py:2436` — `while self._park_event.is_set() and not self._stop_event.is_set():`
+  woken by `tools/workspace/worker_thread.py:2438` — `self._resume_event.wait(1.0)`
+  with status written as `tools/workspace/worker_thread.py:2402` — `self.status = "paused"`
+  and cleared back to ready at `tools/workspace/worker_thread.py:2442` —
+  `self.status = "ready"`.
+- Session Stop is turn-scoped for the parent but kills the children:
+  `web_ui/backend/server.py:1535-1536` — `# Stop button: truncate the running turn only — the bridge` /
+  `# thread and the session survive (close_session is what`
+  then `web_ui/backend/bridge.py:1881` — `workers_stopped = self._stop_session_workers()`
+  whose docstring says `web_ui/backend/bridge.py:1790-1791` —
+  `Worker sub-agents are children of the session, not of the parent's` /
+  `current turn: unless something stops them here they outlive the Stop`
+
+> **SUPERSEDED (Stop is turn-scoped).** `_stop_session_workers` was deleted and Stop no longer touches session workers; see docs/design-pause-reading-mode.md for the current Pause/Stop model.
+
+- The frontend simply sends the session command:
+  `web_ui/frontend/src/components/QueryBar.jsx:74` — `sendCommand('stop_session', {})`
+- The per-worker REST route is fire-and-forget from the caller's point of view:
+  `web_ui/backend/workspace_routes.py:1266` — `@router.post("/{ws_id}/workers/{name}/stop")`
+  and `web_ui/backend/workspace_routes.py:1291` —
+  `registry.  Returns immediately — the worker will transition to ``stopped```
+
+### Every stop consumer, and its disposition under R1
+
+> **SUPERSEDED (Stop is turn-scoped).** The row "`bridge._stop_session_workers()` ... **stays terminate → `kill`**" below no longer holds: `_stop_session_workers` was deleted and Stop never touches session workers. See docs/design-pause-reading-mode.md.
+
+| Consumer | Current effect | Disposition |
+|---|---|---|
+| `Worker` tool `action='stop'` (`tools/workspace/worker_thread.py:3582` → `_action_stop` `:5243`) | terminate: join, save, reclaim, pop | **repoints to detach**; add `action='kill'` → `_action_kill` |
+| `POST /{ws_id}/workers/{name}/stop` (`web_ui/backend/workspace_routes.py:1266`) | enqueues the same stop action | **becomes detach** (URL kept — the user-facing word "stop" now means detach); new `POST /{ws_id}/workers/{name}/kill` |
+| `bridge._stop_session_workers()` (`web_ui/backend/bridge.py:1787`, called from `request_stop` `:1881`) | cascades terminate over all session workers | **stays terminate → `kill`** — this is the "no silent background token burn" guard at `bridge.py:1791` |
+| `QueryBar.jsx:74` `stop_session` | session-level turn truncation | **unaffected** (it never addressed workers directly) |
+| `_action_reset` (`tools/workspace/worker_thread.py:5406`) — "Stop a worker, DROP its persisted context, and free its spawn slot." | terminate + delete `context.json`/`status.json`/`command.json` | **behaviour is preserved only because it must call `_action_kill` explicitly, NOT `_action_stop`** (which now detaches). Routing reset through the repointed `_action_stop` would silently turn a context-dropping reset into a detach — the specific implementation trap R1 creates. |
+| `command.json` file channel (`{"action": "stop"}` written at `tools/workspace/worker_thread.py:1467-1468`) | file-watched action; carries whatever `stop` currently means | **inherits the repointed meaning → detach**, not terminate — the same vocabulary change as the tool action it mirrors; `kill` is **not** exposed on this channel in v1 (adding a `kill` verb to `command.json` is explicitly out of scope) |
+| `_action_pause` / `_action_resume` (same dispatch table) | park/wake without teardown | **unaffected**; `detach` is implemented *on top of* them (see below) |
+
+### Proposed state machine
+
+```
+spawning ──▶ ready ──▶ busy ──▶ ready            (normal turn)
+                │        │
+                │        ├─▶ detached ──▶ ready   (STOP: park loop, state saved)
+                │        │       └────▶ killed    (kill, or detached TTL expiry)
+                └────────┴──────▶ killed         (KILL: reclaim, persist, pop)
+                                 └──▶ error ──▶ killed
+```
+
+- `stopping` / `stopped` (`worker_thread.py:1448`, `:2918`, `:5395`) are **renamed**
+  `detaching` / `detached`; a new terminal `killed` is added. `paused` (`:1915`,
+  `:2402`, `:2615`) is retained as the internal *mechanism* name and is not exposed as
+  a state — the externally visible resting state after a Stop is `detached`.
+- **Survives detach:** the thread, the built agent (`worker_thread.py:2512`), the
+  `WorkerContext` (`:2315`), the registry entry `(sid, worker_name, iid)`, the persisted
+  `context.json` (`:3182`) and `status.json` (`:3137`), and **the worker's containers** —
+  so `_cleanup_worker_containers()` (`:2153`) must *not* run on detach.
+- **Torn down on kill:** containers reclaimed (`:5390`), context saved but not resumable,
+  status `killed` written, registry entry popped (`:5398`), `_stop_event` set. A *reasoned* kill
+  also flips the turn's journal record to `cancelled` (with that reason) and terminalizes its job
+  `stopped` (`worker_thread.py:1854-1855`); a bare `kill()` writes nothing. Paths in **Q2E**.
+- `resume()` must accept `detached`: the guard at `worker_thread.py:1524` narrows from
+  `("stopping", "stopped")` to `("killed",)`, and the existing wake path
+  (`:1546` `self._park_event.clear()`, `:1547` `self._resume_event.set()`, `:1554`
+  `self.status = "ready"`) is reused verbatim. The comment at `:1538` —
+  `# This MUST happen before _park_event.clear(): the pause park loop` — is the
+  ordering constraint detach must respect.
+- **Chained queries while detached:** the next `query`/`submit_query` on a detached
+  worker must clear the park events and then dispatch (detach → resume → query), which
+  is what makes "the next query resumes where it left off" true.
+
+### Preserving "no silent background token burn"
+
+`web_ui/backend/bridge.py:1791` — `current turn: unless something stops them here they outlive the Stop`
+— names the failure mode detach would otherwise create. Three named enforcements:
+
+1. **Park, not run.** Detach sets `_park_event` (`worker_thread.py:1123`), so the agent
+   loop blocks at `:2436`/`:2685` (`while self._park_event.is_set() and ...`) and makes
+   no LLM calls. A detached worker consumes no tokens by construction.
+2. **Session Stop still kills.** `bridge._stop_session_workers()` (`:1787`) continues to
+   call the *kill* path, so closing/stopping a session never leaves a fleet of parked
+   workers behind (docstring at `:1790-1791` stays true).
+
+   > **SUPERSEDED (Stop is turn-scoped).** `_stop_session_workers` was deleted and Stop no longer touches session workers; see docs/design-pause-reading-mode.md for the current Pause/Stop model.
+
+3. **Detached TTL.** A detached worker that is never resumed is killed by the same
+   budget that already bounds a turn: `agent/config/defaults.py:61` —
+   `WORKER_TIMEOUT_SECONDS = 600`, evaluated as
+   `now - detached_at > WORKER_TIMEOUT_SECONDS`. **Operator ruling, recorded verbatim:**
+   "Use the manager tick. Add a distinct `_detached_worker_ttl` check. Explicitly modify
+   `cleanup_stale_worker_containers` to skip containers whose worker status is `detached`.
+   Containers survive detach; the reaper must not touch them." The TTL is therefore
+   enforced by the worker-manager tick (the one that replaces the registry pop) through a
+   distinct `_detached_worker_ttl` check, and
+   `cleanup_stale_worker_containers` (`infra/container_manager.py:5104`) must be modified
+   to **skip** any container belonging to a worker whose status is `detached` — left
+   unmodified it destroys exactly the containers detach exists to preserve.
+A limit of that queue is worth stating before the rules: it is a queue for a **live** worker that is parked, not a mailbox for a worker whose owning process has died. The queue itself is memory and dies with the owning process; what survives a crash is the *turn* — an `inflight` record its successor adopts (**Q2E**) — and that record recovers work, not containers. So the cases are distinguishable only because a detach is recorded against containers (`_detached_state`, `infra/container_manager.py:5143`) while a crash is not — which is exactly the gap **Q2C** fills, and the TTL kill named here is enforced by the in-process watchdog the appendix flags (row 7).
+
+
+### Queries submitted while the worker is detached
+
+A query that arrives for a `detached` worker is **accepted and queued, never rejected**.
+Detach exists so that the work can continue *later*, so refusing the next query would
+make the verb pointless: the caller keeps the existing `submit_query` contract and gets
+its `job_id` back at enqueue time — `tools/workspace/job_registry.py:7` —
+`callers that used ``submit_query`` (which returns immediately with a job_id)`.
+
+- **Strict FIFO, one queue per worker instance.** Multiple submissions preserve arrival
+  order, and the queue is drained head-first, so two callers cannot interleave or be
+  reordered by whichever thread happens to wake first.
+- **Single in flight, always.** The state machine's invariant is unchanged — never two
+  concurrent queries. A queued entry is dispatched only when the worker is otherwise
+  idle, one at a time, and each dispatch is `detach → resume → query`: the park events
+  are cleared and set first (`worker_thread.py:1546` `self._park_event.clear()`, `:1547`
+  `self._resume_event.set()`) and only then is the query handed to the loop.
+- **No token burn while queued.** A queued entry is inert until a resume signal: no
+  polling, no periodic wake-ups, no model calls, nothing scheduled on its behalf. The
+  only wait involved is the existing park loop — `worker_thread.py:2436-2443` and
+  `:2685-2694`, `while self._park_event.is_set() and not self._stop_event.is_set():` /
+  `self._resume_event.wait(1.0)` — which is a once-per-second re-check of two events, not
+  work. Enqueueing **must not** set `_resume_event`: setting it is what *starts* a turn,
+  so a producer that woke the worker on enqueue would turn the queue into exactly the
+  background token spend `web_ui/backend/bridge.py:1791` names as the failure mode.
+- **Expiry rejects, loudly.** If the detached TTL elapses before the worker is resumed,
+  the worker is killed *and* every queued query is rejected with an explicit error naming
+  the TTL — `agent/config/defaults.py:61` — `WORKER_TIMEOUT_SECONDS = 600`, e.g.
+  `worker 'X' detached for longer than WORKER_TIMEOUT_SECONDS (600 s) — queued query
+  discarded`. Queued work never vanishes silently: no TTL path may drop the queue without
+  a job result that says why. **Operator ruling, recorded verbatim:** "A queued query
+  rejected at TTL expiry must surface on the runtime channel and in the audit log, not just
+  as a return value to a dead caller." The job result alone is insufficient because the
+  caller that enqueued the query may itself be gone — the very condition that let the TTL
+  elapse — so the rejection must also be published on the session's runtime channel and
+  recorded in the audit log, where an operator can see it after the fact. The concrete
+  channel and log-table identifiers are pinned by citation as implemented: the
+  runtime-channel publisher is `_publish_global_worker_event` —
+  `tools/workspace/worker_thread.py:305` — which publishes on the event bus
+  `EventBus.publish` — `agent/events.py:486` — and reaches the browser through the web
+  forwarding hop `web_ui/backend/event_forwarder.py:84`; the audit record is written by
+  `audit_event` — `thoughtmachine/audit_logger.py:125`. `bridge.py:1791` is not an audit
+  path: it is cited for a different claim and must not be reused as one.
+- **Kill cancels; it does not discard the evidence.** `kill` drops the *queue* and rejects the
+  queued queries, because the instance (thread, agent, containers) no longer exists to run them.
+  The *turn* is a separate matter: for every reason-carrying kill the journal record becomes
+  `cancelled` + that reason and the turn's job `stopped` + that reason (manager `_stop_thread`,
+  `worker_manager.py:882`, reason `stopped-by-manager` `:78`; `_action_reset`,
+  `worker_thread.py:6921`, reason `reset-drop`). A bare `kill()` still writes nothing, and that
+  is what leaves a turn for a successor to adopt — see **Q2E**.
+- **Reconciling with the chained-query rule above.** The mechanical ordering "clear the
+  park events, then dispatch (detach → resume → query)" describes what a *resume* does to
+  the first queued entry — it is not a description of what a *submission* does. A submission
+  only appends to the queue; the resume signal is the operator's (see below). While a turn
+  is already running, later submissions stay queued behind it.
+
+**Operator ruling, recorded verbatim:** "Resume is operator-initiated in v1. No automatic
+resume. The worker panel shows the queue count and job IDs, and the operator must click
+Resume. The main agent cannot resume a detached worker."
+
+- **Resume is operator-initiated in v1.** Nothing in the system resumes a detached worker
+  automatically — not the queue, not the next submission, not the main agent. The worker
+  panel is the resume surface: it shows the detached worker's **queue count and the job
+  IDs** waiting on it, and the operator clicks Resume. A detached worker whose queue is
+  non-empty is therefore a visible, waiting state, not a self-draining one. The parent agent
+  has **no** API to resume a worker in v1; if one is ever wanted it is a new ruling, not an
+  inference from this design.
+
+### Options
+
+**Option A — make `stop` detach; add `kill` (Ruling 1).**
+Tradeoff: `stop` matches the operator's intent and the button's affordance; in-flight
+work is preserved; resume becomes a real operation instead of "spawn a fresh instance"
+(`worker_thread.py:1521-1522`). A fresh instance is no longer a lossy fallback either: it adopts
+a crashed predecessor's `inflight` record and replays that turn (**Q2E**). Cost: two verbs, two routes, a new state, and a TTL
+reaper; `_action_stop`'s teardown triple (`:5389-5390`, `:5398`) has to be *split* so
+detach keeps containers and kill reclaims them.
+
+**Option B — split the verbs the other way: `stop` stays terminate, add `detach`.**
+Tradeoff: no change to any existing consumer, and the risky teardown path is untouched.
+Cost: contradicts the ruling, keeps the confusing asymmetry where "Stop" destroys work,
+and leaves `resume()`'s refusal (`:1524`) as the only resume story.
+
+**Option C — replace Stop with pause and expose no new verb.**
+Tradeoff: smallest diff — `_action_pause` already exists and works. Cost: `pause` does
+not persist anything, so a process restart still loses the worker; and "pause" does not
+communicate "your work is safe" the way "stop" being safe does.
+
+### Recommendation
+
+**Option A.** `stop` = detach; `kill` = the old `_action_stop` body unchanged (join,
+`_save_context()`, `_cleanup_worker_containers()`, `status = "killed"`, registry pop).
+Detach = `_park_event.set()` + `_resume_event.clear()` + `_save_context()` +
+`_write_status_file()` with `status = "detached"`, and **no** container reclamation.
+Rationale: the mechanism already exists and is tested by the park loop
+(`worker_thread.py:2436-2443`); only the teardown split, the widened `resume()` guard
+(`:1524`) and the TTL are new. Resume is operator-initiated in v1 — the detachment is
+drained only by an explicit operator resume from the worker panel, and no submission, queue
+drain, or parent-agent call can resume a detached worker on its own.
+
+### Blast radius
+
+- Files: `tools/workspace/worker_thread.py` (`stop()` 1444, `_action_stop` 5243-5404,
+  `resume()` 1513, dispatch table 3575-3588, park loops 2436/2685, status writes
+  1448/2918/5395), `web_ui/backend/workspace_routes.py:1266` (+ `/kill`),
+  `web_ui/backend/bridge.py:1787` (cascade → kill),
+  `web_ui/frontend/src/components/QueryBar.jsx:74` (unchanged) and the worker panel
+  that exposes the per-worker stop button.
+- Tests: `tests/integration/test_state_transitions.py:617`
+  (`test_ws_stop_session_status_only`) is unaffected *only if* the session cascade stays
+  terminate — that is the point of routing it to `kill`;
+  `tests/test_bridge_stop_semantics.py`; the frontend
+  `web_ui/frontend/src/components/__tests__/SessionTab.stop_resume.test.jsx`; new tests
+  for `detached` → `query` → `ready` and for detached-TTL kill.
+- Risk: **high** — the registry pop (`:5398`) and container reclaim (`:5390`) are what
+  currently prevent leaked daemon threads; detaching means *deliberately* keeping both
+  alive, so the TTL reaper becomes load-bearing.
+
+---
+
+## Q2 — Timeout semantics: is the work continued or lost?
+
+### Question as understood
+
+When a worker exceeds its time budget, what exactly is enforced (soft budget, query
+wait, hard deadline), is the in-flight work preserved or abandoned, and should the
+system automatically retry/continue the timed-out work? Ruling 2 adds the infra half:
+the main agent can pass only a *soft* timeout, which does not take effect while a
+Docker SDK call is blocking — so which Docker calls can block, and what hard deadline
+does each get?
+
+### Current behaviour — the three clocks
+
+There are three nested clocks, and the outermost one wins; a timeout is **terminal**
+for the instance and the answer is "re-spawn".
+
+Terminal *in the owning process* is not the same as terminal *in the machine*, and the difference is what **Q2C** and **Q2D** close. Q2C supplies the rung that survives the process: a reaper for containers whose owner died before it could honour the ruling, since every ownership record below lives inside the owner. Q2D bounds what happens between the cancel request and the silence, and derives that number (≤ 18 s) from the per-layer budgets rather than asserting it.
+
+- The soft budget the worker's own time monitor enforces:
+  `agent/config/defaults.py:61` — `WORKER_TIMEOUT_SECONDS = 600`
+- The resolution chain is documented and code-backed:
+  `tools/workspace/worker_thread.py:980-982` —
+  `# explicit constructor param > worker definition ("timeout_seconds") >`
+  `# agent_config ("worker_timeout_seconds") > session_config`
+- The soft timeout is *restrictions*, not a kill inside the agent:
+  `agent/core/state.py:231` — `self.restriction_reason = 'timeout'`
+  and it is explicitly reversible in-turn:
+  `agent/core/state.py:252` — `if self.restriction_reason == 'timeout':`
+  (the monitor clears its own restrictions once time returns to LOW —
+  `agent/core/state.py:247-248` — `self.last_time_warning_state = TimeState.LOW` /
+  `# Time returned to LOW — this monitor clears its own restrictions`).
+- Blocked tools while in that state:
+  `agent/core/tool_executor.py:825` —
+  `return f"Tool '{tool_name}' not allowed. Reason: {restriction_reason}. Available tools: {allowed_list}"`.
+- The worker loop detects the crossing robustly (three ways):
+  `tools/workspace/worker_thread.py:2105-2106` —
+  `#   * restriction_reason == 'timeout' (state.py sets this when the` /
+  `#     agent's time monitor crosses the timeout threshold), or`
+  implemented at `tools/workspace/worker_thread.py:2113` — `if _worker_timeout_detected(`,
+  whose first test is `tools/workspace/worker_timeout.py:46` — `if reason == "timeout":`.
+- The caller's wait is deliberately longer than the worker's own budget:
+  `agent/config/defaults.py:37` — `QUERY_WAIT_GRACE_SECONDS = 60`
+  used by `tools/workspace/worker_thread.py:4763-4765` — `wait = _worker_query_wait_timeout(` /
+  `getattr(thread, "_timeout_seconds", None),` / `fallback=300.0,`.
+- If that wait still expires, the query path stops the worker, reclaims containers
+  and waits for exit — it does not hand the work on:
+  `tools/workspace/worker_thread.py:4788` —
+  `# Cooperative stop: the query deadline elapsed with no reply. Stop`
+  `tools/workspace/worker_thread.py:4805` — `thread._cleanup_worker_containers()`
+  `tools/workspace/worker_thread.py:4817` — `clean_exit = self._wait_for_worker_exit(thread)`.
+- That final wait is explicitly **not** a kill and can give up with the thread alive:
+  `tools/workspace/worker_thread.py:4660` — `def _wait_for_worker_exit(self, thread) -> bool:`
+  whose docstring names the cause, `(e.g. stuck inside a` / `DockerCodeRunner call)`, and
+  whose warning reads `"Worker '%s' did not stop within %ds budget after query "` /
+  `"(daemon thread)"`.
+- There is a retry budget on paper only — it is resolved and stored, and never read
+  anywhere else:
+  `tools/workspace/worker_thread.py:1006` — `_retries = _session_cfg.get("worker_max_retries")`
+  then `tools/workspace/worker_thread.py:1009` — `self._worker_max_retries: int = _retries`
+  (grep for `_worker_max_retries` repo-wide returns no other read site; the default is
+  `agent/config/defaults.py:64` — `WORKER_MAX_RETRIES = 3`).
+
+### Current behaviour — where a Docker SDK call can block (Ruling 2)
+
+The SDK is synchronous and most call sites have **no** deadline: the only hard-timeout
+pattern in the layer is `exec()`'s thread + `join(timeout)` + `kill()`.
+
+- The one correct pattern, in `infra/container_manager.py:2561-2570` —
+  `thread.start()` / `thread.join(timeout)` / `container.kill()` /
+  `raise TimeoutError(f"Command timed out after {timeout} seconds")`
+  under `:2496` — `def exec(self, container_id, command, timeout=30, workdir="/workspace", environment=None):`
+- Its own pre-step is *not* covered: `:2533` — `container.exec_run(` (the `mkdir -p`
+  guard) has no deadline, so a wedged daemon blocks before the timer starts.
+- The soft variant abandons rather than kills: `:3907` —
+  `def _exec_checked(self, container, command, timeout=10):` with docstring
+  `Best-effort introspection helper: NEVER raises and NEVER kills the` /
+  `container.` and `:3927` — `thread.join(timeout)` → returns `None` and leaks the thread.
+- The exec-path quota guard blocks twice without a deadline: `:3531` —
+  `container.reload()` and `:3535` — `container.exec_run(`.
+
+| Blocking site | Call | Current behaviour | Proposed hard deadline |
+|---|---|---|---|
+| `infra/container_manager.py:2498` | `self.client.containers.get(container_id)` | unbounded | 10 s |
+| `infra/container_manager.py:2533` | `container.exec_run(` (mkdir pre-step) | unbounded | 10 s, abandon thread |
+| `infra/container_manager.py:2555` | `container.exec_run(**exec_kwargs)` | bounded by caller `timeout=30`, kills the container | keep — the reference pattern |
+| `infra/container_manager.py:3531/3535` | `container.reload()` / quota `exec_run` | unbounded, on the exec hot path | 10 s, soft (abandon, treat as "not over quota") |
+| `infra/container_manager.py:3918` | `_exec_checked` `exec_run` | soft 10 s, never kills | keep soft (introspection must not kill) |
+| `infra/container_manager.py:4424/4437` | `containers.get` / `container.logs(` | unbounded | 30 s |
+| `infra/container_manager.py:1820/1841`, `:2468` | `start()` → `get`, `record.attach(...)` | unbounded (attach opens the log stream) | 30 s start, 10 s attach |
+| `infra/container_manager.py:3558`, `:3611/3614` | `stop()`/`_stop_container` → `get`, `.stop(`, `.kill(` | unbounded | 15 s per call |
+| `infra/container_manager.py:3637/3672`, `:3717/3775`, `:3809`, `:3837` | `restart`, `remove`, `status`, `stats` | unbounded | 15 s (remove: 60 s — layering) |
+| `infra/container_manager.py:4090/4602/5328/5532/5782` | `containers.list(` in `list_containers`, `_find_by_labels`, `sweep_exited…`, `_emit_summary`, `reap_container_record` | unbounded | 30 s |
+| `infra/container_manager.py:5042-5084`, `:5125/5174`, `:4933/4937` | `cleanup_workspace`, `cleanup_stale_worker_containers`, `_remove_container` (`stop`/`remove`) | unbounded | 30 s per call + overall sweep budget |
+| `infra/container_manager.py:795` | `client.images.get(image)` | unbounded | 15 s |
+| `infra/container_manager.py:4324` | `images` build (`build_image`) | unbounded | 600 s (builds are legitimately slow; not on the query path) |
+| `infra/container_create.py:426` | `client.containers.run(` (nested `def _run()` at `:425`) | unbounded — image pull + create + log attach | 300 s |
+| `infra/container_create.py:459` | `handle.attach(container, state=STATE_RUNNING)` | unbounded | 10 s |
+| `infra/resource_container_manager.py:1507` | `exec_run` (untimed pre-step) | unbounded | 10 s |
+| `infra/resource_container_manager.py:1548-1563` | `_run()` + `join(timeout)` + `kill` | already hard-bounded | keep |
+| `infra/resource_container_manager.py:1597/1635`, `:1655/1692/1696` | `stop()` / `remove()` | unbounded | 15 s / 60 s |
+| `infra/container_registry.py:595/724/1213` | `.attach(` | unbounded | 10 s |
+| `infra/container_registry.py:603/728/804/856` | `get(` | unbounded | 10 s |
+| `infra/container_registry.py:811/872`, `:812/820/873` | `.stop(` / `.remove(` | unbounded | 15 s / 60 s |
+| `infra/container_lifecycle.py:145/153` | `container.stop(timeout=…)` / `.remove(force=…)` | bounded by `intent.timeout or 5`, but wrapped in a bare `except Exception` | keep, tighten to a wall-clock join |
+
+**Mechanism.** `signal.alarm` is not usable: workers are threads inside the server
+process (Q1 / `docs/ARCHITECTURE_MACHINE_MODEL.md` — workers are "Host process, **as
+threads in the server**"), and `SIGALRM` is delivered to the main thread only. The house
+pattern already in the file is the right one — spawn a daemon thread, `join(timeout)`,
+and on timeout mark the resource dead. Adopt one helper and route every site above
+through it:
+
+```python
+def _call_with_deadline(fn, timeout, *, on_timeout="abandon", container=None):
+    """Run a blocking SDK call with a hard wall-clock deadline.
+
+    Returns (result, None) or (None, TimeoutError). 'abandon' leaks the daemon
+    thread (introspection); 'kill' additionally kills the container (exec).
+    on_timeout='kill' requires `container`; without it this raises ValueError.
+    """
+```
+
+`concurrent.futures.ThreadPoolExecutor(...).result(timeout=...)` is equivalent (a
+Python thread cannot be cancelled either way) and is acceptable, but it adds an
+executor lifecycle per call; the inline thread keeps parity with
+`infra/container_manager.py:2553-2570`.
+
+The race is named rather than hidden: `container.kill()` is issued from the *caller*
+thread the moment `join(timeout)` expires, while the abandoned daemon thread may still be
+inside the SDK call — so the kill can land mid-call. That is harmless precisely because
+the container dies: the still-blocked thread's eventual completion or failure operates on
+a resource nobody will read, which is why the handle must be a parameter of the helper
+rather than something it discovers itself. An `abandon` deadline, by contrast, leaks a
+daemon thread that outlives the query; if the detached TTL reaper then kills the worker
+and its containers, that leaked thread is operating on a dead container, so it must
+swallow its own exception rather than propagate it into a worker that no longer exists.
+
+**Per-call vs per-worker.** The hard deadline is a *per-call* primitive; the per-worker
+budget stays soft. Composition rule:
+
+```
+worker wall clock  ≤  SOFT_BUDGET (WORKER_TIMEOUT_SECONDS = 600)
+single docker call ≤  min(call_class_deadline, remaining worker wall clock)
+```
+
+so a call can never consume more than the turn has left, and the worker always gets to
+emit its own timeout envelope.
+
+**Interaction with `WORKER_TIMEOUT_SECONDS=600` / `QUERY_WAIT_GRACE_SECONDS=60`.**
+The hard deadline **preempts** the individual call; it neither extends nor shortens
+either clock:
+
+- Call returns `TimeoutError` inside the budget → the tool returns an error string →
+  the agent loop continues → the worker finishes normally with its own envelope. The
+  600 s soft budget is untouched.
+- Every blocking call is now bounded (max 300 s for `containers.run`), so the caller's
+  wait (`timeout_seconds + 60`, `worker_thread.py:4763-4765`) is no longer raced by an
+  unbounded SDK call. The path at `:4817` → `_wait_for_worker_exit` → "returning
+  envelope with thread still running (daemon thread)" becomes the rare case instead of
+  the designed-in one.
+- The hard deadline does **not** kill the worker; the worker's own envelope
+  (`:2917-2918`) remains the only thing that sets `stopped`.
+- `container.kill()` at `infra/container_manager.py:2566` remains the only *site* at
+  which a deadline kills a container; what changes is that it gains a second caller — the
+  exec path and, per the Q4 amendment, the Q5 render deadline
+  (`RENDER_TIMEOUT_SECONDS = 30`) both reach it. The mechanism and the blast radius are
+  unchanged; the number of callers is not.
+
+### Options
+
+**Option A — keep timeout terminal, add hard call deadlines, delete the dead knob.**
+Tradeoff: one truthful contract ("timeout ends the instance, re-spawn"), no config that
+lies, and unbounded SDK calls stop being the reason a turn outlives its budget. Cost:
+a helper threaded through ~25 call sites, and every "abandon" deadline leaks a daemon
+thread until the SDK returns.
+
+**Option B — implement retries on the stored budget.**
+Tradeoff: `WORKER_MAX_RETRIES = 3` starts meaning something
+(`agent/config/defaults.py:64`) and transient overruns self-heal. Cost: retry must
+distinguish "timed out but healthy" from `tools/workspace/worker_thread.py:4805`
+(containers already reclaimed) — retrying after reclaim is a fresh spawn replaying the
+journalled query from the persisted context (**Q2E**), and that replay already exists and is
+bounded (`MAX_ATTEMPTS = 3`, `inflight_journal.py:132`), so the knob buys a second, unbounded
+multiplier. Hard call deadlines also remove the main *wedge* cause, so retries would
+mostly fire on genuinely slow work.
+
+**Option C — keep it terminal but make continuation explicit and cheap.**
+Tradeoff: preserves "timeout is final" while giving the caller a first-class resume path
+(`_save_context()` at `worker_thread.py:5389` + `_load_context()` at `:3020`). Cost: the
+caller makes one more call; the persisted context carries the pre-timeout history, which
+can re-trigger the same overrun unless `timeout_seconds` is raised. Note this becomes
+strictly cheaper once Q1 lands, because Stop = detach already gives a resumable resting
+state.
+
+### Recommendation
+
+**Option A.** Keep terminal timeout semantics (the cleanup at
+`worker_thread.py:4805`-`4817` runs before any caller could resume anything, so
+"continue in place" is not implementable without new teardown ordering), generalise the
+`exec()` deadline pattern to every blocking Docker SDK call in the table above, and
+**delete `_worker_max_retries`** (`worker_thread.py:1009`) together with the
+`worker_max_retries` resolution at `:1006` and `WORKER_MAX_RETRIES`
+(`agent/config/defaults.py:64`) — a knob that is resolved, stored and never read is the
+actual defect here, and wiring it now would add a 4x token multiplier to a failure mode
+that hard deadlines have just made rarer. Continuation, if it is ever wanted, is Q1's
+detach/resume pair (Option C above), not a retry loop. One retry route does exist and is named
+rather than hidden: the query-timeout path kills with **no** journal reason
+(`worker_thread.py:6322`), so the turn's `inflight` record survives and the next spawn replays it,
+bounded at `MAX_ATTEMPTS`. It is not configurable, and it is not this knob.
+
+Two consequences of that ruling are carried forward: a timeout that is terminal needs a reaper for the containers whose owner died before it could honour the ruling, and a cancellation that is honoured needs a bounded cascade down to the last layer that is still holding work. Those are **Q2C** and **Q2D**, below. A third consequence is carried forward too: kill, crash and
+detach are three exits from the same turn, distinguished only by what a record on disk says —
+**Q2E**.
+
+### Blast radius
+
+- Files: `infra/container_manager.py` (~25 sites listed above),
+  `infra/container_create.py:425-462`, `infra/resource_container_manager.py:1503-1563`,
+  `infra/container_registry.py:595-873`, `infra/container_lifecycle.py:133-153`,
+  `tools/workspace/worker_timeout.py`, `tools/workspace/worker_thread.py`
+  (query/join/timeout branches 4701-5090, `_wait_for_worker_exit` 4660, retry chain
+  1002-1009), `agent/core/state.py:231/252`, `agent/core/tool_executor.py:821-825`,
+  `agent/config/defaults.py:37/61/64`.
+- Tests: `tests/` (worker/timeout suites), the strict-envelope contract tests around
+  `tools/workspace/worker_query.py`, `tests/docker/` + `tests/docker_integration/` for
+  the SDK deadlines, and the join cap `tools/workspace/worker_thread.py:5003` —
+  `total = min(requested_timeout, 300)` which the `join`/`wait_for_job` paths pin.
+- Risk: **high** — three clocks, a grace window, ~25 new deadlines and a
+  reclaim-before-resume ordering all interact; a wrong deadline either abandons a live
+  SDK thread (leak) or kills a container mid-write (data loss).
+
+---
+
+## Q2A — The timeout hierarchy: three levels, one cancellation token
+
+### Requirement
+
+Every operation's deadline is the **minimum** of the levels that apply to it, the operator
+ceiling is un-overridable from below (an agent cannot pass a larger value, and a spawn
+argument cannot raise it), and every level observes the **same** cancellation token rather
+than a private flag. Today each level carries its own mechanism: the worker carries a
+threading flag, the Docker layer carries a `join(timeout)` thread, and the tool layer
+carries an SDK argument — three mechanisms, three ways to miss.
+
+### The three levels
+
+| level | owner | config key | default today | what it enforces today | what it MUST enforce | status |
+|---|---|---|---|---|---|---|
+| operator global ceiling | operator / deployment | `WORKER_TIMEOUT_SECONDS` — `agent/config/defaults.py:61` — `WORKER_TIMEOUT_SECONDS = 600` | 600 s | only a *default* in the resolution chain `worker_thread.py:994` (constructor > worker def > `worker_timeout_seconds` > session cfg > default); a caller can exceed it | absolute ceiling, applied as `min()` over every level; a spawn argument above it is clamped, not honoured | **PARTIAL** |
+| `Worker.spawn(timeout=X)` | main agent / UI spawn | worker definition `timeout_seconds`, or `agent_config["worker_timeout_seconds"]` — resolved at `tools/workspace/worker_thread.py:980-994`, injected into the worker agent at `:2004` | inherits 600 | per-worker soft budget; drives the warning threshold `max(5, int(timeout*0.8))` `:2010-2013`, `time_monitor_enabled` `:2014`, `stop_check` `:2016` | the worker's own budget, never above the ceiling; its soft phase drives warning injection, its hard phase the token | **WIRED (soft only)** |
+| `DockerCodeRunner(timeout=Y)` | tool call | `timeout: int` field — `tools/docker_code_runner.py:141`; passed at `:453` — `manager.exec(..., timeout=self.timeout)` | tool schema default | the exec call is bounded; the `finally: manager.stop(...)` at `:458` is **not** bounded by any outer deadline | per-call deadline, clamped by both higher levels, cancellation-visible | **WIRED (exec only)** |
+
+Supporting hard deadlines that already implement the pattern the ceiling needs:
+`infra/container_manager.py:2543-2565` (daemon thread + `join(timeout)` + `container.kill()`)
+and its ancestor `infra/containers/executor.py:1153-1191` — `_exec_with_timeout`; grace
+constants `container_manager.py:265-266` — `_STOP_GRACE_SECONDS = 5` /
+`_REMOVE_GRACE_SECONDS = 1`; kill grace `agent/config/defaults.py:113` — `EXEC_KILL_GRACE = 10`.
+
+### Precedence rules (normative)
+
+1. `effective = min(ceiling, worker_budget, tool_call_budget)`.
+2. The ceiling is **not** a parameter. It has no agent-facing tool argument and no
+   `spawn()` keyword; raising it is an operator edit of
+   `agent/config/defaults.py:61` plus a restart.
+3. A level that is absent inherits the next one up; absence never means *unlimited*.
+4. All three levels read the **same** token (Q2B). A level may not keep a private flag,
+   and `stop_check` (`worker_thread.py:2016`) becomes a read of the token, not of
+   `_stop_event`.
+5. A deadline that fires must still be *reported* through the token's observability
+   contract (Q2B) — a silent `break` is a defect, see the appendix.
+
+### Soft → hard as a state machine
+
+| state | trigger | mechanism today | user / UI sees | must additionally do |
+|---|---|---|---|---|
+| `RUNNING` | turn start | — | normal streaming | token idle |
+| `SOFT` (warning) | elapsed ≥ `timeout*0.8` (`worker_thread.py:2010-2013`) | prompt injection of the time warning; tools may be restricted; text monitor state flips (`agent/core/state.py:231` — `self.restriction_reason = 'timeout'`) | a "wrap up" warning in the stream, tools shrinking | token *flagged* (not cancelled), status field `phase="soft"` |
+| `HARD` | token cancelled (deadline, operator kill, ceiling) | `_hard_deadline_fallback` — `tools/workspace/worker_timeout.py:152` (stop + `join(EXEC_KILL_GRACE)`, returns a timeout envelope) | terminal envelope with reason | token *cancelled*, tracked executions terminated (`worker_execution.py:217` `terminate_all`), status `phase="hard"`, one event |
+| `TERMINAL` | loop exit | `final_status = "killed" if self._stop_event.is_set() else "completed"` — `worker_thread.py:3183`, mirrored into `status.json` `:3185` | a status | must report *why*, not just `killed`/`completed`: a soft-timeout stop, a TTL kill and a bare-`None` stop all currently read `"completed"` |
+
+### Dead machinery retired by this design
+
+| knob | where | why it is dead | disposition |
+|---|---|---|---|
+| `WORKER_MAX_RETRIES` | `agent/config/defaults.py:64` — `WORKER_MAX_RETRIES = 3`; assigned `worker_thread.py:1010`; **never read** repo-wide (tests excluded) | retries belong to the token/hard-deadline world: a re-spawn now does recover the turn through the journal at a bounded `MAX_ATTEMPTS` (Q2E), so this knob is a second, unbounded, unread multiplier — not the mechanism that recovers work | **retired** — delete the constant, the resolver and the attribute |
+| `clamped_wait_for_job_timeout` | `tools/workspace/worker_timeout.py:83`, re-exported `worker_query.py:50/60`, **zero call sites** | the cap it implements becomes rule 1 (`min(...)`) at the call site, not a helper nobody calls | **retired** — fold the `min()` into the callers, delete the helper |
+| `SPAWN_QUEUE_TIMEOUT` | `agent/config/defaults.py:33` — only ever used as `fallback=` for the resume/auto waits (`worker_thread.py:4491`, `:4791`), never as a queue wait bound | a queue wait that is not a deadline is a lie in the defaults table; the real bound is the token | **retired** — either promote to a real bound or delete; do not leave it as a `fallback=` |
+
+## Q2B — Cooperative cancellation: the CancellationToken
+
+### Requirement
+
+One cancellation token, **process-agnostic from day one**. W7 moves workers into separate
+OS processes; a token that only works inside one process is a rewrite waiting to happen.
+The token must be: readable without blocking a thread, awaitable by a loop, checkable at
+loop boundaries, and readable by a *different* process than the one that flips it.
+
+### Why the obvious answer fails
+
+`threading.Event` (what the codebase uses today: `_stop_event` / `_park_event` /
+`_resume_event`, e.g. `worker_thread.py:1534` — `self._stop_event.set()`,
+`:1642` — `self._park_event.clear()`) is a **thread-only** primitive. It cannot cross a
+process boundary at all; it cannot be awaited without occupying a thread; and it cannot be
+*found* by a second process — there is no name for it. Same objection for
+`queue.Queue` (the `_input_queue` / `reply_q` pattern, `worker_thread.py:1337`) and for any
+`dict` shared by reference. The audit's cross-process table is the proof: every fast-path
+control signal is in-process, and the only cross-process channel is `command.json`.
+
+### Candidate mechanisms
+
+| mechanism | latency | atomicity | works in-process on day one | works after W7 | half-write / torn read |
+|---|---|---|---|---|---|
+| UNIX domain socket + `poll()` | sub-ms | per-write message boundary | yes (a socketpair is a normal fd) | yes | a partial write is a truncated message, dropped by the reader |
+| FIFO / pipe, `O_NONBLOCK` read | sub-ms | per-write boundary up to `PIPE_BUF` | yes | yes | reader sees a short read; needs framing |
+| **token file + `os.replace` + `stat`/mtime poll** | one poll interval (today: `_input_queue.get(timeout=2.0)` `worker_thread.py:2641`, i.e. ≤ 2 s) | atomic by rename: a reader sees the old or the new file, never a mix | yes | yes | `os.replace` is atomic on POSIX; a reader that `json.loads` a stale-but-complete file is safe (delete-on-corrupt already exists, `worker_thread.py:1903-1908`) |
+| shared memory / `mmap` atomic flag | sub-ms | single-word store only | yes | yes (needs `multiprocessing.shared_memory`) | a multi-field token cannot be written atomically; needs two-phase + version |
+
+### Decision
+
+**Token file with atomic `os.replace` + `stat` poll**, because it is the only candidate that
+is (a) already implemented in this codebase, (b) already cross-process, and (c) atomic
+against torn reads without new framing. This is a **generalisation of the existing
+`command.json` channel**, not a third signalling channel: `command.json` is written by
+`detach()` (`worker_thread.py:1498-1501`), by `pause()` (`:1597-1600`) and by the UI
+(`web_ui/backend/workspace_routes.py:1197-1200`), unlinked by `resume()` (`:1639`) and by
+every `_poll_command` branch (`:1865`, `:1884`, `:1887`, `:1897`), and parsed at `:1856`.
+`status.json` (`:3185`) and `context.json` are already cross-process artefacts too. The
+design keeps exactly one control file and gives it a schema version, instead of adding a
+socket *alongside* a file that will keep drifting.
+
+Rejected candidates, recorded so a later implementer does not re-open them: a UNIX socket
+is lower latency but is a second channel to keep alive across restarts and reconnects; a
+FIFO needs framing that a JSON file gets for free; `mmap` wins only if sub-millisecond
+latency is required, which it is not — the loop already tolerates 2 s
+(`worker_thread.py:2641`).
+
+### Token semantics
+
+- **One token per worker instance.** It is created at spawn next to the existing
+  `command.json` clean-up (`worker_thread.py:4706`) and destroyed by reset (`:5660`).
+  Scope is the *instance*, not the turn and not the session: a turn-scoped token cannot
+  express an operator kill that arrives between turns, and a session-scoped one would
+  cancel a sibling worker (instances are independent entries in `_worker_registry`).
+- **States:** `idle` → `cancelled{reason, requested_at, requested_by}`. Reasons are an
+  enumerated set: `operator_kill`, `ceiling`, `worker_budget`, `tool_call_budget`,
+  `ttl_expired`, `detached_ttl`. A free-text reason is what produces "Pausing…" screens.
+- **Checked at loop boundaries, not by callback.** Poll sites stay the two that exist —
+  `worker_thread.py:2130` (per agent event) and `:2635` (loop top) — plus the two park
+  loops (`:2689-2692`, `:2947-2951`), which **must** start polling (see the appendix: they
+  currently never call `_poll_command`, so a cross-process kill is invisible until resume).
+- **Awaitable without a thread:** the poll is a `stat()` on the token path, so an async
+  caller can await a small `asyncio` watcher that re-stats every `min(0.25, interval)` and
+  never blocks a worker thread; the synchronous path re-stats at the same boundaries it
+  already has.
+- **Propagation down to a blocked Docker API call:** the token cannot interrupt the SDK
+  (see the appendix, item 2: the `exec_run` thread is deliberately abandoned by
+  `executor.py:1153-1191`). Propagation is therefore *layered*: the token flips → the
+  exec wrapper stops waiting and calls `container.kill()` (`container_manager.py:2543-2565`)
+  → `ExecutionTracker.terminate_all` (`worker_execution.py:217`) reaps tracked pids with
+  `exec_stop(..., timeout=EXEC_KILL_GRACE)` (`:289`, `:387`) and `os.kill(pid, SIGTERM)`
+  (`:418`). Cancellation is thus *cooperative at the loop, violent at the container* — and
+  the document must say that, because the container dies, not the command.
+- **"Already cancelled, don't start":** every entry point that is about to do work
+  (`send_query`, `spawn`, tool dispatch) reads the token **before** the first side effect
+  and returns the terminal envelope with `reason` — no thread started, no container
+  created, no queue entry appended. Today the equivalent check is spread over
+  `resume()`'s `_stop_event`/`status == "killed"` guard (`worker_thread.py:1620`) and does
+  not exist on the query path.
+
+### Observability contract
+
+When the token flips, three records must agree — a UI that reads only one of them is how
+the panel ends up on "Pausing…" forever:
+
+1. `status.json` — written via `_write_status_file` (mirror at `worker_thread.py:3185`)
+   gains `phase` (`soft` / `hard`), `cancel_reason` (the enum above) and `requested_at`.
+   The optimistic write the UI already does (`workspace_routes.py:1206-1211`, which sets
+   `runtime_status: "killed" | "detached"` before the worker has acted) must carry the same
+   three fields, otherwise the panel shows a destination it can never confirm.
+2. `command.json` — the request half: `{"schema": 1, "action": "kill", "reason": ...,
+   "requested_at": ..., "request_id": ...}`. `request_id` is what lets the UI prove the
+   worker consumed *its* request rather than an earlier one; today the file is unlinked on
+   read (`worker_thread.py:1884`) with nothing written back.
+3. event bus — one `WORKER_STOPPING`-class event per state change, as already published at
+   `worker_thread.py:1496` (detached) and `:1529` (killed), plus a terminal event at
+   `:3183-3186`. The terminal event must carry `cancel_reason`, because the current pair
+   `killed` / `completed` cannot distinguish a TTL kill from a clean drain from the
+   bare-`None` defect.
+
+UI rule that follows: the panel may render `Pausing…` / `Stopping…` **only** while
+`request_id` is unconfirmed and no terminal event exists, and it must expire that state on
+timeout with the reason `unconfirmed` — never indefinitely.
+
+---
+
+## Q2C — The orphan reaper: who reaps a container nobody owns?
+
+### Requirement
+
+Containers must be reclaimed even when **every in-process record of their owner has died with
+it**. Four ownership records exist today and all four live inside the owning process:
+
+| # | ownership record | location | dies when |
+|---|---|---|---|
+| 1 | worker teardown | `_cleanup_worker_containers` — `tools/workspace/worker_thread.py:2404-2455`, called from `run()`'s `finally` `:3231` | the process dies — a `finally` does not run after `SIGKILL` |
+| 2 | module-level detached set | `_DETACHED_WORKER_IDENTITIES` — `infra/container_manager.py:5120` | the process dies |
+| 3 | in-process worker registry | `_worker_registry`, read on the fast path `web_ui/backend/workspace_routes.py:1213-1232` | the process dies |
+| 4 | the only watchdog | `PeriodicStaleCheck` — `tools/workspace/worker_manager.py:107` (`_check_once` `:151`, `_check_detached_ttl` `:179`) | it *is* a daemon thread in the watched process (appendix row 7) |
+
+A crash, a `SIGKILL`, or a container-runtime restart therefore leaves
+`agent-exec-ephemeral-…` containers **running** with no owner — and, see below, nothing in
+the existing reaping inventory considers a running container at all.
+
+### What already exists — the reuse map
+
+Do **not** add a second scheduler. These sweeps already run on a timer and are the right host
+for one more entry.
+
+| mechanism | where it runs | scope | why it cannot see an orphan |
+|---|---|---|---|
+| `sweep_exited_workspace_containers` | startup `web_ui/backend/server.py:1032` **and** every `_CONTAINER_SWEEP_INTERVAL_S` (300 s, `:613-614`) via `_periodic_container_sweep_loop` `:709-728` → `_run_container_sweeps` `:676-707` | EXITED only — `infra/container_manager.py:5362` — `Two branches share the same predicate (``status == 'exited'`` AND idle` / `age >= ttl-for-class)`; per-class TTL `ephemeral 900`, others `86400` (`:5395-5401`) | an orphan is `running`, by definition |
+| `_sweep_orphan_container_records` | same loop, `server.py:688`; retention `THOUGHTMACHINE_ORPHAN_RECORD_MAX_AGE_S` = 86400 (`:519-521`) | a *record* whose bound container is gone | the converse case: here the container survives and the owner does not |
+| `sweep_stale_resource_containers` (`infra/resource_container_manager.py:2217`, guarded by `_periodic_registry_has_workspaces` `server.py:617`) | same loop | `thoughtmachine.resource` containers | out of scope by contract — `_gc_should_skip` (`container_manager.py:5317`) makes worker teardown and the stale sweep never touch them |
+| `cleanup_stale_worker_containers` | pre-create self-heal, called `container_manager.py:2301`, defined `:5158` | label-exact `<session>:<worker>`, states `_REMOVABLE_WORKER_STATES = {"created", "exited", "dead"}` (`:5101`), predicate `:5238` | skips `running`; and it only fires when the *same identity* is spawned again |
+| boot integrity scan | `server.py:872-895`, name filter `agent-exec-` | stale mounts vs current defaults | boot only, mount mismatch only |
+| boot drift scan | `server.py:900-931`, `RECORD_LABEL_KEY` | record vs live container mismatch | boot only, and read-only detection |
+
+Measured statement of the gap: **no code path in the repository reaps a `running` container
+whose owning process is gone.** The nearest artifact contradicts itself — the stale-worker
+docstring promises exactly this case, `container_manager.py:5165-5167` — `When a worker dies
+without teardown, its container lingers in` / `created/exited/dead state` — while the
+predicate it implements (`:5101`) *excludes* the dangerous state: a live container holding a
+live mount of the workspace, invisible to the panel because the owner that would have
+reported it has died.
+
+### Identification: what an orphan is, and what evidence exists
+
+**Definition (normative).** A container is an *orphan* iff all four hold:
+
+1. it carries `thoughtmachine.worker` — `container_manager.py:2294` —
+   `labels["thoughtmachine.worker"] = worker_name`. The label is deliberately
+   **ephemeral-only** (gated on `LIFECYCLE_EPHEMERAL`, `:2294`), so lifecycle-class scoping
+   comes for free: `persistent`/`service`/`resource` creates never carry it;
+2. its owner is **not live** (below);
+3. abandonment has been observed on **two consecutive** sweeps;
+4. it is not detached — a parked worker is alive by definition, and
+   `cleanup_stale_worker_containers` already implements the exemption verbatim
+   (`:5202-5207` — `worker is detached (parked workers keep their containers until resume or`
+   / `TTL kill)`).
+
+Evidence available today, and why it is not enough:
+
+| evidence | source | verdict |
+|---|---|---|
+| owner identity `"<session\|unknown>:<worker_name>"` | label `:2294`, documented `:39` | usable, but has **no turn id and no spawn timestamp** |
+| workspace / class / creator | labels `:2272`, `:2273`, `:2281` | usable for scoping, useless for liveness |
+| container name | `agent-exec-ephemeral-{ws12}-{session_tag}-{env8}`, ownership regex `:4106-4112` | the only session-ownership vector, and it is used by *listing*, never by a sweep |
+| `State.StartedAt` / `FinishedAt` | consumed by the sweep's clock-skew guard (`:5362-5372`) | the container's age is known; the *owner's* liveness is not |
+| `status.json` | `workers/<instance_label>/status.json` — path `worker_thread.py:950`, writer `:3403-3452`, fields `:3413-3425` | carries `runtime_status`, `started_at`, `session_id` — **no pid, no boot id, no heartbeat freshness**, and it is deleted only by reset (`:5650-5660`), so a dead worker's file answers forever |
+| heartbeat | `_heartbeat_tick` `worker_thread.py:3564-3581` | **in memory only** — `Updates ``last_heartbeat`` in memory (status.json writes remain the` / `responsibility of the existing status-file machinery)` |
+
+That last row is the crux: the one signal written while a worker is alive is not persisted, so
+a cross-process reaper today cannot distinguish *busy* from *dead*.
+
+**Required change (one writer line, two schema fields).**
+
+1. `_heartbeat_tick` (`:3564`) also atomically replaces `workers/<label>/heartbeat.json` every
+   `HEARTBEAT_INTERVAL_S` (30 s, `agent/config/defaults.py:41`). One `os.replace` per 30 s
+   per worker buys the reaper its only honest liveness vector.
+2. `status.json` gains `owner_pid`, `owner_boot_id` (`/proc/sys/kernel/random/boot_id`) and
+   `spawned_at`, stamped once at spawn beside the existing `command.json` clean-up
+   (`worker_thread.py:4706`). A pid alone is unsafe (reuse); `(boot_id, pid, spawned_at)` is
+   the standard triple, and when `boot_id` cannot be read the answer is **unknown → do not
+   reap**, never a guess (the same tri-state rule as `_detached_state`,
+   `container_manager.py:5143`).
+3. The container gains `thoughtmachine.spawned_at` and `thoughtmachine.instance` beside
+   `:2294`, so the decision is reproducible from the container alone even if the state
+   directory was wiped.
+
+### Liveness vs abandonment (one reap TTL, two strikes)
+
+| verdict | condition | clock |
+|---|---|---|
+| **LIVE** | `heartbeat.json` younger than `3 × HEARTBEAT_INTERVAL_S` = 90 s | none — never reaped |
+| **LIVE (wedged)** | owner pid alive with matching `boot_id`, heartbeat stale | none — a wedged owner is `PeriodicStaleCheck`'s job (`worker_manager.py:151`, `HEARTBEAT_STALE_AFTER_S` 600 s `defaults.py:43`) |
+| **ABANDONED** | pid gone, or `boot_id` mismatch, or no heartbeat for `ORPHAN_REAP_AFTER_S` = 3600 s | starts at the last heartbeat |
+| **ORPHAN (reapable)** | ABANDONED **and** confirmed on two consecutive sweeps | reap |
+
+Why 3600 s: it is the operator's deliberate default — 1 h is the human patience budget, not
+a number derived from the worker ceiling. Nobody can possibly still be waiting on a worker
+whose heartbeat is an hour old, and every in-process stall (a queued container operation, a
+stalled `docker` daemon, a long GC pause) finishes far sooner than that, so 3600 s cannot reap
+a live worker. The earlier form derived a 600 s abandonment floor from
+`WORKER_TIMEOUT_SECONDS` (`defaults.py:61`); the ceiling is a *turn* budget and far too short
+to carry a *delete* authority, so it no longer feeds this clock. 3600 s is also four times the
+900 s exited-ephemeral TTL (`container_manager.py:5400`) and far below the 86400 s record
+retention (`server.py:519-521`), so a reaped container's record is still inspectable. One
+clock, not two: the TTL is the delete authority and the second sample is the only extra guard.
+A second, stricter clock buys no safety once the first already sits an hour past any plausibly
+live worker — it only adds a way to reap early.
+
+The second-sample rule mirrors the existing precedent, `cleanup_stale_worker_containers`
+(`:5183-5193`): *unknown never falls to reap*.
+
+### Where it runs
+
+| # | host | why there |
+|---|---|---|
+| A | **a fourth entry in the existing periodic loop** — `_run_container_sweeps` `server.py:676-707`, whose tuple list `:685-688` gains `('orphan-workers', _periodic_registry_has_workspaces, sweep_orphaned_worker_containers)` | 300 s cadence, `asyncio.to_thread` (`:722`), per-step `try`/`except` and per-step `INFO` log already exist — zero new scheduler, zero new lifecycle |
+| B | **once at startup**, beside `_sweep_exited_workspace_containers()` `server.py:1032` | a crash-restart *is* the event that creates orphans; waiting 300 s for the first tick leaves them running |
+| C | **pre-create self-heal** — extend `cleanup_stale_worker_containers` (`:5158`) with the same liveness predicate, so a respawn reclaims a **running** orphan of its own identity | the only site with a hard "I need this name now" signal; today `_REMOVABLE_WORKER_STATES` (`:5101`) excludes `running` |
+| D | **not `PeriodicStaleCheck` alone** | it is in-process (appendix row 7); it can only reap parked instances it owns — which is precisely why Q2C exists |
+| E | **not a UI route** | a reaper that runs only when someone opens the panel leaks exactly when nobody is looking |
+
+Residual, stated rather than hidden: if the *server itself* is down, nothing reaps, and
+orphans accumulate until the next boot (where host B catches them). That is acceptable — a
+down server also spawns nothing. An out-of-process supervisor would close it and is a
+deployment change, not a design one; it is out of scope here.
+
+### Decision table
+
+| trigger | scan | decision | evidence | action | log |
+|---|---|---|---|---|---|
+| process start | `containers.list(all=True, filters={"label": _WORKER_LABEL})`, one call | orphan per §Identification | `heartbeat.json` age + `(boot_id, pid)` + `thoughtmachine.spawned_at` | stop → `_STOP_GRACE_SECONDS` 5 s (`:265`) → remove | `WARNING` per container: name, owner identity, last-heartbeat age, deciding evidence |
+| every 300 s tick | same query | same, two-strike | same | same | one `INFO` summary line per tick (`reaped N, deferred M`), not one per container |
+| pre-create, same identity | label value `== owner_identity`, all states | reap only if not detached and not live | `_detached_state` tri-state (`:5143`) + heartbeat | stop/remove, then create | existing `INFO`/`WARNING` lines `:5196-5210` gain `reason=orphan_running` |
+| heartbeat < 90 s old but pid dead | — | **defer** one tick | heartbeat | none | `DEBUG` |
+| pid alive, heartbeat stale | — | **defer** (wedged, not orphan) | pid + boot_id | none | `DEBUG` |
+| registry empty or unreadable | — | **skip the tick** | existing fail-closed guard `_periodic_registry_has_workspaces` `server.py:617` | none | existing skip `WARNING` |
+| `dry_run` | as above | compute only | as above | nothing | counts only — same pattern as `sweep_exited_workspace_containers(..., dry_run=True)` (`:5345`) |
+
+Knobs, named to match the existing family (`server.py:509`, `:519`, `:613`):
+`THOUGHTMACHINE_ORPHAN_WORKER_REAP_AFTER_S` (3600 — 1 h, the operator's deliberate default) and
+`THOUGHTMACHINE_ORPHAN_WORKER_DRY_RUN` (0). Rollout: dry-run for one release, then armed.
+
+### Blast radius
+
+- Files: `infra/container_manager.py` (new `sweep_orphaned_worker_containers` beside `:5343`,
+  plus a liveness helper; `_REMOVABLE_WORKER_STATES` `:5101` stays untouched so the existing
+  path's contract does not widen), `web_ui/backend/server.py` (`:685-688`, `:1032`),
+  `tools/workspace/worker_thread.py` (`_heartbeat_tick` `:3564`, spawn stamping `:4706`),
+  `tools/workspace/worker_manager.py` (nothing — read-only participant).
+- Tests: a fake-container sweep suite modelled on the `sweep_exited_workspace_containers`
+  tests, a liveness truth table over (pid alive, pid dead, boot-id mismatch, heartbeat
+  fresh/stale), a two-strike test, and a "detached orphan is never reaped" test.
+- Risk: **medium** — the reaper deletes live-looking containers. Every mitigation is cheap
+  and mandatory: two strikes, a 3600 s (1 h) reap TTL, heartbeat-based (not
+  timestamp-based) liveness, the detached exemption, and a dry-run rollout.
+
+---
+
+## Q2D — The graceful unwind cascade: Main → Worker → Tool
+
+### Requirement
+
+A cancellation must reach every layer that is currently holding work, and **each layer's wait
+must be bounded**, so the layer above can stop waiting. Today cancellation is one hop and one
+lie: the route writes `command.json` and answers `{"status": "ok"}` before anything has
+happened (`web_ui/backend/workspace_routes.py:1197-1199`, `:1235`), while the Docker SDK call
+underneath is not cancellable at all (`infra/containers/executor.py:1153-1191`).
+
+### The cascade
+
+```
+Main agent turn
+  |
+  | cancel(reason)            operator kill / ceiling / TTL / tool budget
+  v
+L1  turn budget         min(ceiling, worker budget, tool budget)       [Q2A rule 1]
+  |
+  | token.cancel(reason, request_id)      command.json schema 1       [Q2B]
+  v
+L2  worker loop         poll <= _input_queue.get(timeout=2.0)         (worker_thread.py:2641)
+  |  stop branch  :1862-1877  -> unlink request :1865 -> final_status :3183
+  |  kill branch  :1878-1885  -> _stop_event.set :1534
+  |  pause/resume :1886-1902  -> MUST poll (appendix defect 1: :2689-2692, :2947-2951)
+  v
+L3  tool / exec         EXEC_KILL_GRACE = 10 s                        (defaults.py:113)
+  |  ExecutionTracker.terminate_all                                   (worker_execution.py:217)
+  |    docker_exec      -> exec_stop(timeout=EXEC_KILL_GRACE)          :289
+  |    container_exec   -> docker exec <c> kill <pid>                  :387
+  |    scoped_container -> container_manager.stop(container_id)
+  |    subprocess       -> killpg(SIGTERM) :418 -> poll 50 ms -> SIGKILL :427-459
+  v
+L4  container          stop grace 5 s -> remove grace 1 s             (container_manager.py:265-266)
+  |  container.kill()  ->  the SDK daemon thread is ABANDONED         (executor.py:1153-1191)
+  v
+L5  orphan reaper      last rung, 3600 s                              [Q2C]
+     for the case where every layer above died with the process
+```
+
+### Per-layer budget, and what each layer cannot reach
+
+| layer | budget | enforced by | reached when | cannot reach |
+|---|---|---|---|---|
+| L1 turn | `min(ceiling, worker, tool)`; ceiling 600 s (`agent/config/defaults.py:61`) | time monitor → token (Q2A/Q2B) | token flip | an SDK call already in flight |
+| L2 loop | ≤ 2 s (`worker_thread.py:2641`) | `_poll_command` (`:1846`), poll sites `:2130`, `:2635`; park loops must add the poll | next loop boundary | the bare-`None` race (appendix defect 2) |
+| L3 exec | `EXEC_KILL_GRACE` 10 s (`defaults.py:113`) | `terminate_all` (`:217`), `exec_stop` (`:289`, `:387`), `SIGTERM`→`SIGKILL` (`:418`, `:427`) | grace expiry | the SDK thread itself |
+| L4 container | 5 s stop + 1 s remove (`container_manager.py:265-266`) | `stop()` / `remove()` | grace expiry | a container already gone |
+| L5 reaper | 3600 s (Q2C) | periodic loop (`server.py:709-728`) | — | a server that is down |
+
+Worst case from "cancel requested" to "every layer silent": 2 s + 10 s + 5 s + 1 s = **≤ 18 s**.
+That derived number — not a guess — is what the UI expiry below must be built on.
+
+### Idempotency: two cancels must converge
+
+Today they do not converge; they *lie*. `_stop_worker_instance` writes the command file
+(`workspace_routes.py:1197-1199`), then **unconditionally** overwrites `status.json` with the
+destination state (`:1206-1211` — `"runtime_status": "killed" if terminate else "detached"`)
+and returns `{"status": "ok", "name": name}` (`:1235`) without asking the worker. The
+in-memory fast path (`:1227-1231`, `thread.kill()` / `thread.stop()`) swallows every exception
+(`:1232` — `pass  # The file-based command will still work`). Three consequences: a second
+cancel is indistinguishable from the first and re-stamps the same optimistic status; a cancel
+that reaches *nothing* (worker already gone, file already unlinked) still answers `ok`; and the
+reverse verb **is** fenced — `resume()` answers `{"status": "refused", …}`
+(`:1665-1672`) when a stop is in flight. Refusing a no-op resume while accepting a no-op cancel
+is the defect.
+
+Normative rule: **cancellation is a monotone, idempotent state transition keyed by
+`request_id`; the first writer wins.**
+
+| incoming request | state | answer | side effects |
+|---|---|---|---|
+| cancel A | `running` | `{"status": "cancelling", "request_id": A}` | write token file with A; one event |
+| cancel B | `cancelling` | `{"status": "cancelling", "request_id": B, "superseded_by": A, "terminal_expected": <ts>}` | **no** `status.json` rewrite, no second event, no new timer |
+| cancel B with a stronger reason (`operator_kill` over `worker_budget`) | `cancelling` | as above, `reason` = B's, escalation rung advanced | one event, `rung=2` |
+| cancel after terminal | `cancelled` / `killed` | `{"status": "already_terminal", "terminal": "killed", "reason": <first>, "request_id": A}` | none |
+| resume while cancelling | `cancelling` | `{"status": "refused", "reason": "cancel in flight", "request_id": A}` — keeps today's shape (`:1665`) | none |
+| resume after terminal | terminal | `{"status": "refused", "reason": "instance is gone; spawn a fresh instance"}` | none |
+
+One writer per fact: the token file (Q2B) records the *request*; `status.json` is written by
+the worker (`_write_status_file`, `worker_thread.py:3403-3452`) plus exactly **one** optimistic
+write by the first cancel — never by the second.
+
+### Escalation ladder
+
+The shape already exists at the tool layer and should be promoted, not invented:
+`_escalate_subprocess_kill` (`tools/workspace/worker_execution.py:427-459`) sends `SIGTERM`,
+polls the group every 50 ms up to `kill_grace_seconds`, and only then escalates
+(`:446` — `os.killpg(pid, signal.SIGKILL)`).
+
+| rung | t | action | evidence it happened | if it fails |
+|---|---|---|---|---|
+| 0 | 0 | token flip with `reason` + `request_id`; every entry point reads the token **before** its first side effect (Q2B) | token file contents | — |
+| 1 | ≤ 2 s | loop boundary observed; stop/kill branch runs; queued jobs answered with the terminal envelope | `WORKER_STOPPING` event, `command.json` unlinked (`:1865`) | rung 2 |
+| 2 | ≤ 2 s + 10 s | `terminate_all` reaps tracked executions (`worker_execution.py:217`) | per-execution `INFO` logs (`:288`, `:387`, `:419`) | rung 3 |
+| 3 | + 5 s | `container.kill()` through the hard-deadline wrapper (`container_manager.py:2543-2565`) | container state `exited` | rung 4 |
+| 4 | + 1 s | `remove()` | container absent | rung 5 |
+| 5 | 3600 s | Q2C reaper | sweep log line | surfaces as a leak, never silently |
+
+Exactly one event per rung, carrying `rung` and `request_id`, so a stuck cascade is readable
+from the log alone — the property the appendix's block-point table demands and that
+`_hard_deadline_fallback` (`tools/workspace/worker_timeout.py:152`) does not provide.
+
+### User-visible states, with expiry
+
+| state | written by | panel shows | expires after | on expiry |
+|---|---|---|---|---|
+| `running` | worker `status.json` | normal streaming | — | — |
+| `cancelling` | first cancel (`workspace_routes.py:1206-1211`) then worker confirmation | `Stopping…` + count of queued jobs | 18 s worst case + 5 s slack | flips to `unconfirmed` — never stays |
+| `cancelled` | worker (`:3183`) | terminal, with `reason` | — | — |
+| `orphaned` | Q2C reaper | `Abandoned (owner gone)` + heartbeat age | — | — |
+| `unconfirmed` | panel, on `cancelling` expiry | `Cancel not confirmed` + `request_id` | — | offers the reaper's evidence (owner, last heartbeat) |
+
+Q2B already forbids an indefinite `Stopping…`; this table supplies its numbers. The panel must
+not derive state from `status.json` alone, because the optimistic write at `:1206-1211` can be
+the **last** write a worker ever receives — three records must agree (Q2B observability
+contract).
+
+### What the cascade does NOT solve
+
+1. **The abandoned SDK daemon thread.** `infra/containers/executor.py:1153-1191` runs
+   `self.container.exec_run(...)` on a daemon thread and, on timeout, kills the *container*
+   (`self.container.kill()`, then `_ensure_container()`). The command dies; the **thread** stays
+   blocked in `exec_run` until the socket errors out. The cascade terminates work, it cannot
+   reclaim a thread or its stack — so tests must not assert that the thread count returns to
+   baseline, and a long-lived process must accept one leaked thread per abandoned exec
+   (appendix row 2).
+2. **The bare-`None` sentinel race.** A cancel exits through the stop branch, which is correct,
+   but the queue may already hold a `None` that a *concurrent* `resume()` makes readable as STOP
+   (`worker_thread.py:1505`, `:1604`, `:2647-2652`; appendix defect 2). The cascade orders
+   requests; it cannot reorder items already in `_input_queue`. The fix is the `request_id`
+   fence plus replying to drained jobs (`:2727-2742`), not more cascade.
+3. **Spawn cannot be recalled.** Nothing reads the token before a container is created today
+   (Q2B's "already cancelled, don't start" is a proposal). A cancel that lands during spawn
+   therefore ends at rung 5, not rung 1.
+4. **No rollback.** A killed turn's context is persisted (`_save_context`), but half-written
+   container files and partially produced artefacts are not transactional and are not undone.
+   This is a cancellation protocol, not a transaction manager.
+5. **The latency floor.** Cross-process cancellation can never be faster than one poll interval
+   (~2 s, `:2641`). Every budget above is built on that floor; sub-second cancellation requires
+   the socket candidate Q2B rejected.
+
+### Blast radius
+
+- Files: `web_ui/backend/workspace_routes.py` (`_stop_worker_instance` `:1124-1245`, `resume`
+  `:1626-1675`), `tools/workspace/worker_thread.py` (poll sites `:1846`/`:2130`/`:2635`, park
+  loops `:2689-2692`/`:2947-2951`, terminal `:3183-3186`), `tools/workspace/worker_execution.py`
+  (rung 2, `:217`), `infra/container_manager.py` (rung 3, `:2543-2565`),
+  `agent/config/defaults.py` (`:61`, `:113`).
+- Tests: the six-row idempotency matrix above, a cascade timing test asserting
+  request→silence ≤ 18 s, and a panel expiry test for `cancelling` → `unconfirmed`.
+- Risk: **high** — the ladder touches the teardown ordering Q2's Option A depends on
+  (`worker_thread.py:4805-4817`, cleanup before any resume), and a rung that fires early is
+  data loss, not a latency win.
+
+---
+
+## Q2E — The in-flight journal: what survives a kill, and how a successor recovers
+
+### Requirement
+
+A worker's turn lives in three places that all die with the process: the thread's stack, the
+agent's context in memory, and the conversation history that reaches `context.json` only when
+the turn *completes*. Q2E adds a fourth place — written before the work runs, readable after
+the writer is gone — `<workspace>/workers/<name>/inflight.json` (`INFLIGHT_FILENAME`,
+`inflight_journal.py:124`; path via `journal_path`, `:332`).
+
+Scope, narrowly: **process death** — a crash, a `SIGKILL`, a kill issued by the query-timeout
+path. It is not power-loss durability, and it claims neither crash consistency nor `fsync`: the
+write is `_atomic_write_json` (`inflight_journal.py:381`), a temp file plus `os.replace` inside
+one directory, so a concurrent reader sees the old bytes or the new bytes and never a torn
+file. What the page cache does after `os.replace` returns is outside the claim. One record, one
+turn, one small JSON file per worker directory.
+
+The requirement: *the turn a dead worker was running must be nameable on disk, and the
+successor that inherits its directory must be able to take it over exactly once, at a bounded
+cost, without a human.*
+
+### The record
+
+`InflightRecord` (`inflight_journal.py:198`) is frozen and ten fields wide, `SCHEMA_VERSION = 1`
+(`:128`):
+
+| field | written by | why it exists |
+|---|---|---|
+| `query_id` | WP1 | identity of the turn; on a replay it is the *dead* job's id, so that job is not left dangling |
+| `query` | WP1 | the text a successor replays — the record carries the work, not a pointer to it |
+| `status` | every WP | `inflight` / `recoverable` / `cancelled` / `adopted` (`:136-139`) |
+| `attempts` | WP1, adoption | `0` for a fresh turn, `predecessor + 1` for a replay; capped by `MAX_ATTEMPTS = 3` (`:132`) |
+| `requested_by` | WP1 | `send_query` when the turn carries a registry job id, else `worker_queue` — a heuristic, not an identity claim |
+| `created_at` | WP1 | identity half of the UPDATE key, never re-stamped, so a later write can tell it is updating the same turn |
+| `updated_at` | every WP | freshness (`utcnow_iso`, `:192`) |
+| `last_tool` | WP2 | `{"name", "args_hash"}` — R2's replacement for a per-tool idempotency ledger |
+| `reason` | WP4, WP5 | which exit abandoned the turn (`detached-midturn-park`, `reset-drop`, `stopped-by-manager`) |
+| `schema` | WP1 | version gate; an unknown schema reads as unusable rather than being guessed at |
+
+The four fence axes are **not** fields: `to_payload(fence)` merges them in from the
+`CommandFence` (`command_channel.py:78`) the caller passes, so identity has exactly one source
+and a record can never be stamped with a fence that disagrees with its writer. Reads are
+asymmetric on purpose: `from_payload` is strict and returns `None` instead of raising (a corrupt
+file is a data condition), while the constructor raises `ValueError` (an invalid status, or
+`attempts` outside `0..MAX_ATTEMPTS`, is a caller bug).
+
+Four statuses, and the displacement rule that makes them usable:
+
+| status | who writes it | what it means | displaced by an ordinary write? |
+|---|---|---|---|
+| `inflight` | WP1, WP2, and the adoption's take | a turn is running — or was, when its writer died | yes: by the same incarnation, or by an adoption |
+| `recoverable` | WP4, the detach park | a turn was parked mid-flight with its containers alive | yes, by the same incarnation (a resume overwrites it in place) |
+| `cancelled` | WP5, a deliberate kill | terminal evidence: nobody will resume this turn | yes — the husk a kill leaves must not wedge the next legitimate turn |
+| `adopted` | `adopt_inflight` | a successor took the turn over | no — a second adoption is refused |
+
+**The fence is a refusal, not a lock.** `write_inflight` (`:474`) fails closed when the record on
+disk belongs to another incarnation and is still work in progress: it answers `_REFUSAL_PREFIX`
+(`:157`) and leaves the foreign file byte-identical (`_refusal_for_existing`, `:423`).
+`read_inflight` (`:639`) never hands back another incarnation's record — it reads as absent and
+reports why. Nothing here is a lease, a heartbeat or a liveness probe: the file cannot tell a
+live sibling from a dead one, and does not pretend to.
+
+### Five write points, and the two exits that must not clear
+
+| # | where | what it writes | why there |
+|---|---|---|---|
+| WP1 | `worker_thread.py:2906` | `inflight` + `query` + `created_at`, `attempts` popped from the replay map (`:2911`) | placed *after* the two early returns (no agent, stop already signalled), so nothing is journalled that this loop will not go on to finish or park |
+| WP2 | `worker_thread.py:3146` | `inflight` with `last_tool = {name, args_hash}` | the only hook that reaches between tool calls; an UPDATE of the same `(query_id, created_at)` |
+| WP3 | `worker_thread.py:3248-3249` | clear of this incarnation's record (`_journal_clear`, `:2317`) | the ordinary terminal exit, so a finished turn leaves nothing to replay |
+| WP4 | `worker_thread.py:3002-3008` | `recoverable` + `reason=detached-midturn-park` (`:97`), then `_journal_interrupt_job` (`:2389`) | the detach park is the one exit that *keeps* the record; the job is terminalized `interrupted` so a join cannot complete or restart it |
+| WP5 | `worker_thread.py:1854-1855` | `cancelled` + `reason`, and the job `stopped` with the same reason | a deliberate kill is terminal evidence, not an abandonment to be recovered |
+
+Two of those exits must not be undone by WP3, and the guard is the whole of `:3248`:
+
+- the **park** sets `_journal_parked` (WP4), so the loop exit skips the clear;
+- a **deliberate kill** sets `_journal_cancel_reason` — and only if the `cancelled` record really
+  reached disk (`:2387`; a refused or failed cancel leaves the flag unset and the exit clears as
+  usual, `test_a_refused_cancel_does_not_hold_the_exit_back`).
+
+Without the guard the loop's own exit would erase the evidence a moment after writing it:
+`clear_inflight` (`:752`) deletes a record fenced to this incarnation *regardless of status*. A
+pause needs no special case — a drained turn that neither parked nor was cancelled falls through
+to the clear like any completed turn.
+
+A **reset** is the fourth path and it drops the file outright: `_drop_persisted_files` (`:6889`)
+unlinks `context.json`, `status.json`, `command.json` and `INFLIGHT_FILENAME` without ever
+parsing the journal, because a reset's promise is that the next spawn starts completely fresh
+and a surviving record — whatever its status — would either owe a successor a replay or hold a
+new turn's WP1 write up as a foreign leftover.
+
+### Kill is a cancellation, not a discard
+
+`kill(*, journal_reason: Optional[str] = None)` (`worker_thread.py:1823`) is keyword-only and
+defaulted, and the default is load-bearing: **a bare `kill()` writes nothing.** No journal read,
+no journal write, no reason — the behaviour a crash-shaped or best-effort kill wants, and the
+behaviour every call site that has not opted in keeps. `tests/test_worker_journal_kill.py` pins
+both halves (`test_a_plain_kill_journals_nothing`, `test_kill_on_an_idle_worker_writes_no_journal`).
+The bookkeeping runs first and never gates the duties: a journal that raises cannot stop a worker
+from dying (`test_a_raising_journal_never_stops_the_kill`).
+
+A caller that *knows* the kill is deliberate hands a reason over, and the record becomes
+`cancelled` + that reason while the job becomes `stopped` + that reason — one grep finds both
+halves:
+
+| supplier | where | reason | what it is saying |
+|---|---|---|---|
+| manager stop | `_stop_thread` (`worker_manager.py:882`), handed at `:898-901` | `stopped-by-manager` (`:78`) | an operator/policy stop; callers `:585`, `:606`, `:655` |
+| worker reset | `_reset_one` (`worker_thread.py:6910`) → `t.kill(journal_reason=_JOURNAL_RESET_REASON)` (`:6921`) | `reset-drop` (`:104`) | the turn is dropped, and its files are about to be unlinked |
+| detached TTL kill | `_kill_detached_worker` (`worker_manager.py:303`) → bare `thread.kill()` (`:308`) | **none — deliberate opt-out** | the parked worker's record is `recoverable`; cancelling it would misfile a resume as a discard |
+| query timeout | `worker_thread.py:6322` → bare `thread.kill()` | **none — deliberate opt-out** | the record stays `inflight`, so the next spawn replays the turn (see the limits below) |
+
+Two opt-outs and not four, and both are the same judgement: a kill with no reason leaves the
+record as the in-flight evidence its successor can act on, while a reasoned kill says the turn is
+over. Reaching the manager path is not an accident of signature discovery either —
+`_accepts_journal_reason` (`worker_manager.py:80`) inspects the callable's signature rather than
+calling it and catching `TypeError`, so a counting double is never counted twice and a genuine
+`TypeError` inside `kill` is not swallowed as "no support"
+(`test_the_manager_still_kills_a_thread_without_the_keyword`,
+`test_the_manager_falls_back_to_stop_when_kill_is_absent`).
+
+`_journal_cancel` (`:2337`) is a read-modify-write, never a fresh record: identity (`query_id`,
+`created_at`, `query`) and `last_tool` are carried over. Three properties it holds deliberately —
+no record on disk means nothing to write (a kill on an idle worker must not conjure a phantom
+turn), a repetition for the same reason finds the record already `cancelled` and writes nothing
+(`:2369-2370`, so the first cancel's bytes and `updated_at` survive), and a record fenced to
+another incarnation reads as absent and is left byte-identical.
+
+### Recovery by adoption
+
+The successor's problem is created by its own write: WP1 **fails closed** on a foreign record
+that is still work in progress, so a spawn that inherited a crashed predecessor's `inflight`
+record would run its turn unjournalled unless something displaced it. One path does — once per
+incarnation, at turn start, before WP1 (`if self._journal_adopted is None:`,
+`worker_thread.py:2837-2839`): `_adopt_predecessor_journal` (`:1057`).
+
+Why the successor has the predecessor's directory at all: the spawn-side registry scan
+(`:5294-5300`) filters on `is_alive()`, so after a crash `live_same == []`; with no explicit
+instance id, the chain (`:5301-5392`) falls through to `spawn_iid = 1`, `instance_label` returns
+the **bare** worker name for instance 1 (`worker_registry.py:129-139`) and `_worker_dir` is
+`workers/<name>` — the very directory the dead incarnation used. Two live instances never share
+it; a dead one and its successor do.
+
+The gates, in order, each one a refusal rather than an error:
+
+| gate | where | condition | if it fails |
+|---|---|---|---|
+| look | `:1126` → `read_inflight_unfenced` (`inflight_journal.py:687`) | a record exists and decodes | `None`, silently — no record, or unusable |
+| ours to take? | `:1130` | `status` is exactly `inflight` | `None`: `recoverable` is the resume path's, `cancelled` is terminal, `adopted` is taken |
+| dead predecessor | `:1135` | the on-disk `epoch` is strictly lower than this incarnation's `_generation` | `None` — a record at this epoch or a later one is not a successor's business |
+| attempts | `:1139` | `existing.attempts + 1 <= MAX_ATTEMPTS` | `None`: attempt 4 is not built, and terminalizing that job is a different decision |
+| take | `:1153` → `adopt_inflight` (`inflight_journal.py:525`) | the *only* displacing writer in the module | whatever refusal it gives, unchanged |
+
+The look is unfenced on purpose: this incarnation's fence can never match a predecessor's epoch
+by definition. The take is `adopt_inflight` and not a local reimplementation, so the module's
+refusal list stays single-sourced (`:161` nothing, `:162` cancelled, `:165` already adopted,
+`:166` own fence, `:167` unusable, `:168` attempts mismatch). The bumped record carries
+`attempts + 1` and is restamped to the **adopting** fence — which is what makes adoption once per
+incarnation: every later turn's look sees its own epoch and declines.
+
+The epoch gate is only as good as the epoch, so `_allocate_generation` (`:4153`) is monotonic per
+worker directory (a `generation` sidecar folded with any `generation` already persisted in
+`context.json`) and **fail-closed**: a lock timeout or a failed rename propagates, because a
+worker that cannot be given a strictly greater epoch must not be spawned — otherwise it could not
+tell its predecessor's record from its own.
+
+The handover into the run loop is three fields and a map:
+
+```
+self._journal_replay_attempts[_adopted_record.query_id] = _adopted_record.attempts   # :2876
+self._input_queue.put((_adopted_record.query_id, _adopted_record.query, None))        # :2879
+```
+
+— and then the ordinary path takes it: the loop pops the queue item, WP1 writes the turn with
+`attempts=self._journal_replay_attempts.pop(self._current_query_id, 0)` (`:2911`), so the
+pre-crash count reaches disk instead of being re-stamped `0`, and `pop` makes the count apply to
+exactly one turn.
+
+The query id is not decoration. `run()` unpacks the triple into `_current_query_id`
+(`:3607-3618`), that id is stamped into the reply envelope (`:3957-3958`) and used to complete the
+registry job (`:3996-4002`), and `_emit_reply` (`:1569-1575`) publishes on it. Replaying under a
+*fresh* id would leave the dead job dangling forever — no completion, no reply, an orphan row in
+the UI. `test_the_replay_carries_the_dead_job_id_so_its_job_is_not_left_dangling` exists because
+that is the failure the id prevents.
+
+Recovery is therefore: same directory, same record file, same query id, `attempts + 1`, one queue
+item, one run. `test_the_adopted_query_actually_runs_once` (once, not twice),
+`test_without_adoption_the_successors_write_point_1_is_refused` (why the path exists at all),
+`test_attempts_accumulate_across_replays_and_stop_at_the_cap` (the chain terminates), and the
+three-process chain in `tests/test_worker_multi_process_adoption.py` (a real crash and a real
+successor, not a double).
+
+### What this does not do
+
+Five limits, stated as limits:
+
+1. **Nothing reads a `recoverable` record.** A repo-wide grep finds that status only where it is
+   defined (`inflight_journal.py:137`), documented (`worker_thread.py:2266`) and written by the
+   detach park (`worker_thread.py:3005`) — there is no reader, so no resume-path replay exists.
+   A same-incarnation resume overwrites the record in place through WP1 (the fence matches, so it
+   is an ordinary update). Adoption covers `inflight` — crash, `SIGKILL`, bare kill — and only
+   that.
+2. **A query timeout replays the turn.** `worker_thread.py:6322` kills the worker with no journal
+   reason, so the record stays `inflight` and the next spawn adopts it, bounded at
+   `MAX_ATTEMPTS`. That qualifies Q2's "a timed-out turn is terminal": terminal for the
+   *instance*, recovered for the *turn*, up to three spawns.
+3. **Adoption is once per incarnation, not once per record.** The takeover restamps the record to
+   the adopting fence; the next takeover continues the chain at `attempts + 1` and stops when
+   `existing.attempts + 1 > MAX_ATTEMPTS`. A poison turn therefore costs at most three spawns,
+   and after that it stays on disk for a human.
+4. **The queue is not journaled.** `_input_queue` is memory — a replay enqueues into it at
+   `:2879` exactly like an ordinary submission — and queries waiting there die with the process.
+   Only the turn in flight is recoverable.
+5. **No fence against a wedged live sibling.** Adoption proves the record is a *dead*
+   predecessor's by epoch; it does not prove the predecessor is dead. A process that stalls
+   indefinitely while its successor is spawned can have its turn adopted and then finish it
+   anyway. Nothing here detects that, and nothing here should be read as claiming otherwise.
+
+### Blast radius
+
+One new module (`tools/workspace/inflight_journal.py`, 790 lines with its docstrings), the five
+write points and the adoption gate in `worker_thread.py`, the reason handover in
+`worker_manager.py` — and nothing else: no route, no API schema, no config key, no event type.
+
+| surface | change |
+|---|---|
+| disk | one small JSON per worker directory; one write per turn start, per tool call, per abandoning exit; the file is the size of the query text |
+| read cost | one unfenced read per incarnation (the adoption look), one fenced read per cancel |
+| failure mode | every call is wrapped and answers a `WARNING`, never an exception: a journal that cannot be written, read, cancelled or adopted degrades to exactly the pre-Q2E behaviour and the turn runs. The guard wraps construction as well as I/O, because an invalid status is a caller bug, not a reason to lose a turn |
+| unchanged behaviour | a bare `kill()`; any thread double that predates the keyword; a worker directory with no journal file; a foreign or corrupt journal (left byte-identical, read as absent) |
+| tests | `tests/test_worker_inflight_journal.py` (the module), `tests/test_worker_journal_kill.py` (kill and the two exits), `tests/test_worker_adoption_at_spawn.py` (the gates and the replay), `tests/test_worker_multi_process_adoption.py` (real processes) |
+
+What it buys, precisely: the turn a crashed incarnation was running is nameable and replayable up
+to `MAX_ATTEMPTS`, carrying its query id, its attempt count and its last tool; and a deliberate
+kill leaves terminal evidence instead of a record that looks like work in progress. What it does
+not buy: containers, the queue, a replay for `recoverable`, or a liveness check on anybody.
+
+---
+
+## Q3 — Config propagation: does a write reach a live worker?
+
+### Question as understood
+
+Given the W1.5 addendum write-through (live session + store under one lock), does a
+config or addendum change made while a worker is running take effect for that
+worker, or does a worker only ever see the config snapshot taken at spawn?
+
+### Current behaviour
+
+A worker sees a **spawn-time snapshot**; write-through reaches the parent's live
+session only.
+
+- The worker's agent is built lazily, once per thread, on the first query:
+  `tools/workspace/worker_thread.py:2512-2513` — `if self._agent is None:` /
+  `agent_cfg = self._build_agent_config()`.
+  Nothing re-runs `_build_agent_config()` for later queries in that instance
+  (its only other call site builds the parent-side config dict,
+  `tools/workspace/worker_thread.py:4244` — `agent_config = self._build_agent_config()`).
+- The worker's agent is bound to the worker's own context object, not the parent
+  session: `tools/workspace/worker_thread.py:2538` — `session=self._worker_ctx,`
+  where `agent/core/worker_context.py:56` — `class WorkerContext:`
+  (a worker-scoped context, constructed at `worker_thread.py:2315`).
+- The W1.5 write-through mirrors onto live **bridges** and the store, not onto worker
+  contexts: `web_ui/backend/addendum_routes.py:227` — `store.save_session(accepted)`,
+  with the cold path described at `web_ui/backend/addendum_routes.py:210-211` —
+  `Returns ``(result, session)``; ``result`` is ``None`` only on the cold path` /
+  `when the session vanished between resolution and the read-modify-write`.
+- Had the worker shared the parent session object, the addendum would be picked up
+  per LLM call, because it is rendered at call time:
+  `agent/core/llm_client.py:225` — `addendum_block = render_addendum_block(getattr(self, 'session', None))`.
+- The product already states the snapshot rule for the neighbouring surface
+  (worker blueprints): `web_ui/frontend/src/components/WorkerBlueprintPanel.jsx:26-27` —
+  `const RESTART_TO_APPLY_HINT =` /
+  `'Edits are saved to the blueprint and apply to FUTURE worker spawns — restart a worker to apply them now.'`
+
+### Options
+
+**Option A — declare the snapshot contract (status quo), document it.**
+Tradeoff: zero code change, and it matches the blueprint copy already shipped
+(`WorkerBlueprintPanel.jsx:27`). Cost: an operator who edits the addendum while a
+worker is mid-flight sees no effect and no message explaining it; the
+`/api/tools`-style read-only surface gives them no way to tell.
+
+**Option B — per-query re-read of config in the worker loop.**
+Tradeoff: predictable "next query sees the new config", and it composes with the
+existing lazy build at `worker_thread.py:2512` by making it a rebuild instead of a
+one-shot. Cost: `_build_agent_config()` builds a whole `AgentConfig`; rebuilding per
+query discards agent state that is deliberately long-lived (tool registry, session
+context) and risks the "rebuild silently drops a field" class of bug that
+`worker_thread.py:983-996` already warns about for the timeout chain.
+
+**Option C — extend the write-through to worker contexts.**
+Tradeoff: one consistent invariant ("every live holder of the session is updated"),
+mirroring `addendum_routes.py`'s bridge sweep. Cost: the worker context is not a
+session copy (`agent/core/worker_context.py:56`), so this means inventing a
+projection from session → worker context plus a cross-thread lock; the addendum is
+rendered per call (`llm_client.py:225`) so correctness would then depend on
+cross-thread visibility of that projection.
+
+### Recommendation
+
+**Option A.** Document "worker config is fixed at spawn; re-spawn to apply" as the
+contract, and make the UI say it (the blueprint panel already does, at
+`WorkerBlueprintPanel.jsx:27`). Option C buys correctness for a case the code does
+not model, and Option B trades a predictable snapshot for a rebuild that
+`worker_thread.py:983-996` shows is easy to get wrong.
+
+### Blast radius
+
+- Files: docs only for Option A; would touch `tools/workspace/worker_thread.py`
+  (1663/2512/4244), `agent/core/worker_context.py:56`,
+  `web_ui/backend/addendum_routes.py` under B/C.
+- Tests: `web_ui/backend/tests/test_addendum_write_through.py`,
+  `web_ui/backend/tests/test_addendum_live_chain.py`,
+  `web_ui/backend/tests/test_addendum_routes.py`,
+  `web_ui/frontend/src/components/__tests__/ConfigPanel.addendum.test.jsx`.
+- Risk: **medium** — Option A is documentation and carries near-zero code risk, but
+  the *claim* is load-bearing: if anyone later makes `_build_agent_config()` per-query
+  without updating this doc, the contract becomes wrong silently.
+
+---
+
+## Q4 — Should tool calls return a job handle instead of blocking?
+
+### Question as understood
+
+Tool calls today block the agent's turn until they return a string. Should a tool be
+able to hand back a job handle (like `submit_query` returns a `job_id`) so the turn
+can continue and the result be polled later?
+
+### Current behaviour
+
+Tools are synchronous and the executor iterates them serially.
+
+- The base contract is a blocking string return:
+  `tools/base.py:41` — `They must implement execute() returning a string.`
+- The dispatcher is a plain sequential loop:
+  `agent/core/tool_executor.py:245` — `for _tc_index, tool_call in enumerate(tool_calls):`.
+- Interruption is only possible *between* calls:
+  `agent/core/tool_executor.py:246-247` — `# Cooperative cancellation: if a stop was requested between tool` /
+  `# calls, skip execution and record a clean 'stopped' tool result`
+  and the check is `getattr(self.config, "stop_check", None)` (called at `:252`).
+- The known consequence is documented as an open problem:
+  `docs/design-interruptible-tool-calls.md:4` —
+  `Currently, a blocking tool call (e.g., `host_bash` running a 10-minute build) cannot be interrupted. The agent's `process_query` generator yields to `execute_tool_calls`, which blocks the thread.`
+
+The async *precedent* already exists, one layer up — for worker queries, not tools:
+
+- `tools/workspace/job_registry.py:4` — `non-blocking worker jobs (action='submit_query').`
+  and `tools/workspace/job_registry.py:7` —
+  `callers that used ``submit_query`` (which returns immediately with a job_id)`
+- Polling is bounded and sliced: `tools/workspace/worker_thread.py:4966` —
+  `Polls the job registry in 0.25s slices for a total of ``timeout_seconds```
+  with `tools/workspace/worker_thread.py:5003` — `total = min(requested_timeout, 300)`
+  and terminals `tools/workspace/worker_thread.py:4972` —
+  `_JOB_TERMINAL = ("completed", "timeout", "error")`.
+- The registry is bounded: `agent/config/defaults.py:88` — `JOB_REGISTRY_MAX_JOBS = 200`.
+
+No tool currently returns a handle: `NOT FOUND — searched `job_id` and `job_registry`
+in `tools/*.py` (only `tools/workspace/*` holds the registry; no tool module imports
+it), and `execute()` signatures in `tools/base.py` (string return only).`
+
+### Options
+
+**Option A — keep tools synchronous.**
+Tradeoff: the whole turn stays a straight line; the LLM sees results in-order and the
+token accounting at `agent/core/tool_executor.py` stays simple. Cost: a long tool
+call cannot be interrupted (verbatim at `docs/design-interruptible-tool-calls.md:4`)
+and eats the worker's soft budget (`agent/config/defaults.py:61`) with nothing to
+show if it times out.
+This is the default for **every** tool. The `visual` tool (Q5) is the single named,
+bounded exception, and it is the exception *because* it ships a dedicated timeout and
+cancellation protocol — see the amendment below.
+
+**Option B — thread the tool, keep the string contract (wrapper only).**
+Tradeoff: solves *interruption* without changing any tool's signature — exactly the
+"Thin Layer" the existing design sketch proposes. Cost: does not give the caller a
+handle to poll, so a slow tool still occupies the turn; and it introduces a
+tool-thread cancellation protocol that the sketch itself flags as coupled to the
+streaming cancellation design.
+
+**Option C — introduce a job handle for long tools.**
+Tradeoff: maximal flexibility, and the shape is already proven by
+`job_registry.py:7` + `worker_thread.py:4966` (bounded, sliced, preview-capped).
+Cost: every consumer of `execute()` must learn a second return type; the agent loop
+must learn to finish a turn with a *pending* tool result, which conflicts with the
+one-shot append at `agent/core/tool_executor.py:245`'s loop; and the LLM must be
+taught a poll convention or it will simply call the tool again.
+
+### Recommendation
+
+**Option A for now; Option B if interruption becomes the requirement.** Do not
+introduce a tool job handle: the executor's contract is one sequential pass that
+appends one result per `tool_call_id` (`agent/core/tool_executor.py:245`), and a
+pending result breaks that invariant far more deeply than it buys. Note explicitly in
+any follow-up that the worker-level `submit_query` precedent
+(`tools/workspace/job_registry.py:4`) is *not* a template for tools — it moves the
+async boundary up to the parent, which is the cheaper lever.
+
+The interruption requirement for one tool has now arrived, and it is discharged by the
+bounded exception in the amendment below — a call-site implementation inside a single tool
+(thread + `join` + `container.kill()`), **not** Option B. Option B remains unrecommended
+and its tool-thread cancellation protocol is not adopted.
+
+Exactly one tool is excepted, and by operator decision rather than by this reasoning:
+the `visual` tool (Q5), the single bounded exception with its own timeout and
+cancellation protocol (amendment below).
+
+### Amendment — the visual tool is the one bounded exception (operator decision)
+
+One boundary of this exception belongs with the ruling itself: it grants a *bounded* long block, not an unbounded one. The bound must therefore be enforced by a layer that outlives the call — the hard-deadline discipline **Q2A** generalises to every blocking Docker SDK call — and the unwind when it fires is **Q2D**'s cascade.
+
+**Operator decision, recorded verbatim:** "Tools are synchronous by default, with the
+visual tool (Q5) being the specific, bounded exception requiring a dedicated timeout and
+cancellation protocol."
+
+This bounds the question rather than re-opening it. Option A stays the **default for all
+tools**: nothing in the `execute() -> str` contract (`tools/base.py:41` — `They must
+implement execute() returning a string.`) or in the sequential dispatch loop
+(`agent/core/tool_executor.py:245`) changes for the existing toolset. Exactly one tool is
+exempt — the container-executed `visual` tool specified in Q5
+(`tools/visual_tool.py`, grain `visual: view`). The exception is not "async tools"; it is
+one named tool whose call is long, external and cancellable.
+
+Because the exception is bounded, it must carry its own budget and its own cancellation
+path instead of inheriting the turn's:
+
+- **Dedicated timeout.** **Operator ruling, recorded verbatim:** "Define
+  `RENDER_TIMEOUT_SECONDS = 30` in the design doc. A 30-second hard cap is sufficient for
+  a headless browser screenshot." `RENDER_TIMEOUT_SECONDS = 30` belongs in
+  `agent/config/defaults.py` next to `WORKER_TIMEOUT_SECONDS` (`:61`); the render's
+  deadline is *that* value, not the worker's soft budget, enforced in the container layer
+  with the pattern R2 already standardises for Q2 — thread + `join(timeout)` +
+  `container.kill()` at `infra/container_manager.py:2561-2570` (`raise TimeoutError(f"Command
+  timed out after {timeout} seconds")`). A render that overruns is killed and returned as
+  an error string, never as a pending result.
+- **Dedicated cancellation.** The render runs as a container exec on its own thread and
+  the tool waits for it in a bounded loop: `join(min(CHUNK_SECONDS, remaining))` per
+  iteration (`CHUNK_SECONDS ≈ 0.5` s), calling `getattr(self.config, "stop_check", None)`
+  at each wake-up and issuing `container.kill()` against the render container when it
+  returns true. `agent/core/tool_executor.py:252` is the *hook name and existing call
+  site* this mirrors — it is deliberately **not** the render's call site, and that
+  citation is no longer load-bearing for this design. The between-calls-only checkpoint
+  at `:246-247` (`# Cooperative cancellation: if a stop was requested between tool` /
+  `# calls, skip execution and record a clean 'stopped' tool result`) cannot reach inside
+  a render, which is exactly why the bounded loop exists. Cancelling kills the render
+  container (ephemeral per Q5, so nothing leaks) and returns a `stopped` result in the
+  established shape.
+- **Everything else stays Option A.** No job handle, no poll convention, no pending tool
+  result in the transcript: the one exception returns a value or an error,
+  synchronously, under a deadline. Q5 owns the rest of the tool's contract — grain
+  (`visual: view`), one PNG `ImageBlock` capped at 1 MB, and the IR/provider
+  prerequisites.
+
+The alternative — treating the visual tool as the thin end of a general async-tool wedge —
+is what this amendment rules out. One named exception with a timeout and a cancellation
+protocol is reviewable; a second return type on `execute()` is not.
+
+**Guard, recorded verbatim:** "visual is the ONLY exception in v1. A second long-blocking
+tool requires its own ruling, not a precedent." The exception is enumerated, not a
+category: it names `visual` and only `visual`, so a future tool that blocks for tens of
+seconds cites this paragraph as the reason it needs its own ruling, never as the reason it
+is already allowed. This guard is what keeps the Q4 recommendation from becoming
+"synchronous tools plus one" that quietly erodes into "tools are async now".
+
+### Blast radius
+
+- Files: `agent/core/tool_executor.py` (dispatch 193-340, restrictions 806-825),
+  `tools/base.py:36-75`, `docs/design-interruptible-tool-calls.md`,
+  `tools/workspace/job_registry.py` (if reused), `agent/config/defaults.py:88-95`.
+- Tests: `tests/` tool-executor suites; the registry's bounded/preview behaviour is
+  pinned by `agent/config/defaults.py:88/90/92` values.
+- Risk: **high** — touching the dispatch loop touches the stop_check checkpoint,
+  the respond/summary tool types and the per-call token accounting in one place.
+
+---
+
+## Q5 — Is there a UI surface for tools?
+
+### Question as understood
+
+The prior draft answered two halves: an operator *viewer* (does the UI list tools and
+explain why one is gated?) and an operator *authoring* surface. Ruling 3 keeps the
+authoring rejection and replaces the rest: the missing surface is **the agent's own
+vision** — a sandboxed, permission-gated capability that renders something and returns
+visual data to the multimodal model. `/api/tools` listing tools is not that.
+
+### Current behaviour
+
+**(a) The tool listing exists and is read-only.** `web_ui/backend/server.py:3951-3952` —
+`@app.get("/api/tools")` / `async def api_get_tools():`, consumed at
+`web_ui/frontend/src/components/ConfigPanel.jsx:257` — `fetch(apiUrl('/api/tools'))`
+and rendered as a tab at
+`web_ui/frontend/src/components/workspace/WorkspaceDetailPage.jsx:783` —
+`) : activeTab === 'Tools' ? (`. Tools are a *selection*
+(`web_ui/frontend/src/components/ConfigPanel.jsx:56-57` — `tools: 'Tools',` /
+`enabled_tools: 'Tools',`), never a definition.
+
+**(b) Authoring is (correctly) not a UI concern.** Tools are code-defined per module —
+`tools/workspace/worker_thread.py:3739` — `def _build_tool_registry() -> dict[str, type["ToolBase"]]:`
+— and each tool receives its permissions *injected by the executor*:
+`tools/base.py:50-53` — `session_permissions: Optional[Dict[str, Any]] = Field(` /
+`default=None,` / `description='Session permissions dict injected by ToolExecutor.',` /
+`)` and `tools/base.py:57-60` — `effective_permissions: Optional[Dict[str, Any]] = Field(` /
+`default=None,` / `description='Effective merged permissions (session × workspace) for atomic checks.',` /
+`)`. No create/update/delete route exists: `NOT FOUND — searched @app.post in
+web_ui/backend/server.py filtered for tool (0 matches) and /api/tool prefixes across
+web_ui/backend/*.py (only the GET at :3951).`
+
+**(c) The agent has no way to see anything.** The IR already models an image —
+`agent/core/ir.py:57` — `class ImageBlock:` with `:67` — `media_type: str  # e.g. "image/png"`
+— but it has **no producer and no provider adapter**: `ImageBlock` appears only in
+`agent/core/ir.py` and `tests/core/test_ir.py`, and `llm_providers/` (base, anthropic,
+openai_compatible, factory, tool_converter) contains no image/vision handling. The
+tool boundary is a string: `tools/base.py:41` — `They must implement execute() returning a string.`
+and `agent/core/ir.py:80` — `class ToolResultBlock:` whose `content` is the flattened
+`str`. A headless browser exists only as test infrastructure
+(`requirements-dev.txt:8` — `playwright>=1.40`, plus `/workspace/chrome-libs/`), never as
+a product capability.
+
+### Proposed design — one tool, one grain, one format, one cap, four named outcomes
+
+Two of the design's requirements are already fixed elsewhere and are not re-derived here: the cap is a container-layer hard deadline (**Q2A**), and the protocol for cancelling a render in flight is **Q2D**'s ladder, whose rung 2 (`terminate_all`) is the layer that reaches an exec already running inside a container.
+
+**The tool.** `VisualTool` (`tools/visual_tool.py:276`, registered in
+`tools/workspace/worker_thread.py:3739`), one action, two parameters:
+`target` — in v1 a `file:///workspace/...` path only; an `http(s)://` URL is rejected with
+an actionable error, pending a cited network level (see the network paragraph below) — and
+`full_page: bool`.
+It renders in a **container** and returns a PNG. The tool enforces
+`RENDER_TIMEOUT_SECONDS = 30` per call and honours `stop_check` during the render — the
+Q4 amendment's dedicated timeout and cancellation protocol, restated here as the tool's
+own contract.
+
+**Execution class: Container, ephemeral.** Per
+`docs/ARCHITECTURE_MACHINE_MODEL.md:28` — `**`host_bash` is the one true host-execution
+grain.** Every other tool either runs in a container or is bounded in-process.` A
+browser is neither bounded nor in-process, so it is a container, and per §3 it is
+**ephemeral** — "created for one call with exactly the envelope that call needs, then
+destroyed", which is exactly the isolation a renderer needs. Declaration mirrors
+`tools/docker_code_runner.py:61` — `required_categories: ClassVar[List[str]] = ["filesystem:write", "container:true"]`
+→ `["visual:view", "container:true"]`.
+
+**Container lifecycle and detach interaction.** The container is created per call with
+exactly that call's envelope — image, mounts, `network`, timeouts — and destroyed in a
+`finally`, so it is reclaimed on success, on timeout, on cancellation and on exception
+alike; no path leaves a render container behind. It is never reclaimed by
+`_cleanup_worker_containers()` (`worker_thread.py:2457`), which detach must not run at all
+(Q1). Detach mid-render does **not** interrupt an in-flight render: the park loop only
+takes effect between iterations (`worker_thread.py:2744-2761`, `:3022-3033`), and the
+render is bounded by `RENDER_TIMEOUT_SECONDS = 30`, so a detach issued during a render
+takes effect at the next iteration boundary after at most that long. This is the design,
+not a derived consequence: a render is allowed to finish its bounded call, and detach is a
+park, not a preemption.
+
+**Permission grain: one new resource `visual`, values `["banned", "ask", "view"]`.**
+Three values, not four: `interact` (click/type/scroll) makes the browser a *mutating*
+agent against third-party state and would need its own threat model, its own tests and
+its own rate limits — out of scope, deliberately. `view` ranks at 2.5 — ABOVE `ask` (2) and below `write` (3) — so `banned < ask < view`: an `ask` session value does NOT satisfy a `view` requirement, and an `ask` workspace ceiling caps a `view` grant down to `ask`.
+Implementation points (all shipped): `security/resource_catalog.py:124-134` —
+`RESOURCE_CATALOG = {` … `"host_bash": ["banned", "ask", "allow"],` …
+`"visual": ["banned", "ask", "view"],`, the rank table at `:155` —
+`GRANT_LEVEL_RANKS: Dict[str, float] = {` with `"view": 2.5` (above `ask`), the catalog entry in
+`agent/config/resource_catalog.json` (per-resource `permission_grain_set`,
+`execution_mode: "container"`, `tools: ["VisualTool"]`, `ui_category: "sandbox"`), and the
+session default `agent/config/defaults.py:273-281` —
+`DEFAULT_SESSION_PERMISSIONS = {` carrying `"visual": "banned"`.
+
+**Return shape: four outcomes — one `ImageBlock`, a capped-text envelope, an error string, or `stopped`.**
+`source` is a base64 string and `media_type` is pinned to `"image/png"`
+(`agent/core/ir.py:57/67`). One format keeps the provider matrix trivial — Anthropic
+accepts `image/png|jpeg|gif|webp` and OpenAI-compatible endpoints accept
+`data:image/png;base64,` URLs, so **PNG is the intersection and is the only format the
+tool emits**. The *mechanism* reuses the existing preview vocabulary rather than
+inventing a second one — the `_truncate_output` envelope shape (`tools/base.py:312`)
+described below. The *cap* cannot: `PREVIEW_CAP = 8000`
+(`agent/config/defaults.py:90`) is a thumbnail, not an image limit, so one new constant is
+added next to it —
+`IMAGE_CAP_BYTES = 1_000_000` — and on overflow return the existing
+`_truncate_output` shape (`tools/base.py:312` — `def _truncate_output(self, output: str, limit: Optional[int] = None) -> str:`)
+as a text envelope (`{"path": ..., "media_type": "image/png", "bytes": N, "truncated": true}`),
+i.e. the image is still on disk in the workspace for a later read. Both providers cap
+around 5 MB per image, so 1 MB is safely inside.
+
+Four outcomes, named so that none is implied: (a) one `ImageBlock` — PNG, inline base64 —
+on success; (b) the JSON **text** envelope above on size overflow, i.e. the existing
+`_truncate_output` shape (`tools/base.py:312`) rendered as
+`{"path", "media_type", "bytes", "truncated": true}`; (c) an actionable **error
+string** on early refusal — bad target, permission denied, image not allow-listed; (d) a
+`stopped` result on cancellation, in the established stopped-tool-result shape.
+
+**Invocation surface: the agent, not a new route.** No REST endpoint, no UI authoring
+surface, no frontend tab. The Tools tab already lists tools
+(`WorkspaceDetailPage.jsx:783`), so a new tool appears there for free; an artifact
+viewer is explicitly out of scope.
+
+**Interaction with `network: banned`.** Rendering a URL needs egress, so `visual:view`
+must **not** imply it: the container gets exactly the session's network envelope
+(`agent/config/defaults.py:264` — `"network": "banned",`). With `network: banned` the
+tool accepts only `file:///workspace/...` targets (screenshot a generated HTML/report
+artifact). The claim this replaces — that with `network` at `write`/`outbound` the tool
+accepts `http(s)://` — is withdrawn: `banned` is the only network value this document can
+evidence (`agent/config/defaults.py:264` — `"network": "banned",`), and a
+`write`/`outbound` level is `NOT FOUND — searched defaults.py/resource_catalog for network
+level names`. Consequence: in v1 `visual` renders `file:///workspace/...` only, and
+`http(s)://` is gated on that unverified level — out of scope for v1. Enforcement lives in
+the container profile, not in the tool's string handling — the tool refuses early with an
+actionable error so the model does not retry blindly.
+
+**Prerequisite, stated because it is the real cost:** `ImageBlock` has no producer and
+no adapter today, so this design requires (1) `ToolResultBlock` to carry image parts
+(today `content` is a `str`, `ir.py:80`), (2) an adapter in
+`llm_providers/anthropic_provider.py` and `llm_providers/openai_compatible.py`, and
+(3) an image base in an allow-listed image — `agent/config/defaults.py:159` —
+`ADMISSION_IMAGE_ALLOWLIST = (DEFAULT_IMAGE, RESOURCE_IMAGE_TAG)` with `:135` —
+`DEFAULT_IMAGE = "agent-executor"`. There is **no Dockerfile in this repository**
+(`NOT FOUND — searched *Dockerfile* excluding worktrees and node_modules (0 files)`),
+so the browser image is an operator-owned build artifact, and the tool must not name
+an image outside the allow-list.
+
+**Operator ruling, recorded verbatim:** "Dedicated executor image (working name
+VISUAL_RENDER_IMAGE), not RESOURCE_IMAGE_TAG. Built via executor provisioning path, pinned
+by digest. Allow-list of exactly one. Network disabled on render container (renders
+file:///workspace only). If provisioning path cannot parameterize, parameterizing it is a
+W6 sub-task."
+
+- **A dedicated executor image, working name `VISUAL_RENDER_IMAGE`** — a name, not yet a
+  constant.
+- **Not an extension of `RESOURCE_IMAGE_TAG`.** The tag is left untouched; this container
+  does not use it.
+- **Built through the existing executor provisioning path and referenced by *digest*,** not
+  by tag, so the image is immutable for the life of the release.
+- **The admission allow-list for this container holds exactly one entry** — that digest. The
+  `ADMISSION_IMAGE_ALLOWLIST = (DEFAULT_IMAGE, RESOURCE_IMAGE_TAG)` shape at
+  `agent/config/defaults.py:159` is therefore not widened; it is bypassed for this one
+  container by an allow-list of one.
+- **`network` stays `banned`** on the render container, consistent with the file-only v1
+  target list above.
+- **If the provisioning path cannot accept a parameterised image, parameterising it is a W6
+  sub-task** and the tool waits on it. There is no fallback to `RESOURCE_IMAGE_TAG`.
+
+### Options
+
+**Option A — keep the read-only listing; the agent stays blind.**
+Tradeoff: zero new attack surface and no provider work. Cost: rejects the ruling; the
+agent cannot verify a rendered report, a UI change or a chart it produced, which is
+exactly the gap the operator named.
+
+**Option B — one `visual` tool with grain `[banned, ask, view]` and one PNG
+`ImageBlock` return (recommended).**
+Tradeoff: bounded — one tool, one grain, one format, one cap — and it composes with the
+existing ephemeral-container model ("correct *by construction*"). Cost: a
+cross-cutting change (IR + two provider adapters + resource catalog + a browser base
+image), and every render is a container create+destroy, so it is not cheap per call.
+
+**Option C — a full browser-control tool with `interact`.** Tradeoff: covers
+click/type/scroll flows and screenshots-after-action. Cost: makes the agent a mutating
+client of third-party state, needs its own permission grain, rate limits, credential
+handling and a much larger test surface; premature for a first visual capability.
+
+### Recommendation
+
+**Option B.** One `VisualTool`, container-executed, gated by
+`visual: view` (rank 2.5, above `ask`), returning a single inline PNG `ImageBlock` capped at
+1 MB. Keep the authoring surface rejected on the grounds already established
+(`tools/base.py:50-60` injects the permission grain from the executor; nothing in the UI
+can validate it). Ship the IR/provider half as the same change, because an
+`ImageBlock` the model cannot receive is a wasted tool.
+
+### Blast radius
+
+- Files: `tools/visual_tool.py` (new), `tools/workspace/worker_thread.py:3739`
+  (registry), `tools/base.py:312` (cap helper reuse), `agent/core/ir.py:57-80/124/251`
+  (`ToolResultBlock` image parts), `llm_providers/anthropic_provider.py`,
+  `llm_providers/openai_compatible.py`, `security/resource_catalog.py:124/155`,
+  `agent/config/resource_catalog.json`, `agent/config/defaults.py:135/159/262` plus a
+  new `IMAGE_CAP_BYTES`.
+- Tests: `tests/core/test_ir.py:41/135` (the only current `ImageBlock` coverage),
+  permission-vocabulary tests around `security/resource_catalog.py`, frontend
+  `web_ui/frontend/src/components/__tests__/permissionVocab.test.jsx`, and the
+  `defaults` pins in `tests/test_worker_lifecycle_trust.py:422`
+  (`assert defaults.PREVIEW_CAP == 8000`).
+- Risk: **medium** — the tool itself is small and container-isolated, but the change
+  reaches the IR and two provider adapters, and a mis-set size cap turns a screenshot
+  into a context-window blowout rather than an error.
+
+---
+
+## Appendix — audit snapshot (2026-11-02, HEAD 93d6d013)
+
+Measured evidence, not aspiration: this is the acceptance criterion for any implementation
+of Q2A/Q2B. Source: read-only audit of the worktree at `93d6d013`; `path:LINE` refer to that
+revision.
+
+### Unbounded / non-cancellable block points
+
+| # | block point | citation | why the deadline does not cancel it |
+|---|---|---|---|
+| 1 | `send_query` waits on a private reply queue | `tools/workspace/worker_thread.py:1337` — `self._output_queue` / `reply_q.get(timeout=remaining)` | the *caller* is bounded; the worker keeps running the query and the reply is dropped |
+| 2 | Docker SDK `exec_run` on an abandoned daemon thread | `infra/containers/executor.py:1153-1191`; `infra/container_manager.py:2543-2565` | `join(timeout)` stops *waiting*, not the SDK call; recovery is `container.kill()` — the container dies, not the command |
+| 3 | bare `container.stop()` / `.remove()` inside `finally:` | `infra/containers/executor.py:737`, `:1425`; `tools/docker_code_runner.py:458` | blocks up to the grace (`infra/container_manager.py:265-266`) with no outer deadline; a hung daemon wedges teardown |
+| 4 | `_hard_deadline_fallback` | `tools/workspace/worker_timeout.py:152` | returns an envelope while leaving a wedged daemon thread behind — a reporting boundary, not a cancellation |
+| 5 | park loops never poll the control file — **FIXED** (`2721b02c`) | `worker_thread.py:2698` (main run loop), `:2976` (parked after the tool loop) | was: they looped on `_heartbeat_tick()` + `_resume_event.wait(1.0)` and tested only the in-process `_stop_event`. Each wake-up now calls `_poll_command()` and breaks out of the park at once when that poll set `_stop_event`, so a cross-process command lands on the next 1 s tick — kill observed and thread dead in **1.00 s**, detach status at **0.998 s**, one poll per second so no busy-spin |
+| 6 | `kill()` writes no control file | `worker_thread.py:1507` (cf. `detach()` `:1498-1501`, `pause()` `:1597-1600`) | the programmatic kill path cannot signal another process; only the UI route compensates (`workspace_routes.py:1197-1200`) |
+| 7 | the only watchdog lives in the watched process | `tools/workspace/worker_manager.py:107` | `PeriodicStaleCheck` is a daemon thread in the owner process — it cannot observe that process dying |
+
+### Two defects found by the audit
+
+1. **Deaf park loop — FIXED (`2721b02c`), regression-tested by `df874da6`.** `_poll_command`
+   was called only at `worker_thread.py:2130` (per event) and `:2635` (loop top). A paused or
+   detached worker sat in `:2689-2692` / `:2947-2951`, so a cross-process `{"action":"kill"}`
+   was **not consumed until the worker was resumed**: an operator kill of a parked worker was a
+   no-op, and the detached TTL (`worker_manager.py:179-205`, TTL = `WORKER_TIMEOUT_SECONDS`
+   600 s) was the only thing that eventually reaped it. Both park loops (`worker_thread.py:2698`
+   main run loop, `:2976` parked-after-tool-loop) now poll `_poll_command()` on every wake-up and
+   break out at once when that poll set `_stop_event`; the added
+   `if self._stop_event.is_set(): break` guard halves kill latency from 2.00 s to 1.00 s
+   (without it the loop still ran its `_heartbeat_tick()` before re-testing). Measured: kill
+   observed and the thread dead in **1.00 s**, detach status at **0.998 s**, one poll per second
+   so no busy-spin. Both loops still skip the `status="ready"` resume transition on a kill, so
+   the final status is still `"killed"`.
+2. **Bare-`None` sentinel reads as STOP.** `_input_queue.put(None)` means both "wake and
+   re-read the flags" (`worker_thread.py:1505`, `:1604`, `:1877`, `:1889`) and "stop"
+   (`break` at `:2746`); the consumer decides at `:2647-2652` by testing `_park_event`.
+   `resume()` clears that event (`:1642`; poll branch `:1898`), so a leftover sentinel is
+   read as STOP: loop exits at `:2746`, `final_status = "killed" if self._stop_event.is_set()
+   else "completed"` (`:3183`) and **every queued job is dropped without a reply**.
+   Measured with a harness replaying the `:2641-2752` dispatch over real
+   `queue.Queue`/`threading.Event` objects: idle worker, detach→resume → thread exited in
+   **4/20** runs; one job queued behind the pause → job lost in **10/10** runs.
+
+---
+
+## Corrections
+
+1. **Q1 recommendation reversed.** The prior draft recommended keeping `stop` as
+   terminate and adding `detach` as a separate verb. Ruling 1 inverts the pair:
+   `stop` = detach, `kill` = terminate. Q1's "Current behaviour" section is retained
+   (it is accurate — it now describes `kill`) and the recommendation is rewritten.
+2. **Q1 file list named an unverified path.** The prior draft listed
+   `WorkerManagementPanel.jsx` as a stop consumer. That path was **not** re-verified in
+   this pass; the verified consumers are the four enumerated in Q1's disposition table
+   (`worker_thread.py:3582`, `workspace_routes.py:1266`, `bridge.py:1787`,
+   `QueryBar.jsx:74`).
+3. **Q2 quote drift fixed.** The prior draft quoted
+   `agent/core/state.py:247-248` as `# (mirrors the turn/token LOW branches; timeout is
+   NOT a hard stop` / `# for the rest of the turn). Do NOT clear restrictions set by`.
+   The actual lines are `self.last_time_warning_state = TimeState.LOW` /
+   `# Time returned to LOW — this monitor clears its own restrictions`. Q2 now quotes
+   the real text; the `:252` claim (`if self.restriction_reason == 'timeout':`) still
+   holds.
+4. **Dead path corrected.** The prior draft referenced `agent/core/docker_executor.py`;
+   that file does not exist. Docker execution is `tools/docker_code_runner.py`
+   (`tools/docker_code_runner.py:61` — `required_categories: ClassVar[List[str]] = ["filesystem:write", "container:true"]`).
+   Q2 now cites the real module.
+5. **Q2 extended, not re-decided.** The recommendation stays "timeout is terminal"
+   (Option A), now with (a) a hard deadline on every blocking Docker SDK call, (b) the
+   `exec()` thread+`join(timeout)`+`kill()` pattern at
+   `infra/container_manager.py:2561-2570` promoted to the layer's one mechanism, and
+   (c) an explicit rule on `_worker_max_retries` (`worker_thread.py:1009`): delete,
+   together with `:1006` and `agent/config/defaults.py:64`.
+6. **Q5 "read-only `/api/tools` suffices" was wrong.** Replaced by the `visual` tool
+   design. The *authoring* rejection stands and is now justified from
+   `tools/base.py:50-60` rather than from the absence of a route.
+7. **`signal.alarm` ruled out.** Workers are threads in the server process
+   (`docs/ARCHITECTURE_MACHINE_MODEL.md` — "Host process, **as threads in the
+   server**"), and `SIGALRM` is delivered to the main thread only; hard deadlines use
+   the thread + `join(timeout)` pattern instead. This is recorded here so a later
+   implementer does not reach for signals first.
+8. **Image capability accounting.** `ImageBlock` (`agent/core/ir.py:57`) is modelled but
+   unproduced and unadapted; `ToolResultBlock.content` is a `str` (`ir.py:80`). Any
+   visual design must change both, which is why Q5 lists them as prerequisites rather
+   than as assumptions.
+9. **Q4 amended, not left "unchanged".** The prior revision of this document asserted
+   "Q3 and Q4 are unchanged" in its header while Q5 introduced a container-executed
+   `visual` tool — i.e. it recommended synchronous tools in Q4 and a long, cancellable
+   tool in Q5. A document asserting two contradictory recommendations is a bug, not a
+   nuance: a reader cannot tell whether tools block. The operator decision closes it
+   verbatim — "Tools are synchronous by default, with the visual tool (Q5) being the
+   specific, bounded exception requiring a dedicated timeout and cancellation protocol."
+   Q4's Option A therefore stays *the default for all tools*, the `visual` tool is named
+   as the single bounded exception, and that exception is specified as a dedicated
+   timeout (container-layer hard deadline) plus a dedicated cancellation path
+   (`stop_check` honoured inside the render). The header claim and the summary-table Q4
+   row are corrected to match, for traceability. The same commit also corrects the Q1 row of
+   that summary table and adds the detached-queue subsection
+   (`### Queries submitted while the worker is detached`, 38 lines); both belong to this
+   amendment batch, not to the revision being corrected.
+10. **Four Main rulings written in before merge (this commit).** (i) Resume is
+    operator-initiated in v1 — the queue never self-drains, the panel shows count + job IDs,
+    and the main agent cannot resume; (ii) a TTL-expiry rejection must surface on the
+    runtime channel and in the audit log, not only as a job result to a caller that may be
+    gone; (iii) the Q4 exception is enumerated, not a category — a second long-blocking tool
+    needs its own ruling; (iv) the browser image is a dedicated executor image
+    (`VISUAL_RENDER_IMAGE`), pinned by digest, allow-list of exactly one, network banned,
+    and parameterising the provisioning path is a W6 sub-task if it cannot already take one.
+    The `[NEEDS MAIN RULING]` marker this item replaces is retired. Two contradictions this
+    batch would otherwise have introduced were resolved in the same commit: the
+    chained-query bullet no longer implies that a submission resumes a worker, and the
+    tool's `target` parameter no longer advertises `http(s)://`.
+11. **Q2A–Q2D added in this pass (2026-11-02), and two of this document's own prior assumptions corrected.** Q2's Option A above is preserved intact, but it is only half the answer: keeping the timeout terminal and putting a hard deadline on every blocking Docker SDK call both act *inside* the worker process, so they need a cross-process cancellation token to be reachable from the panel (Q2B), a reaper for the cases the process cannot act on because it is the thing that died (Q2C), and a bounded cascade so each layer stops waiting on the layer below (Q2D). Stating Option A alone would have implied the problem closes in-process. The same pass records two factual corrections. (a) **A periodic sweep loop already exists** — `web_ui/backend/server.py:613-614` (`THOUGHTMACHINE_CONTAINER_SWEEP_INTERVAL_S`, 300 s), `_periodic_container_sweep_loop` `:709-728`, `_run_container_sweeps` `:676-707`, started at `:1043-1048` — so Q2C adds a fourth entry to that loop instead of a second scheduler. An earlier draft of Q2C assumed the sweeps were startup-only and would have duplicated it; the reuse map in Q2C is the result. (b) The stale-check watchdog class is `PeriodicStaleCheck` (`tools/workspace/worker_manager.py:107`), not `PeriodicStaleChecker`, and the appendix row 7 citation is corrected from `:130-145` to `:107` accordingly.
+12. **Q2C's reaper TTL corrected to 3600 s on an operator ruling (this pass).** Q2C originally derived a 600 s abandonment floor from `WORKER_TIMEOUT_SECONDS` (`agent/config/defaults.py:61`) and then reaped at 3600 s — a two-clock scheme. The operator ruling replaces it: the orphan reaper's default TTL is **1 h (3600 s)**, deliberately chosen ("nobody can possibly still be waiting after an hour") rather than derived from the worker ceiling, so the verdict table now has one clock — `ORPHAN_REAP_AFTER_S` = 3600 s — with the two-consecutive-sweeps confirmation retained as the only additional guard, and the section's former "one generous clock for is-it-slow, one stricter one for is-it-ours-to-delete" rationale is retired along with the 600 s floor it justified. Unrelated 600 s values are deliberately untouched because they are different mechanisms: the turn ceiling (Q2A), the in-process `HEARTBEAT_STALE_AFTER_S = 600` shown in the "LIVE (wedged)" row, `EXEC_KILL_GRACE`'s neighbouring build/exec timeouts, the parked/detached TTL (`worker_manager.py:179-205`), and the 900 s exited-ephemeral container TTL.
+13. **Deaf park loop FIXED (`2721b02c`, regression tests `df874da6`) — and one ordering property, recorded OPEN there and closed on an operator ruling (item 14).** Appendix defect 1 and block-point row 5 are corrected in place, the same traceability pattern as item 11(b). The defect: both park loops (`worker_thread.py:2698` main run loop, `:2976` parked-after-tool-loop) waited on `_resume_event` alone, so a `command.json` written by another process (`workspace_routes.py:1197-1200`) was not consumed until a resume. Each wake-up now polls `_poll_command()` and breaks out of the park at once when that poll set `_stop_event`; the added `if self._stop_event.is_set(): break` guard halves kill latency from 2.00 s to 1.00 s, and both loops still skip the `status="ready"` resume transition on a kill, so the final status remains `"killed"`. Measured on the real thread: kill observed and thread dead in **1.00 s**, detach status at **0.998 s**, one poll per second so no busy-spin. Two regression tests in `tests/test_worker_operation_semantics.py` drive the real thread and write a real `command.json`: (a) `test_command_file_kill_is_seen_while_parked` — a `{"action":"kill"}` terminates the parked worker within ~1 s reporting `"killed"`; (b) `test_command_file_detach_is_seen_while_parked` — a `{"action":"stop"}` detaches it within ~1 s without setting the stop event and with the detached registration set. Both assert the latency is far below the detached TTL, so neither can pass by waiting the TTL out; the fix was mutation-proven — reverting it fails both tests with the "the park loop is deaf" message. **Recorded as OPEN, then CLOSED on an operator ruling — FIXED in `7dd0f972`:** this property was recorded here as an open ordering question rather than silently fixed: `_set_detached_registration(True)` (`worker_thread.py:1505`) ran *after* `status = "detached"` (`:1502`), with a status-file write and a global event publish in between, so a reader that observes `detached` could briefly observe **no** detached registration. It was benign in practice at that revision (no consumer was seen hitting the window), but the operator ruled that a window in which a concurrent reaper can act on detached-without-registration is not acceptable at any probability and must be closed now rather than deferred, so it is fixed rather than merely recorded; item 14 records the fix, its two sites and their regression tests. The regression test polls `is_worker_detached` instead of reading it instantaneously, which removed a test-side flake (5/40 runs, 12.5 %); the ordering itself is now asserted by construction in a separate regression test — an instrumented event list, no sleeps and no polling (item 14) — while that bounded `_wait_until` on the registration remains as the cross-process check. At the time this item was deliberately neither "fixed" nor "wontfix"; `7dd0f972` now closes it as "fixed" (item 14). Suite state at this revision: **126 passed, 2 skipped, 0 failed** across the seven worker test files; `tests/test_worker_operation_semantics.py` alone is **49 passed**.
+14. **Detached-registration ordering FIXED (`7dd0f972`, regression tests in the same commit) — item 13's OPEN property closed on an operator ruling.** The ruling: a window in which `status == "detached"` is observable while the container manager does not yet know the worker is detached is *not* acceptable at any probability, because the stale-container sweep (`PeriodicStaleCheck`, `tools/workspace/worker_manager.py:107`, driven by `_periodic_container_sweep_loop`, `web_ui/backend/server.py:709`) skips registered detached workers and reaps the containers of everything it does not so recognise — so a reader that lands in the window can have a live detached worker's containers destroyed underneath it. It is therefore fixed now rather than deferred. (a) **Ordering, two sites.** Both writers of `status = "detached"` hoist `self._set_detached_registration(True)` *above* the status assignment: `WorkerThread.detach()` (`worker_thread.py:1481`) at `:1514` (registration), `:1515` (`status = "detached"`), `:1516` (`_write_status_file()`), `:1517` (global event publish); and the `"stop"` branch of `_poll_command` (`:1866`) at `:1906`, `:1907`, `:1908`. The inversion is in the safe direction: the new transient is registered-but-not-yet-detached, which cannot be reaped early because the sweep *skips* registered workers, so the window now errs toward "not collected yet" instead of "collected while alive". `_set_detached_registration` never raises and resolves `owner_identity` itself (`:1551-1572`), so hoisting it introduces no new early return and no exception path. (b) **Resume parity — the same bug in reverse.** `_poll_command`'s `"resume"` branch cleared `_park_event`/`_resume_event` and wrote `status = "ready"` while leaving `_detach_requested`, `_detached_at` and the detached registration in place: a worker advertising "ready" that the sweep still skipped as detached, forever. It now mirrors `WorkerThread.resume()` (`:1672-1674`: `_detach_requested = False`, `_detached_at = None`, `_set_detached_registration(False)`) at `:1941-1943`, ahead of `status = "ready"` (`:1944`) and the status write (`:1945`). (c) **Unknown command actions.** A `command.json` whose action matched no branch fell through every branch and stayed on disk, so every poll re-read and re-parsed it forever (1 s while parked at `:2708`/`:2981`, 2 s while idle at `:2642`). Deleting it is *not* the fix and was rejected: `_poll_command` reads then unlinks, so an operator writing the next real command in that window would have it silently destroyed — the same read/unlink race the known actions already have, but one that, with a stray file present, would fire on *every* poll. The branch therefore remembers the payload by digest (`hashlib.sha256` at `:1887`; guard `if digest == self._ignored_command_digest: return` at `:1888-1889`) so re-polls are a no-op until the content changes (`self._ignored_command_digest = digest`, `:1952`). The read/unlink race on the *known* actions is left exactly as it was: it is pre-existing, bounded to a single poll, and outside this ruling. Three regression tests in `tests/test_worker_operation_semantics.py`: `test_detached_status_is_never_observable_before_the_registration` — drives both writers synchronously through monkeypatched `_write_status_file`/`_set_detached_registration` spies that append to an event list, then asserts `registrations[0] < first_detached[0]`; no sleeps, no polling, no threads, so the property is asserted by construction rather than sampled; `test_command_file_resume_lifts_the_detached_registration` — real thread, real status.json, the container manager's real registry: pause, then a cross-process `stop`, then a cross-process `resume` must leave the worker `ready` *and* unregistered; `test_unknown_command_action_is_ignored_without_eating_later_commands` — a counting `json` shim proves one parse across three polls, the stray file still on disk, and a later real `kill` replacing that payload still honoured. Mutation-proven: restoring the old order fails the ordering test at `assert 3 < 2` (detach path, registration at event 3 after the status at 2) and `assert 2 < 1` (stop branch); dropping the registration lift from the resume branch fails its `assert True is False` on `is_worker_detached(...)` after "ready"; removing the digest guard fails the parse count (`parses=3` against 1), and unlinking in the unknown branch instead fails the file-survival assertion (`cmd.is_file()`). Suite state at `7dd0f972`: **129 passed, 2 skipped, 0 failed** across the seven worker test files; `tests/test_worker_operation_semantics.py` alone is **52 passed** (was 49).
+15. **Wave-7: the Stop cascade is superseded — Stop is turn-scoped, and Pause is reading mode.**
+    Q1's premise that a session Stop cascades to the workers it spawned no longer holds:
+    `_stop_session_workers` was deleted (`not hasattr(WebAgentBridge, "_stop_session_workers")`
+    is now asserted in `tests/test_stop_is_turn_scoped.py`), `request_stop` no longer touches
+    session workers at all, and workers are stopped only through `/workers/stop_all`. Pause has
+    also stopped being a park/detach trigger: it is reading mode (`AgentState.restrict('pause')`,
+    allow-list `['Respond']`, one `[SYSTEM NOTIFICATION]` nudge per turn, the turn concluding
+    itself), so every "detach sets `_park_event`" statement above describes the old protocol —
+    the park events survive only as the loop's idle gate. The four Stop-cascade passages carry
+    inline supersession notes. Current model: docs/design-pause-reading-mode.md.
+
+16. **Q2E added — the in-flight journal, and four statements corrected around it (this pass).**
+    A new section, **Q2E — The in-flight journal: what survives a kill, and how a successor
+    recovers**, sits between Q2D and Q3. It documents what already exists in the working tree and
+    was undocumented: `tools/workspace/inflight_journal.py` (790 lines) and its five write points
+    (WP1 `worker_thread.py:2906`, WP2 `:3146`, WP3 `:3248-3249`, WP4 `:3002-3008`, WP5 `:1854-1855`),
+    the two exits WP3 must not clear (the detach park's `_journal_parked`, a deliberate kill's
+    `_journal_cancel_reason`, set only when the `cancelled` record reached disk, `:2387`), the
+    reason suppliers (`stopped-by-manager` `worker_manager.py:78`, `reset-drop`
+    `worker_thread.py:104`, and the two deliberate opt-outs at `worker_manager.py:308` and
+    `worker_thread.py:6322`), and the one adoption path (`_adopt_predecessor_journal` `:1057`,
+    gates `:1126`/`:1130`/`:1135`/`:1139`, take `:1153`, replay enqueued at `:2879`). Four
+    statements elsewhere in this document were corrected rather than left to contradict it:
+    (a) the kill teardown (`:158-159`) now says a *reasoned* kill cancels the turn's record and
+    terminalizes its job while a bare `kill()` writes nothing; (b) the detached-queue limit
+    (`:196`) now says the queue is memory that dies with the process and that what survives a
+    crash is the *turn*, not its containers — Q2C's gap is unchanged; (c) the "Kill discards"
+    rule (`:241-243`) is now "Kill cancels; it does not discard the evidence", with the deleted
+    Stop-cascade clause removed (item 15); (d) the retry rationale (`:493-495`, `:591`) no longer
+    claims a timed-out turn is unrecoverable — a re-spawn replays it through the journal at a
+    bounded `MAX_ATTEMPTS`, which is why `WORKER_MAX_RETRIES` remains retired as a *second*,
+    unbounded multiplier rather than as the only recovery mechanism. Two consequences are
+    recorded honestly. First, `recoverable` is **write-only**: a repo-wide grep finds that status
+    only at its definition (`inflight_journal.py:137`), in a docstring (`worker_thread.py:2266`)
+    and at WP4 (`:3005`) — there is no reader, so no resume-path replay exists, and adoption
+    covers `inflight` (crash, `SIGKILL`, bare kill) only. Second, the query-timeout kill
+    (`worker_thread.py:6322`) passes no journal reason, so a timed-out turn stays `inflight` and
+    is adopted by the next spawn, bounded at `MAX_ATTEMPTS = 3` — which qualifies Q2's "a
+    timed-out turn is terminal" to: terminal for the *instance*, recovered for the *turn*. The
+    section also states the three limits that follow (adoption is once per incarnation, so a
+    chain continues at `attempts + 1`; the input queue is not journaled; there is no fence
+    against a wedged live sibling finishing an already-adopted turn). No claim is made about
+    power loss, crash consistency or `fsync`: the write is a temp file plus `os.replace` inside
+    one directory (`_atomic_write_json`, `inflight_journal.py:381`). Scope of this pass was
+    documentation only — the journal code was not touched. Suite state quoted from the S7b-4
+    breadth gate, **not re-run here**: `6506 passed, 64 skipped, 3 deselected, 5 xfailed,
+    0 failed` across four quartile runs.

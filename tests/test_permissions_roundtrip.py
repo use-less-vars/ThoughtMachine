@@ -92,9 +92,9 @@ class TestSessionPermissionsRoundTrip:
         assert sp2.container == sp1.container
         assert sp2.network == sp1.network
         assert sp2.filesystem == sp1.filesystem
-        assert sp2.system == sp1.system
         assert sp2.git == sp1.git
-        assert sp2.execution == sp1.execution
+        assert sp2.mcp == sp1.mcp
+        assert sp2.host_bash == sp1.host_bash
 
     def test_custom_permissions_round_trip(self):
         """Custom SessionPermissions survives model_dump → re-init."""
@@ -102,10 +102,10 @@ class TestSessionPermissionsRoundTrip:
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
-            system="write",
+            filesystem="write",
             git="read",
-            execution="banned",
+            mcp="connect",
+            host_bash="allow",
         )
         d = cfg1.model_dump()
         cfg2 = AgentConfig(**d)
@@ -113,10 +113,10 @@ class TestSessionPermissionsRoundTrip:
         sp2 = cfg2.session_permissions
         assert sp2.container is True
         assert sp2.network == "write"  # True coercees to 'write'
-        assert sp2.filesystem == "full"
-        assert sp2.system == "write"
+        assert sp2.filesystem == "write"
         assert sp2.git == "read"
-        assert sp2.execution == "banned"
+        assert sp2.mcp == "connect"
+        assert sp2.host_bash == "allow"
 
     def test_permissive_permissions_round_trip(self):
         """Maximally permissive SessionPermissions round-trips correctly."""
@@ -124,10 +124,10 @@ class TestSessionPermissionsRoundTrip:
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
-            system="full",
-            git="full",
-            execution="full",
+            filesystem="write",
+            git="write_on_feature_branch",
+            mcp="full",
+            host_bash="allow",
         )
         d = cfg1.model_dump()
         cfg2 = AgentConfig(**d)
@@ -135,10 +135,10 @@ class TestSessionPermissionsRoundTrip:
         sp2 = cfg2.session_permissions
         assert sp2.container is True
         assert sp2.network == "write"  # True coercees to 'write'
-        assert sp2.filesystem == "full"
-        assert sp2.system == "full"
-        assert sp2.git == "full"
-        assert sp2.execution == "full"
+        assert sp2.filesystem == "write"
+        assert sp2.git == "write_on_feature_branch"
+        assert sp2.mcp == "full"
+        assert sp2.host_bash == "allow"
 
     def test_restrictive_permissions_round_trip(self):
         """Restrictive permissions round-trip correctly."""
@@ -147,9 +147,9 @@ class TestSessionPermissionsRoundTrip:
             container=False,
             network=False,
             filesystem="read",
-            system="banned",
             git="banned",
-            execution="banned",
+            mcp="banned",
+            host_bash="banned",
         )
         d = cfg1.model_dump()
         cfg2 = AgentConfig(**d)
@@ -158,9 +158,9 @@ class TestSessionPermissionsRoundTrip:
         assert sp2.container is False
         assert sp2.network == "banned"  # False coercees to 'banned'
         assert sp2.filesystem == "read"
-        assert sp2.system == "banned"
         assert sp2.git == "banned"
-        assert sp2.execution == "banned"
+        assert sp2.mcp == "banned"
+        assert sp2.host_bash == "banned"
 
     def test_model_dump_is_serializable(self):
         """model_dump() output must be JSON-serializable (no Pydantic models leaked)."""
@@ -169,9 +169,9 @@ class TestSessionPermissionsRoundTrip:
             container=True,
             network=False,
             filesystem="write",
-            system="read",
-            git="full",
-            execution="banned",
+            git="write_on_feature_branch",
+            mcp="banned",
+            host_bash="banned",
         )
         d = cfg.model_dump()
         # Should not raise TypeError
@@ -179,15 +179,15 @@ class TestSessionPermissionsRoundTrip:
         parsed = json.loads(json_str)
         assert parsed["session_permissions"]["container"] is True
         assert parsed["session_permissions"]["filesystem"] == "write"
-        assert parsed["session_permissions"]["execution"] == "banned"
+        assert parsed["session_permissions"]["host_bash"] == "banned"
 
     def test_exclude_api_key_keeps_permissions(self):
         """Excluding api_key from serialization must NOT drop session_permissions."""
         cfg = AgentConfig()
-        cfg.session_permissions = SessionPermissions(filesystem="full")
+        cfg.session_permissions = SessionPermissions(filesystem="write")
         d = cfg.model_dump(exclude={"api_key"})
         assert "session_permissions" in d
-        assert d["session_permissions"]["filesystem"] == "full"
+        assert d["session_permissions"]["filesystem"] == "write"
 
 
 # =========================================================================
@@ -224,9 +224,9 @@ class TestConfigFileRoundTrip:
         assert sp2.container == sp1.container
         assert sp2.network == sp1.network
         assert sp2.filesystem == sp1.filesystem
-        assert sp2.system == sp1.system
         assert sp2.git == sp1.git
-        assert sp2.execution == sp1.execution
+        assert sp2.mcp == sp1.mcp
+        assert sp2.host_bash == sp1.host_bash
 
     def test_custom_permissions_survive_file_io(self, temp_config_path):
         """Custom permissions survive save_config → load_config cycle."""
@@ -234,10 +234,10 @@ class TestConfigFileRoundTrip:
         cfg.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
-            system="write",
+            filesystem="write",
             git="read",
-            execution="banned",
+            mcp="connect",
+            host_bash="allow",
         )
         config_dict = cfg.model_dump(exclude={"api_key"}, exclude_none=True)
 
@@ -248,10 +248,10 @@ class TestConfigFileRoundTrip:
         sp2 = cfg2.session_permissions
         assert sp2.container is True
         assert sp2.network == "write"  # True coercees to 'write'
-        assert sp2.filesystem == "full"
-        assert sp2.system == "write"
+        assert sp2.filesystem == "write"
         assert sp2.git == "read"
-        assert sp2.execution == "banned"
+        assert sp2.mcp == "connect"
+        assert sp2.host_bash == "allow"
 
     def test_json_file_contents_are_human_readable(self, temp_config_path):
         """The saved JSON should have readable permission values."""
@@ -271,8 +271,9 @@ class TestConfigFileRoundTrip:
         assert sp["container"] is True
         assert sp["network"] == "banned"  # False coercees to 'banned'
         assert sp["filesystem"] == "write"
-        assert sp["system"] == "read"  # default
-        assert sp["execution"] == "banned"  # default
+        assert sp["git"] == "read"  # default
+        assert sp["mcp"] == "banned"  # default
+        assert sp["host_bash"] == "banned"  # default
 
     def test_missing_session_permissions_backfilled_from_defaults(self, temp_config_path):
         """If loaded JSON has no session_permissions key, defaults are used."""
@@ -284,12 +285,17 @@ class TestConfigFileRoundTrip:
         loaded_dict = load_config(temp_config_path)
         cfg2 = AgentConfig(**loaded_dict)
 
-        # Should have factory defaults (layered config)
+        # Should have factory defaults (layered config: resources/default_config.json
+        # deep-merges the PERMISSIVE profile — verified at runtime in the container:
+        # SessionPermissions(container=True, network='write', filesystem='write',
+        #                    git='read', mcp='banned', host_bash='banned'))
         sp = cfg2.session_permissions
-        assert sp.container is False
+        assert sp.container is True
         assert sp.network == "write"  # factory default (True coerces to 'write')
         assert sp.filesystem == "write"  # factory default
-        assert sp.execution == "banned"
+        assert sp.git == "read"  # factory default
+        assert sp.mcp == "banned"  # factory default
+        assert sp.host_bash == "banned"  # factory default
 
     def test_partial_permissions_backfilled_from_defaults(self, temp_config_path):
         """Partial session_permissions should have missing fields backfilled."""
@@ -309,7 +315,9 @@ class TestConfigFileRoundTrip:
         assert sp.container is True       # from file
         assert sp.network == "write"      # factory default (network: true -> 'write')
         assert sp.filesystem == "write"   # factory default
-        assert sp.execution == "banned"
+        assert sp.git == "read"           # factory default
+        assert sp.mcp == "banned"         # factory default
+        assert sp.host_bash == "banned"   # factory default
 
 
 # =========================================================================
@@ -418,14 +426,17 @@ class TestToolExecutionAfterConfigCycle:
         )
 
     def test_permissive_config_allows_write_after_cycle(self, tmp_path):
-        """After save/load cycle with full permissions, file writes are allowed."""
+        """RISK-3 (new contract): after a save/load cycle a permissive mirror
+        (filesystem='write') is NOT honoured by the id-less executor -- the
+        write is denied fail-closed.  (Canonical disk-mode grant:
+        tests/test_worker_disk_mode_inheritance.py.)"""
         cfg1 = AgentConfig()
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
+            filesystem="write",
             system="full",
-            git="full",
+            git="write_on_feature_branch",
             execution="full",
         )
         config_path = os.path.join(tmp_path, "test_config.json")
@@ -440,7 +451,11 @@ class TestToolExecutionAfterConfigCycle:
             FileWriteTool, {}, "FileWriteTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Write OK"
+        # RISK-3 (new contract): the id-less executor reads NO canonical grant
+        # source, so even a permissive mirror (filesystem='write') is IGNORED
+        # and the write is DENIED fail-closed.
+        assert "Permission denied" in result["result"], result
+        assert "filesystem:write" in result["result"], result
 
     def test_restrictive_config_denies_after_cycle(self, tmp_path):
         """After save/load cycle with restrictive permissions, writes are denied."""
@@ -469,14 +484,15 @@ class TestToolExecutionAfterConfigCycle:
         assert "filesystem:write" in result["result"]
 
     def test_multi_requirement_tool_after_cycle(self, tmp_path):
-        """Multi-requirement tools are correctly gated after config cycle."""
+        """RISK-3 (new contract): the id-less executor denies the
+        multi-requirement tool fail-closed (container:true blocked first)."""
         cfg1 = AgentConfig()
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=True,
-            filesystem="full",
+            filesystem="write",
             system="full",
-            git="full",
+            git="write_on_feature_branch",
             execution="full",
         )
         config_path = os.path.join(tmp_path, "test_config_multi.json")
@@ -491,17 +507,20 @@ class TestToolExecutionAfterConfigCycle:
             MultiRequirementTool, {}, "MultiRequirementTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Multi OK"
+        # RISK-3 (new contract): fail-closed denial, not a grant.
+        assert "Permission denied" in result["result"], result
+        assert "container:true" in result["result"], result
 
     def test_multi_requirement_denied_if_one_missing_after_cycle(self, tmp_path):
-        """One missing permission blocks multi-requirement tool after cycle."""
+        """RISK-3 (new contract): the id-less executor is deny-all, so the
+        multi-requirement tool is denied on the FIRST category (container:true)."""
         cfg1 = AgentConfig()
         cfg1.session_permissions = SessionPermissions(
             container=True,
             network=False,  # <--- missing
-            filesystem="full",
+            filesystem="write",
             system="full",
-            git="full",
+            git="write_on_feature_branch",
             execution="full",
         )
         config_path = os.path.join(tmp_path, "test_config_deny_multi.json")
@@ -516,8 +535,10 @@ class TestToolExecutionAfterConfigCycle:
             MultiRequirementTool, {}, "MultiRequirementTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert "Permission denied" in result["result"]
-        assert "network" in result["result"]
+        # RISK-3 (new contract): id-less -> fail-closed, denied on the FIRST
+        # requirement (container:true) rather than the mirror's 'network'.
+        assert "Permission denied" in result["result"], result
+        assert "container:true" in result["result"], result
 
 
 # =========================================================================
@@ -530,8 +551,10 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
     This is by design — they are separate systems."""
 
     def test_session_config_is_independent_of_tool_permissions(self):
-        """Session.security_config can be set to 'deny' everything but
-        tool execution still uses AgentConfig.session_permissions."""
+        """Session.security_config is NOT bridged to tool execution: setting it
+        to 'deny' everything leaves the id-less ToolExecutor fail-closed
+        (RISK-3 new contract) -- and the AgentConfig.session_permissions mirror
+        is not an authority either (Session.security_config doesn't bridge)."""
         restrictive_session_config = {
             "version": 1,
             "session_policy": {
@@ -553,9 +576,9 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
 
         # Now verify ToolExecutor doesn't use this — it uses AgentConfig
         cfg = AgentConfig()
-        cfg.session_permissions = SessionPermissions(filesystem="full")
+        cfg.session_permissions = SessionPermissions(filesystem="write")
 
-        # Even though Session says deny, ToolExecutor says full → allowed
+        # Session says deny; the id-less executor is fail-closed regardless.
         executor = ToolExecutor(
             tool_classes=[FileWriteTool],
             config=cfg,
@@ -568,7 +591,10 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
             FileWriteTool, {}, "FileWriteTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
-        assert result["result"] == "Write OK"
+        # RISK-3 (new contract): the id-less executor does NOT bridge the
+        # AgentConfig.session_permissions mirror -- the write is denied.
+        assert "Permission denied" in result["result"], result
+        assert "filesystem:write" in result["result"], result
 
     def test_session_config_can_be_independently_modified(self):
         """Modifying Session.security_config has zero effect on AgentConfig."""
@@ -598,8 +624,12 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
 import threading
 import queue
 
+import thoughtmachine.security as _security_module
+from agent.events import EventBus, create_event as _create_event
 from thoughtmachine.security import (
     cancel_pending_prompts,
+    get_default_security_config,
+    is_allowed,
     _prompt_cancelled,
     _pending_security_requests,
     _pending_requests_lock,
@@ -643,50 +673,69 @@ class TestCancelPendingPrompts:
         assert _prompt_cancelled.is_set()
         _prompt_cancelled.clear()
 
-    def test_thread_exits_with_denial_on_cancel(self):
-        """A thread blocked in _request_security_prompt exits with denial
-        when cancel_pending_prompts is called from another thread."""
+    def test_thread_exits_with_denial_on_cancel(self, monkeypatch):
+        """Cancel means deny, through the REAL prompt-resolution flow.
+
+        The prompt is raised through the public ``is_allowed`` API (the same
+        path the live gate / tool-executor uses when a policy is "ask"), then
+        cancelled via ``cancel_pending_prompts`` (the live app's cancel
+        channel). The blocked call must return False (denial).
+
+        (The previous version called the private ``_request_security_prompt``
+        directly; that function short-circuits to "allow" whenever the event
+        system is not wired up at module import time, so the test could see
+        approved=True even though the live system denies on cancel.)
+        """
         import time
-        from thoughtmachine.security import _request_security_prompt
+
+        # Wire a deterministic, isolated event bus so the prompt actually
+        # blocks.  (In some environments the ambient module-level bus ends up
+        # None and _request_security_prompt degrades to an instant "allow" —
+        # exactly the drift this test is fixing.)
+        monkeypatch.setattr(_security_module, "global_event_bus", EventBus())
+        monkeypatch.setattr(_security_module, "EVENT_SYSTEM_AVAILABLE", True)
+        monkeypatch.setattr(_security_module, "create_event", _create_event)
 
         _prompt_cancelled.clear()
         result = {"approved": None}
 
         def waiter():
-            # We pass a config that triggers an "ask" policy
-            config = {
-                "session_policy": {
-                    "tool_overrides": {"TestTool": "ask"},
-                    "default_policy": "allow",
-                    "capability_requirements": {},
-                }
-            }
+            # Real security-config shape with an explicit "ask" override,
+            # which is what makes is_allowed raise a security prompt.
+            config = get_default_security_config()
+            config["session_policy"]["tool_overrides"] = {"TestTool": "ask"}
             try:
-                approved = _request_security_prompt(
+                approved = is_allowed(
                     agent_id="test-agent",
                     tool_name="TestTool",
-                    required_capabilities=[],
-                    arguments={},
                     security_config=config,
-                    policy_type="tool_override",
-                    policy_target="TestTool",
                 )
                 result["approved"] = approved
-            except Exception as e:
+            except Exception as e:  # pragma: no cover - diagnostic only
                 result["exception"] = e
 
         t = threading.Thread(target=waiter, daemon=True)
         t.start()
 
-        # Give the thread time to reach the blocking get
-        time.sleep(0.2)
+        # Wait until the prompt is actually pending (registered in
+        # _pending_security_requests) before cancelling — deterministic, and
+        # avoids the race where cancel fires before the prompt starts blocking.
+        deadline = time.monotonic() + 5.0
+        pending = 0
+        while time.monotonic() < deadline:
+            with _pending_requests_lock:
+                pending = len(_pending_security_requests)
+            if pending:
+                break
+            time.sleep(0.02)
+        assert pending > 0, "Security prompt was never registered as pending"
 
-        # Cancel from main thread
+        # Cancel from the main thread (the live app's cancel channel)
         cancel_pending_prompts()
 
         t.join(timeout=5.0)
         assert not t.is_alive(), "Waiter thread did not exit"
-        assert result["approved"] is False, (
+        assert result.get("approved") is False, (
             f"Expected denial (False) on cancel, got {result}"
         )
 

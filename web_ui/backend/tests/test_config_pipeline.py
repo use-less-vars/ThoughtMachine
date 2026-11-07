@@ -3,14 +3,14 @@ Tests for the web_ui backend config pipeline.
 
 Covers:
 - bridge.apply_config() stores and persists config correctly
-- _translate_frontend_config() correctly maps frontend ↔ backend fields
+- translate_frontend_config() correctly maps frontend ↔ backend fields
 """
 import json
 import pytest
 from pathlib import Path
 from agent.config.models import AgentConfig
 from web_ui.backend.bridge import WebAgentBridge
-from web_ui.backend.server import _translate_frontend_config
+from web_ui.backend.config_manager import translate_frontend_config, backend_to_frontend_config
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -22,6 +22,42 @@ def _find_session_files(sessions_dir: Path) -> list:
     return sorted(f for f in sessions_dir.glob("*.json") if not f.name.startswith("_meta"))
 
 
+def _restore_real_session_types(monkeypatch) -> None:
+    """Re-bind the concrete ``session`` types onto the bridge modules.
+
+    ``test_bridge_dedup.py`` injects MagicMock stand-ins for the ``session``
+    package into ``sys.modules`` while ``web_ui.backend.bridge`` /
+    ``web_ui.backend.session_manager`` are first imported (to avoid heavy
+    optional deps).  It restores ``sys.modules`` afterwards, but the
+    ``Session`` / ``FileSystemSessionStore`` names those two modules bound at
+    import time remain MagicMocks for the rest of the process.  Consequently
+    ``WebAgentBridge.save_session`` builds a MagicMock ``Session`` whose
+    ``session_id`` / ``metadata['name']`` are not strings, so
+    ``session.store._sanitize_filename`` raises
+    ``TypeError: expected string or bytes-like object, got 'MagicMock'`` and no
+    session file is written.
+
+    Re-binding the real classes (auto-undone by ``monkeypatch``) restores the
+    string-typed contract so the real persistence path runs; the test's
+    assertions are unchanged.
+    """
+    import session.models as _session_models
+    import session.store as _session_store_mod
+    import web_ui.backend.bridge as _bridge_mod
+    import web_ui.backend.session_manager as _session_manager_mod
+
+    monkeypatch.setattr(_bridge_mod, "Session", _session_models.Session)
+    monkeypatch.setattr(
+        _bridge_mod, "FileSystemSessionStore", _session_store_mod.FileSystemSessionStore
+    )
+    monkeypatch.setattr(_session_manager_mod, "Session", _session_models.Session)
+    monkeypatch.setattr(
+        _session_manager_mod,
+        "FileSystemSessionStore",
+        _session_store_mod.FileSystemSessionStore,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Tests: bridge.apply_config
 # ══════════════════════════════════════════════════════════════════════════════
@@ -29,29 +65,40 @@ def _find_session_files(sessions_dir: Path) -> list:
 class TestApplyConfig:
     """Tests for WebAgentBridge.apply_config()."""
 
-    def test_apply_config_updates_bridge_config(self, session_store, temp_session_dir):
+    def test_apply_config_updates_bridge_config(self, session_store, temp_session_dir, monkeypatch):
         """
         apply_config should:
         1. Update bridge._config with the supplied values
         2. Persist the config to a session file on disk
         """
+        # Repair MagicMock leakage from test_bridge_dedup.py so the real (string-
+        # typed) session classes are exercised (see helper for the full story).
+        _restore_real_session_types(monkeypatch)
+
         # ── Setup ──────────────────────────────────────────────────────
-        bridge = WebAgentBridge()
-        bridge._session_store = session_store
+        # NOTE: SessionManager caches the session store at construction time
+        # (bridge.py:251-252), so the store MUST be passed via the constructor.
+        # A post-hoc `bridge._session_store = ...` override is ignored by
+        # save_session() and the config would be persisted to the default store.
+        bridge = WebAgentBridge(session_store=session_store)
 
         # ── Exercise ───────────────────────────────────────────────────
         result = bridge.apply_config({
             "temperature": 1.5,
             "model": "test-model",
-            "max_turns": 30,
+            "max_turns": 100,
         })
 
         # ── Assert: bridge config updated ──────────────────────────────
-        assert result == {"success": True}, f"apply_config failed: {result}"
-        assert bridge._config is not None, "bridge._config should not be None after apply_config"
-        assert bridge._config.temperature == 1.5
-        assert bridge._config.model == "test-model"
-        assert bridge._config.max_turns == 30
+        assert result is not None, "apply_config returned None"
+        assert "config" in result, f"apply_config result missing 'config': {result}"
+        assert "settings" in result
+        assert "permissions" in result
+        assert "merged_config" in result
+        assert bridge._session_config is not None, "bridge._session_config should not be None after apply_config"
+        assert bridge._session_config.temperature == 1.5
+        assert bridge._session_config.model == "test-model"
+        assert bridge._session_config.max_turns == 100
 
         # ── Assert: session file written to disk ───────────────────────
         session_files = _find_session_files(temp_session_dir)
@@ -62,67 +109,65 @@ class TestApplyConfig:
         with open(latest, "r") as f:
             session_data = json.load(f)
 
-        agent_config = session_data.get("metadata", {}).get("agent_config", {})
-        assert agent_config.get("temperature") == 1.5, \
-            f"Expected temperature=1.5 in session file, got {agent_config.get('temperature')}"
-        assert agent_config.get("model") == "test-model", \
-            f"Expected model='test-model' in session file, got {agent_config.get('model')}"
-        assert agent_config.get("max_turns") == 30, \
-            f"Expected max_turns=30 in session file, got {agent_config.get('max_turns')}"
+        session_config = session_data.get("metadata", {}).get("session_config", {})
+        assert session_config.get("temperature") == 1.5, \
+            f"Expected temperature=1.5 in session file, got {session_config.get('temperature')}"
+        assert session_config.get("model") == "test-model", \
+            f"Expected model='test-model' in session file, got {session_config.get('model')}"
+        assert session_config.get("max_turns") == 100, \
+            f"Expected max_turns=100 in session file, got {session_config.get('max_turns')}"
 
     def test_apply_config_merges_with_existing_config(self, session_store, temp_session_dir):
         """
         apply_config should merge with the existing config rather than
         replacing it entirely.
         """
-        bridge = WebAgentBridge()
-        bridge._session_store = session_store
-
+        bridge = WebAgentBridge(session_store=session_store)
+    
         # Set initial config
-        bridge.apply_config({
+        result1 = bridge.apply_config({
             "temperature": 0.5,
             "model": "initial-model",
-            "max_turns": 10,
+            "max_turns": 100,
         })
+        assert result1 is not None, "first apply_config returned None"
 
         # Apply a partial update — only temperature changes
-        bridge.apply_config({
+        result2 = bridge.apply_config({
             "temperature": 1.0,
         })
+        assert result2 is not None, "second apply_config returned None"
 
         # model and max_turns should be preserved from the initial call
-        assert bridge._config.temperature == 1.0
-        assert bridge._config.model == "initial-model"
-        assert bridge._config.max_turns == 10
+        assert bridge._session_config.temperature == 1.0
+        assert bridge._session_config.model == "initial-model"
+        assert bridge._session_config.max_turns == 100
 
     def test_apply_config_invalid_values_return_error(self, session_store):
-        """apply_config should return {'success': False} for invalid input."""
-        bridge = WebAgentBridge()
-        bridge._session_store = session_store
-
-        result = bridge.apply_config({
-            "temperature": "not-a-number",  # invalid type
-        })
-
-        assert result.get("success") is False
-        assert "error" in result
+        """apply_config should raise ValueError for invalid types."""
+        bridge = WebAgentBridge(session_store=session_store)
+    
+        with pytest.raises((ValueError, TypeError)):
+            bridge.apply_config({
+                "temperature": "not-a-number",  # invalid type
+            })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tests: _translate_frontend_config
+# Tests: translate_frontend_config
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestTranslateFrontendConfig:
-    """Tests for _translate_frontend_config()."""
+    """Tests for translate_frontend_config()."""
 
     def test_translate_frontend_config_passes_all_fields(self):
         """
-        _translate_frontend_config should:
+        translate_frontend_config should:
         - Map 'provider' → 'provider_type'
         - Pass through model, temperature unchanged
         - Convert tools [{name, enabled}] → enabled_tools list of enabled names
         """
-        result = _translate_frontend_config({
+        result = translate_frontend_config({
             "temperature": 1.0,
             "model": "gpt-4",
             "provider": "openai",
@@ -149,37 +194,41 @@ class TestTranslateFrontendConfig:
 
     def test_translate_frontend_config_anthropic_provider(self):
         """Verify 'anthropic' provider maps to provider_type='anthropic'."""
-        result = _translate_frontend_config({"provider": "anthropic"})
+        result = translate_frontend_config({"provider": "anthropic"})
         assert result.get("provider_type") == "anthropic"
 
     def test_translate_frontend_config_local_provider(self):
         """Verify 'local' provider maps to provider_type='openai_compatible'."""
-        result = _translate_frontend_config({"provider": "local"})
+        result = translate_frontend_config({"provider": "local"})
         assert result.get("provider_type") == "openai_compatible"
 
     def test_translate_frontend_config_no_tools_list(self):
         """When no tools field is provided, enabled_tools should not be set."""
-        result = _translate_frontend_config({"temperature": 0.5})
+        result = translate_frontend_config({"temperature": 0.5})
         assert "enabled_tools" not in result
 
     def test_translate_frontend_config_empty_tools_list(self):
-        """When tools is an empty list, enabled_tools should not be set."""
-        result = _translate_frontend_config({"tools": []})
-        assert "enabled_tools" not in result
+        """When tools is an empty list, enabled_tools should be an empty list
+        (all tools explicitly disabled)."""
+        result = translate_frontend_config({"tools": []})
+        assert result.get("enabled_tools") == [], \
+            f"Expected enabled_tools=[], got {result.get('enabled_tools')}"
 
     def test_translate_frontend_config_all_disabled_tools(self):
-        """When all tools are disabled, enabled_tools should not be set."""
-        result = _translate_frontend_config({
+        """When all tools are disabled, enabled_tools should be an empty list
+        (all tools explicitly disabled)."""
+        result = translate_frontend_config({
             "tools": [
                 {"name": "bash", "enabled": False},
                 {"name": "file_read", "enabled": False},
             ],
         })
-        assert "enabled_tools" not in result
+        assert result.get("enabled_tools") == [], \
+            f"Expected enabled_tools=[], got {result.get('enabled_tools')}"
 
     def test_translate_frontend_config_strips_private_keys(self):
         """Keys starting with '_' should be stripped from the result."""
-        result = _translate_frontend_config({
+        result = translate_frontend_config({
             "temperature": 0.7,
             "_internal_id": "abc123",
             "_debug": True,
@@ -190,5 +239,60 @@ class TestTranslateFrontendConfig:
 
     def test_translate_frontend_config_no_provider(self):
         """When no provider is given, provider_type should not be set."""
-        result = _translate_frontend_config({"temperature": 0.5})
+        result = translate_frontend_config({"temperature": 0.5})
         assert "provider_type" not in result
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tests: backend_to_frontend_config  (round-trip completeness)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBackendToFrontendConfig:
+    """Tests for backend_to_frontend_config()."""
+
+    def test_backend_to_frontend_emits_all_tools(self):
+        """
+        backend_to_frontend_config should emit ALL known tools from
+        SIMPLIFIED_TOOL_CLASSES, each with enabled: true/false.
+        """
+        result = backend_to_frontend_config({
+            "enabled_tools": ["FileEditor", "ReadFile"],
+        })
+        tools = result.get("tools", [])
+        # Should be a list; every entry has name + enabled
+        assert isinstance(tools, list)
+        assert len(tools) > 5, (
+            f"Expected many tools from SIMPLIFIED_TOOL_CLASSES, "
+            f"got {len(tools)}: {[t['name'] for t in tools]}"
+        )
+        # FileEditor should be enabled
+        fe = next((t for t in tools if t["name"] == "FileEditor"), None)
+        assert fe is not None, "FileEditor should be in tools list"
+        assert fe["enabled"] is True
+        # Something not in enabled_tools should be disabled
+        disabled = [t for t in tools if not t["enabled"]]
+        assert len(disabled) > 0, (
+            "At least some tools should be disabled (only enabled_tools "
+            "containing FileEditor and ReadFile were passed)"
+        )
+
+    def test_backend_to_frontend_no_enabled_tools_key(self):
+        """
+        When enabled_tools key is absent, tools should remain as-is
+        (or absent), not be populated.
+        """
+        result = backend_to_frontend_config({"temperature": 0.5})
+        # tools should not be populated from nowhere
+        assert "tools" not in result or result["tools"] is None
+
+    def test_backend_to_frontend_empty_enabled_tools(self):
+        """
+        When enabled_tools is an empty list, all tools should be
+        present with enabled=False.
+        """
+        result = backend_to_frontend_config({"enabled_tools": []})
+        tools = result.get("tools", [])
+        assert len(tools) > 0, "Should still emit all tools"
+        assert all(t["enabled"] is False for t in tools), (
+            "All tools should be disabled when enabled_tools is empty"
+        )
+

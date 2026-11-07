@@ -8,16 +8,22 @@ workers, mcp_servers) as well as GET effective_permissions.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from fastapi import APIRouter, HTTPException, Query, status
-from fastapi.responses import PlainTextResponse
+logger = logging.getLogger(__name__)
+
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
+
+from thoughtmachine.workspace_registry import WorkspaceRegistry
 
 from thoughtmachine.workspace_capabilities import (
     WorkspaceCapabilities,
@@ -26,22 +32,244 @@ from thoughtmachine.workspace_capabilities import (
     load_workspace_capabilities,
 )
 
-from tools.workspace.worker import _worker_registry, _registry_lock
+from thoughtmachine.permission_store import (
+    PermissionStoreError,
+    read_session_permissions,
+)
+from thoughtmachine.vault import vault_root
+
+from tools.workspace.command_channel import (
+    COMMAND_FILENAME,
+    CommandFence,
+    write_command,
+)
+from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
+from tools.workspace.worker_runtime import StaleWorkerFence, runtime_handle_for
+_worker_registry = _WorkerRegistry.get_instance()._worker_registry
+_registry_lock = _WorkerRegistry.get_instance()._registry_lock
+
+from tools.host_resource_policy import load_workspace_config
+
+from agent.models.worker_definition import WorkerDefinition
+
+
+# Module-level reference for monkeypatchability in tests; the import is
+# guarded so a failing worker module can never break router import.
+try:
+    from tools.workspace.worker_manager import get_manager as _get_worker_manager
+except Exception:  # pragma: no cover - defensive
+    _get_worker_manager = None
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_RESOURCE_CATALOG_PATH = _PROJECT_ROOT / "agent" / "config" / "resource_catalog.json"
 
 # ── Router ───────────────────────────────────────────────────────────────────
 
 router = APIRouter(prefix="/api/workspace")
 
+# ── POST /api/workspace/resolve ─────────────────────────────────────────────────
+
+
+class ResolvePathBody(BaseModel):
+    path: str
+
+
+# ── Path confinement helpers (mirror of web_ui/backend/server.py) ───────────────────────────────────────────────────────────────────
+# The vault trust anchor is resolved through the canonical
+# ``thoughtmachine.vault.vault_root`` (imported at module top); the former
+# local ``_vault_root_path`` helper has been removed.
+
+
+def _path_is_within(path: str, prefix: str) -> bool:
+    """Return True if *path* equals *prefix* or is nested under it."""
+    norm = os.path.normpath(path)
+    base = os.path.normpath(prefix)
+    return norm == base or norm.startswith(base + os.sep)
+
+
+def _confine_to_home(path: str) -> str:
+    """Resolve *path* to an absolute path outside the vault root.
+
+    TRUST ANCHOR: ``~/.thoughtmachine`` is the trust anchor for this server —
+    it holds the workspace registry, credentials, configuration and session
+    state.  User-reachable endpoints (browse, create, workspace registration)
+    must never resolve into it: a workspace rooted there would hand the agent
+    the trust anchor and everything inside it.  Paths OUTSIDE $HOME are fine
+    (e.g. ``D:\\Coding`` on Windows) — the legacy $HOME-only confinement
+    blocked legitimate workspaces on other drives.
+
+    Raises ``ValueError`` when the resolved path is not absolute (including
+    drive-relative forms such as ``C:``) or resolves inside the vault root.
+    The function name is retained for backwards compatibility (tests patch it
+    by name); the $HOME-only confinement has been removed.
+    """
+    resolved = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    if not os.path.isabs(resolved):
+        raise ValueError(
+            f"Path '{path}' resolves to '{resolved}', which is not an "
+            f"absolute path"
+        )
+    vault = os.path.realpath(str(vault_root()))
+    if _path_is_within(resolved, vault):
+        raise ValueError(
+            f"Path '{path}' resolves into the protected vault directory '{vault}'"
+        )
+    return resolved
+
+
+@router.post("/resolve")
+async def resolve_workspace_path(
+    request: Request, body: ResolvePathBody
+) -> Dict[str, Any]:
+    """Resolve a filesystem path to a workspace ID.
+
+    If the path is already registered, returns the existing workspace ID.
+    Otherwise, registers it as a new workspace and returns the new ID.
+
+    TRUST ANCHOR: ``~/.thoughtmachine`` is the trust anchor for this server.
+    New registrations may be any ABSOLUTE path that does not resolve into
+    ``~/.thoughtmachine`` (workspaces on other drives, e.g. ``D:\\Coding``
+    on Windows, are legitimate); vault paths are rejected with HTTP 403
+    Forbidden, and a non-existent path with HTTP 400. Already-registered
+    paths are returned as-is — their entries were written only by trusted
+    code (bootstrap, server startup, or this same confined endpoint), so they
+    are trusted.
+    """
+    try:
+        if not body.path or not body.path.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="path is required",
+            )
+
+        registry = WorkspaceRegistry.get_default()
+
+        # Already registered → return the existing (trusted) entry untouched.
+        existing = registry.resolve_by_root(body.path)
+        if existing is not None:
+            return {"workspace_id": existing.id, "root": existing.root_path}
+
+        # New registration: must be absolute and outside the vault root.
+        try:
+            confined = _confine_to_home(body.path)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            )
+        if not os.path.isdir(confined):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Path '{confined}' is not an existing directory",
+            )
+
+        entry = registry.register_by_root(confined)
+        if entry:
+            # Best-effort provisioning of the hidden git resource container.
+            # NEVER fatal: a missing docker daemon or a failed provision must
+            # not break the resolve endpoint.
+            try:
+                from infra.resource_container_manager import (
+                    provision_workspace_resource,
+                )
+
+                provision_workspace_resource(entry.id, entry.root_path)
+            except Exception as exc:
+                logger.warning(
+                    "resolve_workspace_path: resource provisioning failed for "
+                    "workspace %s: %s",
+                    entry.id,
+                    exc,
+                )
+            return {"workspace_id": entry.id, "root": entry.root_path}
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to register workspace path",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to resolve workspace path: {exc}",
+        )
+
+
+# ── GET /api/workspace/list ─────────────────────────────────────────────────────
+
+@router.get("/list")
+async def list_workspaces() -> List[Dict[str, Any]]:
+    """List all registered workspaces."""
+    try:
+        registry = WorkspaceRegistry.get_default()
+        entries = registry.list_workspaces()
+        return [
+            {
+                "id": entry.id,
+                "root": entry.root_path,
+                "label": entry.label or entry.id,
+            }
+            for entry in entries
+        ]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list workspaces: {exc}",
+        )
+
+
+# ── GET /api/workspace/templates ────────────────────────────────────────────────
+
+@router.get("/templates")
+async def get_worker_templates() -> List[Dict[str, Any]]:
+    """Return validated worker templates as a JSON array.
+
+    Reads from ``~/.thoughtmachine/worker_templates/`` first (the user's
+    deployed templates, set up by ``bootstrap.py`` on first run).  Falls
+    back to ``resources/worker_templates/`` in the repo if the user directory
+    doesn't exist or contains no ``.json`` files — this ensures the endpoint
+    works on a fresh install before the first bootstrap completes.
+
+    Invalid or unparseable ``.json`` files are skipped with a warning log
+    message; remaining valid templates are still returned.
+    """
+    # Resolve template directories
+    user_dir = Path.home() / ".thoughtmachine" / "worker_templates"
+    repo_dir = (
+        Path(__file__).resolve().parents[2]
+        / "resources"
+        / "worker_templates"
+    )
+
+    # Prefer deployed user templates; fall back to repo source templates
+    if user_dir.is_dir() and list(user_dir.glob("*.json")):
+        template_dir = user_dir
+    else:
+        template_dir = repo_dir
+
+    results: List[Dict[str, Any]] = []
+
+    if template_dir.is_dir():
+        for json_file in sorted(template_dir.glob("*.json")):
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+                wd = WorkerDefinition.model_validate(data)
+                results.append(wd.model_dump())
+            except Exception as exc:
+                logger.warning(
+                    "Skipping invalid template %s: %s",
+                    json_file.name,
+                    exc,
+                )
+
+    return results
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
-
 
 class DomainAllowlistBody(BaseModel):
     domains: List[str]
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
 
 def _atomic_write_json(data: Any, file_path: Path, retries: int = 3) -> None:
     """Atomically write *data* as JSON to *file_path*, with Windows-safe retries.
@@ -85,32 +313,209 @@ def _atomic_write_json(data: Any, file_path: Path, retries: int = 3) -> None:
             time.sleep(0.2 * attempt)
 
 
-def _load_session_permissions(session_id: str) -> Optional[Dict[str, Any]]:
-    """Load session permissions from a saved session's metadata.
+def _read_worker_generation(worker_dir: Path) -> Optional[int]:
+    """Read a worker's incarnation counter (``_generation``) off disk.
 
-    Returns ``None`` if the session cannot be found or has no permissions
-    embedded.  The frontend is expected to pass ``session_id`` from the
-    currently active WebSocket connection.
+    The authority is the ``generation`` sidecar that ``WorkerThread`` writes
+    when it allocates a generation; ``context.json`` carries the same value
+    and is the fallback for directories written before that sidecar existed.
+    Returns ``None`` when neither file holds a positive integer -- the caller
+    then has no epoch to fence a command with.
     """
     try:
-        from session.store import FileSystemSessionStore
+        value = int((worker_dir / "generation").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pass
+    else:
+        if value > 0:
+            return value
 
-        store = FileSystemSessionStore()
-        session = store.load_session(session_id)
-        if session is None:
-            return None
-
-        # Check workspace_id against this session's workspace
-        agent_config_data = session.metadata.get("agent_config", {})
-        if isinstance(agent_config_data, dict):
-            return agent_config_data.get("session_permissions")
+    try:
+        data = json.loads((worker_dir / "context.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
+
+    value = data.get("generation") if isinstance(data, dict) else None
+    # ``True`` IS an ``int`` in Python and would otherwise read as epoch 1.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+#: Command-file action -> the ``WorkerRuntimeHandle`` verb that carries it out.
+#: The same four actions ``WorkerThread._poll_command`` obeys, with the same
+#: meanings (``stop`` parks/revives, ``kill`` is the only terminating verb), so
+#: a command routed through a handle and one polled off disk cannot disagree.
+_RUNTIME_COMMAND_VERBS = {
+    "stop": "stop",
+    "kill": "kill",
+    "pause": "pause",
+    "resume": "resume",
+}
+
+
+def _dispatch_via_runtime(handle: Any, action: str) -> None:
+    """Deliver one command verb straight to a live runtime *handle*.
+
+    Reached only when :func:`tools.workspace.worker_runtime.runtime_handle_for`
+    found a handle for this worker.  Since S7a-3 that is the ordinary case for a
+    worker spawned by this process (the spawn path registers its handle); it is
+    still not the only one, so the caller keeps the ``command.json`` path below
+    as its fallback.  With a handle the supervisor reaches the runtime
+    in-process, so the direct call is the transport and no command file is
+    written: one command, one transport.
+
+    An action with no handle equivalent raises :class:`ValueError` rather than
+    being silently swallowed -- a verb this seam cannot honour has to be
+    visible, and every current caller passes one of the four mapped verbs.
+    """
+    verb = _RUNTIME_COMMAND_VERBS.get(action)
+    if verb is None:
+        raise ValueError(
+            f"no WorkerRuntimeHandle verb for worker command {action!r}; "
+            f"mapped actions: {sorted(_RUNTIME_COMMAND_VERBS)}"
+        )
+    result = getattr(handle, verb)()
+    logger.debug(
+        "Worker command %r delivered to the runtime handle (%s -> %r)",
+        action,
+        verb,
+        result,
+    )
+
+
+def _write_worker_command(
+    worker_dir: Path,
+    action: str,
+    *,
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: int,
+) -> None:
+    """Write a fenced ``command.json`` into *worker_dir*.
+
+    If the supervisor holds a live ``WorkerRuntimeHandle`` for this worker the
+    command goes straight to it (:func:`_dispatch_via_runtime`) and nothing is
+    written to disk.  Since S7a-3 that registry is populated by the spawn path,
+    so a worker spawned by this process is normally reached in process -- and
+    when the handle is absent, fenced or the dispatch itself fails, the command
+    is written to ``command.json`` exactly as it was before the seam existed,
+    which is what keeps a failed dispatch a degraded path and not a lost verb.
+
+    The fence (session / worker name / instance / epoch) is what lets the
+    polling worker reject a command addressed to a different incarnation --
+    a stale command from a previous spawn, or one meant for another worker
+    sharing the directory.  The epoch is the worker's own ``_generation`` as
+    persisted in *worker_dir*; when it cannot be read (a directory laid down
+    without a thread, e.g. a pre-seeded fixture) the command is written
+    UNFENCED with a warning rather than dropped, so the caller's request is
+    never silently ignored.
+    """
+    handle = runtime_handle_for(session_id, worker_name, instance_id)
+    if handle is not None:
+        try:
+            _dispatch_via_runtime(handle, action)
+        except Exception:
+            logger.warning(
+                "Worker %s (instance %s, session %s): runtime dispatch of %s "
+                "failed -- falling back to the fenced command channel",
+                worker_name,
+                instance_id,
+                session_id,
+                action,
+                exc_info=True,
+            )
+        else:
+            return
+
+    generation = _read_worker_generation(worker_dir)
+    if generation is None:
+        logger.warning(
+            "Worker %s (instance %s, session %s): no generation on disk in %s "
+            "-- writing an UNFENCED %s command, so it cannot be told apart "
+            "from a stale one",
+            worker_name,
+            instance_id,
+            session_id,
+            worker_dir,
+            action,
+        )
+        _atomic_write_json({"action": action}, worker_dir / COMMAND_FILENAME)
+        return
+
+    fence = CommandFence(
+        session_id=session_id or "",
+        worker_name=worker_name,
+        instance_id=instance_id,
+        epoch=generation,
+    )
+    if not write_command(worker_dir, action, fence):
+        logger.warning(
+            "Worker %s (instance %s, session %s): could not write the %s "
+            "command to %s",
+            worker_name,
+            instance_id,
+            session_id,
+            action,
+            worker_dir,
+        )
+
+
+def _atomic_write_text(data: str, file_path: Path, retries: int = 3) -> None:
+    """Atomically write a plain-text string to *file_path*, with Windows-safe retries.
+
+    Same pattern as ``_atomic_write_json`` but writes raw text instead of JSON.
+    """
+    for attempt in range(1, retries + 2):
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            delete=False,
+            dir=str(file_path.parent),
+            suffix=".tmp",
+            prefix="workspace_",
+            encoding="utf-8",
+        )
+        try:
+            tmp.write(data)
+            tmp.flush()
+            tmp_path = tmp.name
+        finally:
+            tmp.close()
+
+        try:
+            os.replace(tmp_path, str(file_path))
+            return  # success
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+            if attempt > retries:
+                try:
+                    shutil.move(tmp_path, str(file_path))
+                    return
+                except OSError as exc:
+                    raise exc
+
+            time.sleep(0.2 * attempt)
+
+def _load_session_permissions(
+    session_id: str, workspace_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Load a session's raw permission grants from the canonical sidecar (P1).
+
+    Returns ``None`` when the grant store has no entry for the session.  The
+    retired ``metadata.session_config`` / ``metadata.agent_config`` lookup
+    loops are no longer consulted: ``read_session_permissions`` is the sole
+    grants source.
+    """
+    try:
+        return read_session_permissions(vault_root(), workspace_id, session_id)
     except Exception:
         return None
 
-
 # ── GET /api/workspace/{ws_id}/dockerfile ────────────────────────────────────
-
 
 @router.get("/{ws_id}/dockerfile", response_class=PlainTextResponse)
 async def get_dockerfile(ws_id: str):
@@ -124,9 +529,7 @@ async def get_dockerfile(ws_id: str):
         )
     return PlainTextResponse(path.read_text(encoding="utf-8"))
 
-
 # ── GET /api/workspace/{ws_id}/domain_allowlist ──────────────────────────────
-
 
 @router.get("/{ws_id}/domain_allowlist")
 async def get_domain_allowlist(ws_id: str):
@@ -141,38 +544,65 @@ async def get_domain_allowlist(ws_id: str):
     except (json.JSONDecodeError, OSError):
         return []
 
-
 # ── PUT /api/workspace/{ws_id}/domain_allowlist ──────────────────────────────
 
-
 @router.put("/{ws_id}/domain_allowlist")
-async def put_domain_allowlist(ws_id: str, body: DomainAllowlistBody):
+async def put_domain_allowlist(request: Request, ws_id: str, body: DomainAllowlistBody):
     """Atomically replace the workspace's domain allowlist."""
     ensure_workspace_dirs(ws_id)
     path = _workspace_dir(ws_id) / "domain_allowlist.json"
     _atomic_write_json(body.domains, path)
     return {"domains": body.domains}
 
-
 # ── GET /api/workspace/{ws_id}/workers ───────────────────────────────────────
 
 
-@router.get("/{ws_id}/workers")
-async def get_workers(ws_id: str):
-    """Return worker configs merged with runtime status and persisted context.
+def _worker_instance_key(label: str):
+    """Split a worker directory label into (base_name, instance_id).
 
-    Each worker entry includes:
-      - Config fields from workers.json (name, system_prompt, tool_classes, etc.)
-      - runtime_status:  "running" | "completed" | "failed" | "idle" | None
-      - current_task:    current activity description (if running)
-      - last_heartbeat:  ISO-8601 timestamp of last activity
-      - error:           error message (if failed)
-      - has_persisted_context: whether the worker has saved conversation on disk
+    Instance dirs are named with ``instance_label``: the bare worker name for
+    instance 1 and ``<name>#<N>`` for N>1.  A label whose final ``#`` suffix is
+    an integer belongs to that instance; anything else is treated as its own
+    base name at instance 1.
     """
+    if "#" in label:
+        base, _, suffix = label.rpartition("#")
+        if suffix.isdigit():
+            return base, int(suffix)
+    return label, 1
+
+
+def _query_default(value):
+    """Normalize a FastAPI ``Query`` sentinel to its declared default.
+
+    FastAPI substitutes ``Query(...)`` defaults for their value only while
+    binding HTTP requests; direct calls (e.g. tests invoking the endpoint
+    function) receive the ``Query`` object itself.  Treating that sentinel as
+    ``None`` keeps both paths identical for these optional params.
+    """
+    from fastapi.params import Query as QueryParam
+
+    return None if isinstance(value, QueryParam) else value
+
+
+@router.get("/{ws_id}/workers")
+async def get_workers(
+    ws_id: str,
+    name: Optional[str] = Query(None, description="Filter to a single worker by name"),
+):
+    """Return the worker config templates defined for this workspace.
+
+    This endpoint is intentionally configuration-only: each entry is a raw
+    template from ``workers.json`` (name, system_prompt, tool_classes, ...).
+    Live runtime state is exposed separately via
+    ``GET /api/workspace/{ws_id}/workers/active``, so the frontend can render
+    template CRUD and runtime monitoring independently.
+    """
+    name = _query_default(name)
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
 
-    # 1. Load worker configurations from workers.json
+    # Load worker configurations from workers.json
     config_path = ws_dir / "workers.json"
     if config_path.exists():
         try:
@@ -182,56 +612,524 @@ async def get_workers(ws_id: str):
     else:
         configs = []
 
-    # 2. Read runtime status from status.json written by the worker thread.
-    #    This bridges the agent process and the backend API server process.
-    workers_dir = ws_dir / "workers"
-    runtime_statuses = {}
-    if workers_dir.is_dir():
-        for subdir in workers_dir.iterdir():
-            if subdir.is_dir():
-                status_path = subdir / "status.json"
-                if status_path.exists():
-                    try:
-                        data = json.loads(status_path.read_text(encoding="utf-8"))
-                        runtime_statuses[subdir.name] = {
-                            "runtime_status": data.get("runtime_status"),
-                            "current_task": data.get("current_task"),
-                            "last_heartbeat": data.get("last_heartbeat"),
-                            "error": data.get("error"),
-                        }
-                    except (json.JSONDecodeError, OSError):
-                        pass
-
-    # 3. Check for persisted contexts on disk
-    persisted_names = set()
-    if workers_dir.is_dir():
-        for subdir in workers_dir.iterdir():
-            if subdir.is_dir() and (subdir / "context.json").exists():
-                persisted_names.add(subdir.name)
-
-    # 4. Merge everything
-    result = []
+    result: List[Dict[str, Any]] = []
     for cfg in configs:
-        name = cfg.get("name", "")
-        entry = dict(cfg)
-        if name in runtime_statuses:
-            entry["runtime_status"] = runtime_statuses[name]["runtime_status"]
-            entry["current_task"] = runtime_statuses[name]["current_task"]
-            entry["last_heartbeat"] = runtime_statuses[name]["last_heartbeat"]
-            entry["error"] = runtime_statuses[name]["error"]
-        else:
-            entry["runtime_status"] = None
-            entry["current_task"] = None
-            entry["last_heartbeat"] = None
-            entry["error"] = None
-        entry["has_persisted_context"] = name in persisted_names
-        result.append(entry)
+        if isinstance(cfg, str):
+            # Legacy shorthand: a bare name with no config fields.
+            result.append({"name": cfg})
+        elif isinstance(cfg, dict):
+            result.append(cfg)
+
+    if name is not None:
+        match = [cfg for cfg in result if cfg.get("name") == name]
+        if not match:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Worker '{name}' not found",
+            )
+        return match[0]
 
     return result
 
 
-# ── GET /api/workspace/{ws_id}/mcp_servers ───────────────────────────────────
+# ── GET /api/workspace/{ws_id}/workers/active ─────────────────────────────────
 
+
+def _resolve_worker_manager():
+    """Return the live WorkerManager singleton, or None if unavailable."""
+    if _get_worker_manager is None:
+        return None
+    try:
+        return _get_worker_manager()
+    except Exception:
+        return None
+
+
+def _worker_elapsed_seconds(started_at: Optional[str]) -> Optional[float]:
+    """Seconds since *started_at* (ISO-8601), rounded to 1 decimal place.
+
+    Returns ``None`` when the timestamp is missing or unparseable, and never
+    returns a negative value (a clock skew between the worker thread and this
+    process is clamped to zero).
+    """
+    if not started_at:
+        return None
+    try:
+        parsed = started_at.replace("Z", "+00:00")
+        started = datetime.fromisoformat(parsed)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        delta = (datetime.now(timezone.utc) - started).total_seconds()
+        return round(max(0.0, delta), 1)
+    except (ValueError, TypeError):
+        return None
+
+
+def _worker_queued_queries(thread) -> Dict[str, Any]:
+    """Report the queries *thread* has accepted but not yet dequeued.
+
+    The single source of truth is ``WorkerThread.pending_query_jobs()``, which
+    returns a copy of the thread's in-memory deque of accepted job ids; entries
+    leave that deque as the worker loop dequeues them, so the reported count is
+    a live snapshot rather than a ledger.  Reading it is purely observational:
+    no enqueue, resume, registry or audit side effects and no EventBus traffic.
+    ``pending_query_jobs()`` copies the deque under the thread's
+    ``_queued_lock``, a plain ``threading.Lock`` that no holder keeps across I/O
+    or an LLM call, so this cannot stall the route.
+
+    Deliberately defensive: duck-typed thread doubles without a callable
+    ``pending_query_jobs``, a getter that raises, a non-sequence result, and
+    inactive/stopped threads (whose queue is cleared when pending queries are
+    rejected) all report an empty queue instead of failing the request.
+    """
+    getter = getattr(thread, "pending_query_jobs", None)
+    if not callable(getter):
+        # Genuinely no queue to read (duck-typed double, inactive entry):
+        # reporting 0 is correct here, so this path stays silent.
+        return {"queued_query_count": 0, "queued_query_ids": []}
+    worker_name = getattr(thread, "worker_name", "") or ""
+    try:
+        job_ids = getter()
+    except Exception:
+        # The queue state is UNKNOWN but the response says 0 — never let that
+        # silently read as an idle worker.
+        logger.warning(
+            "Worker %r: could not read its queued queries — "
+            "pending_query_jobs() raised, so queued_query_count is reported "
+            "as 0 and any queries it holds are not shown",
+            worker_name,
+            exc_info=True,
+        )
+        return {"queued_query_count": 0, "queued_query_ids": []}
+    if not isinstance(job_ids, (list, tuple)):
+        # Same unknown-state case, without an exception to attach.
+        logger.warning(
+            "Worker %r: could not read its queued queries — "
+            "pending_query_jobs() returned %s instead of a list/tuple, so "
+            "queued_query_count is reported as 0 and any queries it holds "
+            "are not shown",
+            worker_name,
+            type(job_ids).__name__,
+        )
+        return {"queued_query_count": 0, "queued_query_ids": []}
+    ids = [str(job_id) for job_id in job_ids]
+    return {"queued_query_count": len(ids), "queued_query_ids": ids}
+
+
+def _worker_active_entry(thread) -> Dict[str, Any]:
+    """Map a live WorkerThread to its compact runtime handle.
+
+    Carries the instance identity (``name``/``worker_name``, ``instance_id``),
+    its owning session, runtime status and heartbeat freshness.  ``elapsed``
+    is seconds since start (None when the start timestamp is missing);
+    ``container_id`` is the thread's provisioned container when attributable
+    (None otherwise).  ``queued_query_count``/``queued_query_ids`` expose the
+    queries the thread has accepted but not yet dequeued (see
+    ``_worker_queued_queries``); ``worker_name``/``instance_id``/``status``/
+    ``elapsed`` are kept for backward compatibility with existing consumers.
+    """
+    return {
+        "worker_name": getattr(thread, "worker_name", ""),
+        "instance_id": getattr(thread, "instance_id", 1),
+        "status": getattr(thread, "status", "unknown"),
+        "elapsed": _worker_elapsed_seconds(getattr(thread, "started_at", None)),
+        "name": getattr(thread, "worker_name", ""),
+        "session_id": getattr(thread, "session_id", "") or "",
+        "last_heartbeat": getattr(thread, "last_heartbeat", None),
+        "container_id": getattr(thread, "container_id", None),
+        **_worker_queued_queries(thread),
+    }
+
+
+def _collect_active_workers(ws_id: str) -> List[Dict[str, Any]]:
+    """Collect live worker threads belonging to *ws_id*.
+
+    Resolution order:
+      1. Sessions registered for this workspace (``SessionRegistry``); worker
+         threads are looked up per session via the WorkerManager.
+      2. Fallback when no open session maps to the workspace: scan the entire
+         worker registry and keep only threads attributable to this workspace.
+         Threads with no session id, or whose session maps to a different
+         workspace, are not listed here. See design/unattributed-worker-surface
+         for where unattributed workers should surface.
+    """
+    manager = _resolve_worker_manager()
+    if manager is None:
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+
+    session_ids: List[str] = []
+    try:
+        from session.session_registry import SessionRegistry
+
+        sessions = SessionRegistry.get_default().get_all()
+        if isinstance(sessions, dict):
+            for s in sessions.values():
+                if not isinstance(s, dict):
+                    continue
+                if s.get("workspace_id") == ws_id and s.get("is_open"):
+                    sid = str(s.get("session_id") or "")
+                    if sid:
+                        session_ids.append(sid)
+    except Exception:
+        session_ids = []
+
+    def _append(thread) -> None:
+        key = (
+            getattr(thread, "session_id", "") or "",
+            getattr(thread, "worker_name", "") or "",
+            getattr(thread, "instance_id", 1),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append(_worker_active_entry(thread))
+
+    if session_ids:
+        for sid in session_ids:
+            try:
+                threads = manager.list_workers(sid) or []
+            except Exception:
+                threads = []
+            for thread in threads:
+                _append(thread)
+    else:
+        # keep only threads attributable to this workspace. Empty-session and other-workspace threads are excluded; see design/unattributed-worker-surface.
+        try:
+            registry = getattr(manager, "_registry", None)
+            all_workers = getattr(registry, "get_all_workers", lambda: {})() or {}
+        except Exception:
+            all_workers = {}
+        for (sid, _wname, _iid), thread in all_workers.items():
+            try:
+                from session.session_registry import SessionRegistry
+
+                sessions = SessionRegistry.get_default().get_all()
+                owner_ws = None
+                if isinstance(sessions, dict):
+                    s = sessions.get(str(sid))
+                    if isinstance(s, dict):
+                        owner_ws = s.get("workspace_id")
+                if not sid or owner_ws != ws_id:
+                    continue
+            except Exception:
+                pass
+            _append(thread)
+
+    entries.sort(key=lambda e: (e["worker_name"], e["instance_id"]))
+    return entries
+
+
+@router.get("/{ws_id}/workers/active")
+async def get_active_workers(
+    ws_id: str,
+    session_id: Optional[str] = Query(None, description="Filter to a single session id"),
+) -> List[Dict[str, Any]]:
+    """Return live worker threads for the workspace (runtime handles only).
+
+    Each handle carries ``{worker_name, instance_id, status, elapsed, name,
+    session_id, last_heartbeat, container_id, queued_query_count,
+    queued_query_ids}`` where ``elapsed`` is the seconds since the thread
+    started (None when the start timestamp is missing), ``last_heartbeat`` is
+    the thread's last heartbeat ISO timestamp (None when the thread has not
+    heartbeated yet) and ``container_id`` is the thread's provisioned container
+    (None when not attributable).  ``queued_query_count``/``queued_query_ids``
+    report the queries the thread has accepted but not yet picked up, with the
+    ids in FIFO order (both empty when nothing is pending or the thread cannot
+    report a queue).  The optional ``?session_id=`` query param narrows the
+    result to the threads of a single session.  Template definitions are served
+    by ``GET /api/workspace/{ws_id}/workers`` instead.
+    """
+    session_id = _query_default(session_id)
+    entries = _collect_active_workers(ws_id)
+    if session_id is not None:
+        entries = [e for e in entries if e.get("session_id") == session_id]
+    return entries
+
+
+# ── Worker blueprints /api/workspace/{ws_id}/workers/blueprints ───────────────
+#
+# Blueprint endpoints expose the workspace's worker definitions as validated,
+# fully-normalised ``WorkerDefinition`` payloads and support in-place field
+# edits.  They are registered BEFORE the ``/{ws_id}/workers/{name}``
+# PUT/DELETE routes so the literal ``blueprints`` path segment wins over the
+# ``{name}`` path parameter.
+
+
+def _load_worker_blueprints(ws_id: str, *, required: bool = True) -> List[Any]:
+    """Read the raw ``workers.json`` list for *ws_id*.
+
+    When *required* is True (the default) an absent file raises 404.  When it
+    is False an absent file yields an empty list instead, so read/projection
+    callers can fall back to template workers without synthesising the file.
+    Raises 422 when the file is unreadable or not a JSON array.
+    """
+    path = _workspace_dir(ws_id) / "workers.json"
+    if not path.exists():
+        if not required:
+            return []
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workers file not found",
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid workers.json: {exc}",
+        )
+    if not isinstance(data, list):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="workers.json is not a JSON array",
+        )
+    return data
+
+
+def _blueprint_name(entry: Any) -> Optional[str]:
+    """Return the worker name of a raw ``workers.json`` entry (else None)."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        name = entry.get("name")
+        return name if isinstance(name, str) else None
+    return None
+
+
+def _normalise_blueprint(entry: Any) -> Dict[str, Any]:
+    """Validate a raw entry through ``WorkerDefinition`` and dump every field.
+
+    Legacy string entries are treated as a bare worker name.  Invalid entries
+    raise 422 (naming the offending worker when known).
+    """
+    candidate = {"name": entry} if isinstance(entry, str) else entry
+    try:
+        return WorkerDefinition.model_validate(candidate).model_dump()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(f"Invalid worker blueprint '{_blueprint_name(entry)}': {exc}"),
+        )
+
+
+def _merged_worker_blueprints(ws_id: str) -> list:
+    """Return *ws_id*'s ``workers.json`` entries plus projected templates.
+
+    Reuses ``Worker._merge_template_workers`` — the exact merge the worker-spawn
+    path applies — so the blueprint routes and the runtime agree on the
+    effective worker set.  The import is lazy (function body) so importing the
+    web backend never pays the worker module's import cost.
+    """
+    from tools.workspace.worker_thread import Worker
+
+    raw = _load_worker_blueprints(ws_id, required=False)
+
+    return Worker._merge_template_workers(raw, include_bundled=False)
+
+
+@router.get("/{ws_id}/workers/blueprints")
+async def list_worker_blueprints(ws_id: str) -> List[Dict[str, Any]]:
+    """Return the workspace's worker blueprints as normalised definitions."""
+    raw = _merged_worker_blueprints(ws_id)
+    return [_normalise_blueprint(entry) for entry in raw]
+
+
+@router.get("/{ws_id}/workers/blueprints/{name}")
+async def get_worker_blueprint(ws_id: str, name: str) -> Dict[str, Any]:
+    """Return a single normalised worker blueprint by name (404 when absent)."""
+    raw = _merged_worker_blueprints(ws_id)
+    for entry in raw:
+        if _blueprint_name(entry) == name:
+            return _normalise_blueprint(entry)
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Worker '{name}' not found",
+    )
+
+
+@router.patch("/{ws_id}/workers/blueprints/{name}")
+async def patch_worker_blueprint(
+    ws_id: str, name: str, request: Request
+) -> Dict[str, Any]:
+    """Apply a partial update to a worker blueprint in place.
+
+    Only the fields present in the request body are changed; the merged result
+    is validated against ``WorkerDefinition`` and ``workers.json`` is rewritten
+    atomically.  Every other entry is preserved verbatim and the file is never
+    created when it is missing.
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}")
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must be a JSON object",
+        )
+
+    raw = _load_worker_blueprints(ws_id, required=False)
+    index = next(
+        (i for i, entry in enumerate(raw) if _blueprint_name(entry) == name),
+        None,
+    )
+    if index is None:
+        # Not in workers.json — a same-named template may be projected in.
+        # Materialise it by appending the template entry, then patch that entry.
+        template = next(
+            (
+                entry
+                for entry in _merged_worker_blueprints(ws_id)
+                if _blueprint_name(entry) == name
+            ),
+            None,
+        )
+        if template is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Worker '{name}' not found",
+            )
+        raw.append(template)
+        index = len(raw) - 1
+
+    existing = raw[index]
+    merged = dict(existing) if isinstance(existing, dict) else {"name": existing}
+    merged.update(body)
+    try:
+        updated = WorkerDefinition.model_validate(merged)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    raw[index] = updated.model_dump()
+    path = _workspace_dir(ws_id) / "workers.json"
+    if not path.parent.exists():
+        ensure_workspace_dirs(ws_id)
+    _atomic_write_json(raw, path)
+    return updated.model_dump()
+
+
+# ── POST /api/workspace/{ws_id}/workers ───────────────────────────────────────
+
+@router.post("/{ws_id}/workers", status_code=status.HTTP_201_CREATED)
+async def create_worker(ws_id: str, request: Request):
+    """Create a new worker definition in the workspace.
+
+    Validates the request body against ``WorkerDefinition``, checks for
+    duplicate names, and appends to ``workers.json`` atomically.
+    """
+    # 1. Parse and validate request body
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON: {e}")
+    # 2. Validate with Pydantic
+    try:
+        worker = WorkerDefinition.model_validate(body)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    # 2. Load existing workers.json
+    ensure_workspace_dirs(ws_id)
+    path = _workspace_dir(ws_id) / "workers.json"
+    existing = []
+    if path.exists():
+        existing = json.loads(path.read_text())
+    # 3. Duplicate check
+    if any(w["name"] == worker.name for w in existing):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Worker '{worker.name}' already exists",
+        )
+    # 4. Append & write
+    existing.append(worker.model_dump())
+    _atomic_write_json(existing, path)
+    return JSONResponse(status_code=status.HTTP_201_CREATED, content=worker.model_dump())
+
+# ── PUT /api/workspace/{ws_id}/workers/{name} ──────────────────────────────
+
+@router.put("/{ws_id}/workers/{name}")
+async def update_worker(ws_id: str, name: str, request: Request):
+    """Update an existing worker definition by name.
+
+    Validates the request body, finds the matching worker, replaces it
+    in ``workers.json`` atomically, and returns the updated definition.
+    """
+    # 1. Parse and validate request body
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON: {e}")
+    # 2. Validate
+    try:
+        updated_worker = WorkerDefinition.model_validate(body)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    # 2. Load existing
+    ws_dir = _workspace_dir(ws_id)
+    path = ws_dir / "workers.json"
+    if not path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workers file not found",
+        )
+    existing = json.loads(path.read_text())
+    # 3. Find index
+    index = next((i for i, w in enumerate(existing) if w["name"] == name), None)
+    if index is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Worker '{name}' not found",
+        )
+    # 4. Replace & write
+    existing[index] = updated_worker.model_dump()
+    _atomic_write_json(existing, path)
+    return updated_worker.model_dump()
+
+# ── DELETE /api/workspace/{ws_id}/workers/{name} ───────────────────────────
+
+@router.delete("/{ws_id}/workers/{name}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_worker(request: Request, ws_id: str, name: str):
+    """Delete a worker definition by name from ``workers.json``.
+
+    Removes the matching worker and writes the remaining list atomically.
+    Returns 204 with no content on success.
+    """
+    ws_dir = _workspace_dir(ws_id)
+    path = ws_dir / "workers.json"
+    if not path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workers file not found",
+        )
+    existing = json.loads(path.read_text())
+    filtered = [w for w in existing if w["name"] != name]
+    if len(filtered) == len(existing):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Worker '{name}' not found",
+        )
+    _atomic_write_json(filtered, path)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+# ── PUT /api/workspace/{ws_id}/dockerfile ──────────────────────────────────
+
+@router.put("/{ws_id}/dockerfile")
+async def put_dockerfile(ws_id: str, request: Request):
+    """Atomically replace the workspace's ``Dockerfile`` with raw text.
+
+    Reads the request body as UTF-8 text and writes it to the workspace's
+    ``Dockerfile`` using the same atomic-write pattern as other endpoints.
+    """
+    body = await request.body()
+    text = body.decode("utf-8")
+    ensure_workspace_dirs(ws_id)
+    path = _workspace_dir(ws_id) / "Dockerfile"
+    _atomic_write_text(text, path)
+    return {"status": "ok", "workspace_id": ws_id}
+
+# ── GET /api/workspace/{ws_id}/mcp_servers ───────────────────────────────────
 
 @router.get("/{ws_id}/mcp_servers")
 async def get_mcp_servers(ws_id: str):
@@ -246,9 +1144,7 @@ async def get_mcp_servers(ws_id: str):
     except (json.JSONDecodeError, OSError):
         return []
 
-
 # ── GET /api/workspace/{ws_id}/effective_permissions ─────────────────────────
-
 
 @router.get("/{ws_id}/effective_permissions")
 async def get_effective_permissions(
@@ -258,8 +1154,13 @@ async def get_effective_permissions(
     """Return the effective (merged) permissions for this workspace.
 
     Merges the session-level permissions with workspace-level capabilities.
-    If *session_id* is provided, the session is loaded and its embedded
-    ``session_permissions`` are used; otherwise a read-only, no-network
+    If *session_id* is provided, session permissions are resolved from the
+    session grants sidecar (``permission_store.read_session_permissions``) --
+    the sidecar is the SOLE grants source.  A missing or unreadable grants
+    source fail-closes to the deny-all sentinel
+    (``permission_store.read_grants_or_deny_all``); it never falls back to a
+    saved session's embedded ``session_permissions`` metadata.  With no
+    *session_id* there is no grants path to read, so a read-only, no-network
     default is assumed.
     """
     ensure_workspace_dirs(ws_id)
@@ -270,33 +1171,56 @@ async def get_effective_permissions(
         caps = WorkspaceCapabilities.default()
 
     # ── Build SessionPermissions ─────────────────────────────────────────
+    # Fail-closed: the shared helper returns the readable session grants or,
+    # on any failure (unreadable/missing sidecar, wrong shape) the deny-all
+    # sentinel -- never the permissive read-only default.  A call with no
+    # session id has no grants path to read, so it returns the designed
+    # default (D1=A).  "An unreadable grants path must not produce a
+    # permissive value."
+    from thoughtmachine.permission_store import (
+        deny_all_grants,
+        read_grants_or_deny_all,
+    )
     from thoughtmachine.security import SessionPermissions
 
-    session_perms = None
-    if session_id:
-        raw_perms = _load_session_permissions(session_id)
-        if raw_perms is not None and isinstance(raw_perms, dict):
-            try:
-                session_perms = SessionPermissions(**raw_perms)
-            except Exception:
-                session_perms = None
+    raw_perms = read_grants_or_deny_all(session_id, ws_id)
+    try:
+        session_perms = SessionPermissions(**raw_perms)
+    except Exception:
+        # A malformed grants payload must DENY, not fall back to the
+        # permissive default.  ``read_grants_or_deny_all(None, None)`` now
+        # returns the designed default under D1=A, so use the sentinel
+        # explicitly here instead.
+        session_perms = SessionPermissions(**deny_all_grants())
 
-    if session_perms is None:
-        # Default safety: read-only filesystem, no network, no container
-        session_perms = SessionPermissions(
-            container=False,
-            network="banned",
-            filesystem="read",
-            system="read",
-            git="read",
-            execution="banned",
-        )
+    # ── Load the workspace permission ceiling. The ceiling is the explicitly
+    # saved workspace permissions (config.json "permissions"). A workspace
+    # with no saved permissions is bootstrapped by ensure_workspace_dirs(),
+    # which seeds config.json with the safe-default permission map; so a fresh
+    # workspace's ceiling is that safe-default map (session grants above it
+    # are capped), rather than "no ceiling". The purpose-preset fallback is
+    # intentionally NOT applied here (it remains /summary-only).
+    try:
+        raw_cfg = _load_workspace_config(ws_id)
+        ceiling = raw_cfg.get("permissions") if isinstance(raw_cfg, dict) else None
+    except Exception:
+        ceiling = None
+    if not isinstance(ceiling, dict):
+        ceiling = {}
 
     # ── Merge via security gate (lazy import, with fallback) ──────────────
     try:
         from security.security_gate import get_effective_permissions as _gate_effective
 
-        effective = _gate_effective(session_perms, caps)
+        # Supplying both ids engages the gate's DISK branch: the vault grants
+        # sidecar and the config.json ceiling become the authoritative sources,
+        # and any unreadable/empty source fails CLOSED to the deny-all
+        # sentinels (the supplied session_perms/ceiling are then ignored).
+        # With no session_id there is no grants path to read, so the gate keeps
+        # the legacy in-memory merge of session_perms against this ceiling.
+        effective = _gate_effective(
+            session_perms, caps, ceiling, session_id=session_id, workspace_id=ws_id
+        )
     except ImportError:
         # Fallback when security gate dependencies are not available
         # (e.g., in minimal test environments)
@@ -305,81 +1229,326 @@ async def get_effective_permissions(
             "network": session_perms.network,
             "container": session_perms.container,
             "git": session_perms.git,
-            "system": session_perms.system,
-            "execution": session_perms.execution,
+            "mcp": session_perms.mcp,
+            "host_bash": session_perms.host_bash,
             "workspace_restrictions": {
                 "allow_docker": caps.allow_docker,
                 "allow_network": caps.allow_network,
                 "filesystem_write": caps.filesystem_write,
             },
         }
-    return {"workspace_id": ws_id, "effective_permissions": effective}
+    # ── Ceiling provenance (additive; existing keys unchanged) ───────────
+    # The gate records, on the returned dict, the workspace-ceiling levels it
+    # actually enforced and flags any resource whose SESSION grant sits above
+    # its ceiling (the "session exceeds workspace ceiling" contradiction).
+    # Exposed read-only so the GUI can warn inline; the gate's annotation
+    # contract itself is unchanged.  A missing gate degrades to empty/neutral
+    # values (never a silent fallback of the permissions themselves).
+    try:
+        from security.security_gate import ceiling_contradictions, ceiling_levels
+
+        workspace_ceiling = ceiling_levels(effective)
+        contradictions = ceiling_contradictions(effective)
+    except ImportError:
+        workspace_ceiling = {}
+        contradictions = []
+
+    return {
+        "workspace_id": ws_id,
+        "effective_permissions": effective,
+        "workspace_ceiling": workspace_ceiling,
+        "contradictions": contradictions,
+    }
 
 # ── GET /api/workspace/{ws_id}/workers/{name}/events ─────────────────────
 
+# ── POST /api/workspace/{ws_id}/workers/stop_all ───────────────────────────
 
-@router.get("/{ws_id}/workers/{name}/events")
-async def get_worker_events(
-    ws_id: str,
+
+class StopAllWorkersBody(BaseModel):
+    """Optional request body for ``POST .../workers/stop_all``.
+
+    ``session_id`` restricts the stop to the workers of one session
+    (``workers/<session_id>/...``).  An absent body (or ``session_id: null``)
+    stops every worker instance in the workspace.
+    """
+
+    session_id: Optional[str] = None
+
+
+def _stop_worker_instance(
+    ws_dir: Path,
     name: str,
-    limit: Optional[int] = Query(None, description="Max number of events to return (most recent)"),
-    since: Optional[str] = Query(None, description="ISO-8601 timestamp \u2014 return only events after this time"),
+    instance_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+    terminate: bool = False,
+) -> Dict[str, Any]:
+    """Stop (DETACH) — or with ``terminate``, KILL — one worker instance.
+
+    Shared by the per-worker ``stop``/``kill`` routes and the ``stop_all``
+    route so all of them use the exact same directory resolution and error
+    handling:
+
+    * resolve the worker directory from the same on-disk layout
+      (``workers/<session_id>/<name>[/<name>#<N>]`` session-scoped or legacy
+      ``workers/<name>``/``workers/<name>#<N>``),
+    * write ``command.json`` with ``{"action": "stop"}`` (detach) or
+      ``{"action": "kill"}`` (terminate) so the polling worker thread picks
+      the signal up (within its poll interval),
+    * optimistically write ``status.json`` with the matching
+      ``runtime_status`` (``"detached"`` for stop, ``"killed"`` for kill) so
+      the UI sees the new state immediately (instead of "jumping back" to
+      "busy" before the worker processes the command),
+    * fast-path the in-memory registry thread, optionally narrowed by
+      ``session_id`` and ``instance_id``: ``thread.stop()`` (which detaches,
+      PHASE 2.1a) or, when ``terminate`` is set, ``thread.kill()``.
+
+    PHASE 2.1a: ``stop`` no longer terminates anything — it parks the worker
+    (detached); termination is ``kill`` and only ``kill``.
+
+    Returns the per-worker response dict used by both routes
+    (``{"status": "ok", "name": name}``, plus ``instance_id`` /
+    ``instance_label`` when ``instance_id`` is not None).
+    """
+    workers_dir = ws_dir / "workers"
+
+    # Optional instance targeting: with instance_id, resolve the instance
+    # directory "<name>" (instance 1) or "<name>#<N>" (N>1).  Without it,
+    # keep the legacy by-name lookup (first matching directory).
+    target_label = (
+        _WorkerRegistry.instance_label(name, instance_id)
+        if instance_id is not None else None
+    )
+
+    # ── Find the worker directory (session-scoped first, then legacy) ──
+    worker_dir: Optional[Path] = None
+    # The session the command is addressed to; the ``session_id`` parameter
+    # above stays untouched because the registry fast-path narrows on it.
+    resolved_session_id: Optional[str] = session_id
+
+    if workers_dir.is_dir():
+        for subdir in workers_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            # Check if this is a session directory (contains sub-worker dirs)
+            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+            if first_child is not None and first_child.is_dir():
+                # Session-scoped: workers/<session_id>/<name>/ or <name#N>/
+                candidate = subdir / (target_label if target_label is not None else name)
+                if candidate.is_dir():
+                    worker_dir = candidate
+                    resolved_session_id = subdir.name
+                    break
+            else:
+                # Legacy: workers/<name>/ or workers/<name#N>/
+                if subdir.name == (target_label if target_label is not None else name):
+                    worker_dir = subdir
+                    break
+
+    if worker_dir is None or not worker_dir.is_dir():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"status": "not_found", "name": name},
+        )
+
+    # Instance the resolved directory belongs to: the caller's when given,
+    # else the one the label encodes (``<name>`` is instance 1).
+    resolved_instance_id = (
+        instance_id
+        if instance_id is not None
+        else _worker_instance_key(worker_dir.name)[1]
+    )
+
+    # Write the command file — the worker thread polls for this.
+    # PHASE 2.1a: "stop" only DETACHES the worker; "kill" terminates it.
+    # The command carries an identity fence (session / worker name / instance
+    # / epoch) so a worker that reuses this directory can reject a command
+    # meant for a different incarnation.
+    _write_worker_command(
+        worker_dir,
+        "kill" if terminate else "stop",
+        session_id=resolved_session_id,
+        worker_name=name,
+        instance_id=resolved_instance_id,
+    )
+
+    # Immediately write status.json with the state the worker is heading for
+    # ("detached" on stop, "killed" on kill) so the UI doesn't "jump back"
+    # to "busy" on the next poll before the worker thread has a chance to
+    # process the command.
+    _atomic_write_json({
+        "runtime_status": "killed" if terminate else "detached",
+        "current_task": None,
+        "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+        "error": None,
+    }, worker_dir / "status.json")
+
+    # Fast-path: if the thread is in-memory (same process), signal directly.
+    # Registry keys are tuples (session_id, worker_name[, instance_id]), so
+    # iterate all entries matching the worker name — optionally narrowed to
+    # the requested session and/or instance.
+    with _registry_lock:
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
+            if wname != name:
+                continue
+            if session_id is not None and (key[0] if len(key) > 0 else None) != session_id:
+                continue
+            if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
+                continue
+            try:
+                if terminate:
+                    thread.kill()
+                else:
+                    thread.stop()
+            except Exception:
+                pass  # The file-based command will still work
+
+    resp = {"status": "ok", "name": name}
+    if target_label is not None:
+        resp["instance_id"] = instance_id
+        resp["instance_label"] = target_label
+    return resp
+
+
+def _enumerate_worker_instances(
+    ws_dir: Path,
+    session_id: Optional[str] = None,
+) -> List[tuple]:
+    """Enumerate ``(session_id, worker_name, instance_id)`` triples from the
+    same on-disk layout the per-worker routes use.
+
+    Session-scoped directories (``workers/<session_id>/<name>/`` or
+    ``<name>#<N>/``) yield one entry per instance, carrying the session the
+    directory sits under -- that is the session a command for it must be
+    fenced with.  When ``session_id`` is given only that session's directory
+    is considered.  Legacy directories (``workers/<name>/``,
+    ``workers/<name>#<N>/``) yield ``session_id=None`` and are included only
+    when no ``session_id`` filter is active.  Non-directory entries are
+    skipped.
+    """
+    workers_dir = ws_dir / "workers"
+    if not workers_dir.is_dir():
+        return []
+    targets: List[tuple] = []
+    for subdir in workers_dir.iterdir():
+        if not subdir.is_dir():
+            continue
+        first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+        if first_child is not None and first_child.is_dir():
+            # Session-scoped: workers/<session_id>/<name>[/<name>#<N>]/
+            if session_id is not None and subdir.name != session_id:
+                continue
+            for worker_subdir in subdir.iterdir():
+                if not worker_subdir.is_dir():
+                    continue
+                name, instance_id = _worker_instance_key(worker_subdir.name)
+                targets.append((subdir.name, name, instance_id))
+        else:
+            # Legacy: workers/<name>/ or workers/<name#N>/
+            if session_id is not None:
+                continue
+            name, instance_id = _worker_instance_key(subdir.name)
+            targets.append((None, name, instance_id))
+    return targets
+
+
+@router.post("/{ws_id}/workers/stop_all")
+async def stop_all_workers(
+    request: Request, ws_id: str, body: Optional[StopAllWorkersBody] = None
 ):
-    """Return the event log for a specific worker as a JSON array.
+    """Detach every worker instance in the workspace.
 
-    Events are read from ``workers/events.jsonl`` and filtered by the
-    worker's ``name`` field (present on every event line).
+    Enumerates instances from the same on-disk layout the per-worker ``stop``
+    route uses (``workers/<session_id>/<name>[/<name>#<N>]`` and legacy
+    ``workers/<name>``/``workers/<name>#<N>``) and stops each one through the
+    shared per-worker helper: a file-based ``command.json`` signal plus an
+    optimistic ``status.json`` (``runtime_status: "detached"``) plus the
+    in-memory registry fast-path.  PHASE 2.1a: ``stop`` DETACHES — no
+    ``Thread.kill``, the workers park and can be resumed; terminate with the
+    per-worker ``kill`` route.  No job_registry or container changes.
 
-    Query parameters:
-      - ``limit``: max number of events to return (most recent)
-      - ``since``: ISO-8601 timestamp \u2014 return only events after this time
+    An optional JSON body ``{"session_id": "<id>"}`` restricts the stop to
+    that session's workers; an absent or empty body stops all instances.
+    If one worker fails, the remaining workers are still processed.
+
+    Returns:
+        200 with a JSON list of per-worker results::
+
+            [{"worker_name": ..., "instance_id": ...,
+              "status": "ok" | "not_found" | "error", "error": ...|None}, ...]
     """
     ensure_workspace_dirs(ws_id)
-    events_path = _workspace_dir(ws_id) / "workers" / "events.jsonl"
-    if not events_path.exists():
-        return []
-
-    events = []
-    try:
-        with open(events_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    if event.get("worker_name") != name:
-                        continue
-                    # Apply ?since= filter
-                    if since is not None:
-                        ts = event.get("timestamp", "")
-                        if ts < since:
-                            continue
-                    events.append(event)
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-
-    # Apply ?limit= (most recent N)
-    if limit is not None and limit > 0 and len(events) > limit:
-        events = events[-limit:]
-
-    return events
+    ws_dir = _workspace_dir(ws_id)
+    session_filter = body.session_id if body is not None else None
+    targets = _enumerate_worker_instances(ws_dir, session_id=session_filter)
+    results = []
+    for target_session_id, name, instance_id in targets:
+        try:
+            resp = _stop_worker_instance(
+                ws_dir, name, instance_id, session_id=target_session_id
+            )
+            results.append({
+                "worker_name": name,
+                "instance_id": resp.get("instance_id", instance_id),
+                "status": resp.get("status", "ok"),
+                "error": None,
+            })
+        except HTTPException as exc:
+            results.append({
+                "worker_name": name,
+                "instance_id": instance_id,
+                "status": "not_found",
+                "error": exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail, default=str),
+            })
+        except Exception as exc:  # pragma: no cover - defensive
+            results.append({
+                "worker_name": name,
+                "instance_id": instance_id,
+                "status": "error",
+                "error": str(exc),
+            })
+    return results
 
 
 # ── POST /api/workspace/{ws_id}/workers/{name}/stop ────────────────────────
 
-
 @router.post("/{ws_id}/workers/{name}/stop")
-async def stop_worker(ws_id: str, name: str):
-    """Stop a running worker via a file-based command signal.
+async def stop_worker(
+    request: Request,
+    ws_id: str,
+    name: str,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
+    """Detach a running worker via a file-based command signal.
+
+    PHASE 2.1a: ``stop`` means DETACH.  The worker is parked, not killed: its
+    thread, containers and registry entry survive and it can be resumed later.
+    Termination is the sibling ``kill`` route.
+
+    Supports both directory layouts:
+      - ``workers/<session_id>/<name>/`` (session-scoped)
+      - ``workers/<name>/`` (legacy, no session)
+
+    When ``instance_id`` is provided the command targets that specific
+    instance: the directory is resolved as ``<name>`` (instance 1) or
+    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
+    Without it, the legacy by-name behavior is kept (first matching directory,
+    all matching threads).
 
     Writes ``{"action": "stop"}`` to the worker's ``command.json`` so that
     the worker thread (which polls for this file) picks it up within 2 seconds.
-    Also attempts an in-memory stop as a fast path if the thread is in the
-    registry.  Returns immediately — the worker will transition to ``stopped``
-    asynchronously.
+    Also attempts an in-memory detach as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition to
+    ``detached`` asynchronously.
+
+    Also immediately writes ``status.json`` with ``runtime_status: "detached"``
+    so the web UI's next poll sees the new state right away (instead of
+    "jumping back" to "busy" when the optimistic update gets overwritten
+    before the worker processes the stop).
 
     Returns:
         200 with ``{"status": "ok", "name": name}`` on success.
@@ -387,25 +1556,1151 @@ async def stop_worker(ws_id: str, name: str):
     """
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
-    worker_dir = ws_dir / "workers" / name
+    instance_id = _query_default(instance_id)
+    return _stop_worker_instance(ws_dir, name, instance_id)
 
-    if not worker_dir.is_dir():
+# ── POST /api/workspace/{ws_id}/workers/{name}/kill ─────────────────────
+
+@router.post("/{ws_id}/workers/{name}/kill")
+async def kill_worker(
+    request: Request,
+    ws_id: str,
+    name: str,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
+    """Kill a running worker via a file-based command signal.
+
+    PHASE 2.1a: ``kill`` is the ONLY terminating route — ``stop`` merely
+    detaches.  The worker's run loop exits, its containers are reclaimed by
+    the normal cleanup path and it is never revived.
+
+    Supports both directory layouts:
+      - ``workers/<session_id>/<name>/`` (session-scoped)
+      - ``workers/<name>/`` (legacy, no session)
+
+    When ``instance_id`` is provided the command targets that specific
+    instance: the directory is resolved as ``<name>`` (instance 1) or
+    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
+    Without it, the legacy by-name behavior is kept (first matching directory,
+    all matching threads).
+
+    Writes ``{"action": "kill"}`` to the worker's ``command.json`` so that
+    the worker thread (which polls for this file) picks it up within 2 seconds.
+    Also attempts an in-memory kill as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition to ``killed``
+    asynchronously.
+
+    Also immediately writes ``status.json`` with ``runtime_status: "killed"``
+    so the web UI's next poll sees the terminal state right away (instead of
+    "jumping back" to "busy" when the optimistic update gets overwritten
+    before the worker processes the kill).
+
+    Returns:
+        200 with ``{"status": "ok", "name": name}`` on success.
+        404 if the worker directory does not exist.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    instance_id = _query_default(instance_id)
+    return _stop_worker_instance(ws_dir, name, instance_id, terminate=True)
+
+
+# ── POST /api/workspace/{ws_id}/workers/{name}/config ───────────────────────
+
+
+class WorkerConfigUpdateBody(BaseModel):
+    """Request body for ``POST .../workers/{name}/config``.
+
+    ``config`` is an ``AgentConfig`` *patch* -- the same shape a worker is
+    spawned with -- because that is what a ``config_update`` frame carries: a
+    runtime merges it onto the config it was born with, so a caller that does
+    not know every field cannot silently erase one.
+
+    The worker PANEL is not an authority for every field this body accepts: it
+    sends only what a ``WorkerDefinition`` carries (``system_prompt``,
+    ``temperature``, ``max_turns``, ...), and a ``WorkerDefinition`` has no
+    provider field at all.  ``provider_type`` / ``model`` are set in the
+    SESSION ``ConfigPanel`` and nowhere else; a worker inherits them at spawn.
+    """
+
+    config: Dict[str, Any] = {}
+
+
+def _resolve_worker_dir(
+    ws_dir: Path, name: str, instance_id: Optional[int]
+) -> tuple:
+    """Resolve ``(worker_dir, session_id)`` for one worker instance.
+
+    Same layout and same precedence as ``_stop_worker_instance``: the
+    session-scoped ``workers/<session_id>/<name>[#N]`` first, then the legacy
+    ``workers/<name>[#N]`` (which yields ``session_id=None``, the key a legacy
+    spawn registers its runtime handle under).  Returns ``(None, None)`` when
+    nothing matches, so the caller can answer 404 exactly as ``stop`` does.
+    """
+    lookup = (
+        _WorkerRegistry.instance_label(name, instance_id)
+        if instance_id is not None
+        else name
+    )
+    workers_dir = ws_dir / "workers"
+    if not workers_dir.is_dir():
+        return None, None
+    for subdir in workers_dir.iterdir():
+        if not subdir.is_dir():
+            continue
+        first_child = next(subdir.iterdir(), None)
+        if first_child is not None and first_child.is_dir():
+            candidate = subdir / lookup
+            if candidate.is_dir():
+                return candidate, subdir.name
+        elif subdir.name == lookup:
+            return subdir, None
+    return None, None
+
+
+@router.post("/{ws_id}/workers/{name}/config")
+async def update_worker_config(
+    request: Request,
+    ws_id: str,
+    name: str,
+    body: WorkerConfigUpdateBody,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
+    """Push a new agent config at a LIVE worker and report the runtime's verdict.
+
+    W9: the answer is the runtime's ``config_ack`` -- ``ok`` plus ``tier`` --
+    never an optimistic "applied".  ``tier: hot_swap`` means the running agent
+    will take the change at its next turn boundary; ``tier:
+    requires_respawn`` means it will not, and the caller has to respawn.  The
+    route therefore does not pretend: ``applied_live`` is true only when the
+    ack says ``ok`` **and** ``hot_swap``.
+
+    No live runtime handle is a real answer, not an error to hide: a worker
+    spawned by another process, or one with no handle registered, cannot be
+    reached in-process, so the honest reply is ``409`` with a
+    ``requires_respawn`` tier -- the same information a caller would get from a
+    capability-gapped runtime.
+
+    Persisting the definition (``PUT .../workers/{name}``) is a SEPARATE step
+    and must happen FIRST: the store is what a respawn reads, so a respawn that
+    runs before the persist brings the worker back on the old config.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    instance_id = _query_default(instance_id)
+
+    worker_dir, resolved_session_id = _resolve_worker_dir(ws_dir, name, instance_id)
+    if worker_dir is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"status": "not_found", "name": name},
         )
 
-    # Write the stop command file — the worker thread polls for this
-    _atomic_write_json({"action": "stop"}, worker_dir / "command.json")
+    resolved_instance_id = (
+        instance_id
+        if instance_id is not None
+        else _worker_instance_key(worker_dir.name)[1]
+    )
+    config = dict(body.config or {})
 
-    # Fast-path: if the thread is in-memory (same process), signal directly
+    handle = runtime_handle_for(resolved_session_id, name, resolved_instance_id)
+    if handle is None:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "ok": False,
+                "tier": "requires_respawn",
+                "status": (
+                    "no live runtime handle for this worker: the config cannot "
+                    "be pushed in-process, so persist the definition and "
+                    "respawn the worker"
+                )[:200],
+                "request_id": None,
+                "applied_live": False,
+                "name": name,
+                "instance_id": resolved_instance_id,
+            },
+        )
+
+    try:
+        ack = handle.update_config(config)
+    except StaleWorkerFence as exc:
+        # A successor occupies the slot: pushing the config at it would be a
+        # change nobody asked for, so the fence wins and the caller respawns.
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "ok": False,
+                "tier": "requires_respawn",
+                "status": str(exc)[:200],
+                "request_id": None,
+                "applied_live": False,
+                "name": name,
+                "instance_id": resolved_instance_id,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - answered, never a 500
+        logger.warning(
+            "Worker %s (instance %s): config update failed",
+            name,
+            resolved_instance_id,
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={
+                "ok": False,
+                "tier": "requires_respawn",
+                "status": f"{type(exc).__name__}: {exc}"[:200],
+                "request_id": None,
+                "applied_live": False,
+                "name": name,
+                "instance_id": resolved_instance_id,
+            },
+        )
+
+    ok = bool(getattr(ack, "ok", False))
+    tier = str(getattr(ack, "tier", "") or "requires_respawn")
+    return {
+        "ok": ok,
+        "tier": tier,
+        "status": str(getattr(ack, "status", ""))[:200],
+        "request_id": getattr(ack, "request_id", None),
+        "applied_live": bool(ok and tier == "hot_swap"),
+        "name": name,
+        "instance_id": resolved_instance_id,
+        "session_id": resolved_session_id,
+    }
+
+
+# ── GET /api/workspace/{ws_id}/config_tiers ─────────────────────────────────
+
+
+@router.get("/{ws_id}/config_tiers")
+async def get_config_tiers(request: Request, ws_id: str):
+    """The config tier of every ``AgentConfig`` field, as the agent decides it.
+
+    ``agent.core.agent.config_field_tiers`` derives each entry by asking
+    ``config_requires_respawn`` -- the single authority ``Agent._can_hot_swap``
+    also delegates to -- so a UI badge built from this map cannot drift from
+    the verdict the running process acts on.  The field list is whatever
+    ``AgentConfig`` declares; neither this route nor the caller hardcodes it.
+    """
+    from agent.core.agent import config_field_tiers
+    from tools.workspace.worker_runtime_protocol import CONFIG_TIERS
+
+    ensure_workspace_dirs(ws_id)
+    try:
+        tiers = config_field_tiers()
+    except Exception as exc:  # noqa: BLE001 - never a bare 500 with no detail
+        logger.warning("Could not classify config fields: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"status": "error", "error": f"{type(exc).__name__}: {exc}"},
+        )
+    return {
+        "workspace_id": ws_id,
+        "tiers": tiers,
+        "tier_values": list(CONFIG_TIERS),
+    }
+
+# ── POST /api/workspace/{ws_id}/workers/{name}/pause ───────────────────────
+
+@router.post("/{ws_id}/workers/{name}/pause")
+async def pause_worker(
+    request: Request,
+    ws_id: str,
+    name: str,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
+    """Pause a running worker after it completes its current turn.
+
+    Supports both directory layouts:
+      - ``workers/<session_id>/<name>/`` (session-scoped)
+      - ``workers/<name>/`` (legacy, no session)
+
+    When ``instance_id`` is provided the command targets that specific
+    instance: the directory is resolved as ``<name>`` (instance 1) or
+    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
+    Without it, the legacy by-name behavior is kept (first matching directory,
+    all matching threads).
+
+    Writes ``{"action": "pause"}`` to the worker's ``command.json`` so that
+    the worker thread (which polls for this file) picks it up within 2 seconds.
+    Also attempts an in-memory pause as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition to ``paused``
+    asynchronously.
+
+    Also immediately writes ``status.json`` with ``runtime_status: "pausing"``
+    so the web UI's next poll shows the pending pause right away.  The worker
+    transitions to ``"paused"`` only once its current turn actually completes.
+
+    Returns:
+        200 with ``{"status": "pausing", "name": name}`` on success.
+        404 if the worker directory does not exist.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    workers_dir = ws_dir / "workers"
+    instance_id = _query_default(instance_id)
+
+    # Optional instance targeting: with instance_id, resolve the instance
+    # directory "<name>" (instance 1) or "<name>#<N>" (N>1).  Without it,
+    # keep the legacy by-name lookup (first matching directory).
+    target_label = (
+        _WorkerRegistry.instance_label(name, instance_id)
+        if instance_id is not None else None
+    )
+
+    # ── Find the worker directory (session-scoped first, then legacy) ──
+    worker_dir: Optional[Path] = None
+    # The session the command is addressed to (None when the directory
+    # layout is legacy).
+    resolved_session_id: Optional[str] = None
+
+    if workers_dir.is_dir():
+        for subdir in workers_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            # Check if this is a session directory (contains sub-worker dirs)
+            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+            if first_child is not None and first_child.is_dir():
+                # Session-scoped: workers/<session_id>/<name>/ or <name#N>/
+                candidate = subdir / (target_label if target_label is not None else name)
+                if candidate.is_dir():
+                    worker_dir = candidate
+                    resolved_session_id = subdir.name
+                    break
+            else:
+                # Legacy: workers/<name>/ or workers/<name#N>/
+                if subdir.name == (target_label if target_label is not None else name):
+                    worker_dir = subdir
+                    break
+
+    if worker_dir is None or not worker_dir.is_dir():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"status": "not_found", "name": name},
+        )
+
+    # Instance the resolved directory belongs to: the caller's when given,
+    # else the one the label encodes (``<name>`` is instance 1).
+    resolved_instance_id = (
+        instance_id
+        if instance_id is not None
+        else _worker_instance_key(worker_dir.name)[1]
+    )
+
+    # Write the pause command file — the worker thread polls for this.  It
+    # carries the worker's identity fence so a stale command (or one meant
+    # for a previous incarnation of this directory) is rejected.
+    _write_worker_command(
+        worker_dir,
+        "pause",
+        session_id=resolved_session_id,
+        worker_name=name,
+        instance_id=resolved_instance_id,
+    )
+
+    # Immediately write status.json as "pausing" (the pause is in flight).
+    # The worker flips to "paused" only when its current turn completes.
+    _atomic_write_json({
+        "runtime_status": "pausing",
+        "current_task": None,
+        "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+        "error": None,
+    }, worker_dir / "status.json")
+
+    # Fast-path: if the thread is in-memory (same process), signal directly.
+    # Registry keys are tuples (session_id, worker_name[, instance_id]), so
+    # iterate all entries matching the worker name — optionally narrowed to
+    # the requested instance.
     with _registry_lock:
-        thread = _worker_registry.get(name)
-    if thread is not None:
-        try:
-            thread.stop()
-        except Exception:
-            pass  # File-based stop will still work
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
+            if wname != name:
+                continue
+            if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
+                continue
+            try:
+                thread.pause()
+            except Exception:
+                pass  # File-based pause will still work
 
-    return {"status": "ok", "name": name}
+    resp = {"status": "pausing", "name": name}
+    if target_label is not None:
+        resp["instance_id"] = instance_id
+        resp["instance_label"] = target_label
+    return resp
+
+
+# ── POST /api/workspace/{ws_id}/workers/{name}/resume ──────────────────────
+
+@router.post("/{ws_id}/workers/{name}/resume")
+async def resume_worker(
+    request: Request,
+    ws_id: str,
+    name: str,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
+    """Resume a paused worker.
+
+    Supports both directory layouts:
+      - ``workers/<session_id>/<name>/`` (session-scoped)
+      - ``workers/<name>/`` (legacy, no session)
+
+    When ``instance_id`` is provided the command targets that specific
+    instance: the directory is resolved as ``<name>`` (instance 1) or
+    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
+    Without it, the legacy by-name behavior is kept (first matching directory,
+    all matching threads).
+
+    Writes ``{"action": "resume"}`` to the worker's ``command.json`` so that
+    the worker thread (which polls for this file) picks it up within 2 seconds.
+    Also attempts an in-memory resume as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition back to
+    ``ready``/``busy`` asynchronously.
+
+    Returns:
+        200 with ``{"status": "resumed", "name": name}`` on success.
+        404 if the worker directory does not exist.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    workers_dir = ws_dir / "workers"
+    instance_id = _query_default(instance_id)
+
+    # Optional instance targeting: with instance_id, resolve the instance
+    # directory "<name>" (instance 1) or "<name>#<N>" (N>1).  Without it,
+    # keep the legacy by-name lookup (first matching directory).
+    target_label = (
+        _WorkerRegistry.instance_label(name, instance_id)
+        if instance_id is not None else None
+    )
+
+    # ── Find the worker directory (session-scoped first, then legacy) ──
+    worker_dir: Optional[Path] = None
+    # The session the command is addressed to (None when the directory
+    # layout is legacy).
+    resolved_session_id: Optional[str] = None
+
+    if workers_dir.is_dir():
+        for subdir in workers_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            # Check if this is a session directory (contains sub-worker dirs)
+            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+            if first_child is not None and first_child.is_dir():
+                # Session-scoped: workers/<session_id>/<name>/ or <name#N>/
+                candidate = subdir / (target_label if target_label is not None else name)
+                if candidate.is_dir():
+                    worker_dir = candidate
+                    resolved_session_id = subdir.name
+                    break
+            else:
+                # Legacy: workers/<name>/ or workers/<name#N>/
+                if subdir.name == (target_label if target_label is not None else name):
+                    worker_dir = subdir
+                    break
+
+    if worker_dir is None or not worker_dir.is_dir():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"status": "not_found", "name": name},
+        )
+
+    # Instance the resolved directory belongs to: the caller's when given,
+    # else the one the label encodes (``<name>`` is instance 1).
+    resolved_instance_id = (
+        instance_id
+        if instance_id is not None
+        else _worker_instance_key(worker_dir.name)[1]
+    )
+
+    # Write the resume command file — the worker thread polls for this.  It
+    # carries the worker's identity fence so a stale command (or one meant
+    # for a previous incarnation of this directory) is rejected.
+    _write_worker_command(
+        worker_dir,
+        "resume",
+        session_id=resolved_session_id,
+        worker_name=name,
+        instance_id=resolved_instance_id,
+    )
+
+    # Fast-path: if the thread is in-memory (same process), signal directly.
+    # Registry keys are tuples (session_id, worker_name[, instance_id]), so
+    # iterate all entries matching the worker name — optionally narrowed to
+    # the requested instance.
+    # ``resume()`` returns False when the worker has a stop already in flight
+    # (a stop signalled out-of-process sets the stop event without touching
+    # ``status``, so a "paused"-looking thread may still be dying). Report that
+    # truthfully instead of unconditionally claiming "resumed".
+    resumed_threads: List[Dict[str, Any]] = []
+    refused_threads: List[Dict[str, Any]] = []
+    with _registry_lock:
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
+            if wname != name:
+                continue
+            tid = key[2] if len(key) > 2 else 1
+            if instance_id is not None and tid != instance_id:
+                continue
+            try:
+                outcome = thread.resume()
+            except Exception as exc:
+                outcome = False
+                logger.warning(
+                    "Resume: worker '%s' instance %s raised on resume: %s",
+                    wname, tid, exc,
+                )
+            if outcome is False:
+                refused_threads.append({
+                    "worker_name": wname,
+                    "instance_id": tid,
+                    "reason": "stop already in flight",
+                })
+            else:
+                resumed_threads.append({
+                    "worker_name": wname,
+                    "instance_id": tid,
+                })
+
+    if refused_threads and not resumed_threads:
+        # Every in-memory thread we found refused: the resume command file was
+        # written, but this live instance will ignore it (its stop wins), so do
+        # not answer "resumed".
+        resp: Dict[str, Any] = {
+            "status": "refused",
+            "name": name,
+            "workers_refused": refused_threads,
+            "note": (
+                "Stop already in flight for the matching worker instance; the "
+                "resume command was written but the live instance will not "
+                "honour it. Spawn a fresh instance instead."
+            ),
+        }
+    else:
+        resp = {"status": "resumed", "name": name}
+        if refused_threads:
+            resp["workers_refused"] = refused_threads
+    if target_label is not None:
+        resp["instance_id"] = instance_id
+        resp["instance_label"] = target_label
+    return resp
+
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Workspace config backbone: purpose / permissions / risk (Phase 1)
+#  New routes: POST /api/workspace (create with purpose preset),
+#  GET/PUT /api/workspace/{ws_id}/permissions, GET /api/workspace/{ws_id}.
+#  Persisted in vault workspaces/<id>/config.json alongside the existing
+#  capabilities / domain_allowlist keys (see agent/config/schema_manifest.json).
+#  Registered last so the more specific /list, /templates, /{ws_id}/... routes
+#  keep route-matching precedence.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class WorkspacePermissionsBody(BaseModel):
+    """Body for PUT /api/workspace/{ws_id}/permissions.
+
+    ``permissions`` values are level strings (banned|ask|read|write, or
+    banned|ask|allow for host_bash) except ``container`` which the validator
+    accepts as a real boolean (True == write-level enabled) - so the map
+    carries ``Union[str, bool]`` values.
+    """
+
+    permissions: Dict[str, Union[str, bool]]
+    allow_host_resources: Optional[bool] = None
+
+
+class WorkspaceCreateBody(BaseModel):
+    """Body for POST /api/workspace (create workspace with a purpose preset)."""
+
+    path: str
+    purpose: Optional[str] = "general"
+    settings: Optional[Dict[str, Any]] = {}
+
+
+def _load_workspace_config(ws_id: str) -> Dict[str, Any]:
+    """Load vault ``workspaces/<id>/config.json`` (``{}`` if missing/unparsable)."""
+    return load_workspace_config(ws_id)
+
+
+def _save_workspace_config(ws_id: str, data: Dict[str, Any]) -> None:
+    """Atomically write vault ``workspaces/<id>/config.json``."""
+    _atomic_write_json(data, _workspace_dir(ws_id) / "config.json")
+
+
+_GIT_IDENTITY_FORBIDDEN_CHARS = "\r\n\x00<>"
+
+
+def _validated_git_identity(raw: Any) -> Optional[Dict[str, str]]:
+    """Validate a caller-supplied ``git_identity`` for the workspace config.
+
+    Returns ``None`` when *raw* is ``None`` (no identity supplied), and a
+    ``{"name": str, "email": str}`` dict when it is valid; raises
+    ``ValueError`` with a human-readable message otherwise.
+
+    The key is ALWAYS persisted (the caller substitutes a blank pair for
+    ``None``) so the UI has something to edit.  A blank pair is a legal stored
+    value: the git writer reads a blank or incomplete identity exactly like an
+    absent key, so it means "not configured" -- git's own repo-local/global
+    resolution applies -- and never "commit with an empty ident".  What is
+    still refused is a value the writer cannot make sense of at all: a
+    non-string half, and the forbidden characters, which would be injected
+    verbatim into ``user.name`` / ``user.email``.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("git_identity must be an object with 'name' and 'email'")
+    identity: Dict[str, str] = {}
+    for label in ("name", "email"):
+        value = raw.get(label)
+        if not isinstance(value, str):
+            raise ValueError(f"git_identity.{label} must be a string")
+        if any(ch in value for ch in _GIT_IDENTITY_FORBIDDEN_CHARS):
+            raise ValueError(
+                f"git_identity.{label} contains a character that is not allowed "
+                "in a git identity (newline, NUL, '<' or '>')"
+            )
+        identity[label] = value
+    return identity
+
+
+def _resolve_workspace_permissions(cfg: Dict[str, Any], purpose: str) -> Dict[str, Any]:
+    """Return the saved permission map, or ``{}`` when none is stored.
+
+    Real booleans are preserved verbatim: ``container`` is stored as a real
+    boolean (True == write-level enabled) once validated, and stringifying it
+    to 'True'/'False' would break the round trip (the PUT validator rejects
+    the string forms) and would be misread as an unknown level downstream.
+    """
+    saved = cfg.get("permissions")
+    if isinstance(saved, dict) and saved:
+        return saved
+    return {}
+
+
+# ── GET /api/workspace/{ws_id}/permissions ─────────────────────────────────────
+
+
+@router.get("/{ws_id}/permissions")
+async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
+    """Return the workspace's resource permission map, purpose and host flag.
+
+    Returns exactly the saved permission map; a workspace with no saved map
+    returns an empty map.
+    """
+    ensure_workspace_dirs(ws_id)
+    cfg = _load_workspace_config(ws_id)
+    purpose = cfg.get("purpose", "general")
+    allow_host_resources = bool(cfg.get("allow_host_resources", False))
+    permissions = _resolve_workspace_permissions(cfg, purpose)
+    raw_cfg_permissions = cfg.get("permissions")
+    raw = (
+        dict(raw_cfg_permissions)
+        if isinstance(raw_cfg_permissions, dict) and raw_cfg_permissions
+        else {}
+    )
+    return {
+        "workspace_id": ws_id,
+        "purpose": purpose,
+        "permissions": permissions,
+        "allow_host_resources": allow_host_resources,
+        "raw": raw,
+        "declared_ceiling": permissions,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ── PUT /api/workspace/{ws_id}/permissions ─────────────────────────────────────
+
+
+def _notify_workspace_permissions_changed(ws_id: str) -> None:
+    """Best-effort: notify every live session of *ws_id* of the new ceiling.
+
+    A workspace permission write must never fail because a notice could not be
+    delivered, so the whole sweep is wrapped in ``try``/``except`` and logged
+    as a WARNING.  Only bridges reporting this workspace and currently holding
+    a session take part, so the cost is bounded by the number of open tabs;
+    each session gets its own effective profile (its grants merged with the new
+    ceiling) computed by the session routes' own pipeline.
+    """
+    try:
+        from web_ui.backend import session_routes
+        from web_ui.backend.event_forwarder import _active_tab_bridges
+
+        session_ids: List[str] = []
+        for bridge in list(_active_tab_bridges):
+            if getattr(bridge, "workspace_id", None) != ws_id:
+                continue
+            holders = [
+                getattr(getattr(bridge, "_agent", None), "session", None),
+                getattr(bridge, "_session", None),
+                getattr(bridge, "_loaded_session", None),
+            ]
+            for holder in holders:
+                sid = getattr(holder, "session_id", None)
+                if sid and sid not in session_ids:
+                    session_ids.append(sid)
+
+        for sid in session_ids:
+            try:
+                effective = session_routes._compute_effective_session_permissions(
+                    ws_id, sid
+                )
+            except Exception as exc:  # noqa: BLE001 - one session cannot block
+                logger.warning(
+                    "effective permissions for %s/%s unavailable: %s", ws_id, sid, exc
+                )
+                continue
+            session_routes._notify_permissions_changed(sid, effective)
+    except Exception as exc:  # noqa: BLE001 - best-effort by contract
+        logger.warning(
+            "permissions_changed notice for workspace %s failed: %s", ws_id, exc
+        )
+
+
+@router.put("/{ws_id}/permissions")
+async def put_workspace_permissions(
+    request: Request,
+    ws_id: str,
+    body: WorkspacePermissionsBody,
+) -> Dict[str, Any]:
+    """Persist a workspace resource permission map (validated against the catalog).
+
+    422 on unknown resource names or invalid permission levels; otherwise
+    merges into ``config.json`` (preserving purpose / capabilities /
+    domain_allowlist) and returns the updated map with its runtime risk
+    assessment. ``allow_host_resources`` is updated only when explicitly
+    provided in the body (None leaves the saved value untouched).
+    """
+    from agent.config.resource_catalog import validate_workspace_permissions
+    from agent.config.risk_model import compute_workspace_risk
+
+    ensure_workspace_dirs(ws_id)
+    normalized, errors = validate_workspace_permissions(body.permissions)
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"errors": errors},
+        )
+
+    cfg = _load_workspace_config(ws_id)
+    if body.allow_host_resources is not None:
+        cfg["allow_host_resources"] = bool(body.allow_host_resources)
+    cfg["permissions"] = normalized
+    _save_workspace_config(ws_id, cfg)
+    _notify_workspace_permissions_changed(ws_id)
+
+    purpose = cfg.get("purpose", "general")
+    allow_host_resources = bool(cfg.get("allow_host_resources", False))
+    risk = compute_workspace_risk(
+        permissions=normalized,
+        allow_host_resources=allow_host_resources,
+        purpose=purpose,
+    )
+    return {
+        "workspace_id": ws_id,
+        "purpose": purpose,
+        "permissions": normalized,
+        "allow_host_resources": allow_host_resources,
+        "risk": risk,
+        "raw": normalized,
+        "effective": normalized,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ── POST /api/workspace (create) ───────────────────────────────────────────────
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_workspace(
+    request: Request, body: WorkspaceCreateBody
+) -> Dict[str, Any]:
+    """Register a new workspace rooted at *path* with a purpose preset.
+
+    Validates the purpose (422), confines the path to $HOME minus the vault
+    root (403), registers the workspace, creates the vault workspace dirs
+    and writes ``config.json`` with ``{root, purpose, permissions,
+    allow_host_resources}``.  ``settings.permissions`` (dict of
+    resource→level overrides) and ``settings.allow_host_resources`` (bool)
+    are layered on top of the purpose preset.  ``settings.git_identity``
+    (``{"name", "email"}``) is validated (422 when malformed) and is ALWAYS
+    written: an unsupplied identity is stored as the blank pair
+    ``{"name": "", "email": ""}`` the UI edits, which the git writer reads
+    as "not configured" and leaves git's own resolution standing.
+    """
+    from agent.config.workspace_purpose import WORKSPACE_PURPOSES, apply_purpose_preset
+    from agent.config.risk_model import compute_workspace_risk
+
+    if body.purpose not in WORKSPACE_PURPOSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "errors": [
+                    f"unknown purpose '{body.purpose}' "
+                    f"(expected one of {WORKSPACE_PURPOSES})"
+                ]
+            },
+        )
+
+    try:
+        confined = _confine_to_home(body.path)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        )
+    if not os.path.isdir(confined):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Path '{body.path}' does not exist or is not a directory",
+        )
+
+    # Validate the optional git identity *before* registering, so a rejected
+    # identity never leaves a half-created workspace behind.
+    try:
+        git_identity = _validated_git_identity((body.settings or {}).get("git_identity"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"errors": [str(exc)]},
+        )
+
+    registry = WorkspaceRegistry.get_default()
+    entry = registry.register_by_root(confined)
+    ensure_workspace_dirs(entry.id)
+
+    settings = body.settings or {}
+    custom_permissions = settings.get("permissions")
+    if not isinstance(custom_permissions, dict):
+        custom_permissions = None
+    permissions = apply_purpose_preset(body.purpose, custom_permissions)
+    allow_host_resources = bool(settings.get("allow_host_resources", False))
+
+    cfg = _load_workspace_config(entry.id)
+    # ``root`` is the host directory this workspace owns: host execution
+    # (host_bash cwd anchoring) reads it live from config.json and refuses
+    # without it.  The registry owns the value, so persist a copy here.
+    cfg["root"] = entry.root_path
+    cfg["purpose"] = body.purpose
+    cfg["permissions"] = permissions
+    cfg["allow_host_resources"] = allow_host_resources
+    # The key is ALWAYS present so the UI has something to edit.  A blank pair
+    # means "not configured" -- git's own resolution applies, never an empty
+    # ident (``git_write_tool._workspace_git_identity`` reads it as absent).
+    cfg["git_identity"] = (
+        git_identity
+        if git_identity is not None
+        else {"name": "", "email": ""}
+    )
+    _save_workspace_config(entry.id, cfg)
+
+    risk = compute_workspace_risk(
+        permissions=permissions,
+        allow_host_resources=allow_host_resources,
+        purpose=body.purpose,
+    )
+    return {
+        "workspace_id": entry.id,
+        "root": entry.root_path,
+        "purpose": body.purpose,
+        "permissions": permissions,
+        "allow_host_resources": allow_host_resources,
+        "risk": risk,
+    }
+
+
+# ── GET /api/workspace/{ws_id}/summary ────────────────────────────────────────
+
+
+def _workspace_root_mountable(entry) -> bool:
+    """True when the workspace root exists and is outside the vault.
+
+    The vault root (~/.thoughtmachine) is the trust anchor and must never be
+    mounted into a container; the registry should never contain it, but a
+    defensive check keeps this invariant cheap to enforce.
+    """
+    try:
+        root = os.path.abspath(os.path.expanduser(entry.root_path))
+        vault = str(vault_root())
+        if root == vault or root.startswith(vault + os.sep):
+            return False
+        return bool(root)
+    except Exception:
+        return False
+
+
+def _containers_for_workspace(entry) -> Optional[List[Dict[str, Any]]]:
+    """List the docker containers provisioned for this workspace.
+
+    Returns ``None`` when the workspace root is not mountable or the container
+    manager cannot be reached (e.g. no docker daemon) - callers treat None as
+    "unknown" and fall back to an empty list. Mirrors global_routes.py.
+    """
+    if not _workspace_root_mountable(entry):
+        return None
+    try:
+        from infra.container_manager import ContainerManager
+
+        manager = ContainerManager(
+            workspace_path=entry.root_path,
+            workspace_id=entry.id,
+            session_id=None,
+            session_permissions=None,
+        )
+        raw = manager.list_containers() or []
+        handles = []
+        for c in raw:
+            name = c.get("name") or ""
+            handles.append(
+                {
+                    "id": c.get("container_id") or "",
+                    "name": name,
+                    "type": "resource" if name.startswith("tm-res-") else "free_use",
+                    "workspace_id": c.get("workspace_id") or entry.id,
+                    "status": c.get("status") or "unknown",
+                }
+            )
+        handles.sort(key=lambda h: h["name"])
+        return handles
+    except Exception:
+        return None
+
+
+def _containers_listed_for_workspace(entry) -> int:
+    """Count of the workspace's UI container enumeration (the FULL live set).
+
+    This is the count the Containers panel renders: every live container for
+    the workspace, *including* resource containers, which the agent-facing
+    ``_containers_for_workspace()`` deliberately hides.  It reuses the single
+    owner of the "workspace live set" fact
+    (``server._list_workspace_live_containers``) rather than inventing a second
+    enumeration.  Returns 0 when enumeration is unavailable (no docker client /
+    daemon), matching the summary's degrade-to-empty contract.
+    """
+    if not _workspace_root_mountable(entry):
+        return 0
+    try:
+        from infra.container_manager import ContainerManager
+
+        manager = ContainerManager(
+            workspace_path=entry.root_path,
+            workspace_id=entry.id,
+            session_id=None,
+            session_permissions=None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "_containers_listed_for_workspace: ContainerManager construction "
+            "failed for workspace %s: %s",
+            entry.id,
+            exc,
+        )
+        return 0
+    try:
+        from web_ui.backend.server import _list_workspace_live_containers
+
+        live = _list_workspace_live_containers(manager, entry.id)
+    except Exception as exc:
+        logger.warning(
+            "_containers_listed_for_workspace: live container enumeration "
+            "failed for workspace %s: %s",
+            entry.id,
+            exc,
+        )
+        return 0
+    return len(live or [])
+
+
+@router.get("/{ws_id}/summary")
+async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
+    """Return a full read-only overview of a workspace for the UI dashboard.
+
+    Combines configuration (permissions ceiling, capabilities, dockerfile,
+    worker templates) with live state (active worker threads, open sessions,
+    provisioned containers) and global registries (tool list, resource
+    catalog). No secrets are included: file contents are limited to the
+    workspace Dockerfile.
+    """
+    registry = WorkspaceRegistry.get_default()
+    entry = registry.get_workspace(ws_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workspace '{ws_id}' not found",
+        )
+
+    # Permissions ceiling (saved config wins, else purpose preset, else {}).
+    try:
+        from web_ui.backend.config_manager import _load_workspace_permission_ceiling
+
+        permissions = _load_workspace_permission_ceiling(ws_id)
+    except Exception:
+        permissions = {}
+    if not isinstance(permissions, dict):
+        permissions = {}
+
+    # Capability flags (default = fully permissive when nothing saved).
+    try:
+        capabilities = WorkspaceCapabilities.default()
+        caps = load_workspace_capabilities(ws_id)
+        if caps is not None:
+            capabilities = caps
+    except Exception:
+        capabilities = WorkspaceCapabilities.default()
+
+    # Workspace Dockerfile (content is safe - it is user-authored build config).
+    dockerfile_path = _workspace_dir(ws_id) / "Dockerfile"
+    try:
+        dockerfile = {
+            "path": str(dockerfile_path),
+            "content": dockerfile_path.read_text(encoding="utf-8"),
+        }
+    except OSError:
+        dockerfile = {"path": str(dockerfile_path), "content": None}
+
+    # Worker templates (config only) + live worker threads.
+    try:
+        worker_templates = await get_workers(ws_id)
+    except Exception:
+        worker_templates = []
+    try:
+        active_workers = _collect_active_workers(ws_id)
+    except Exception:
+        active_workers = []
+
+    # Open sessions for this workspace.
+    active_sessions: List[Dict[str, Any]] = []
+    try:
+        from session.session_registry import SessionRegistry
+
+        sessions = SessionRegistry.get_default().get_all()
+        if isinstance(sessions, dict):
+            for s in sessions.values():
+                if not isinstance(s, dict):
+                    continue
+                if s.get("workspace_id") != ws_id or not s.get("is_open"):
+                    continue
+                active_sessions.append(
+                    {
+                        "session_id": str(s.get("session_id") or ""),
+                        "workspace_id": ws_id,
+                        "name": s.get("name") or "",
+                        "mode": s.get("mode") or "",
+                        "started_at": s.get("created_at") or "",
+                    }
+                )
+            active_sessions.sort(key=lambda s: s["session_id"])
+    except Exception:
+        active_sessions = []
+
+    # Provisioned (agent-facing) containers for this workspace.  The agent
+    # enumeration excludes resource containers (list_containers hides them).
+    try:
+        containers_in_use = _containers_for_workspace(entry) or []
+    except Exception:
+        containers_in_use = []
+
+    # UI enumeration count: the full live set, resource containers included.
+    # Derived from the single owner of that fact, never a second list.
+    containers_listed = _containers_listed_for_workspace(entry)
+
+    # Tool registry + resource catalog.
+    try:
+        from session.tool_presets import _ALL_TOOLS
+    except ImportError:
+        try:
+            from agent.config.presets import _ALL_TOOLS
+        except ImportError:
+            _ALL_TOOLS = []
+    tools = sorted(_ALL_TOOLS) if isinstance(_ALL_TOOLS, (list, tuple)) else []
+
+    resource_catalog: List[Any] = []
+    try:
+        if _RESOURCE_CATALOG_PATH.is_file():
+            data = json.loads(_RESOURCE_CATALOG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                resource_catalog = data
+    except (OSError, ValueError):
+        resource_catalog = []
+
+    return {
+        "workspace_id": ws_id,
+        "label": entry.label or entry.id,
+        "root_path": entry.root_path,
+        "allow_host_resources": bool(
+            _load_workspace_config(ws_id).get("allow_host_resources", False)
+        ),
+        "permissions": permissions,
+        "capabilities": capabilities.to_dict(),
+        "dockerfile": dockerfile,
+        "worker_templates": worker_templates,
+        "active_workers": active_workers,
+        "active_sessions": active_sessions,
+        "containers_in_use": containers_in_use,
+        "containers_listed": containers_listed,
+        "tools": tools,
+        "resource_catalog": resource_catalog,
+    }
+
+
+# ── GET /api/workspace/{ws_id} (summary) ───────────────────────────────────────
+
+
+@router.get("/{ws_id}")
+async def get_workspace_summary(ws_id: str) -> Dict[str, Any]:
+    """Return the workspace summary: root, purpose, permissions, risk.
+
+    Registered after the more specific ``/{ws_id}/...`` routes so they keep
+    precedence.  404 when the workspace ID is not in the registry.
+    """
+    from agent.config.risk_model import compute_workspace_risk
+
+    registry = WorkspaceRegistry.get_default()
+    entry = registry.get_workspace(ws_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workspace '{ws_id}' not found",
+        )
+
+    cfg = _load_workspace_config(ws_id)
+    purpose = cfg.get("purpose", "general")
+    allow_host_resources = bool(cfg.get("allow_host_resources", False))
+    permissions = _resolve_workspace_permissions(cfg, purpose)
+
+    risk = compute_workspace_risk(
+        permissions=permissions,
+        allow_host_resources=allow_host_resources,
+        purpose=purpose,
+    )
+    return {
+        "workspace_id": ws_id,
+        "root": entry.root_path,
+        "purpose": purpose,
+        "permissions": permissions,
+        "allow_host_resources": allow_host_resources,
+        "risk": risk,
+    }
 

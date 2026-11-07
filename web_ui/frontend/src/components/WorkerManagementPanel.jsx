@@ -1,0 +1,1979 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { getPill } from '../data/permissionVocab';
+
+// ── Inline Catppuccin palette (matching the shared config palette) ──────────
+const inputStyle = {
+  background: '#1e1e2e',
+  color: '#cdd6f4',
+  border: '1px solid #585b70',
+  borderRadius: '4px',
+  padding: '0.4rem 0.5rem',
+  fontSize: '0.85rem',
+  width: '100%',
+  boxSizing: 'border-box',
+  outline: 'none',
+};
+
+const labelStyle = {
+  display: 'block',
+  marginBottom: '0.25rem',
+  fontSize: '0.85rem',
+  color: '#a6adc8',
+};
+
+const btnPrimary = {
+  background: '#89b4fa',
+  color: '#1e1e2e',
+  border: 'none',
+  borderRadius: '4px',
+  padding: '0.35rem 0.75rem',
+  fontSize: '0.8rem',
+  cursor: 'pointer',
+  fontWeight: 600,
+};
+
+const btnDanger = {
+  background: '#f38ba8',
+  color: '#1e1e2e',
+  border: 'none',
+  borderRadius: '4px',
+  padding: '0.35rem 0.75rem',
+  fontSize: '0.8rem',
+  cursor: 'pointer',
+  fontWeight: 600,
+};
+
+const btnGhost = {
+  background: 'transparent',
+  color: '#89b4fa',
+  border: '1px solid #89b4fa',
+  borderRadius: '4px',
+  padding: '0.25rem 0.5rem',
+  fontSize: '0.75rem',
+  cursor: 'pointer',
+};
+
+const modalOverlay = {
+  position: 'fixed',
+  inset: 0,
+  background: 'rgba(0,0,0,0.6)',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  zIndex: 1000,
+};
+
+const modalBox = {
+  background: '#313244',
+  border: '1px solid #585b70',
+  borderRadius: '8px',
+  padding: '1.25rem',
+  width: '560px',
+  maxWidth: '90vw',
+  maxHeight: '85vh',
+  overflowY: 'auto',
+  color: '#cdd6f4',
+};
+
+// Runtime status vocabulary. These value strings are the BACKEND's own, not
+// invented here: `WorkerThread.status` assignments in
+// tools/workspace/worker_thread.py — detaching (:1481), detached (:1494),
+// killed (:1514, and the terminal kill path :3184), ready (:1655), paused
+// (:2166), busy (:2804), error (:3144), completed (:3184) — surfaced verbatim
+// by `_worker_active_entry` as `"status": getattr(thread, "status", "unknown")`
+// (web_ui/backend/workspace_routes.py:579).
+const STATUS_DOT_COLORS = {
+  ready: '#585b70',    /* grey — idle, spawned but not doing anything */
+  running: '#a6e3a1',  /* green — real runtime_status for an active worker */
+  busy: '#a6e3a1',     /* green with pulse — actively processing */
+  completed: '#6c7086', /* muted grey — finished */
+  error: '#f38ba8',    /* red — something went wrong */
+  pausing: '#f9e2af',  /* amber — pause in flight (not yet paused) */
+  paused: '#f9e2af',   /* amber — paused; matches session StatusBar */
+  detaching: '#f9e2af', /* amber — detach (stop) in flight, not yet parked */
+  detached: '#cba6f7', /* mauve — parked but ALIVE: resumable, queue preserved */
+  killed: '#f38ba8',   /* red — terminated: NOT resumable, queue rejected */
+  stopped: '#313244',  /* dark/off — not spawned */
+};
+
+// Display labels for the statuses above. Anything NOT in this map is degraded
+// VISIBLY in the row by statusLabel() — a status this panel does not know must
+// never render blank and must never render as a healthy-looking state.
+const STATUS_LABELS = {
+  ready: 'ready',
+  running: 'running',
+  busy: 'busy',
+  completed: 'completed',
+  error: 'error',
+  pausing: 'Pausing…',
+  paused: 'Paused',
+  detaching: 'Detaching…',
+  detached: 'Detached',
+  killed: 'Killed',
+  stopped: 'stopped',
+};
+
+const STATUS_TEXT_COLORS = {
+  ready: '#a6adc8',
+  running: '#89b4fa',
+  busy: '#89b4fa',
+  completed: '#a6adc8',
+  error: '#f38ba8',
+  pausing: '#f9e2af',
+  paused: '#f9e2af',
+  detaching: '#f9e2af',
+  detached: '#cba6f7',
+  killed: '#f38ba8',
+  stopped: '#a6adc8',
+};
+
+// Unrecognized status → amber, so a status this panel cannot explain never
+// looks like a normal (grey) or healthy (blue/green) state.
+const UNKNOWN_STATUS_COLOR = '#f9e2af';
+
+function statusLabel(status) {
+  if (STATUS_LABELS[status]) return STATUS_LABELS[status];
+  return status ? `${status} (unrecognized)` : 'unknown status';
+}
+
+function statusTextColor(status) {
+  return STATUS_TEXT_COLORS[status] || UNKNOWN_STATUS_COLOR;
+}
+
+// ── Helper: relative time ──────────────────────────────────────────────────
+function relativeTime(ts) {
+  if (!ts) return '';
+  const diffMs = Date.now() - new Date(ts).getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return 'just now';
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  return `${Math.floor(diffHr / 24)}d ago`;
+}
+
+// ── Helper: compact token count (12400 -> '12.4k') ──────────────────────────
+function formatTokens(n) {
+  if (n == null) return '';
+  if (n >= 1000) {
+    const k = n / 1000;
+    return `${k % 1 === 0 ? k.toFixed(0) : k.toFixed(1)}k`;
+  }
+  return String(n);
+}
+
+// ── Helper: human-readable duration (130 -> '2m 10s', 3600 -> '1h') ────────
+function formatDuration(sec) {
+  if (sec == null || sec < 0 || !Number.isFinite(sec)) return '';
+  const s = Math.round(sec);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return remS === 0 ? `${m}m` : `${m}m ${remS}s`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM === 0 ? `${h}h` : `${h}h ${remM}m`;
+}
+
+// ── Helper: truncate ───────────────────────────────────────────────────────
+function truncate(str, maxLen = 120) {
+  if (!str) return '';
+  const s = typeof str === 'string' ? str : JSON.stringify(str);
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen) + '…';
+}
+
+// ── Helper: per-instance identity key (name + instance_id) ────────────────
+function workerInstanceKey(w) {
+  return `${w.name}#${w.instance_id ?? '0'}`;
+}
+
+// ── Helper: the live-apply patch for a stored worker definition ───────────
+// The patch is the intersection of the definition and the backend's tier map,
+// i.e. exactly the fields the backend says are agent config. No field list is
+// spelled out on this side, here or anywhere else in this panel.
+function workerConfigPatch(definition, configTiers) {
+  const patch = {};
+  Object.entries(definition || {}).forEach(([field, value]) => {
+    if (Object.prototype.hasOwnProperty.call(configTiers || {}, field)) patch[field] = value;
+  });
+  return patch;
+}
+
+// ── Helper: does this patch force a respawn? ──────────────────────────────
+// A single `requires_respawn` field is what makes the click persist → apply →
+// kill; a patch with nothing the live worker cannot take is a pure kill.
+function patchNeedsRespawn(patch, configTiers) {
+  return Object.entries(patch || {}).some(
+    ([field]) => (configTiers || {})[field] === 'requires_respawn'
+  );
+}
+
+// ── The button's whole contract in one place (W9) ─────────────────────────
+// Label, title, clickability and "does the handler kill afterwards" are ONE
+// decision: `handleForceRespawn` recomputes this same object at click time and
+// obeys it, so the label the operator read and the action performed cannot
+// disagree. Every state is explicit -- including the one where nothing is
+// known yet, because a button that promises nothing must not be clickable.
+export function workerRespawnPlan(definition, configTiers, definitionsLoaded) {
+  if (!definitionsLoaded) {
+    return {
+      label: '…',
+      title: 'reading stored definition',
+      disabled: true,
+      killAfterApply: false,
+    };
+  }
+  if (!definition) {
+    return {
+      label: 'No stored config',
+      title:
+        'no stored worker definition: there is nothing to persist or apply, so a kill could not bring this worker back on a new config',
+      disabled: true,
+      killAfterApply: false,
+    };
+  }
+  if (patchNeedsRespawn(workerConfigPatch(definition, configTiers), configTiers)) {
+    return {
+      label: 'Apply & Kill Worker',
+      title:
+        'persist the definition, push it at the live worker, then kill the instance: the stored config has a requires_respawn field, so the worker must be rebuilt to take it',
+      disabled: false,
+      killAfterApply: true,
+    };
+  }
+  return {
+    label: 'Apply (no restart)',
+    title:
+      'persist the definition and push it at the live worker: every field is hot_swap, so the worker keeps running',
+    disabled: false,
+    killAfterApply: false,
+  };
+}
+
+// ── Helper: queued-query surface (PHASE 2.1b) ─────────────────────────────
+// `queued_query_count` / `queued_query_ids` come verbatim from the active-
+// worker payload (`**_worker_queued_queries(thread)`,
+// web_ui/backend/workspace_routes.py:585, count/ids at :534), with the ids in
+// FIFO order. Absent/None fields mean "nothing queued" — never a crash and
+// never a fabricated id list.
+function queuedQueryIds(w) {
+  const ids = Array.isArray(w.queued_query_ids) ? w.queued_query_ids : [];
+  return ids.map((id) => String(id));
+}
+
+function queuedQueryCount(w, ids) {
+  const n = w.queued_query_count;
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : ids.length;
+}
+
+// ── Status dot ─────────────────────────────────────────────────────────────
+function WorkerDot({ status }) {
+  const color = STATUS_DOT_COLORS[status] || '#585b70';
+  const isBusy = status === 'busy';
+  return (
+    <span
+      className={isBusy ? 'worker-dot-busy' : ''}
+      style={{
+        width: 8,
+        height: 8,
+        borderRadius: '50%',
+        background: color,
+        display: 'inline-block',
+        flexShrink: 0,
+      }}
+    />
+  );
+}
+
+// ── Permission pill ────────────────────────────────────────────────────────
+function PermissionPill({ name, value }) {
+  const pill = getPill(value);
+  return (
+    <span
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '0.25rem',
+        background: pill.bg,
+        color: pill.fg,
+        borderRadius: '10px',
+        padding: '0.1rem 0.5rem',
+        fontSize: '0.7rem',
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+      }}
+      title={`${name}: ${value}`}
+    >
+      {name}:{pill.label}
+    </span>
+  );
+}
+
+// ── Empty state ────────────────────────────────────────────────────────────
+function EmptyState({ message, onNew, onFromTemplate }) {
+  return (
+    <div style={{ textAlign: 'center', padding: '1.5rem 0', color: '#6c7086' }}>
+      <div style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>{message}</div>
+      <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center' }}>
+        <button style={btnPrimary} onClick={onNew}>+ New Worker</button>
+        {onFromTemplate && (
+          <button style={btnGhost} onClick={onFromTemplate}>From Template</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Delete confirmation dialog ─────────────────────────────────────────────
+function DeleteConfirm({ name, onConfirm, onCancel }) {
+  return (
+    <div style={modalOverlay} onClick={onCancel}>
+      <div
+        className="delete-confirm-dialog"
+        style={modalBox}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: '0 0 0.5rem', fontSize: '1rem', color: '#f38ba8' }}>
+          Delete Worker
+        </h3>
+        <p style={{ fontSize: '0.85rem', color: '#a6adc8', margin: '0 0 1rem' }}>
+          Are you sure you want to delete <strong>{name}</strong>? This cannot be undone.
+        </p>
+        <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+          <button style={{ ...btnGhost, color: '#cdd6f4', borderColor: '#585b70' }} onClick={onCancel}>
+            Cancel
+          </button>
+          <button style={btnDanger} onClick={() => onConfirm(name)}>
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Stop all workers confirmation dialog ───────────────────────────────────
+function StopAllConfirm({ onConfirm, onCancel }) {
+  return (
+    <div style={modalOverlay} onClick={onCancel}>
+      <div
+        className="stop-all-confirm-dialog"
+        style={modalBox}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: '0 0 0.5rem', fontSize: '1rem', color: '#f38ba8' }}>
+          Stop All Workers
+        </h3>
+        <p style={{ fontSize: '0.85rem', color: '#a6adc8', margin: '0 0 1rem' }}>
+          Stop every running worker instance in this workspace? This cannot be undone.
+        </p>
+        <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+          <button style={{ ...btnGhost, color: '#cdd6f4', borderColor: '#585b70' }} onClick={onCancel}>
+            Cancel
+          </button>
+          <button style={btnDanger} onClick={onConfirm}>
+            Stop All
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Kill worker confirmation dialog ────────────────────────────────────────
+// PHASE 2.1a: stop and kill are different actions. Stop DETACHES (recoverable,
+// queue preserved); kill TERMINATES and rejects every queued query, so it goes
+// through this panel's existing destructive-confirm pattern before any request
+// is sent.
+function KillConfirm({ label, queuedCount, onConfirm, onCancel }) {
+  const queueText =
+    queuedCount > 0
+      ? `its ${queuedCount} queued ${queuedCount === 1 ? 'query' : 'queries'}`
+      : 'anything it has queued';
+  return (
+    <div style={modalOverlay} onClick={onCancel}>
+      <div
+        className="kill-confirm-dialog"
+        style={modalBox}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: '0 0 0.5rem', fontSize: '1rem', color: '#f38ba8' }}>
+          Kill Worker
+        </h3>
+        <p style={{ fontSize: '0.85rem', color: '#a6adc8', margin: '0 0 1rem' }}>
+          Terminate <strong>{label}</strong>? Killing rejects {queueText} and
+          cannot be undone — the worker cannot be resumed afterwards. Use{' '}
+          <strong>Stop</strong> instead to detach it and keep it recoverable.
+        </p>
+        <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+          <button style={{ ...btnGhost, color: '#cdd6f4', borderColor: '#585b70' }} onClick={onCancel}>
+            Cancel
+          </button>
+          <button style={btnDanger} onClick={onConfirm}>
+            Kill now
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Template picker ────────────────────────────────────────────────────────
+function TemplatePicker({ templates, onSelect, onCancel }) {
+  return (
+    <div style={modalOverlay} onClick={onCancel}>
+      <div
+        style={{ ...modalBox, width: '440px' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: '0 0 0.75rem', fontSize: '1rem' }}>New Worker from Template</h3>
+        {templates.length === 0 && (
+          <p style={{ color: '#6c7086', fontSize: '0.85rem' }}>No templates available.</p>
+        )}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+          {templates.map((t) => (
+            <button
+              key={t.name}
+              onClick={() => onSelect(t)}
+              style={{
+                background: '#45475a',
+                color: '#cdd6f4',
+                border: '1px solid #585b70',
+                borderRadius: '6px',
+                padding: '0.6rem 0.75rem',
+                cursor: 'pointer',
+                textAlign: 'left',
+                fontSize: '0.85rem',
+                transition: 'background 0.15s',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = '#585b70'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = '#45475a'; }}
+            >
+              <strong>{t.name}</strong>
+              <span style={{ color: '#a6adc8', marginLeft: '0.5rem', fontSize: '0.78rem' }}>
+                {t.description}
+              </span>
+              {t.tools && (
+                <span style={{ color: '#6c7086', marginLeft: '0.4rem', fontSize: '0.7rem' }}>
+                  ({t.tools.length} tools)
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+        <div style={{ marginTop: '0.75rem', textAlign: 'right' }}>
+          <button style={{ ...btnGhost, color: '#cdd6f4', borderColor: '#585b70' }} onClick={onCancel}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Worker form modal (create / edit) ──────────────────────────────────────
+const FORM_WIDTH = '100%';
+const formRow = {
+  marginBottom: '0.6rem',
+};
+
+/** W9: a field's config tier, exactly as the backend authority reported it. */
+function ConfigTierBadge({ tier }) {
+  if (!tier) return null;
+  const hot = tier === 'hot_swap';
+  return (
+    <span
+      style={{
+        marginLeft: '0.4rem',
+        padding: '0.05rem 0.35rem',
+        borderRadius: '3px',
+        fontSize: '0.6rem',
+        fontWeight: 600,
+        background: hot ? '#a6e3a1' : '#f9e2af',
+        color: '#1e1e2e',
+      }}
+      title={
+        hot
+          ? 'hot_swap: a running worker applies this at its next turn boundary'
+          : 'requires_respawn: a running worker will not take this — it needs a fresh runtime'
+      }
+    >
+      {tier}
+    </span>
+  );
+}
+
+export function WorkerFormModal({ worker, templates, configTiers = {}, onSave, onCancel, isCreateFromTemplate }) {
+  const isEdit = !!worker && !isCreateFromTemplate;
+  const [name, setName] = useState(worker?.name || '');
+  const [description, setDescription] = useState(worker?.description || '');
+  const [systemPrompt, setSystemPrompt] = useState(worker?.system_prompt || '');
+  const [toolsText, setToolsText] = useState(
+    Array.isArray(worker?.tools) ? worker.tools.join('\n') : ''
+  );
+  const [permFootprint, setPermFootprint] = useState(
+    worker?.permission_footprint ? JSON.stringify(worker.permission_footprint, null, 2) : '{}'
+  );
+  const [timeoutSeconds, setTimeoutSeconds] = useState(worker?.timeout_seconds ?? '');
+  const [maxContextTokens, setMaxContextTokens] = useState(worker?.max_tokens ?? '');
+  const [warningThresholdTokens, setWarningThresholdTokens] = useState(worker?.warning_threshold_tokens ?? '');
+  const [turnLimit, setTurnLimit] = useState(worker?.max_turns ?? '');
+  const [temperature, setTemperature] = useState(worker?.temperature ?? '');
+  const [saveError, setSaveError] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    setSaveError('');
+    setSaving(true);
+
+    // Validate: name, tools parsing, perm footprint parsing
+    if (!name.trim()) {
+      setSaveError('Name is required.');
+      setSaving(false);
+      return;
+    }
+
+    let tools;
+    try {
+      tools = toolsText
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } catch {
+      setSaveError('Invalid tools list.');
+      setSaving(false);
+      return;
+    }
+
+    let footprint;
+    try {
+      footprint = permFootprint.trim() ? JSON.parse(permFootprint) : {};
+    } catch {
+      setSaveError('Permission footprint must be valid JSON (e.g. {"filesystem": "write"}).');
+      setSaving(false);
+      return;
+    }
+
+    const payload = {
+      name: name.trim(),
+      description: description.trim(),
+      system_prompt: systemPrompt,
+      tools,
+      permission_footprint: footprint,
+    };
+
+    // Only include optional fields if they have a value
+    if (timeoutSeconds !== '') payload.timeout_seconds = Number(timeoutSeconds);
+    if (maxContextTokens !== '') payload.max_tokens = Number(maxContextTokens);
+    if (warningThresholdTokens !== '') payload.warning_threshold_tokens = Number(warningThresholdTokens);
+    if (turnLimit !== '') payload.max_turns = Number(turnLimit);
+    if (temperature !== '') payload.temperature = Number(temperature);
+
+    onSave(payload, isEdit);
+    setSaving(false);
+  };
+
+  const inputErrorStyle = saveError ? { borderColor: '#f38ba8' } : {};
+
+  return (
+    <div style={modalOverlay} onClick={onCancel}>
+      <div
+        style={modalBox}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: '0 0 0.75rem', fontSize: '1rem' }}>
+          {isEdit ? `Edit Worker: ${worker.name}` : 'New Worker'}
+        </h3>
+
+        {/* Name */}
+        <div style={formRow}>
+          <label style={labelStyle}>Name *</label>
+          <input
+            style={{ ...inputStyle, ...inputErrorStyle }}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. my-coder"
+            disabled={isEdit} /* name is the identity key — can't change */
+          />
+        </div>
+
+        {/* Description */}
+        <div style={formRow}>
+          <label style={labelStyle}>Description</label>
+          <input
+            style={inputStyle}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="What this worker does"
+          />
+        </div>
+
+        {/* System prompt */}
+        <div style={formRow}>
+          <label style={labelStyle}>
+            System Prompt
+            <ConfigTierBadge tier={configTiers.system_prompt} />
+          </label>
+          <textarea
+            style={{ ...inputStyle, minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' }}
+            value={systemPrompt}
+            onChange={(e) => setSystemPrompt(e.target.value)}
+            placeholder="Instructions for the worker agent…"
+          />
+        </div>
+
+        {/* Tools (one per line) */}
+        <div style={formRow}>
+          <label style={labelStyle}>
+            Tools{' '}
+            <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(one per line)</span>
+          </label>
+          <textarea
+            style={{ ...inputStyle, minHeight: '64px', resize: 'vertical', fontFamily: 'monospace' }}
+            value={toolsText}
+            onChange={(e) => setToolsText(e.target.value)}
+            placeholder="ApplyEdits&#10;CodeModifier&#10;FileEditor"
+          />
+        </div>
+
+        {/* Permission footprint (JSON) */}
+        <div style={formRow}>
+          <label style={labelStyle}>
+            Permission Footprint{' '}
+            <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(JSON)</span>
+          </label>
+          <textarea
+            style={{ ...inputStyle, minHeight: '48px', resize: 'vertical', fontFamily: 'monospace' }}
+            value={permFootprint}
+            onChange={(e) => setPermFootprint(e.target.value)}
+            placeholder='{"filesystem": "write", "container": true}'
+          />
+        </div>
+
+        {/* Optional overrides — inline row */}
+        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.6rem' }}>
+          <div style={{ flex: '1 1 120px', minWidth: '80px' }}>
+            <label style={labelStyle}>Timeout (s)</label>
+            <input
+              style={inputStyle}
+              type="number"
+              value={timeoutSeconds}
+              onChange={(e) => setTimeoutSeconds(e.target.value)}
+              placeholder="default"
+            />
+          </div>
+          <div style={{ flex: '1 1 120px', minWidth: '80px' }}>
+            <label style={labelStyle}>Max Tokens</label>
+            <input
+              style={inputStyle}
+              type="number"
+              value={maxContextTokens}
+              onChange={(e) => setMaxContextTokens(e.target.value)}
+              placeholder="default"
+            />
+          </div>
+          <div style={{ flex: '1 1 120px', minWidth: '80px' }}>
+            <label style={labelStyle}>Warn Threshold</label>
+            <input
+              style={inputStyle}
+              type="number"
+              value={warningThresholdTokens}
+              onChange={(e) => setWarningThresholdTokens(e.target.value)}
+              placeholder="default"
+            />
+          </div>
+          <div style={{ flex: '1 1 80px', minWidth: '60px' }}>
+            <label style={labelStyle}>Turns</label>
+            <input
+              style={inputStyle}
+              type="number"
+              value={turnLimit}
+              onChange={(e) => setTurnLimit(e.target.value)}
+              placeholder="∞"
+            />
+          </div>
+          <div style={{ flex: '1 1 80px', minWidth: '60px' }}>
+            <label style={labelStyle}>Temp.</label>
+            <input
+              style={inputStyle}
+              type="number"
+              step="0.1"
+              min="0"
+              max="2"
+              value={temperature}
+              onChange={(e) => setTemperature(e.target.value)}
+              placeholder="default"
+            />
+          </div>
+        </div>
+
+        {/* Error message */}
+        {saveError && (
+          <div style={{ color: '#f38ba8', fontSize: '0.8rem', marginBottom: '0.5rem' }}>
+            {saveError}
+          </div>
+        )}
+
+        {/* Buttons */}
+        <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end', marginTop: '0.5rem' }}>
+          <button
+            style={{ ...btnGhost, color: '#cdd6f4', borderColor: '#585b70' }}
+            onClick={onCancel}
+            disabled={saving}
+          >
+            Cancel
+          </button>
+          <button
+            style={{ ...btnPrimary, opacity: saving ? 0.7 : 1 }}
+            onClick={handleSave}
+            disabled={saving}
+          >
+            {saving ? 'Saving…' : isEdit ? 'Update Worker' : 'Create Worker'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main WorkerManagementPanel ─────────────────────────────────────────────
+export default function WorkerManagementPanel({
+  workspaceId,
+  sessionId,
+  onSelectWorker,
+  selectedWorker,
+  isActive,
+}) {
+  // ── State ────────────────────────────────────────────────────────────────
+  const [workers, setWorkers] = useState([]);        // from GET /api/workspace/{ws_id}/workers/active (runtime instances)
+  const [loading, setLoading] = useState(true);
+  const [stopErrors, setStopErrors] = useState({});
+
+  // Modal state
+  const [showForm, setShowForm] = useState(false);
+  const [editingWorker, setEditingWorker] = useState(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(null); // worker name string
+  const [showTemplatePicker, setShowTemplatePicker] = useState(false);
+  const [templates, setTemplates] = useState([]);
+  const [isCreateFromTemplate, setIsCreateFromTemplate] = useState(false);
+  const [showStopAllConfirm, setShowStopAllConfirm] = useState(false);
+  const [stopAllError, setStopAllError] = useState('');
+  // { name, instanceId, label, queuedCount } for the kill confirmation dialog
+  const [killTarget, setKillTarget] = useState(null);
+
+  // ── Auto-open logic (from old WorkersSection) ────────────────────────────
+  const prevStatusMapRef = useRef(new Map());
+  const dismissedWorkersRef = useRef(new Set());
+  const prevSelectedWorkerRef = useRef(selectedWorker);
+
+  useEffect(() => {
+    const prev = prevSelectedWorkerRef.current;
+    if (prev && !selectedWorker) {
+      dismissedWorkersRef.current.add(workerInstanceKey(prev));
+    }
+    prevSelectedWorkerRef.current = selectedWorker;
+  }, [selectedWorker]);
+
+  useEffect(() => {
+    const currentMap = new Map(workers.map((w) => [workerInstanceKey(w), w.runtime_status]));
+    const prev = prevStatusMapRef.current;
+
+    for (const [key, status] of currentMap) {
+      if (dismissedWorkersRef.current.has(key)) {
+        if (status !== 'busy' && status !== 'ready') {
+          dismissedWorkersRef.current.delete(key);
+        }
+        continue;
+      }
+
+      const prevStatus = prev.get(key);
+      if (
+        !prev.has(key) ||
+        (prevStatus !== 'ready' && prevStatus !== 'busy' && (status === 'ready' || status === 'busy'))
+      ) {
+        const worker = workers.find((w) => workerInstanceKey(w) === key);
+        if (worker) {
+          onSelectWorker?.(worker.name, workspaceId, worker.instance_id, worker.instance_label);
+        }
+        break;
+      }
+    }
+
+    prevStatusMapRef.current = currentMap;
+  }, [workers, workspaceId, onSelectWorker]);
+
+  // ── Fetch workers (active instances with runtime status) ────────────────
+  const fetchWorkers = useCallback(() => {
+    if (!workspaceId) return;
+    const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+    fetch(`/api/workspace/${workspaceId}/workers/active${query}`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const rows = Array.isArray(data) ? data : [];
+        // Normalize active-instance entries into the row shape used by the
+        // rest of this panel (name/instance_id/runtime_status/…).
+        setWorkers(rows.map((e) => {
+          const name = e.worker_name ?? e.name ?? '';
+          const instanceId = e.instance_id ?? 1;
+          return {
+            name,
+            instance_id: instanceId,
+            instance_label: e.instance_label ?? (instanceId > 1 ? `${name}#${instanceId}` : name),
+            runtime_status: e.status ?? e.runtime_status,
+            status: e.status,
+            elapsed: e.elapsed,
+            session_id: e.session_id,
+            last_heartbeat: e.last_heartbeat,
+            container_id: e.container_id,
+            description: e.description ?? '',
+            tools: e.tools ?? [],
+            permission_footprint: e.permission_footprint ?? {},
+            current_context_tokens: e.current_context_tokens,
+            max_context_tokens: e.max_context_tokens,
+            paused_manually: e.paused_manually,
+            queued_query_count: e.queued_query_count,
+            queued_query_ids: e.queued_query_ids,
+            time_since_last_query: e.time_since_last_query,
+            current_task: e.current_task,
+          };
+        }));
+      })
+      .catch(() => setWorkers([]))
+      .finally(() => setLoading(false));
+  }, [workspaceId, sessionId]);
+
+  useEffect(() => {
+    fetchWorkers();
+    const interval = setInterval(fetchWorkers, 3000);
+    return () => clearInterval(interval);
+  }, [fetchWorkers]);
+
+  // ── Fetch templates ──────────────────────────────────────────────────────
+  const fetchTemplates = useCallback(() => {
+    fetch('/api/workspace/templates')
+      .then(async (res) => {
+        if (!res.ok) return;
+        setTemplates(await res.json());
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    fetchTemplates();
+  }, [fetchTemplates]);
+
+  // ── Config tiers (W9) ────────────────────────────────────────────────
+  // Whether an AgentConfig field can be hot-swapped onto a RUNNING worker or
+  // needs a fresh runtime is decided by the backend authority
+  // (agent.core.agent.config_requires_respawn) and published as a map. The UI
+  // never hardcodes the field list: a field with no entry simply gets no badge,
+  // and a badge cannot disagree with the verdict the agent will act on.
+  //
+  // This map is NOT a grant of authority: a patch built here can only carry
+  // what a worker definition actually holds (prompt, temperature, turns).
+  // Provider/model are never worker-panel settings -- the SESSION ConfigPanel
+  // is the only authority for them, and a worker inherits them at spawn.
+  const [configTiers, setConfigTiers] = useState({});
+  useEffect(() => {
+    if (!workspaceId) return undefined;
+    let cancelled = false;
+    fetch(`/api/workspace/${workspaceId}/config_tiers`)
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setConfigTiers(data?.tiers || {});
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
+
+  // ── Stored worker definitions (input to the button plan) ─────────────────
+  // GET /workers/active carries runtime state only, so the render-time
+  // question "would this click apply anything?" is answered from the stored
+  // definition instead. ``null`` means "not read yet" and is a DISTINCT state:
+  // until the map resolves the button promises nothing and is disabled, which
+  // is why the initial value is not an empty object. Re-read when the set of
+  // defined workers changes; the click handler re-reads the definition itself,
+  // so a stale cache can only affect the label of a button the plan still
+  // allowed -- never turn one promised action into another.
+  const [definitions, setDefinitions] = useState(null);
+  const workerNameKey = workers.map((w) => w.name).join('|');
+  useEffect(() => {
+    if (!workspaceId) return undefined;
+    let cancelled = false;
+    fetch(`/api/workspace/${workspaceId}/workers`)
+      .then(async (res) => {
+        if (!res.ok) {
+          if (cancelled) return;
+          setDefinitions({});
+          return;
+        }
+        const rows = await res.json();
+        if (cancelled) return;
+        const map = {};
+        (Array.isArray(rows) ? rows : []).forEach((d) => {
+          if (d && d.name) map[d.name] = d;
+        });
+        setDefinitions(map);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setDefinitions({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, workerNameKey]);
+
+  // ── Stop worker ──────────────────────────────────────────────────────────
+  const handleStop = useCallback(
+    async (name, instanceId) => {
+      const key = workerInstanceKey({ name, instance_id: instanceId });
+      const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+      try {
+        const res = await fetch(
+          `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/stop${instanceQuery}`,
+          { method: 'POST' }
+        );
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `HTTP ${res.status}`);
+        }
+        setWorkers((prev) =>
+          prev.map((w) =>
+            w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+              // stop DETACHES (worker_thread.py:1494): the backend reports
+              // 'detached' and the parked worker keeps its queue.
+              ? { ...w, runtime_status: 'detached' }
+              : w
+          )
+        );
+        setStopErrors((prev) => {
+          const n = { ...prev };
+          delete n[key];
+          return n;
+        });
+      } catch (err) {
+        setStopErrors((prev) => ({ ...prev, [key]: err.message }));
+        setTimeout(() => {
+          setStopErrors((prev) => {
+            const n = { ...prev };
+            delete n[key];
+            return n;
+          });
+        }, 3000);
+      }
+    },
+    [workspaceId]
+  );
+
+  // ── Stop all workers ─────────────────────────────────────────────────────
+  const handleStopAll = useCallback(async () => {
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/workers/stop_all`,
+        sessionId
+          ? {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ session_id: sessionId }),
+            }
+          : { method: 'POST' }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || body?.detail || `HTTP ${res.status}`);
+      }
+      setStopAllError('');
+      // stop_all detaches every instance (workspace_routes.py:1282).
+      setWorkers((prev) => prev.map((w) => ({ ...w, runtime_status: 'detached' })));
+    } catch (err) {
+      setStopAllError(err.message);
+    } finally {
+      setShowStopAllConfirm(false);
+    }
+  }, [workspaceId, sessionId]);
+
+  const handlePause = useCallback(async (name, instanceId) => {
+    const key = workerInstanceKey({ name, instance_id: instanceId });
+    const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/pause${instanceQuery}`,
+        { method: 'POST' }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || `HTTP ${res.status}`);
+      }
+      setWorkers((prev) =>
+        prev.map((w) =>
+          w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+            ? { ...w, runtime_status: 'pausing' }
+            : w
+        )
+      );
+      setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
+    } catch (err) {
+      setStopErrors((prev) => ({ ...prev, [key]: err.message }));
+      setTimeout(() => {
+        setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
+      }, 3000);
+    }
+  }, [workspaceId]);
+
+  const handleResume = useCallback(async (name, instanceId) => {
+    const key = workerInstanceKey({ name, instance_id: instanceId });
+    const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/resume${instanceQuery}`,
+        { method: 'POST' }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || `HTTP ${res.status}`);
+      }
+      setWorkers((prev) =>
+        prev.map((w) =>
+          w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+            ? { ...w, runtime_status: 'ready' }
+            : w
+        )
+      );
+      setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
+    } catch (err) {
+      setStopErrors((prev) => ({ ...prev, [key]: err.message }));
+      setTimeout(() => {
+        setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
+      }, 3000);
+    }
+  }, [workspaceId]);
+
+  // ── Kill worker (terminate: NOT recoverable, queue rejected) ─────────────
+  const handleKill = useCallback(async (name, instanceId) => {
+    const key = workerInstanceKey({ name, instance_id: instanceId });
+    const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/kill${instanceQuery}`,
+        { method: 'POST' }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || `HTTP ${res.status}`);
+      }
+      setWorkers((prev) =>
+        prev.map((w) =>
+          w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+            // A killed worker never drains its queue: WorkerThread.kill()
+            // rejects every queued query (worker_thread.py:1533), so drop the
+            // queue locally instead of showing queries that will never run.
+            ? { ...w, runtime_status: 'killed', queued_query_count: 0, queued_query_ids: [] }
+            : w
+        )
+      );
+      setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
+    } catch (err) {
+      setStopErrors((prev) => ({ ...prev, [key]: err.message }));
+      setTimeout(() => {
+        setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
+      }, 3000);
+    }
+  }, [workspaceId]);
+
+  // ── Apply / respawn (W9: persist → apply live → kill, in that order) ─────
+  // The persisted definition is what a respawn reads, so it is written FIRST;
+  // only then is the live worker asked to take it. Whether the instance is
+  // killed afterwards is decided BEFORE anything is sent, by the same
+  // `workerRespawnPlan` the label came from -- never by the ack, because an ack
+  // that contradicts the label must not silently rewrite what the button said
+  // it would do. Respawning first would bring the worker back on the OLD
+  // config, which is the one outcome this ordering exists to prevent.
+  const [respawnBusy, setRespawnBusy] = useState({});
+  const handleForceRespawn = useCallback(
+    async (name, instanceId) => {
+      const key = workerInstanceKey({ name, instance_id: instanceId });
+      const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+      const workersUrl = `/api/workspace/${workspaceId}/workers`;
+      const workerUrl = `${workersUrl}/${encodeURIComponent(name)}`;
+      // The plan is recomputed here from the same three inputs the label used,
+      // so the label that was clicked and the action performed are one
+      // decision. A disabled plan promised nothing, so nothing is done.
+      const plan = workerRespawnPlan(
+        definitions ? definitions[name] : undefined,
+        configTiers,
+        definitions !== null
+      );
+      if (plan.disabled) return;
+      setRespawnBusy((prev) => ({ ...prev, [key]: true }));
+      try {
+        // 1. persist: read the stored definition and write it back unchanged.
+        // The reader is the list route's ?name= filter (there is no by-name
+        // GET); the PUT below does target the by-name route.
+        const defRes = await fetch(`${workersUrl}?name=${encodeURIComponent(name)}`);
+        if (!defRes.ok) {
+          const body = await defRes.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `definition read failed: HTTP ${defRes.status}`);
+        }
+        const definition = await defRes.json();
+        const putRes = await fetch(workerUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(definition),
+        });
+        if (!putRes.ok) {
+          const body = await putRes.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `persist failed: HTTP ${putRes.status}`);
+        }
+
+        // 2. apply live. The patch is the intersection of the definition and
+        // the tier map -- i.e. the fields the backend says are agent config --
+        // so no field list is spelled out on this side.
+        // workerConfigPatch is shared with the button label, so the plan the
+        // label advertises and the plan executed here cannot drift apart.
+        const patch = workerConfigPatch(definition, configTiers);
+        const applyRes = await fetch(`${workerUrl}/config${instanceQuery}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ config: patch }),
+        });
+        const ack = await applyRes.json().catch(() => ({}));
+        const ackTier = ack?.tier || 'unknown';
+        const ackStatus = ack?.status || 'no status in the config ack';
+
+        if (!plan.killAfterApply) {
+          // The label said "no restart", so no kill happens here -- not even if
+          // the ack says the config did not go live. That contradiction is
+          // surfaced on the row instead; it never converts this button into a
+          // kill the operator was not promised.
+          setStopErrors((prev) => {
+            const n = { ...prev };
+            if (ack?.applied_live) {
+              delete n[key];
+            } else {
+              n[key] = `${ackTier}: ${ackStatus} — config not applied live; kill the worker manually to rebuild it`;
+            }
+            return n;
+          });
+          return;
+        }
+
+        // 3. respawn: the label said the worker dies, so it dies. Deliberately
+        // NOT gated on `ack.applied_live` -- a promise kept only when the
+        // backend agrees is not a promise; the contradiction is logged below.
+        const killRes = await fetch(`${workerUrl}/kill${instanceQuery}`, { method: 'POST' });
+        if (!killRes.ok) {
+          const body = await killRes.json().catch(() => ({}));
+          throw new Error(body?.detail?.error || `respawn failed: HTTP ${killRes.status}`);
+        }
+        setWorkers((prev) =>
+          prev.map((w) =>
+            w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+              ? { ...w, runtime_status: 'killed', queued_query_count: 0, queued_query_ids: [] }
+              : w
+          )
+        );
+        setStopErrors((prev) => ({
+          ...prev,
+          [key]: `${ackTier}: ${ackStatus}${
+            ack?.applied_live
+              ? ' — config reported applied_live; killed anyway because the label promised a kill'
+              : ' — killed; the next spawn builds on the persisted definition'
+          }`,
+        }));
+      } catch (err) {
+        setStopErrors((prev) => ({ ...prev, [key]: err.message }));
+      } finally {
+        setRespawnBusy((prev) => { const n = { ...prev }; delete n[key]; return n; });
+      }
+    },
+    [workspaceId, configTiers, definitions]
+  );
+
+  const canStop = useCallback((status) => {
+    return status === 'busy' || status === 'ready' || !status;
+  }, []);
+
+  const canPause = useCallback((status) => {
+    return status === 'busy' || status === 'ready';
+  }, []);
+
+  const canResume = useCallback((status) => {
+    return status === 'paused';
+  }, []);
+
+  // Statuses that are still alive and therefore killable. 'detached' counts:
+  // killing a detached worker is how its preserved queue gets rejected. A
+  // terminal/unknown status is not offered a kill (we cannot vouch for it).
+  const canKill = useCallback((status) => {
+    return (
+      status === 'busy' || status === 'ready' || status === 'paused' ||
+      status === 'pausing' || status === 'detaching' || status === 'detached'
+    );
+  }, []);
+
+  // ── Create / Update worker ───────────────────────────────────────────────
+  const handleSaveWorker = useCallback(
+    async (payload, isEdit) => {
+      const url = isEdit
+        ? `/api/workspace/${workspaceId}/workers/${encodeURIComponent(payload.name)}`
+        : `/api/workspace/${workspaceId}/workers`;
+      const method = isEdit ? 'PUT' : 'POST';
+
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body?.detail || `HTTP ${res.status}`);
+        }
+        // Refresh the worker list
+        setShowForm(false);
+        setEditingWorker(null);
+        fetchWorkers();
+      } catch (err) {
+        // Surface error in the form
+        setShowForm(false);
+        setEditingWorker(null);
+        // Re-fetch anyway to stay in sync
+        fetchWorkers();
+        // Show a brief alert
+        alert(`Failed to ${isEdit ? 'update' : 'create'} worker: ${err.message}`);
+      }
+    },
+    [workspaceId, fetchWorkers]
+  );
+
+  // ── Delete worker ────────────────────────────────────────────────────────
+  const handleDeleteWorker = useCallback(
+    async (name) => {
+      try {
+        const res = await fetch(
+          `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}`,
+          { method: 'DELETE' }
+        );
+        if (!res.ok && res.status !== 204) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body?.detail || `HTTP ${res.status}`);
+        }
+        setShowDeleteConfirm(null);
+        fetchWorkers();
+      } catch (err) {
+        alert(`Failed to delete worker: ${err.message}`);
+        setShowDeleteConfirm(null);
+      }
+    },
+    [workspaceId, fetchWorkers]
+  );
+
+  // ── Open form for editing ────────────────────────────────────────────────
+  const openEdit = useCallback((worker) => {
+    setEditingWorker(worker);
+    setIsCreateFromTemplate(false);
+    setShowForm(true);
+  }, []);
+
+  // ── Open form for new worker from template ───────────────────────────────
+  const openNewFromTemplate = useCallback((template) => {
+    setShowTemplatePicker(false);
+    setIsCreateFromTemplate(true);
+    setEditingWorker({
+      name: template.name,
+      description: template.description || '',
+      system_prompt: template.system_prompt || '',
+      tools: template.tools || [],
+      permission_footprint: template.permission_footprint || {},
+      timeout_seconds: template.timeout_seconds,
+      max_tokens: template.max_tokens,
+      warning_threshold_tokens: template.warning_threshold_tokens,
+      max_turns: template.max_turns,
+      temperature: template.temperature,
+    });
+    setShowForm(true);
+  }, []);
+
+  // ── Render ───────────────────────────────────────────────────────────────
+  if (!workspaceId) {
+    return (
+      <div style={{ color: '#6c7086', fontSize: '0.85rem', padding: '1rem 0', textAlign: 'center' }}>
+        No workspace loaded.
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading workers…</div>
+    );
+  }
+
+  return (
+    <>
+      {/* ── Action buttons ────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.5rem' }}>
+        <button
+          style={btnPrimary}
+          onClick={() => {
+            setEditingWorker(null);
+            setIsCreateFromTemplate(false);
+            setShowForm(true);
+          }}
+        >
+          + New Worker
+        </button>
+        <button
+          style={btnGhost}
+          onClick={() => {
+            fetchTemplates();
+            setShowTemplatePicker(true);
+          }}
+        >
+          From Template
+        </button>
+        <button style={btnDanger} onClick={() => setShowStopAllConfirm(true)}>
+          Stop All Workers
+        </button>
+      </div>
+
+      {/* ── Worker list ───────────────────────────────────────────────── */}
+      {workers.length === 0 ? (
+        <EmptyState
+          message="No workers configured. Create one now, or start from a template."
+          onNew={() => {
+            setEditingWorker(null);
+            setIsCreateFromTemplate(false);
+            setShowForm(true);
+          }}
+          onFromTemplate={() => {
+            fetchTemplates();
+            setShowTemplatePicker(true);
+          }}
+        />
+      ) : (
+        <div
+          style={{
+            border: '1px solid #45475a',
+            borderRadius: '6px',
+            overflow: 'hidden',
+          }}
+        >
+          {/* Column headers */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.4rem',
+              padding: '0.4rem 0.5rem',
+              background: '#181825',
+              borderBottom: '1px solid #45475a',
+              fontSize: '0.75rem',
+              color: '#6c7086',
+              fontWeight: 600,
+              textTransform: 'uppercase',
+            }}
+          >
+            <span style={{ width: 8, flexShrink: 0 }} />
+            <span style={{ flex: '0 0 130px', minWidth: 0 }}>Name</span>
+            <span style={{ flex: 1, minWidth: 0 }}>Description</span>
+            <span style={{ flex: '0 0 60px', textAlign: 'center' }}>Tools</span>
+            <span style={{ flex: '0 0 150px', textAlign: 'center' }}>Status</span>
+            <span style={{ flex: '0 0 92px', textAlign: 'center' }}>Queue</span>
+            <span style={{ flex: '0 0 80px', textAlign: 'right' }}>Actions</span>
+          </div>
+
+          {/* Rows */}
+          {workers.map((w, i) => {
+            const isRunning = canStop(w.runtime_status);
+            const queuedIds = queuedQueryIds(w);
+            const queuedCount = queuedQueryCount(w, queuedIds);
+            const toolsList = Array.isArray(w.tools) ? w.tools : [];
+            const perms = w.permission_footprint || {};
+            const instKey = workerInstanceKey(w);
+            const dispLabel = w.instance_label || w.name;
+            // One plan drives the button AND the click that follows it: the
+            // label, the title, whether it is clickable at all, and whether
+            // the handler kills afterwards.
+            const plan = workerRespawnPlan(
+              definitions ? definitions[w.name] : undefined,
+              configTiers,
+              definitions !== null
+            );
+            const isSelected =
+              selectedWorker?.name === w.name &&
+              selectedWorker?.workspaceId === workspaceId &&
+              (selectedWorker.instance_id == null || selectedWorker.instance_id === w.instance_id);
+
+            return (
+              <div
+                key={w.name ? instKey : i}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.4rem',
+                  padding: '0.45rem 0.5rem',
+                  fontSize: '0.85rem',
+                  color: '#cdd6f4',
+                  borderBottom: i < workers.length - 1 ? '1px solid #45475a' : 'none',
+                  cursor: 'pointer',
+                  borderRadius: '0',
+                  transition: 'background 0.15s',
+                  background: isSelected ? '#45475a' : 'transparent',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = '#585b70';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = isSelected ? '#45475a' : 'transparent';
+                }}
+                onClick={() => {
+                  dismissedWorkersRef.current.delete(instKey);
+                  onSelectWorker?.(w.name, workspaceId, w.instance_id, w.instance_label);
+                }}
+              >
+                {/* Status dot */}
+                <WorkerDot status={w.runtime_status} />
+
+                {/* Name */}
+                <span
+                  style={{
+                    flex: '0 0 130px',
+                    fontWeight: 600,
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    minWidth: 0,
+                  }}
+                  title={dispLabel}
+                >
+                  {dispLabel}
+                </span>
+
+                {/* Description */}
+                <span
+                  style={{
+                    flex: 1,
+                    color: '#a6adc8',
+                    fontSize: '0.8rem',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    minWidth: 0,
+                  }}
+                  title={w.description || ''}
+                >
+                  {truncate(w.description, 50) || <span style={{ color: '#6c7086' }}>—</span>}
+                </span>
+
+                {/* Tools count */}
+                <span
+                  style={{
+                    flex: '0 0 60px',
+                    textAlign: 'center',
+                    color: '#6c7086',
+                    fontSize: '0.78rem',
+                    cursor: 'help',
+                  }}
+                  title={toolsList.join(', ')}
+                >
+                  {toolsList.length}
+                </span>
+
+                {/* Status + runtime info */}
+                <div
+                  style={{
+                    flex: '0 0 150px',
+                    textAlign: 'center',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '0.25rem',
+                    fontSize: '0.75rem',
+                  }}
+                >
+                  {w.runtime_status ? (
+                    <>
+                      {/* Status text comes from the backend vocabulary only —
+                          statusLabel() degrades an unknown status visibly rather
+                          than printing it as if it were a known healthy state. */}
+                      <span style={{ color: statusTextColor(w.runtime_status) }}>
+                        {statusLabel(w.runtime_status)}
+                      </span>
+                      {w.elapsed != null && (
+                        <span
+                          style={{ color: '#6c7086', fontSize: '0.68rem', whiteSpace: 'nowrap' }}
+                          title={`Uptime ${formatDuration(w.elapsed)}`}
+                        >
+                          {formatDuration(w.elapsed)}
+                        </span>
+                      )}
+                      {/* Pause / Resume toggle */}
+                      {w.runtime_status === 'paused' ? (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleResume(w.name, w.instance_id);
+                          }}
+                          style={{
+                            background: '#a6e3a1',
+                            color: '#1e1e2e',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: 'pointer',
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                            marginRight: '4px',
+                          }}
+                          title={`Resume ${dispLabel}`}
+                        >
+                          ▶ Resume
+                        </button>
+                      ) : w.runtime_status === 'detached' ? (
+                        // Detached is PARKED BUT ALIVE and keeps its queue
+                        // (worker_thread.py:1494). Resume is ALWAYS available:
+                        // an empty queue is not a reason to withhold the
+                        // affordance, because a detached worker with nothing
+                        // queued still needs a path back to accepting fresh
+                        // work — otherwise the only exits are Kill or TTL
+                        // expiry and "detach" is not actually recoverable.
+                        // The title says what the click does in both cases.
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleResume(w.name, w.instance_id);
+                          }}
+                          style={{
+                            background: '#a6e3a1',
+                            color: '#1e1e2e',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: 'pointer',
+                            opacity: queuedCount > 0 ? 1 : 0.9,
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                            marginRight: '4px',
+                          }}
+                          title={
+                            queuedCount > 0
+                              ? `Resume ${dispLabel} — runs its ${queuedCount} queued ${queuedCount === 1 ? 'query' : 'queries'} in order (nothing is discarded)`
+                              : `Resume ${dispLabel} — revives the worker so it can accept new work (nothing is queued right now)`
+                          }
+                        >
+                          ▶ Resume
+                        </button>
+                      ) : w.runtime_status === 'pausing' ? (
+                        <button
+                          disabled
+                          style={{
+                            background: '#f9e2af',
+                            color: '#1e1e2e',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: 'default',
+                            opacity: 0.6,
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                            marginRight: '4px',
+                          }}
+                          title={`Pausing ${dispLabel}…`}
+                        >
+                          ⏸ Pausing…
+                        </button>
+                      ) : (
+                        canPause(w.runtime_status) && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handlePause(w.name, w.instance_id);
+                            }}
+                            style={{
+                              background: '#f9e2af',
+                              color: '#1e1e2e',
+                              border: 'none',
+                              borderRadius: '3px',
+                              padding: '0.1rem 0.4rem',
+                              cursor: 'pointer',
+                              fontWeight: 600,
+                              fontSize: '0.65rem',
+                              lineHeight: '1.4',
+                              marginRight: '4px',
+                            }}
+                            title={`Pause ${dispLabel}`}
+                          >
+                            ⏸ Pause
+                          </button>
+                        )
+                      )}
+                      {/* Stop button — DETACH (recoverable, queue kept), so it
+                          is styled as a soft outline rather than the solid red
+                          used by the unrecoverable Kill action below. */}
+                      {isRunning && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleStop(w.name, w.instance_id);
+                          }}
+                          style={{
+                            background: 'transparent',
+                            color: '#fab387',
+                            border: '1px solid #fab387',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: 'pointer',
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                          }}
+                          title={`Stop ${dispLabel} — detach (recoverable, queued queries are kept)`}
+                        >
+                          Stop
+                        </button>
+                      )}
+                      {/* Kill button — TERMINATE (unrecoverable, queue rejected).
+                          Goes through the KillConfirm dialog; no request is sent
+                          from here. */}
+                      {canKill(w.runtime_status) && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setKillTarget({
+                              name: w.name,
+                              instanceId: w.instance_id,
+                              label: dispLabel,
+                              queuedCount,
+                            });
+                          }}
+                          style={{
+                            background: '#f38ba8',
+                            color: '#1e1e2e',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: 'pointer',
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                          }}
+                          title={`Kill ${dispLabel} — terminate now (unrecoverable, discards its queued queries)`}
+                        >
+                          Kill
+                        </button>
+                      )}
+                      {/* Apply / respawn (W9) — persist → apply live → kill.
+                          The label IS the contract: `plan` above is the same
+                          object the click handler recomputes, so the promise
+                          made here is the action taken there. A disabled plan
+                          (definition map still loading, or no stored
+                          definition) promises nothing and cannot be clicked. */}
+                      {isRunning && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleForceRespawn(w.name, w.instance_id);
+                          }}
+                          disabled={!!respawnBusy[workerInstanceKey(w)] || plan.disabled}
+                          style={{
+                            background: 'transparent',
+                            color: '#89b4fa',
+                            border: '1px solid #89b4fa',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor:
+                              respawnBusy[workerInstanceKey(w)] || plan.disabled
+                                ? 'default'
+                                : 'pointer',
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                            marginLeft: '4px',
+                            opacity:
+                              respawnBusy[workerInstanceKey(w)] || plan.disabled ? 0.6 : 1,
+                          }}
+                          title={plan.title}
+                        >
+                          {respawnBusy[workerInstanceKey(w)] ? 'Applying…' : plan.label}
+                        </button>
+                      )}
+                      {/* manual-pause badge (payload.paused_manually) */}
+                      {w.paused_manually && (
+                        <span
+                          title="Paused manually"
+                          style={{
+                            background: '#f9e2af',
+                            color: '#1e1e2e',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.3rem',
+                            fontSize: '0.6rem',
+                            fontWeight: 600,
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          manual pause
+                        </span>
+                      )}
+                      {/* compact token indicator */}
+                      {w.current_context_tokens != null && (
+                        <span style={{ color: '#a6adc8', fontSize: '0.65rem' }} title="Context tokens">
+                          ctx: {formatTokens(w.current_context_tokens)}
+                          {w.max_context_tokens != null
+                            ? ` / ${formatTokens(w.max_context_tokens)}`
+                            : ''}
+                        </span>
+                      )}
+                      {/* time since last query (falls back to heartbeat) */}
+                      {(w.time_since_last_query != null && w.time_since_last_query >= 0) ||
+                      w.last_heartbeat ? (
+                        <span
+                          style={{ color: '#6c7086', fontSize: '0.65rem' }}
+                          title="Time since last query"
+                        >
+                          {w.time_since_last_query != null && w.time_since_last_query >= 0
+                            ? formatDuration(w.time_since_last_query)
+                            : relativeTime(w.last_heartbeat)}
+                        </span>
+                      ) : null}
+                    </>
+                  ) : (
+                    <span style={{ color: '#6c7086' }}>—</span>
+                  )}
+                </div>
+
+                {/* Queue: queued_query_count / queued_query_ids (FIFO order) */}
+                <div
+                  style={{
+                    flex: '0 0 92px',
+                    textAlign: 'center',
+                    fontSize: '0.7rem',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {queuedCount > 0 ? (
+                    <span
+                      style={{ color: '#89b4fa', fontWeight: 600 }}
+                      title={
+                        queuedIds.length
+                          ? `Queued queries (FIFO): ${queuedIds.join(', ')}`
+                          : `${queuedCount} queued (ids not reported)`
+                      }
+                    >
+                      ⧗ {queuedCount} queued
+                    </span>
+                  ) : (
+                    <span style={{ color: '#6c7086' }} title="No queued queries">
+                      none queued
+                    </span>
+                  )}
+                </div>
+
+                {/* Actions: Edit / Delete */}
+                <div
+                  style={{
+                    flex: '0 0 80px',
+                    textAlign: 'right',
+                    display: 'flex',
+                    gap: '0.3rem',
+                    justifyContent: 'flex-end',
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    style={{
+                      background: 'transparent',
+                      color: '#89b4fa',
+                      border: 'none',
+                      cursor: 'pointer',
+                      fontSize: '0.75rem',
+                      padding: '0.1rem 0.3rem',
+                      borderRadius: '3px',
+                    }}
+                    onClick={() => openEdit(w)}
+                    title="Edit worker"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    style={{
+                      background: 'transparent',
+                      color: '#f38ba8',
+                      border: 'none',
+                      cursor: 'pointer',
+                      fontSize: '0.75rem',
+                      padding: '0.1rem 0.3rem',
+                      borderRadius: '3px',
+                    }}
+                    onClick={() => setShowDeleteConfirm(w.name)}
+                    title="Delete worker"
+                  >
+                    Del
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ── Runtime bottom bar: current task for selected worker ──────── */}
+      {workers.map((w) => {
+        const instKey = workerInstanceKey(w);
+        if (
+          selectedWorker?.name === w.name &&
+          selectedWorker?.workspaceId === workspaceId &&
+          (selectedWorker.instance_id == null || selectedWorker.instance_id === w.instance_id) &&
+          w.current_task
+        ) {
+          return (
+            <div
+              key={`task-${instKey}`}
+              style={{
+                marginTop: '0.4rem',
+                fontSize: '0.8rem',
+                color: '#a6adc8',
+                padding: '0.25rem 0.35rem',
+                background: '#1e1e2e',
+                borderRadius: '4px',
+                border: '1px solid #45475a',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+              title={w.current_task}
+            >
+              <strong>{w.instance_label || w.name}:</strong> {truncate(w.current_task, 100)}
+            </div>
+          );
+        }
+        return null;
+      })}
+
+      {/* ── Inline stop errors ────────────────────────────────────────── */}
+      {Object.entries(stopErrors).map(([name, err]) => (
+        <div
+          role="alert"
+          key={`err-${name}`}
+          style={{
+            marginTop: '0.3rem',
+            fontSize: '0.75rem',
+            color: '#f38ba8',
+          }}
+        >
+          ✗ {name}: {err}
+        </div>
+      ))}
+
+      {/* ── Stop-all error ────────────────────────────────────────────── */}
+      {stopAllError && (
+        <div
+          role="alert"
+          style={{
+            marginTop: '0.3rem',
+            fontSize: '0.75rem',
+            color: '#f38ba8',
+          }}
+        >
+          ✗ {stopAllError}
+        </div>
+      )}
+
+      {/* ── Permission pills for running worker ───────────────────────── */}
+      {workers
+        .filter((w) => w.runtime_status && w.runtime_status !== 'stopped')
+        .map((w) => {
+          const perms = w.permission_footprint || {};
+          const permEntries = Object.entries(perms);
+          if (permEntries.length === 0) return null;
+          return (
+            <div
+              key={`perms-${workerInstanceKey(w)}`}
+              style={{
+                display: 'flex',
+                gap: '0.3rem',
+                flexWrap: 'wrap',
+                marginTop: '0.3rem',
+              }}
+            >
+              <span style={{ color: '#6c7086', fontSize: '0.7rem', marginRight: '0.2rem' }}>
+                {w.instance_label || w.name}:
+              </span>
+              {permEntries.map(([k, v]) => (
+                <PermissionPill key={k} name={k} value={v} />
+              ))}
+            </div>
+          );
+        })}
+
+      {/* ── Modals ────────────────────────────────────────────────────── */}
+
+      {/* Create / Edit form */}
+      {showForm && (
+        <WorkerFormModal
+          worker={editingWorker}
+          templates={templates}
+          configTiers={configTiers}
+          isCreateFromTemplate={isCreateFromTemplate}
+          onSave={handleSaveWorker}
+          onCancel={() => {
+            setShowForm(false);
+            setEditingWorker(null);
+            setIsCreateFromTemplate(false);
+          }}
+        />
+      )}
+
+      {/* Delete confirmation */}
+      {showDeleteConfirm && (
+        <DeleteConfirm
+          name={showDeleteConfirm}
+          onConfirm={handleDeleteWorker}
+          onCancel={() => setShowDeleteConfirm(null)}
+        />
+      )}
+
+      {/* Stop all workers confirmation */}
+      {showStopAllConfirm && (
+        <StopAllConfirm
+          onConfirm={handleStopAll}
+          onCancel={() => setShowStopAllConfirm(false)}
+        />
+      )}
+
+      {/* Kill worker confirmation (terminate — NOT recoverable, queue rejected) */}
+      {killTarget && (
+        <KillConfirm
+          label={killTarget.label}
+          queuedCount={killTarget.queuedCount}
+          onConfirm={() => {
+            const target = killTarget;
+            setKillTarget(null);
+            handleKill(target.name, target.instanceId);
+          }}
+          onCancel={() => setKillTarget(null)}
+        />
+      )}
+
+      {/* Template picker */}
+      {showTemplatePicker && (
+        <TemplatePicker
+          templates={templates}
+          onSelect={openNewFromTemplate}
+          onCancel={() => setShowTemplatePicker(false)}
+        />
+      )}
+    </>
+  );
+}

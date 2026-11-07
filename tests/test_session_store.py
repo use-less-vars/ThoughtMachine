@@ -72,14 +72,20 @@ class TestInit:
                                         enable_session_history_pruning=False)
         assert store.state_dir == state
 
-    def test_directories_created_on_init(self, tmp_path):
-        """Verify directories are created automatically."""
+    def test_directories_created_lazily_on_first_write(self, tmp_path):
+        """Verify directories are created on first write, not on init."""
         sessions = tmp_path / "new_sessions"
         state = tmp_path / "new_state"
         assert not sessions.exists()
         assert not state.exists()
         store = FileSystemSessionStore(sessions_dir=str(sessions), state_dir=str(state),
                                         enable_session_history_pruning=False)
+        # Construction performs no filesystem I/O
+        assert not sessions.exists()
+        assert not state.exists()
+        # The first write creates the directories
+        from session.models import Session
+        store.save_session(Session())
         assert sessions.exists()
         assert state.exists()
 
@@ -92,9 +98,11 @@ class TestOpenSessionsPath:
         path = store.get_open_sessions_path()
         assert path == store.state_dir / 'open_sessions.json'
 
-    def test_path_parent_created(self, store):
-        """Verify the state directory exists for the path."""
+    def test_path_parent_created_on_write(self, store):
+        """Verify the state directory is created lazily on first write."""
         path = store.get_open_sessions_path()
+        assert not path.parent.exists()
+        store.save_open_sessions([])
         assert path.parent.exists()
 
 
@@ -263,6 +271,27 @@ class TestDeleteSession:
         """Verify deleting a non-existent session returns False."""
         assert store.delete_session('nonexistent') is False
 
+    def test_delete_scoped_to_workspace_leaves_other_workspace_intact(
+        self, store, sample_session, tmp_path, monkeypatch
+    ):
+        """Verify a workspace-scoped delete cannot reach another workspace.
+
+        Workspace-scoped session files live under vault_root()/workspaces, so
+        the vault root is redirected into tmp_path for isolation.
+        """
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        session_id = sample_session.session_id
+        store.save_session(sample_session, workspace_id="ws-b")
+        assert store.load_session(session_id, workspace_id="ws-b") is not None
+
+        # Deleting under a different workspace must not touch the session.
+        assert store.delete_session(session_id, workspace_id="ws-a") is False
+        assert store.load_session(session_id, workspace_id="ws-b") is not None
+
+        # The owning workspace can still delete it.
+        assert store.delete_session(session_id, workspace_id="ws-b") is True
+        assert store.load_session(session_id, workspace_id="ws-b") is None
+
 
 # --- Get Session Path Tests ---
 
@@ -280,35 +309,48 @@ class TestGetSessionPath:
 # --- Migration Tests ---
 
 class TestCurrentSessionMigration:
-    """Test migration of .current_session from sessions_dir to state_dir."""
+    """Test read-only fallback to legacy .current_session in sessions_dir."""
 
-    def test_migrates_from_old_location_on_read(self, store):
-        """Verify .current_session is migrated from sessions_dir to state_dir on first read."""
+    def test_falls_back_to_old_location_read_only(self, store):
+        """Verify the legacy marker is read without migrating.
+
+        The legacy fallback is read-only: the old marker stays in place and no
+        new marker is written to state_dir.  set_current_session_id still writes
+        the new-location marker.
+        """
+        # sessions_dir is created lazily on first write; create it manually
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         # Write .current_session in old location (sessions_dir)
         old_marker = store.sessions_dir / ".current_session"
         old_marker.write_text("migrated-session-id")
         assert old_marker.exists()
         assert not (store.state_dir / ".current_session").exists()
 
-        # Read should trigger migration
+        # Read falls back to the old location without migrating
         session_id = store.get_current_session_id()
         assert session_id == "migrated-session-id"
 
-        # Old marker should be removed
-        assert not old_marker.exists(), "Old marker should be deleted after migration"
+        # Old marker should be left in place (read-only fallback)
+        assert old_marker.exists(), "Old marker should NOT be deleted by a read"
 
-        # New marker should exist
+        # No new marker should be created by the read
         new_marker = store.state_dir / ".current_session"
+        assert not new_marker.exists(), "Read should not write a new marker"
+
+        # A subsequent set still writes the new-location marker
+        store.set_current_session_id("migrated-session-id")
         assert new_marker.exists()
         assert new_marker.read_text().strip() == "migrated-session-id"
 
     def test_prefers_new_location_over_old(self, store):
         """Verify the new location takes precedence when both exist."""
         # Write in new location
+        store.state_dir.mkdir(parents=True, exist_ok=True)
         new_marker = store.state_dir / ".current_session"
         new_marker.write_text("new-session-id")
 
         # Write in old location (should be ignored)
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         old_marker = store.sessions_dir / ".current_session"
         old_marker.write_text("old-session-id")
 
@@ -321,6 +363,7 @@ class TestCurrentSessionMigration:
 
     def test_empty_old_marker_does_not_migrate(self, store):
         """Verify an empty old marker does not create a new marker."""
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         old_marker = store.sessions_dir / ".current_session"
         old_marker.write_text("")
         assert store.get_current_session_id() is None
@@ -335,10 +378,12 @@ class TestOpenSessionsMigration:
     def test_reads_from_new_location_first(self, store):
         """Verify new location is tried first."""
         # Write in new location
+        store.state_dir.mkdir(parents=True, exist_ok=True)
         new_path = store.state_dir / 'open_sessions.json'
         new_path.write_text('["session-1"]')
 
         # Write in old location (should be ignored)
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         old_path = store.sessions_dir / 'open_sessions.json'
         old_path.write_text('["session-2"]')
 
@@ -348,6 +393,7 @@ class TestOpenSessionsMigration:
     def test_fallback_to_old_location(self, store):
         """Verify old location is a fallback concept in main_window (tested via store path)."""
         # Old location exists, new does not
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         old_path = store.sessions_dir / 'open_sessions.json'
         old_path.write_text('["session-a"]')
 
@@ -373,4 +419,188 @@ class TestOpenSessionsMigration:
         sessions = store.list_sessions()
         assert len(sessions) == 1
         assert sessions[0]['session_id'] == s.session_id
+
+
+# --- Workspace-scoped read path tests ---
+
+class TestWorkspaceScopedReadPaths:
+    """Reads that name a workspace must never resolve into another workspace.
+
+    Workspace-scoped session files live under vault_root()/workspaces, so the
+    vault root is redirected into tmp_path for isolation (same pattern as
+    ``TestDeleteSession.test_delete_scoped_to_workspace_leaves_other_workspace_intact``).
+    """
+
+    def test_load_session_scoped_to_workspace(
+        self, store, sample_session, tmp_path, monkeypatch
+    ):
+        """D: a scoped load may not read another workspace's session."""
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        session_id = sample_session.session_id
+        store.save_session(sample_session, workspace_id="ws-b")
+
+        # A different workspace sees nothing.
+        assert store.load_session(session_id, workspace_id="ws-a") is None
+
+        # The owning workspace still loads it.
+        loaded = store.load_session(session_id, workspace_id="ws-b")
+        assert loaded is not None
+        assert loaded.session_id == session_id
+
+    def test_path_cache_is_not_shared_between_workspaces(
+        self, store, sample_session, tmp_path, monkeypatch
+    ):
+        """E: a path cached in one workspace is never served to another."""
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        session_id = sample_session.session_id
+        store.save_session(sample_session, workspace_id="ws-b")
+
+        # Resolve in the owning workspace first, populating the path cache.
+        assert store.load_session(session_id, workspace_id="ws-b") is not None
+        assert any(
+            key[1] == session_id for key in store._cached_paths
+        ), "the ws-b load should have populated the path cache"
+
+        # Asked within the same TTL window, a different workspace must not be
+        # served the cached ws-b path.
+        assert store.load_session(session_id, workspace_id="ws-a") is None
+
+        # The unscoped lookup keeps its historical cross-workspace scan.
+        assert store.load_session(session_id) is not None
+
+    def test_size_bytes_and_path_are_workspace_scoped(
+        self, store, sample_session, tmp_path, monkeypatch
+    ):
+        """F: get_session_size_bytes / get_session_path honour workspace_id."""
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        session_id = sample_session.session_id
+        store.save_session(sample_session, workspace_id="ws-b")
+        ws_b_path = store._find_session_path(session_id, workspace_id="ws-b")
+        assert ws_b_path is not None
+
+        # Stamp a size into the owner's file so the lookup has something to find.
+        data = json.loads(ws_b_path.read_text())
+        data["session_size_bytes"] = 4242
+        ws_b_path.write_text(json.dumps(data))
+
+        assert store.get_session_size_bytes(session_id, workspace_id="ws-b") == 4242
+        assert store.get_session_size_bytes(session_id, workspace_id="ws-a") is None
+
+        assert store.get_session_path(session_id, workspace_id="ws-b") == ws_b_path
+        ws_a_path = store.get_session_path(session_id, workspace_id="ws-a")
+        assert "ws-b" not in str(ws_a_path)
+
+    def test_save_into_other_workspace_does_not_move_file(
+        self, store, sample_session, tmp_path, monkeypatch
+    ):
+        """D3: saving into another workspace must not MOVE the owner's file."""
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        session_id = sample_session.session_id
+        store.save_session(sample_session, workspace_id="ws-b")
+        ws_b_path = store._find_session_path(session_id, workspace_id="ws-b")
+        assert ws_b_path is not None and ws_b_path.exists()
+
+        # Re-save the same session under a DIFFERENT workspace.
+        store.save_session(sample_session, workspace_id="ws-a")
+
+        # ws-b's copy must survive: it was never this writer's to move.
+        assert ws_b_path.exists(), "saving into ws-a moved ws-b's session file"
+        assert store.load_session(session_id, workspace_id="ws-b") is not None
+        # And the ws-a write landed in ws-a.
+        assert store._find_session_path(session_id, workspace_id="ws-a") is not None
+
+    def test_re_save_into_other_workspace_keeps_single_copy(
+        self, store, sample_session, tmp_path, monkeypatch
+    ):
+        """D4: a re-save into another workspace never duplicates the record.
+
+        A persisted session's ``workspace_id`` is immutable, so the second save
+        cannot honour the new workspace.  It must keep updating the owner's own
+        file: writing a second copy into the requested workspace would both
+        duplicate the session and mislabel it, because the payload would still
+        carry the old workspace_id.  (The unowned/legacy case — no recorded
+        workspace_id at all — is D3 above.)
+        """
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+        sample_session.workspace_id = "ws-a"
+        session_id = sample_session.session_id
+        store.save_session(sample_session, workspace_id="ws-a")
+        ws_a_path = store._find_session_path(session_id, workspace_id="ws-a")
+        assert ws_a_path is not None, "the first save did not land in ws-a"
+
+        # Re-save the same session into a DIFFERENT workspace.
+        store.save_session(sample_session, workspace_id="ws-b")
+
+        # Exactly ONE copy of the session exists across every workspace dir.
+        copies = []
+        for ws_sessions in (tmp_path / "vault" / "workspaces").glob("*/sessions"):
+            for path in ws_sessions.glob("*.json"):
+                if path.name.startswith("_meta_"):
+                    continue
+                if json.loads(path.read_text()).get("session_id") == session_id:
+                    copies.append((ws_sessions.parent.name, path))
+        assert len(copies) == 1, (
+            f"expected exactly one copy of the session, found {copies}"
+        )
+
+        # ... it lives in the owning workspace, and its payload agrees with it.
+        owner, path = copies[0]
+        assert owner == "ws-a", f"the single copy landed in {owner!r}, not the owner's ws-a"
+        payload_workspace_id = json.loads(path.read_text()).get("workspace_id")
+        assert payload_workspace_id == owner, (
+            f"payload workspace_id {payload_workspace_id!r} disagrees with its "
+            f"directory {owner!r}"
+        )
+        assert store._find_session_path(session_id, workspace_id="ws-a") == path
+
+    def test_legacy_resident_session_readable_but_never_leaks_another_workspace(
+        self, store, sample_session, tmp_path, monkeypatch
+    ):
+        """D (compat): the legacy dir is workspace-agnostic, not a leak channel.
+
+        Records written with no workspace_id land in the legacy sessions_dir
+        (that is what ``SessionManager.create_session`` produces).  They belong
+        to no workspace at all, so a workspace-scoped read must still resolve
+        them -- otherwise every REST-created session becomes unreadable through
+        its own workspace.
+
+        That widening must NOT reopen the cross-workspace leak: a ws-b-owned
+        record stays invisible under ws-a even while the legacy dir is
+        non-empty.  This half is the regression guard for the widened
+        candidate list in ``_find_session_path``.
+        """
+        from session.models import Session
+
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path / "vault"))
+
+        # (i) A legacy-resident record (no workspace_id) is readable through a
+        # scoped call, in ANY workspace, because it belongs to none.
+        legacy_session = Session()
+        legacy_session.metadata['name'] = 'Legacy Session'
+        legacy_session.add_message('user', 'Hello')
+        store.save_session(legacy_session)  # no workspace_id -> legacy sessions_dir
+        legacy_id = legacy_session.session_id
+        legacy_path = store._find_session_path(legacy_id)
+        assert legacy_path is not None
+        assert legacy_path.parent == store.sessions_dir
+
+        for ws in ("ws-a", "ws-b"):
+            loaded = store.load_session(legacy_id, workspace_id=ws)
+            assert loaded is not None, (
+                f"legacy-resident session must remain readable under {ws}"
+            )
+            assert loaded.session_id == legacy_id
+
+        # (ii) A ws-b-owned record is still invisible to ws-a, even though the
+        # legacy dir now holds a real session file.
+        store.save_session(sample_session, workspace_id="ws-b")
+        owned_id = sample_session.session_id
+        ws_b_path = store._find_session_path(owned_id, workspace_id="ws-b")
+        assert ws_b_path is not None
+        assert "ws-b" in str(ws_b_path)
+
+        assert store.load_session(owned_id, workspace_id="ws-a") is None, (
+            "widening the candidate list reopened the cross-workspace leak"
+        )
+        assert store.load_session(owned_id, workspace_id="ws-b") is not None
 

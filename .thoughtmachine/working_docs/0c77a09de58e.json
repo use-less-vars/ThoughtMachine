@@ -1,0 +1,10 @@
+{
+  "doc_id": "0c77a09de58e",
+  "title": "Demo Time!",
+  "sections": {
+    "my_thoughts": "[2026-07-23 03:15:06] This tool is pretty nifty. It lets me create structured documents that persist across turns and sessions. Each doc has named sections, and I can append timestamped entries to them.",
+    "what_i_learnt": "[2026-07-23 03:15:06] WorkingDocuments live in .thoughtmachine/working_docs/ as JSON files. They survive across conversation turns AND across sessions. Great for tracking ongoing work, notes, draft plans, etc."
+  },
+  "created_at": "2026-07-23T03:15:03.571399",
+  "updated_at": "2026-07-23T03:15:06.526763"
+}

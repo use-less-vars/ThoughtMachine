@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Union, TypedDict, Protocol, runtime_checkable
 from dataclasses import dataclass, field, asdict
 from pydantic import BaseModel, Field, validator
+import threading
 
 class EventType(enum.Enum):
     """Standardized event types for the agent system."""
@@ -27,6 +28,7 @@ class EventType(enum.Enum):
     LLM_RESPONSE = 'llm_response'
     RAW_RESPONSE = 'raw_response'
     TOOL_CALL = 'tool_call'
+    TOOL_CALL_START = 'tool_call_start'
     TOOL_RESULT = 'tool_result'
     CONVERSATION_UPDATE = 'conversation_update'
     CONVERSATION_PRUNE = 'conversation_prune'
@@ -34,6 +36,7 @@ class EventType(enum.Enum):
     SESSION_STATE_CHANGE = 'session_state_change'
     TOKEN_WARNING = 'token_warning'
     TURN_WARNING = 'turn_warning'
+    TIME_WARNING = 'time_warning'
     TOKEN_UPDATE = 'token_update'
     TURN_UPDATE = 'turn_update'
     AGENT_RESPONDED = 'agent_responded'
@@ -59,6 +62,52 @@ class EventType(enum.Enum):
     RATE_LIMIT_WARNING = 'rate_limit_warning'
     TOOL_CALL_LEGACY = 'tool_call'
     TOOL_RESULT_LEGACY = 'tool_result'
+    SYSTEM_NOTIFICATION = 'system_notification'
+    WORKER_SPAWNED = 'worker_spawned'
+    WORKER_STATUS = 'worker_status'
+    WORKER_COMPLETED = 'worker_completed'
+    WORKER_ERROR = 'worker_error'
+    WORKER_MESSAGE = 'worker_message'
+    ASSISTANT_MESSAGE = 'assistant_message'
+    USER_MESSAGE = 'user_message'
+    WEBSOCKET_CONNECT = 'websocket_connect'
+    WEBSOCKET_DISCONNECT = 'websocket_disconnect'
+    CONFIG_LOADED = 'config_loaded'
+    # Worker-specific status/notification event types (for WorkerBusAdapter)
+    TOKENS_UPDATED = 'tokens_updated'
+    CONTEXT_UPDATED = 'context_updated'
+    STATUS_MESSAGE = 'status_message'
+    ERROR_OCCURRED = 'error_occurred'
+    CONFIG_CHANGED = 'config_changed'
+    CONVERSATION_CHANGED = 'conversation_changed'
+    TOKEN_RECOVERY = 'token_recovery'
+    CONTEXT_CLEARED = 'context_cleared'
+    CONTEXT_SUMMARIZED = 'context_summarized'
+    # Worker lifecycle events (Phase 2A)
+    WORKER_RUNNING = 'worker_running'
+    WORKER_STOPPING = 'worker_stopping'
+    WORKER_HEARTBEAT = 'worker_heartbeat'
+    WORKER_PARTIAL_RESULT = 'worker_partial_result'
+    WORKER_TIMEOUT = 'worker_timeout'
+    WORKER_PAUSED = 'worker_paused'
+    WORKER_RESUMED = 'worker_resumed'
+    # Container lifecycle events (routed to the tenant event log)
+    CONTAINER_REMOVED = 'container_removed'
+    CONTAINER_LIFECYCLE = 'container_lifecycle'
+    # Credential events (audit trail: credential names only, never values)
+    CREDENTIAL_USE = 'credential_use'
+    CREDENTIAL_ROTATED = 'credential_rotated'
+    CREDENTIAL_DELETED = 'credential_deleted'
+    # Token-level streaming deltas.  One of these is emitted per LLM chunk, so
+    # they share the event pipe with every lifecycle event.  They MUST be
+    # declared here: convert_from_legacy_format() -> BaseEvent.from_dict() falls
+    # back to EventType(<str>) for unknown types, and a ValueError there is
+    # caught by the caller as a WARNING (agent/controller:545 for the main
+    # agent, tools/workspace/worker_thread:1951 for workers) -- i.e. one bogus
+    # warning per streamed token.
+    TEXT_DELTA = 'text_delta'
+    REASONING_DELTA = 'reasoning_delta'
+
 
 class EventMetadata(BaseModel):
     """Metadata common to all events."""
@@ -250,6 +299,133 @@ class SecurityResponseEvent(BaseEvent):
                 raise ValueError(f"SecurityResponseEvent requires '{field}' in data")
         return v
 
+class WorkerSpawnedEvent(BaseEvent):
+    """Worker thread spawned and ready."""
+    type: EventType = Field(default=EventType.WORKER_SPAWNED)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("WorkerSpawnedEvent requires 'worker_name' in data")
+        return v
+
+class WorkerStatusEvent(BaseEvent):
+    """Worker runtime status changed."""
+    type: EventType = Field(default=EventType.WORKER_STATUS)
+
+    @validator('data')
+    def validate_data(cls, v):
+        required = ['worker_name', 'status']
+        for field in required:
+            if field not in v:
+                raise ValueError(f"WorkerStatusEvent requires '{field}' in data")
+        return v
+
+class WorkerCompletedEvent(BaseEvent):
+    """Worker finished execution."""
+    type: EventType = Field(default=EventType.WORKER_COMPLETED)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("WorkerCompletedEvent requires 'worker_name' in data")
+        return v
+
+class WorkerMessageEvent(BaseEvent):
+    """Worker message event."""
+    type: EventType = Field(default=EventType.WORKER_MESSAGE)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("WorkerMessageEvent requires 'worker_name' in data")
+        return v
+
+
+class AssistantMessageEvent(BaseEvent):
+    """Assistant message from a worker."""
+    type: EventType = Field(default=EventType.ASSISTANT_MESSAGE)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("AssistantMessageEvent requires 'worker_name' in data")
+        return v
+
+
+class WorkerErrorEvent(BaseEvent):
+    """Worker encountered an error."""
+    type: EventType = Field(default=EventType.WORKER_ERROR)
+
+    @validator('data')
+    def validate_data(cls, v):
+        required = ['worker_name', 'error']
+        for field in required:
+            if field not in v:
+                raise ValueError(f"WorkerErrorEvent requires '{field}' in data")
+        return v
+
+
+class WorkerRunningEvent(BaseEvent):
+    """Worker transitioned into a running (busy) state."""
+    type: EventType = Field(default=EventType.WORKER_RUNNING)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("WorkerRunningEvent requires 'worker_name' in data")
+        return v
+
+
+class WorkerStoppingEvent(BaseEvent):
+    """Worker received a stop request and is stopping."""
+    type: EventType = Field(default=EventType.WORKER_STOPPING)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("WorkerStoppingEvent requires 'worker_name' in data")
+        return v
+
+
+class WorkerHeartbeatEvent(BaseEvent):
+    """Periodic worker liveness heartbeat."""
+    type: EventType = Field(default=EventType.WORKER_HEARTBEAT)
+
+    @validator('data')
+    def validate_data(cls, v):
+        required = ['worker_name', 'status']
+        for field in required:
+            if field not in v:
+                raise ValueError(f"WorkerHeartbeatEvent requires '{field}' in data")
+        return v
+
+
+class WorkerPartialResultEvent(BaseEvent):
+    """Worker ended without a complete final reply (stopped/paused/error/timeout)."""
+    type: EventType = Field(default=EventType.WORKER_PARTIAL_RESULT)
+
+    @validator('data')
+    def validate_data(cls, v):
+        required = ['worker_name', 'reason']
+        for field in required:
+            if field not in v:
+                raise ValueError(f"WorkerPartialResultEvent requires '{field}' in data")
+        return v
+
+
+class WorkerTimeoutEvent(BaseEvent):
+    """Worker query timed out (query expiry or hung heartbeat)."""
+    type: EventType = Field(default=EventType.WORKER_TIMEOUT)
+
+    @validator('data')
+    def validate_data(cls, v):
+        required = ['worker_name', 'reason']
+        for field in required:
+            if field not in v:
+                raise ValueError(f"WorkerTimeoutEvent requires '{field}' in data")
+        return v
+
 def create_event(event_type: Union[EventType, str], data: Dict[str, Any], source: str='unknown', session_id: Optional[str]=None, turn: Optional[int]=None) -> BaseEvent:
     """Create a typed event with proper validation."""
     if isinstance(event_type, str):
@@ -258,7 +434,13 @@ def create_event(event_type: Union[EventType, str], data: Dict[str, Any], source
         except ValueError:
             event_type = _map_legacy_event_type(event_type)
     metadata = EventMetadata(source=source, session_id=session_id, turn=turn)
-    event_class_map = {EventType.AGENT_START: AgentStartEvent, EventType.AGENT_END: AgentEndEvent, EventType.TOOL_CALL: ToolCallEvent, EventType.TOOL_RESULT: ToolResultEvent, EventType.TOKEN_WARNING: TokenWarningEvent, EventType.TURN_WARNING: TurnWarningEvent, EventType.ERROR: ErrorEvent, EventType.TURN: TurnEvent, EventType.CAPABILITY_CHECK: BaseEvent, EventType.SECURITY_PROMPT: SecurityPromptEvent, EventType.SECURITY_RESPONSE: SecurityResponseEvent, EventType.FINAL: BaseEvent, EventType.MAX_TURNS: BaseEvent, EventType.STOPPED: BaseEvent, EventType.PAUSED: BaseEvent, EventType.THREAD_FINISHED: BaseEvent, EventType.USER_INTERACTION_REQUESTED: BaseEvent, EventType.RATE_LIMIT_WARNING: BaseEvent, EventType.TOKEN_UPDATE: BaseEvent, EventType.EXECUTION_STATE_CHANGE: BaseEvent, EventType.SESSION_STATE_CHANGE: BaseEvent}
+    event_class_map = {EventType.AGENT_START: AgentStartEvent, EventType.AGENT_END: AgentEndEvent, EventType.TOOL_CALL: ToolCallEvent, EventType.TOOL_RESULT: ToolResultEvent, EventType.TOKEN_WARNING: TokenWarningEvent, EventType.TURN_WARNING: TurnWarningEvent, EventType.ERROR: ErrorEvent, EventType.TURN: TurnEvent, EventType.CAPABILITY_CHECK: BaseEvent, EventType.SECURITY_PROMPT: SecurityPromptEvent, EventType.SECURITY_RESPONSE: SecurityResponseEvent, EventType.FINAL: BaseEvent, EventType.MAX_TURNS: BaseEvent, EventType.STOPPED: BaseEvent, EventType.PAUSED: BaseEvent, EventType.THREAD_FINISHED: BaseEvent, EventType.USER_INTERACTION_REQUESTED: BaseEvent, EventType.RATE_LIMIT_WARNING: BaseEvent, EventType.TOKEN_UPDATE: BaseEvent, EventType.TOKEN_RECOVERY: BaseEvent, EventType.CONTEXT_CLEARED: BaseEvent, EventType.CONTEXT_SUMMARIZED: BaseEvent, EventType.EXECUTION_STATE_CHANGE: BaseEvent, EventType.SESSION_STATE_CHANGE: BaseEvent, EventType.WORKER_SPAWNED: WorkerSpawnedEvent, EventType.WORKER_STATUS: WorkerStatusEvent, EventType.WORKER_COMPLETED: WorkerCompletedEvent, EventType.WORKER_ERROR: WorkerErrorEvent, EventType.WORKER_MESSAGE: WorkerMessageEvent, EventType.ASSISTANT_MESSAGE: AssistantMessageEvent,
+    EventType.WORKER_RUNNING: WorkerRunningEvent, EventType.WORKER_STOPPING: WorkerStoppingEvent, EventType.WORKER_HEARTBEAT: WorkerHeartbeatEvent, EventType.WORKER_PARTIAL_RESULT: WorkerPartialResultEvent, EventType.WORKER_TIMEOUT: WorkerTimeoutEvent,
+    EventType.WEBSOCKET_CONNECT: BaseEvent,
+    EventType.WEBSOCKET_DISCONNECT: BaseEvent,
+    EventType.CONFIG_LOADED: BaseEvent,
+    EventType.TEXT_DELTA: BaseEvent,
+    EventType.REASONING_DELTA: BaseEvent,}
     event_class = event_class_map.get(event_type, BaseEvent)
     return event_class(type=event_type, metadata=metadata, data=data)
 
@@ -283,6 +465,7 @@ class EventBus:
     def __init__(self):
         self._subscribers: Dict[EventType, List[callable]] = {}
         self._wildcard_subscribers: List[callable] = []
+        self._lock = threading.Lock()
 
     def subscribe(self, event_type: Optional[EventType]=None, callback: callable=None):
         """Subscribe to events of specific type or all events."""
@@ -292,22 +475,25 @@ class EventBus:
                 self.subscribe(event_type, func)
                 return func
             return decorator
-        if event_type is None:
-            self._wildcard_subscribers.append(callback)
-        else:
-            if event_type not in self._subscribers:
-                self._subscribers[event_type] = []
-            self._subscribers[event_type].append(callback)
+        with self._lock:
+            if event_type is None:
+                self._wildcard_subscribers.append(callback)
+            else:
+                if event_type not in self._subscribers:
+                    self._subscribers[event_type] = []
+                self._subscribers[event_type].append(callback)
 
     def publish(self, event: BaseEvent):
         """Publish an event to all subscribers."""
-        if event.type in self._subscribers:
-            for callback in self._subscribers[event.type]:
-                try:
-                    callback(event)
-                except Exception as e:
-                    log('ERROR', 'core.event_bus', f'Error in event subscriber for {event.type}: {e}')
-        for callback in self._wildcard_subscribers:
+        with self._lock:
+            subscribers = list(self._subscribers.get(event.type, []))
+            wildcard = list(self._wildcard_subscribers)
+        for callback in subscribers:
+            try:
+                callback(event)
+            except Exception as e:
+                log('ERROR', 'core.event_bus', f'Error in event subscriber for {event.type}: {e}')
+        for callback in wildcard:
             try:
                 callback(event)
             except Exception as e:
@@ -318,11 +504,43 @@ class EventBus:
         event = BaseEvent.from_dict(event_dict)
         self.publish(event)
 
+    def unsubscribe(self, event_type: Optional[EventType]=None, callback: callable=None):
+        """Unsubscribe a callback from events of specific type or all events."""
+        with self._lock:
+            if event_type is None:
+                try:
+                    self._wildcard_subscribers.remove(callback)
+                except ValueError:
+                    pass
+            else:
+                if event_type in self._subscribers:
+                    try:
+                        self._subscribers[event_type].remove(callback)
+                    except ValueError:
+                        pass
+                    if not self._subscribers[event_type]:
+                        del self._subscribers[event_type]
+
+
 def _map_legacy_event_type(event_type_str: str) -> EventType:
     """Map legacy event type strings to standardized EventType."""
     import os
     log('DEBUG', 'core.events', f"_map_legacy_event_type: '{event_type_str}'")
-    mapping = {'tool_call': EventType.TOOL_CALL, 'tool_result': EventType.TOOL_RESULT, 'token_warning': EventType.TOKEN_WARNING, 'turn_warning': EventType.TURN_WARNING, 'agent_responded': EventType.AGENT_RESPONDED, 'final': EventType.FINAL, 'stopped': EventType.STOPPED, 'max_turns': EventType.MAX_TURNS, 'thread_finished': EventType.THREAD_FINISHED, 'paused': EventType.PAUSED, 'error': EventType.ERROR, 'turn': EventType.TURN, 'token_update': EventType.TOKEN_UPDATE, 'user_interaction_requested': EventType.USER_INTERACTION_REQUESTED, 'user_query': EventType.USER_QUERY, 'rate_limit_warning': EventType.RATE_LIMIT_WARNING, 'execution_state_change': EventType.EXECUTION_STATE_CHANGE, 'session_state_change': EventType.SESSION_STATE_CHANGE}
+    mapping = {'tool_call': EventType.TOOL_CALL, 'tool_result': EventType.TOOL_RESULT, 'token_warning': EventType.TOKEN_WARNING, 'turn_warning': EventType.TURN_WARNING, 'time_warning': EventType.TIME_WARNING, 'agent_responded': EventType.AGENT_RESPONDED, 'final': EventType.FINAL, 'stopped': EventType.STOPPED, 'max_turns': EventType.MAX_TURNS, 'thread_finished': EventType.THREAD_FINISHED, 'paused': EventType.PAUSED, 'error': EventType.ERROR, 'turn': EventType.TURN, 'token_update': EventType.TOKEN_UPDATE, 'token_recovery': EventType.TOKEN_RECOVERY, 'context_cleared': EventType.CONTEXT_CLEARED, 'context_summarized': EventType.CONTEXT_SUMMARIZED, 'user_interaction_requested': EventType.USER_INTERACTION_REQUESTED, 'user_query': EventType.USER_QUERY, 'rate_limit_warning': EventType.RATE_LIMIT_WARNING, 'execution_state_change': EventType.EXECUTION_STATE_CHANGE, 'session_state_change': EventType.SESSION_STATE_CHANGE, 'worker_spawned': EventType.WORKER_SPAWNED, 'worker_status': EventType.WORKER_STATUS, 'worker_completed': EventType.WORKER_COMPLETED, 'worker_error': EventType.WORKER_ERROR,
+    'websocket_connect': EventType.WEBSOCKET_CONNECT,
+    'websocket_disconnect': EventType.WEBSOCKET_DISCONNECT,
+    'config_loaded': EventType.CONFIG_LOADED,
+    'tokens_updated': EventType.TOKENS_UPDATED,
+    'context_updated': EventType.CONTEXT_UPDATED,
+    'status_message': EventType.STATUS_MESSAGE,
+    'error_occurred': EventType.ERROR_OCCURRED,
+    'config_changed': EventType.CONFIG_CHANGED,
+    'conversation_changed': EventType.CONVERSATION_CHANGED,
+    # Streaming deltas: mapped explicitly (rather than relying on the
+    # EventType(str) fallback below) so the hot per-token path does not log
+    # "No mapping for ..." at DEBUG on every chunk.
+    'text_delta': EventType.TEXT_DELTA,
+    'reasoning_delta': EventType.REASONING_DELTA,}
     result = mapping.get(event_type_str)
     if result is None:
         log('DEBUG', 'core.events', f"No mapping for '{event_type_str}', attempting direct EventType creation")

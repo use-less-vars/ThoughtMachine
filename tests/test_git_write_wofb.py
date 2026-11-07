@@ -1,0 +1,267 @@
+"""test_git_write_wofb.py -- write_on_feature_branch gate + tool enforcement.
+
+Phase-3 contract under test:
+
+* ``write_on_feature_branch`` ranks at the WRITE tier (3) in
+  ``security.gate_helpers._value_satisfies``: the outer ``git:write``
+  category gate passes for a wofb session, while ``full`` (rank 4) stays
+  denied and rank-3 ordering is preserved (wofb + write -> write via
+  ``_min_permission``).
+* The feature-branch-only restriction lives in ``tools/git_write_tool.py``:
+  ``_git_write_allowed`` admits the wofb grain, and ``_git_commit`` refuses
+  commits when the current branch is protected (dev/master/main) or cannot
+  be resolved (fail closed).  Full ``write``/``full``/``ask`` grants are
+  never branch-restricted by the tool.
+* A worker whose git level resolves to ``ask`` is auto-denied for
+  ``git:write`` (ask requires interactive approval; not available in
+  worker context).
+
+All git subprocess execution is mocked: no real git binary is required.
+"""
+
+import pytest
+from unittest import mock
+
+from security.gate_helpers import _value_satisfies
+from security.security_gate import (
+    _min_permission,
+    check_required_categories,
+    get_effective_permissions,
+)
+from thoughtmachine.security import SessionPermissions
+from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
+from tools.git_write_tool import GitWriteTool
+
+_FULL_CAPS = WorkspaceCapabilities()
+
+
+def _commit_tool(**params):
+    """A GitWriteTool instance pre-wired for a commit operation with a
+    write_on_feature_branch effective grant (the effective-permissions
+    convention injected by the ToolExecutor)."""
+    defaults = {
+        "operation": "commit",
+        "message": "agent commit",
+        "file_path": ["note.txt"],
+        "effective_permissions": {"git": "write_on_feature_branch"},
+    }
+    defaults.update(params)
+    return GitWriteTool(**defaults)
+
+
+# ── Gate level: wofb ranks at the write tier (rank 3) ─────────────────────
+
+def test_wofb_gate_ranks_at_write_tier():
+    """Phase-3 helper edit: _value_satisfies ranks write_on_feature_branch
+    at the write tier -- git:read AND git:write pass, full (rank 4) is
+    denied, and rank-3 ordering is preserved (wofb + write -> write)."""
+    assert _value_satisfies("read", "write_on_feature_branch") is True
+    assert _value_satisfies("write", "write_on_feature_branch") is True
+    assert _value_satisfies("banned", "write_on_feature_branch") is True
+    assert _value_satisfies("full", "write_on_feature_branch") is False
+    assert _min_permission("write", "write_on_feature_branch") == "write"
+    assert _min_permission("read", "write_on_feature_branch") == "read"
+
+
+def test_wofb_session_passes_git_write_category_gate():
+    """A write_on_feature_branch session produces effective grains and now
+    passes the outer git:write category gate (enforcement moved tool-side)."""
+    eff = get_effective_permissions(
+        SessionPermissions(git="write_on_feature_branch"), _FULL_CAPS
+    )
+    assert eff["git"] == "write_on_feature_branch"
+    ok, msg = check_required_categories(
+        ["git:write"], dict(eff), "GitWriteTool", {}, "write git", event_bus=None
+    )
+    assert ok is True and msg == ""
+
+
+# ── Tool gate: wofb commits restricted to non-protected branches ──────────
+
+@pytest.mark.parametrize("branch", ["dev", "master", "main", ""])
+def test_wofb_commit_denied_on_protected_or_unresolved_branch(tmp_path, branch):
+    """A wofb-granted commit on a protected branch (or with empty branch
+    output) is denied with a clear message and the commit subprocess never
+    runs (only branch resolution is attempted)."""
+    tool = _commit_tool()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with mock.patch.object(
+        tool, "_run_git", return_value=branch + "\n"
+    ) as run:
+        result = tool._git_commit(repo)
+    assert "Error: git:write denied" in result
+    assert "write_on_feature_branch" in result
+    assert "protected" in result
+    run.assert_called_once_with(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
+
+
+def test_wofb_commit_fails_closed_when_branch_unresolvable(tmp_path):
+    """Hard security errors while resolving the current branch fail closed:
+    the commit is denied as unresolved ('unknown')."""
+    tool = _commit_tool()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with mock.patch.object(tool, "_run_git", side_effect=RuntimeError("denied")):
+        result = tool._git_commit(repo)
+    assert "Error: git:write denied" in result
+    assert "unknown" in result
+
+
+def test_wofb_commit_allowed_on_feature_branch(tmp_path):
+    """A wofb-granted commit on a non-protected branch proceeds: branch
+    resolution runs, then the selective add+commit subprocess flow runs."""
+    tool = _commit_tool()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with mock.patch.object(
+        tool, "_run_git", side_effect=["feat/x\n", "committed"]
+    ) as run, mock.patch.object(
+        tool, "_validated_rel_paths", return_value=["note.txt"]
+    ), mock.patch.object(tool, "_git_add", return_value=""):
+        result = tool._git_commit(repo)
+    assert "git:write denied" not in result
+    assert "write_on_feature_branch" not in result
+    assert run.call_count == 2
+    assert run.call_args_list[0].args[1] == ["rev-parse", "--abbrev-ref", "HEAD"]
+    assert run.call_args_list[1].args[1][0] == "commit"
+
+
+def test_full_write_grant_commit_allowed_on_protected_branch(tmp_path):
+    """write/full grants are NOT branch-restricted by this tool: a commit on
+    a protected branch proceeds via the effective-permissions (ToolExecutor)
+    path."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tool_sp = _commit_tool(
+        effective_permissions={"git": "write"}
+    )
+    with mock.patch.object(
+        tool_sp, "_run_git", return_value="committed"
+    ) as run_sp, mock.patch.object(
+        tool_sp, "_validated_rel_paths", return_value=["note.txt"]
+    ), mock.patch.object(tool_sp, "_git_add", return_value=""):
+        result_sp = tool_sp._git_commit(repo)
+    assert "git:write denied" not in result_sp
+    assert run_sp.call_count == 2
+    assert run_sp.call_args_list[0].args[1] == ["rev-parse", "--abbrev-ref", "HEAD"]
+    assert run_sp.call_args_list[1].args[1][0] == "commit"
+
+    tool_eff = _commit_tool(
+        agent_config={},
+        effective_permissions={"git": "write"},
+    )
+    with mock.patch.object(
+        tool_eff, "_run_git", return_value="committed"
+    ) as run_eff, mock.patch.object(
+        tool_eff, "_validated_rel_paths", return_value=["note.txt"]
+    ), mock.patch.object(tool_eff, "_git_add", return_value=""):
+        result_eff = tool_eff._git_commit(repo)
+    assert "git:write denied" not in result_eff
+    assert run_eff.call_count == 2
+    assert run_eff.call_args_list[0].args[1] == ["rev-parse", "--abbrev-ref", "HEAD"]
+    assert run_eff.call_args_list[1].args[1][0] == "commit"
+
+
+# ── Worker path: ask git level auto-denied (no interactive user) ──────────
+
+def test_worker_ask_git_write_auto_denied():
+    """A worker call whose git level resolves to 'ask' is denied immediately
+    for git:write with the established no-interactive-user message."""
+    eff = get_effective_permissions(SessionPermissions(git="ask"), _FULL_CAPS)
+    denied, deny_msg = check_required_categories(
+        ["git:write"], dict(eff), "GitWriteTool", {}, "write git",
+        event_bus=None, is_worker_context=True,
+    )
+    assert denied is False
+    assert "ask requires interactive approval; not available in worker context" in deny_msg
+
+
+
+# ── vault_repair git-fold: ask ranks ABOVE read (canonical order) ─────────
+
+def test_merged_git_value_prefers_ask_over_read():
+    """``thoughtmachine.vault_repair._GIT_MERGE_RANK`` mirrors the canonical
+    ``security.resource_catalog.GRANT_LEVEL_RANKS`` order ``banned < read <
+    ask < write == write_on_feature_branch < full``.
+
+    Regression for the stale mirror that ranked ``ask`` BELOW ``read``: folding
+    a legacy ``git_read`` value of ``'ask'`` against an existing ``git`` of
+    ``'read'`` must resolve to the more permissive ``'ask'`` (in either key
+    order), never silently downgrade to ``'read'``.
+    """
+    from thoughtmachine.vault_repair import _GIT_MERGE_RANK, _merged_git_value
+
+    # Canonical ordering, mirroring GRANT_LEVEL_RANKS.
+    assert _GIT_MERGE_RANK["banned"] < _GIT_MERGE_RANK["read"]
+    assert _GIT_MERGE_RANK["read"] < _GIT_MERGE_RANK["ask"]
+    assert _GIT_MERGE_RANK["ask"] < _GIT_MERGE_RANK["write"]
+    assert _GIT_MERGE_RANK["write"] == _GIT_MERGE_RANK["write_on_feature_branch"]
+    assert _GIT_MERGE_RANK["write_on_feature_branch"] < _GIT_MERGE_RANK["full"]
+
+    # ask beats read regardless of which key carries which value.
+    assert _merged_git_value({"git": "read", "git_read": "ask"}) == "ask"
+    assert _merged_git_value({"git": "ask", "git_read": "read"}) == "ask"
+
+
+
+# ── Part-2: no operator-managed-worktree exemption in _git_commit ───────────
+#
+# The legacy commit path refused every commit inside an operator-managed
+# worktree unless a narrow feat/*+container exception applied (Guard B).  That
+# worktree exemption is removed: a ``write`` grant is never branch-restricted
+# by the tool, so a worktree checkout behaves exactly like a plain one.
+
+
+def test_write_grant_commit_in_operator_managed_worktree_not_refused(tmp_path):
+    """A ``write`` grant commits even inside an operator-managed worktree.
+
+    Contract: ``_git_commit`` no longer consults any operator-managed
+    worktree gate, so a ``write``-granted commit is not refused for being in
+    a worktree (and protected ``dev`` is fine for a ``write`` grant).  Only
+    the detached-HEAD probe + add/commit subprocesses are expected.  RED on a
+    HEAD whose ``_git_commit`` still runs Guard B (which refuses ``dev`` with
+    the operator-managed message).
+    """
+    tool = _commit_tool(effective_permissions={"git": "write"})
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with mock.patch.object(
+        tool, "_use_container_mode", return_value=True
+    ), mock.patch.object(
+        tool, "_run_git", side_effect=["dev\n", "committed"]
+    ) as run, mock.patch.object(
+        tool, "_validated_rel_paths", return_value=["note.txt"]
+    ), mock.patch.object(tool, "_git_add", return_value=""):
+        result = tool._git_commit(repo)
+    assert "operator" not in result.lower()
+    assert "git:write denied" not in result
+    assert run.call_args_list[-1].args[1][0] == "commit"
+
+
+# ── (a) write + commit to dev (plain checkout) is not refused by the tool ───
+#
+# Folded from the RED-first probe file test_git_commit_branch_permission.py.
+# Cases (b) wofb+dev refused and (c) wofb+feature-branch allowed are already
+# covered above by test_wofb_commit_denied_on_protected_or_unresolved_branch
+# and test_wofb_commit_allowed_on_feature_branch.
+
+
+def test_write_grant_commit_to_dev_not_refused(tmp_path):
+    """``write`` grants full branch access: a commit on ``dev`` (plain
+    checkout) must not be refused by the tool's branch gate."""
+    tool = _commit_tool(effective_permissions={"git": "write"})
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # First _run_git call is the detached-HEAD probe (returns the branch),
+    # the second is the commit itself.
+    with mock.patch.object(
+        tool, "_run_git", side_effect=["dev\n", "committed"]
+    ) as run, mock.patch.object(
+        tool, "_validated_rel_paths", return_value=["note.txt"]
+    ), mock.patch.object(tool, "_git_add", return_value=""):
+        result = tool._git_commit(repo)
+    assert "git:write denied" not in result
+    assert "protected" not in result
+    assert run.call_args_list[-1].args[1][0] == "commit"
+

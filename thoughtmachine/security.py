@@ -7,7 +7,6 @@ with comprehensive logging.
 import os
 import sys
 import logging
-import hashlib
 import time
 import docker
 from pathlib import Path
@@ -18,6 +17,9 @@ import queue
 import uuid
 
 from pydantic import BaseModel, Field, ConfigDict, field_validator
+
+from security.resource_catalog import RESOURCE_CATALOG
+from thoughtmachine.audit_logger import audit_event
 
 # Try to import the logging facade and types
 try:
@@ -47,6 +49,43 @@ _pending_security_requests: Dict[str, queue.Queue] = {}
 _pending_requests_lock = threading.Lock()
 _prompt_cancelled = threading.Event()
 
+# Vault directories that are forbidden for file tools to access
+VAULT_BLOCKED_SUBDIRS = [
+    "credentials",
+    "system",
+    "global",
+    "user",
+    "state",
+    "sessions",
+    "workspaces",
+    "logs",
+    "worker_templates",
+]
+
+VAULT_ROOT = os.path.join(os.path.expanduser("~"), ".thoughtmachine")
+
+# Workspace-internal paths that file tools may never access even when they
+# resolve inside the workspace. Matched component-aware against the FIRST
+# path components of the workspace-relative path (see
+# _match_blocked_workspace_path) — never a naive substring.
+#
+# Design note: only two .git entries are blocked (.git/config, .git/HEAD)
+# rather than all of .git. Normal tooling legitimately reads the repo's own
+# refs/objects (e.g. .git/refs/heads/main) and must keep working; the blocked
+# entries are precisely the ones that can leak credentials (config/HEAD).
+# .git/hooks itself is NOT blocked because git never consults it anymore:
+# commits run ONLY the policy-owned workspace .githooks directory (container
+# path injects -c core.hooksPath=/workspace/.githooks — the container-mapped
+# absolute workspace path) and the host fallback neutralizes
+# hooks entirely via core.hooksPath=/dev/null + --no-verify.
+WORKSPACE_BLOCKED_PATH_PREFIXES = [
+    ".git/config",
+    ".git/HEAD",
+    ".ssh",
+    ".npmrc",
+    ".env",
+]
+
 # Security exceptions
 class SecurityError(Exception):
     """Base security exception."""
@@ -72,37 +111,66 @@ class SessionPermissions(BaseModel):
     Maps to the permission system used by
     ``tool_executor._check_permissions()``:
 
+    The canonical session permission categories are exactly the keys of
+    ``security.resource_catalog.RESOURCE_CATALOG``:
+    ``container | network | filesystem | git | mcp | host_bash | ci |
+    credential | visual``.
+
     - **container**:  Boolean — may the tool spawn containers?
-    - **network**:    ``'banned' | 'ask' | 'write'`` (legacy booleans are accepted)
-    - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **security**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **execution**:  ``'banned' | 'read' | 'write' | 'full' | 'ask'``
+    - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
+    - **filesystem**: ``'banned' | 'read' | 'write' | 'ask'``
+    - **git**:        ``'banned' | 'read' | 'write' | 'ask' | 'write_on_feature_branch'``
+    - **mcp**:        ``'banned' | 'connect' | 'full'``
+    - **host_bash**:  ``'banned' | 'ask' | 'allow'`` (supervised host shell access level; the security gate caps the session value by the workspace ceiling)
+    - **credential**: ``'banned' | 'read' | 'use'`` (``read`` lists credential
+      names only; ``use`` injects credential values)
+    - **visual**:     ``'banned' | 'ask' | 'view'`` (``view`` may invoke the
+      visual-render tool; the security gate caps the session value by the
+      workspace ceiling)
+
+    The legacy ``system``/``execution`` permission categories and the split
+    ``git_read``/``git_write`` grains were removed in the permission-schema
+    unification: the git tools (named ``git_read``/``git_write``) gate on the
+    single ``git`` category instead.
     """
 
     container: bool = Field(
         default=False,
         description='May the tool spawn containers?',
     )
-    network: Literal['banned', 'ask', 'write'] = Field(
+    network: Literal['banned', 'ask', 'write', 'outbound'] = Field(
         default='banned',
         description='Network access level for the session.',
     )
-    filesystem: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
+    filesystem: Literal['banned', 'read', 'write', 'ask'] = Field(
         default='read',
         description='Filesystem access level for the session.',
     )
-    system: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
-        default='read',
-        description='System operations access level.',
-    )
-    git: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
+    git: Literal[
+        'banned', 'read', 'write', 'ask', 'write_on_feature_branch',
+    ] = Field(
         default='read',
         description='Git operations access level for the session.',
     )
-    execution: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
+    mcp: Literal['banned', 'connect', 'full'] = Field(
         default='banned',
-        description='Code execution access level for the session.',
+        description='MCP server connection access level.',
+    )
+    host_bash: Literal['banned', 'ask', 'allow'] = Field(
+        default='banned',
+        description='Supervised host shell access level.',
+    )
+    ci: Literal['banned', 'read'] = Field(
+        default='banned',
+        description='CI monitoring (read-only) access level.',
+    )
+    credential: Literal['banned', 'read', 'use'] = Field(
+        default='banned',
+        description='Credential access level (read = names only, use = values).',
+    )
+    visual: Literal['banned', 'ask', 'view'] = Field(
+        default='banned',
+        description='Visual/render artifact access level (view = may render).',
     )
 
     @field_validator('network', mode='before')
@@ -129,25 +197,62 @@ class SessionPermissions(BaseModel):
 # Coerce raw permission dicts into safe values, rejecting invalid keys
 # and levels.  Used at session load and config translation boundaries.
 
-VALID_PERMISSION_LEVELS = ("banned", "ask", "read", "write")
-# "full" is intentionally excluded — it is not a valid mode for
-# the Docker security gate and should not be settable from the UI.
+# The canonical session-grant vocabulary lives in ``security.resource_catalog``
+# (``RESOURCE_CATALOG``); the constants below are thin derived views of it, so
+# the session-permission surface can never drift from the catalog.
+#
+# ``VALID_PERMISSION_LEVELS`` mirrors the ``filesystem`` scale; "full" is
+# intentionally excluded — it is not a valid mode for the Docker security gate
+# and should not be settable from the UI.  ``write_on_feature_branch`` is a
+# git-only level ("commit only on feature branches"; the security gate maps it
+# to a write-restricted git grant).  It must NOT leak into the other
+# VALID_PERMISSION_LEVELS consumers (filesystem/network), so ``git`` uses the
+# full canonical git tuple below.
+VALID_PERMISSION_LEVELS = tuple(RESOURCE_CATALOG["filesystem"])
+GIT_PERMISSION_LEVELS = tuple(RESOURCE_CATALOG["git"])
+# Canonical permission categories: exactly the ``RESOURCE_CATALOG`` keys
+# (container, network, filesystem, git, mcp, host_bash, ci, credential,
+# visual). The legacy
+# ``system``/``execution`` categories and the split ``git_read``/``git_write``
+# grains no longer exist as permission resources.
 PERMISSION_SCHEMA: Dict[str, tuple] = {
-    "network":   ("banned", "ask", "write"),
-    "filesystem": VALID_PERMISSION_LEVELS,   # banned, ask, read, write (no "full")
-    "container":  (True, False),
-    "execution":  ("banned", "ask", "read", "write"),
-    "git":        VALID_PERMISSION_LEVELS,
-    "system":     VALID_PERMISSION_LEVELS,
+    key: tuple(levels) for key, levels in RESOURCE_CATALOG.items()
 }
-SAFE_DEFAULTS: Dict[str, Any] = {
+# Out-of-the-box session grants -- the SINGLE owner of permission defaults,
+# published to the JS boundary via ``GET /api/permission-defaults`` (see
+# ``web_ui.backend.server``).  ``SAFE_DEFAULTS`` is keyed off
+# ``RESOURCE_CATALOG`` so its key set can never drift from the canonical
+# resource keys, and each value is a member of that resource's scale.  This
+# owner is authoritative: ``agent.config.resource_catalog`` residual literals
+# and the JS boot-fallback literal in ``web_ui/frontend/src/store/useStore.js``
+# must agree with it (pinned by ``tests/test_safe_defaults_single_owner.py``).
+# ``network`` defaults to ``"banned"`` (fail-closed): outbound access is
+# opt-in, never granted by default.
+_SAFE_DEFAULT_LEVELS: Dict[str, Any] = {
     "container": False,
-    "execution": "banned",
     "filesystem": "read",
     "git": "read",
+    "host_bash": "banned",
+    "mcp": "banned",
     "network": "banned",
-    "system": "read",
+    "ci": "banned",
+    "credential": "banned",
+    "visual": "banned",
 }
+SAFE_DEFAULTS: Dict[str, Any] = {
+    key: _SAFE_DEFAULT_LEVELS[key] for key in RESOURCE_CATALOG
+}
+
+#: Workspace permission ceiling written EXPLICITLY by the fresh-workspace
+#: seeder (``thoughtmachine.workspace_capabilities.ensure_workspace_dirs``)
+#: into a new ``config.json['permissions']``.  DERIVED from
+#: :data:`SAFE_DEFAULTS` (the single owner of permission defaults) so the value
+#: a fresh workspace carries can never drift from the framework default.  A
+#: fresh workspace is therefore capped at the framework default
+#: (filesystem/git ``read``; network/mcp/host_bash ``banned``; container
+#: ``False``) rather than left with no ``permissions`` key -- an absent key and
+#: an explicit ``{}`` are indistinguishable and both fail closed in the gate.
+FRESH_WORKSPACE_DEFAULT_PERMISSIONS: Dict[str, Any] = dict(SAFE_DEFAULTS)
 
 
 def coerce_session_permissions(
@@ -209,6 +314,21 @@ def set_logger(logger: Optional[Any]) -> None:
     _logger = logger
 
 
+def _safe_log(level: str, message: str) -> None:
+    """Log *message* via the injected logger, tolerating partial logger interfaces.
+
+    ``set_logger`` accepts any object, and ``agent.core.agent`` injects the
+    agent's ``_AgentLogger``, which exposes ``log_*`` helpers but NOT the
+    stdlib ``info`` / ``warning`` / ``debug`` / ``error`` interface. Never
+    assume that interface here -- a logging statement must never raise.
+    """
+    if not _logger or not LOGGING_AVAILABLE:
+        return
+    fn = getattr(_logger, level, None)
+    if callable(fn):
+        fn(message)
+
+
 def _redact_sensitive_data(data: Any) -> Any:
     """
     Redact potentially sensitive data from log entries.
@@ -233,6 +353,43 @@ def _redact_sensitive_data(data: Any) -> Any:
         return data
 
 
+def _match_blocked_workspace_path(rel_path: str) -> Optional[str]:
+    """Return the deny-list entry matching a workspace-relative path, or None.
+
+    Matching is component-aware against the FIRST path components of the
+    relative path (never a naive substring):
+
+    - Multi-component entries (``.git/config``) match the path itself or
+      anything beneath it: ``.git/config`` (the file) and
+      ``.git/config/anything-below`` (structural prefix match).
+    - Single-component entries match the path itself, anything beneath it as
+      a directory (``.ssh`` -> ``.ssh/config``), and dotfile variants
+      (``.env`` -> ``.env.local``; the separator must be a dot, so ``.env2``
+      does NOT match).
+    - Everything else stays unblocked: ``not-really-.env``, ``.gitignore``,
+      ``.git/refs/heads/main``, ``.git/hooks/pre-commit``, ``src/main.py``.
+    """
+    if not rel_path:
+        return None
+    # Normalize separators so matching is platform-independent.
+    rel_norm = rel_path.replace(os.sep, "/").lstrip("/")
+    for entry in WORKSPACE_BLOCKED_PATH_PREFIXES:
+        if "/" in entry:
+            # Directory-prefix entry: match the entry or anything below it.
+            if rel_norm == entry or rel_norm.startswith(entry + "/"):
+                return entry
+        else:
+            # Single-component entry: exact file, directory beneath it, or
+            # dotfile variant (".env" -> ".env.local", but not ".env2").
+            if (
+                rel_norm == entry
+                or rel_norm.startswith(entry + "/")
+                or rel_norm.startswith(entry + ".")
+            ):
+                return entry
+    return None
+
+
 def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] = None) -> str:
     """
     Validate that a given path is within the allowed workspace.
@@ -250,21 +407,70 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
         ValueError: For invalid inputs.
     """
     original_path = path
-    
+
+    # ── REJECT NULL BYTES ─────────────────────────────────────────────────
+    # Null bytes in paths can cause silent truncation on some OSes, bypassing
+    # path validation. Always reject them early.
+    if '\x00' in path:
+        _log_security_event(
+            event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+            message=f"Rejected path containing null byte: '{original_path}'",
+            level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+            data={
+                "path": original_path,
+                "reason": "null_byte_in_path"
+            }
+        )
+        raise ValueError(f"Path contains null byte: '{original_path}'")
+
     # If workspace_path is provided, treat relative paths as relative to workspace_path
     if workspace_path and not os.path.isabs(path):
         # Join with workspace_path
         path = os.path.join(workspace_path, path)
-    
+
     # First, get absolute path of the requested location (without following symlinks)
     try:
         requested_abs = os.path.abspath(path)
     except Exception as e:
-        raise ValueError(f"Invalid path '{original_path}': {e}")
-    
+        raise ValueError(f"Invalid path '{original_path}': {e}")    
     # Use requested_abs as the path to validate
     target_abs = requested_abs
-    
+
+    # ── BLOCK VAULT COMPARTMENTS ──────────────────────────────────────────
+    # Never allow file tools to access ~/.thoughtmachine/ or its subdirectories
+    try:
+        vault_root_resolved = os.path.realpath(VAULT_ROOT)
+    except Exception:
+        vault_root_resolved = VAULT_ROOT  # Fallback if realpath fails
+
+    # If the path itself is directly under ~/.thoughtmachine/, block it
+    if requested_abs.startswith(vault_root_resolved) or requested_abs.startswith(VAULT_ROOT):
+        # Check each blocked subdirectory
+        blocked_reason = None
+        for subdir in VAULT_BLOCKED_SUBDIRS:
+            subdir_path = os.path.join(VAULT_ROOT, subdir)
+            try:
+                resolved_subdir = os.path.realpath(subdir_path)
+            except Exception:
+                resolved_subdir = subdir_path
+            if requested_abs.startswith(resolved_subdir) or requested_abs.startswith(subdir_path):
+                blocked_reason = subdir
+                break
+        if blocked_reason is None:
+            # Path is in ~/.thoughtmachine/ but not in a known blocked subdir — still block
+            blocked_reason = "vault_root"
+        _log_security_event(
+            event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+            message=f"Blocked vault access attempt: '{original_path}' (compartment: {blocked_reason})",
+            level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+            data={
+                "path": original_path,
+                "resolved_path": requested_abs,
+                "reason": f"vault_blocked:{blocked_reason}"
+            }
+        )
+        raise PathOutsideWorkspaceError(f"Access to vault compartment '{blocked_reason}' is blocked: '{original_path}'")
+
     # If no workspace restriction, return canonical path if possible
     if not workspace_path:
         try:
@@ -310,17 +516,130 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
             }
         )
         raise PathOutsideWorkspaceError(f"Path {original_path} is outside workspace {workspace_abs}")
-    
+
+    # ── BLOCK SENSITIVE WORKSPACE-INTERNAL PATHS ──────────────────────────
+    # Even inside the workspace, deny file-tool access to git hook/config
+    # files, ssh keys, and env/secret files. Matching is component-aware
+    # against the FIRST path components of the workspace-relative path (see
+    # _match_blocked_workspace_path) — never a naive substring.
+    blocked_entry = _match_blocked_workspace_path(target_rel)
+    if blocked_entry:
+        _log_security_event(
+            event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+            message=(
+                f"Blocked sensitive workspace path: '{original_path}' "
+                f"(relative: '{target_rel}', blocked entry: '{blocked_entry}')"
+            ),
+            level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+            data={
+                "path": original_path,
+                "resolved_path": target_abs,
+                "workspace": workspace_abs,
+                "mode": mode,
+                "relative_path": target_rel,
+                "blocked_entry": blocked_entry,
+                "reason": "workspace_blocked_path"
+            }
+        )
+        raise PathOutsideWorkspaceError(
+            f"Path '{original_path}' is blocked: workspace-relative path "
+            f"'{target_rel}' matches blocked entry '{blocked_entry}'"
+        )
+
     # Try to get canonical path (following symlinks) for return value
-    # If symlink points outside workspace or is broken, that's OK - we already validated
-    # the symlink itself is within workspace
     canonical_abs = target_abs
     try:
         canonical_abs = os.path.realpath(target_abs)
     except Exception:
         # Broken symlink or other issue - keep the absolute path
         pass
-    
+
+    # ── RE-CHECK VAULT AFTER SYMLINK RESOLUTION ──────────────────────────
+    # A symlink inside the workspace may point to a vault file. Even though
+    # the symlink itself passed the vault check, the resolved target must not
+    # be in the vault.
+    try:
+        vault_root_resolved = os.path.realpath(VAULT_ROOT)
+    except Exception:
+        vault_root_resolved = VAULT_ROOT
+    if canonical_abs != target_abs:
+        # Symlink was resolved — check if target is in vault
+        try:
+            canonical_resolved = os.path.realpath(canonical_abs)
+        except Exception:
+            canonical_resolved = canonical_abs
+        if canonical_resolved.startswith(vault_root_resolved) or canonical_resolved.startswith(VAULT_ROOT):
+            _log_security_event(
+                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+                message=f"Blocked vault access via symlink: '{original_path}' resolves to '{canonical_resolved}'",
+                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+                data={
+                    "path": original_path,
+                    "resolved_path": canonical_resolved,
+                    "symlink_target": canonical_abs,
+                    "reason": "vault_blocked_via_symlink"
+                }
+            )
+            raise PathOutsideWorkspaceError(f"Access to vault via symlink is blocked: '{original_path}' -> '{canonical_resolved}'")
+
+        # ── RE-CHECK WORKSPACE BOUNDARY AFTER SYMLINK RESOLUTION ──────────
+        # A symlink inside the workspace may resolve to a location OUTSIDE the
+        # workspace. The pre-resolution checks only saw the symlink's own
+        # location, so re-verify the resolved target against the boundary.
+        try:
+            canonical_rel = os.path.relpath(canonical_resolved, workspace_abs)
+        except ValueError:
+            # Paths on different drives (Windows) -> outside the workspace
+            canonical_rel = ".."
+        if canonical_rel.startswith("..") or os.path.isabs(canonical_rel):
+            _log_security_event(
+                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+                message=(
+                    f"Path violation attempt via symlink: '{original_path}' "
+                    f"resolves to '{canonical_resolved}' outside workspace '{workspace_abs}'"
+                ),
+                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+                data={
+                    "path": original_path,
+                    "resolved_path": canonical_resolved,
+                    "symlink_target": canonical_abs,
+                    "workspace": workspace_abs,
+                    "mode": mode,
+                    "reason": "outside_workspace_via_symlink"
+                }
+            )
+            raise PathOutsideWorkspaceError(
+                f"Path {original_path} is outside workspace {workspace_abs} "
+                f"(resolved symlink target '{canonical_resolved}')"
+            )
+
+        # Also re-check the deny list against the resolved path, so a symlink
+        # cannot smuggle access to a blocked file that lives inside the
+        # workspace (e.g. a link named 'notes' -> workspace/.env).
+        resolved_blocked = _match_blocked_workspace_path(canonical_rel)
+        if resolved_blocked:
+            _log_security_event(
+                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+                message=(
+                    f"Blocked sensitive workspace path via symlink: '{original_path}' "
+                    f"resolves to '{canonical_resolved}' (blocked entry: '{resolved_blocked}')"
+                ),
+                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+                data={
+                    "path": original_path,
+                    "resolved_path": canonical_resolved,
+                    "symlink_target": canonical_abs,
+                    "workspace": workspace_abs,
+                    "mode": mode,
+                    "blocked_entry": resolved_blocked,
+                    "reason": "workspace_blocked_path_via_symlink"
+                }
+            )
+            raise PathOutsideWorkspaceError(
+                f"Path '{original_path}' is blocked: resolved symlink target "
+                f"'{canonical_resolved}' matches blocked entry '{resolved_blocked}'"
+            )
+
     # Log successful access
     try:
         file_size = os.path.getsize(canonical_abs) if os.path.exists(canonical_abs) and os.path.isfile(canonical_abs) else None
@@ -342,6 +661,18 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
     
     return canonical_abs
 
+
+# Imported here (still module-level, before setup_docker_sandbox's def-time
+# default). Imported from thoughtmachine.timeout_constants (a dependency-free
+# module; the thoughtmachine package imports nothing) rather than
+# agent.config.timeout_constants, because importing agent.config at module
+# level used to pull in agent.config.models -> tools ->
+# tools.docker_code_runner -> back into this module while it was still
+# initializing — a circular import that silently dropped DockerCodeRunner
+# from TOOL_CLASSES.
+from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
+
+
 def setup_docker_sandbox(
     image: str,
     workspace_path: str,
@@ -349,7 +680,7 @@ def setup_docker_sandbox(
     mem_limit: str = "512m",
     cpu_quota: int = 50000,
     force_rebuild: bool = False,
-    idle_timeout: int = 300
+    idle_timeout: int = IDLE_TIMEOUT_SECONDS
 ) -> 'DockerExecutor':
     """
     Set up a Docker sandbox container using the centralized DockerExecutor.
@@ -375,7 +706,7 @@ def setup_docker_sandbox(
         import os
         import importlib
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import docker_executor
+        import infra.containers.executor as docker_executor
         DockerExecutor = importlib.reload(docker_executor).DockerExecutor
     except ImportError as e:
         raise DockerSetupError(f"Could not import DockerExecutor: {e}")
@@ -390,11 +721,17 @@ def setup_docker_sandbox(
             force_rebuild=force_rebuild,
             idle_timeout=idle_timeout
         )
-        with open("/tmp/container_audit.log", "a") as _f:
-            _f.write(f"{time.time()} | SECURITY_SETUP_DOCKER | workspace={workspace_path} network_passed={network}\n")
+        audit_event("SECURITY_SETUP_DOCKER", f"workspace={workspace_path} network_passed={network}")
+        network_mode, workspace_mode = executor._compute_container_config()
+        container_name = docker_executor.build_container_name(
+            workspace_path,
+            docker_executor.LIFECYCLE_PERSISTENT,
+            network_mode=network_mode,
+            workspace_mode=workspace_mode,
+        )
         _log_docker_sandbox_event(
             container_id="<lazy>",
-            container_name=f"agent-exec-{hashlib.sha256(workspace_path.encode()).hexdigest()[:12]}",
+            container_name=container_name,
             image=image,
             command=[],
             action="setup",
@@ -560,8 +897,7 @@ def _ensure_security_response_handler() -> None:
             q.put((approved, remember))
         else:
             # Log warning about orphaned response
-            if _logger and LOGGING_AVAILABLE:
-                _logger.warning(f"Received security response for unknown request: {request_id}")
+            _safe_log("warning", f"Received security response for unknown request: {request_id}")
     
     # Register handler
     global_event_bus.subscribe(_handle_security_response)
@@ -724,10 +1060,7 @@ def _update_security_config(
     # default policy is not stored per-target
     
     # Log the update
-    if _logger and LOGGING_AVAILABLE:
-        _logger.info(
-            f"Security configuration updated: {policy_type} {policy_target} = {policy_value}"
-        )
+    _safe_log("info", f"Security configuration updated: {policy_type} {policy_target} = {policy_value}")
 
 
 def is_allowed(
@@ -930,7 +1263,7 @@ def get_default_security_config() -> Dict[str, Any]:
             "read_only": False,
             "allowed_networks": [],  # list of domain patterns
             "tool_overrides": {},    # {"FileEditor": "ask", "DockerCodeRunner": "deny"}
-            "default_policy": "allow",  # "allow", "ask", "deny"
+            "default_policy": "deny",  # "allow", "ask", "deny"
             "capability_requirements": {}  # {"fs:write": "ask", "container:exec": "deny"}
         },
         "agent_overrides": {}  # for future multi-agent support

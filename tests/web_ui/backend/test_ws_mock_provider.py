@@ -12,14 +12,19 @@ The MockProvider:
 
 Tests:
 1. new_session emits lifecycle events
-2. continue_session with mock provider returns a response
-3. apply_config merges correctly via the bridge
-4. saving and loading session preserves config
-5. config merge respects nested session_permissions (deep_merge fix)
+2. continue_session without a usable provider emits an error (mock never used)
+3. apply_config IGNORES a session_permissions payload (P1 — grants are
+   written only through the canonical session-permission sidecar)
+4. saving and loading session preserves config (but does NOT resurrect the
+   ignored session_permissions grant)
+5. model_override is ignored by apply_config
+6. api_key is stripped from the config dump
+7. ProviderFactory can instantiate the mock provider directly (unit-level)
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys as sys_mod
 import tempfile
@@ -220,9 +225,9 @@ def poll_for_type(ws, expected_type: str, timeout: float = 5.0) -> list:
 
 
 def new_session(ws):
-    """Create a new session and drain the initial 6 lifecycle events."""
+    """Create a new session and drain the initial 5 lifecycle events."""
     ws.send_json({"command": "new_session"})
-    return recv_n(ws, 6, timeout=5.0)
+    return recv_n(ws, 5, timeout=5.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -231,32 +236,34 @@ def new_session(ws):
 
 class TestWebSocketWithMockProvider:
 
-    def test_new_session_emits_six_events(self, mock_server):
-        """new_session emits the standard 6 lifecycle events."""
+    def test_new_session_emits_five_events(self, mock_server):
+        """new_session emits the standard 5 lifecycle events."""
         app, _tmp_home = mock_server
         with TestClient(app) as client:
             with client.websocket_connect("/ws") as ws:
                 messages = new_session(ws)
 
-        assert len(messages) == 6
+        assert len(messages) == 5
         expected_types = [
-            "session_loaded", "state_changed", "tokens_updated",
+            "session_loaded", "tokens_updated",
             "context_updated", "config_changed", "status_message",
         ]
         assert [m["type"] for m in messages] == expected_types
 
-    def test_continue_session_calls_mock_provider(self, mock_server):
+    def test_continue_session_mock_provider_not_used(self, mock_server):
         """
-        continue_session triggers the mock provider and returns a response.
-        The MockProvider should be called exactly once.
+        continue_session without a usable provider emits an error status_message.
+        apply_config can no longer deliver provider_type to the factory, so the
+        mock provider must never be instantiated/called through the WS path.
         """
         app, _tmp_home = mock_server
+        instances_before = len(MockProvider._instances)
         with TestClient(app) as client:
             with client.websocket_connect("/ws") as ws:
                 # Create session
                 new_session(ws)
 
-                # Send a query (no API key needed — mock provider handles it)
+                # Attempt to configure the mock provider (will NOT be applied)
                 ws.send_json({
                     "command": "apply_config",
                     "config": {
@@ -266,97 +273,109 @@ class TestWebSocketWithMockProvider:
                         "model": "mock-model",
                     },
                 })
-                # Wait for config_changed confirmation
                 poll_for_type(ws, "config_changed", timeout=5.0)
 
-                # Continue session
+                # Continue session — expect an error status_message
                 ws.send_json({
                     "command": "continue_session",
                     "query": "Hello, mock provider!",
                 })
+                messages = poll_for_type(ws, "status_message", timeout=8.0)
 
-                # Collect messages — we expect at least state_changed + conversation_changed
-                responses = []
-                deadline = time.monotonic() + 10.0
-                while time.monotonic() < deadline:
-                    try:
-                        raw = ws.receive_text()
-                        msg = json.loads(raw)
-                        responses.append(msg)
-                        # Stop when we see a response_type that indicates finish
-                        if msg.get("type") == "conversation_changed":
-                            break
-                    except Exception:
-                        break
-
-        # The conversation_changed should contain the mock response
-        conv_msgs = [m for m in responses if m.get("type") == "conversation_changed"]
-        assert len(conv_msgs) > 0, (
-            f"No conversation_changed received. Got types: "
-            f"{[m.get('type') for m in responses]}"
+        status_msgs = [m for m in messages if m.get("type") == "status_message"]
+        assert len(status_msgs) > 0, (
+            f"No status_message received. All messages: "
+            f"{[m.get('type') for m in messages]}"
+        )
+        error_related = any(
+            "error" in m.get("text", "").lower()
+            or "api" in m.get("text", "").lower()
+            or "key" in m.get("text", "").lower()
+            or "fail" in m.get("text", "").lower()
+            or "invalid" in m.get("text", "").lower()
+            or "not configured" in m.get("text", "").lower()
+            for m in status_msgs
+        )
+        assert error_related, (
+            f"No error-related status_message found. All status messages: "
+            f"{[m.get('text') for m in status_msgs]}"
         )
 
-        # Find the mock provider instance and verify it was called
-        mock_instances = MockProvider._instances
-        assert len(mock_instances) > 0, "No MockProvider was ever created"
-        called = any(inst.call_count > 0 for inst in mock_instances)
-        assert called, "MockProvider was never called"
+        # The mock provider must NOT have been instantiated by this flow
+        assert len(MockProvider._instances) == instances_before, (
+            f"MockProvider instances grew from {instances_before} to "
+            f"{len(MockProvider._instances)} — the mock must not be used"
+        )
 
-    def test_apply_config_deep_merge_permissions(self, mock_server):
+    def test_apply_config_permissions_payload_is_ignored(self, mock_server, caplog):
         """
-        apply_config with partial session_permissions should deep-merge,
-        not overwrite the other permission fields (the shallow merge bug).
+        apply_config does NOT carry grants (P1): a ``session_permissions`` key
+        on the payload is IGNORED — the canonical grant store is the session
+        permission sidecar.  The emitted set is the session default and is left
+        unchanged by both payloads; the payload value never lands.
         """
         app, _tmp_home = mock_server
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws") as ws:
-                # Create session
-                new_session(ws)
+        first_perms = {
+            "filesystem": "read",
+            "network": "banned",
+            "git": "read",
+            "container": False,
+            "mcp": "banned",
+            "host_bash": "banned",
+        }
+        with caplog.at_level(logging.WARNING, logger="web_ui.backend.config_manager"):
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws") as ws:
+                    # Create session
+                    new_session(ws)
 
-                # First, apply a config with full session_permissions
-                ws.send_json({
-                    "command": "apply_config",
-                    "config": {
-                        "provider_type": "mock",
-                        "api_key": "mock-key",
-                        "model": "mock-model",
-                        "session_permissions": {
-                            "filesystem": "read",
-                            "network": False,
-                            "browser": "deny",
+                    # Payload #1 carries a full session_permissions set
+                    # (canonical permission keys only).
+                    ws.send_json({
+                        "command": "apply_config",
+                        "config": {
+                            "provider_type": "mock",
+                            "api_key": "mock-key",
+                            "model": "mock-model",
+                            "session_permissions": dict(first_perms),
                         },
-                    },
-                })
-                poll_for_type(ws, "config_changed", timeout=5.0)
+                    })
+                    first_msgs = poll_for_type(ws, "config_changed", timeout=5.0)
+                    first_emitted = (
+                        first_msgs[-1]["config"].get("session_permissions") or {}
+                    )
 
-                # Now apply a partial update — only change one field
-                ws.send_json({
-                    "command": "apply_config",
-                    "config": {
-                        "session_permissions": {
-                            "filesystem": "write",
+                    # Payload #2 tries a partial update — a single field.
+                    ws.send_json({
+                        "command": "apply_config",
+                        "config": {
+                            "session_permissions": {
+                                "filesystem": "write",
+                            },
                         },
-                    },
-                })
-                config_msgs = poll_for_type(ws, "config_changed", timeout=5.0)
-                last_config = config_msgs[-1]["config"]
+                    })
+                    config_msgs = poll_for_type(ws, "config_changed", timeout=5.0)
+                    last_config = config_msgs[-1]["config"]
 
-        # The deep-merge fix should preserve network and browser
-        perms = last_config.get("session_permissions", {})
-        assert perms.get("filesystem") == "write", (
-            f"Expected filesystem=write, got {perms.get('filesystem')}"
+        # P1: neither payload granted anything — the emitted session_permissions
+        # is the session default, unchanged between the two payloads.
+        perms = last_config.get("session_permissions") or {}
+        assert perms == first_emitted, (
+            f"apply_config payload changed the emitted permissions "
+            f"({first_emitted!r} -> {perms!r}); the payload must be ignored"
         )
-        assert perms.get("network") is False, (
-            f"Expected network=False (preserved by deep_merge), got {perms.get('network')}"
+        assert perms.get("filesystem") != "write", (
+            f"payload value must NOT land; got "
+            f"filesystem={perms.get('filesystem')!r} in {perms}"
         )
-        assert perms.get("browser") == "deny", (
-            f"Expected browser=deny (preserved by deep_merge), got {perms.get('browser')}"
-        )
+        assert any(
+            "session_permissions" in r.getMessage() for r in caplog.records
+        ), caplog.records
 
-    def test_model_override_priority(self, mock_server):
+    def test_model_override_ignored(self, mock_server):
         """
-        model_override should take precedence over user's model and
-        profile's default_model.
+        model_override is NOT applied by apply_config (only model is mutable);
+        the user's model value wins.
         """
         app, _tmp_home = mock_server
         with TestClient(app) as client:
@@ -376,9 +395,9 @@ class TestWebSocketWithMockProvider:
                 config_msgs = poll_for_type(ws, "config_changed", timeout=5.0)
                 last_config = config_msgs[-1]["config"]
 
-        # model_override should win → model = gpt-4-turbo
-        assert last_config.get("model") == "gpt-4-turbo", (
-            f"Expected model=gpt-4-turbo (model_override wins), "
+        # model_override is ignored → the user's model value wins
+        assert last_config.get("model") == "gpt-3.5-turbo", (
+            f"Expected model=gpt-3.5-turbo (model_override ignored), "
             f"got model={last_config.get('model')!r}"
         )
 
@@ -409,13 +428,13 @@ class TestWebSocketWithMockProvider:
             f"api_key should be stripped from config dump, "
             f"got {config_api_key!r}"
         )
-        # But api_key_configured should be True
-        assert last_config.get("api_key_configured") is True
+        # api_key is never persisted, so api_key_configured is False
+        assert last_config.get("api_key_configured") is False
 
-    def test_save_and_load_session_roundtrip(self, mock_server):
+    def test_save_and_load_session_roundtrip_strips_grants(self, mock_server):
         """
-        Saving a session and loading it back should preserve config fields
-        (including session_permissions).
+        Saving a session and loading it back preserves config fields but does
+        NOT resurrect the ignored session_permissions grant.
         """
         app, tmp_home = mock_server
         session_id = None
@@ -433,7 +452,7 @@ class TestWebSocketWithMockProvider:
                         "api_key": "mock-key",
                         "model": "mock-model",
                         "session_permissions": {
-                            "filesystem": "read",
+                            "filesystem": "write",
                             "network": "all",
                         },
                         "system_prompt": "You are a test agent.",
@@ -462,13 +481,36 @@ class TestWebSocketWithMockProvider:
         assert loaded_config.get("model") == "mock-model"
         assert loaded_config.get("system_prompt") == "You are a test agent."
         perms = loaded_config.get("session_permissions", {})
-        assert perms.get("filesystem") == "read"
-        assert perms.get("network") == "all"
+        # P1/P2: the apply_config payload grant was IGNORED and the session
+        # record does not persist it, so it is never resurrected on load.
+        # (Robust whether the projection emits {} or the gate's deny-all shape.)
+        assert perms.get("network") != "all"
+        assert perms.get("filesystem") != "write"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Run directly
 # ══════════════════════════════════════════════════════════════════════════════
+
+def test_provider_factory_instantiates_mock_provider():
+    """
+    Unit-level: ProviderFactory.create_provider(provider_type='mock') must
+    build a MockProvider from keyword config and serve chat_completion.
+    This proves the mock mechanism works when provider_type actually reaches
+    the factory (which WS apply_config can no longer do).
+    """
+    _register_mock_provider()
+    provider = ProviderFactory.create_provider(
+        provider_type="mock",
+        api_key="mock-key",
+        model="mock-model",
+        base_url="https://mock.local/v1",
+    )
+    assert isinstance(provider, MockProvider)
+    response = provider.chat_completion([{"role": "user", "content": "hello"}])
+    assert response.provider == "mock"
+    assert provider.call_count == 1
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--timeout=30"])

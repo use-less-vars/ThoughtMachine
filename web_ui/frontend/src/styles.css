@@ -94,6 +94,87 @@ body {
   color: var(--border);
 }
 
+/* ── Session error banner (dismissible; from 'error' / abnormal 'session_stop' events) ── */
+.session-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  background: rgba(243, 139, 168, 0.12);
+  color: var(--danger);
+  border-bottom: 1px solid rgba(243, 139, 168, 0.3);
+  font-size: 0.82rem;
+  font-family: var(--font-sans);
+}
+
+.session-error-banner-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-error-banner-dismiss {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--danger);
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 0.15rem 0.3rem;
+  border-radius: 4px;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+.session-error-banner-dismiss:hover {
+  background: rgba(243, 139, 168, 0.25);
+}
+
+/* Fix 3C: brief pulse on the recovery banner when a send is blocked (uses the
+   recoloured session-error-banner-pulse keyframe — pink alert accent, same shape/timing as worker-glow-pulse). */
+.session-error-banner--pulse {
+  animation: session-error-banner-pulse 0.4s ease-in-out 1;
+}
+
+/* ── Docker health banner (top-level; shown when the backend is unreachable
+      or the Docker daemon is unavailable) ── */
+.docker-health-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  background: rgba(249, 226, 175, 0.12);
+  color: var(--warning);
+  border-bottom: 1px solid rgba(249, 226, 175, 0.3);
+  font-size: 0.82rem;
+  font-family: var(--font-sans);
+}
+
+.docker-health-banner-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.docker-health-banner-dismiss {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--warning);
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 0.15rem 0.3rem;
+  border-radius: 4px;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+.docker-health-banner-dismiss:hover {
+  background: rgba(249, 226, 175, 0.25);
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
    ConfigPanel (sidebar)
    ────────────────────────────────────────────────────────────────────────── */
@@ -513,6 +594,21 @@ body {
   border-radius: var(--radius);
 }
 
+/* Ephemeral (client-only) system bubbles.
+ *
+ * Modifier, not a role class: it composes with whatever role class the bubble
+ * already carries (.message-system-as-user) and overrides its enclosure.
+ * Those notices are NOT part of the stored conversation — status acks and
+ * worker state changes that vanish on the next server-driven replace — so they
+ * read as hollow and dashed, while persisted notices stay enclosed and solid. */
+.message-ephemeral {
+  background-color: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  opacity: 0.85;
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
    QueryBar
    ────────────────────────────────────────────────────────────────────────── */
@@ -592,6 +688,14 @@ body {
 }
 .btn-stop:hover:not(:disabled) {
   filter: brightness(1.1);
+}
+
+.btn-resume {
+  background: var(--accent);
+  color: var(--bg-primary);
+}
+.btn-resume:hover:not(:disabled) {
+  background: var(--accent-hover);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -812,6 +916,380 @@ body {
 
 
 /* ──────────────────────────────────────────────────────────────────────────
+   Worker Output Panel (right-most sidebar)
+   ────────────────────────────────────────────────────────────────────────── */
+
+.worker-output-panel {
+  height: 100%;
+  overflow: hidden;
+  flex-shrink: 0;
+  /* Width managed dynamically by WorkerOutputPanel.panelWidth */
+}
+
+/* ── Worker Output Panel inner layout ────────────────────── */
+.worker-output-wrapper {
+  display: flex;
+  height: 100%;
+  font-family: var(--font-sans);
+}
+
+.worker-output-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.worker-output-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.worker-output-header-label {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.worker-output-header-ctx {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+
+.worker-output-header-task-inline {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
+}
+
+/* (dead CSS removed — header-top, header-name, header-status, header-task, header-bottom, elapsed) */
+
+.worker-output-stop-btn {
+  background: var(--danger);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: var(--radius);
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  transition: opacity 0.15s;
+}
+.worker-output-stop-btn:disabled {
+  background: var(--border);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+.worker-output-stop-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.worker-output-pause-btn {
+  background: var(--warning);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: var(--radius);
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  transition: opacity 0.15s;
+}
+.worker-output-pause-btn:disabled {
+  background: var(--border);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+.worker-output-pause-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.worker-output-resume-btn {
+  background: var(--success);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: var(--radius);
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  transition: opacity 0.15s;
+}
+.worker-output-resume-btn:disabled {
+  background: var(--border);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+.worker-output-resume-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.worker-output-close-btn {
+  background: transparent;
+  color: var(--text-secondary);
+  border: none;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.15rem 0.3rem;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+.worker-output-close-btn:hover {
+  background: var(--bg-surface);
+}
+
+/* ── Bottom bar (matches main QueryBar) ──────────────────── */
+.worker-output-bottom-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  /* match main QueryBar height when textarea is empty (40px min-height + 1.5rem padding) */
+  min-height: calc(40px + 1.5rem);
+}
+
+.worker-output-bottom-name {
+  font-size: 0.8rem;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.worker-output-bottom-elapsed {
+  font-size: 0.8rem;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.worker-output-bottom-error {
+  font-size: 0.7rem;
+  color: var(--danger);
+  white-space: nowrap;
+}
+
+/* ── Scroll area ─────────────────────────────────────────── */
+.worker-output-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.5rem 1rem;
+  background: var(--bg-primary);
+  position: relative;
+}
+
+.worker-output-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-secondary);
+  font-style: italic;
+  text-align: center;
+  padding: 2rem;
+  font-size: 0.85rem;
+}
+
+.worker-output-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--danger);
+  text-align: center;
+  padding: 2rem;
+  font-size: 0.82rem;
+}
+
+
+/* ── Timestamp ───────────────────────────────────────────── */
+.worker-event-timestamp {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-left: 0.5rem;
+}
+
+/* ── New events floating button ──────────────────────────── */
+.new-events-container {
+  position: sticky;
+  bottom: 0.5rem;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 5;
+}
+.new-events-btn {
+  background: var(--accent);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: 20px;
+  padding: 0.35rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.8rem;
+  pointer-events: auto;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  transition: opacity 0.15s, transform 0.15s;
+}
+.new-events-btn:hover {
+  opacity: 0.9;
+  transform: translateY(-1px);
+}
+
+/* ── Scroll nav buttons for worker panel ─────────────────── */
+.worker-scroll-nav {
+  position: absolute;
+  bottom: 1rem;
+  right: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  z-index: 10;
+}
+
+/* ── Status dot (color applied via JS, base styles here) ── */
+.worker-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* Glow/pulse animation for active (busy) status dot in WorkerOutputPanel */
+@keyframes worker-glow-pulse {
+  0%, 100% {
+    box-shadow: 0 0 4px 0 rgba(166, 227, 161, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 8px 3px rgba(166, 227, 161, 0.6);
+  }
+}
+
+/* Fix 3C: pink glow pulse for the session-error recovery banner (same shape as
+   worker-glow-pulse, recoloured to the banner's pink alert accent). */
+@keyframes session-error-banner-pulse {
+  0%, 100% {
+    box-shadow: 0 0 4px 0 rgba(243, 139, 168, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 8px 3px rgba(243, 139, 168, 0.6);
+  }
+}
+.worker-status-dot-busy {
+  animation: worker-glow-pulse 1.5s ease-in-out infinite;
+}
+
+/* Label next to the status dot in the WorkerOutputPanel header (F5) */
+.worker-status-label {
+  font-size: 11px;
+  color: #6c7086;
+  margin-left: 6px;
+  user-select: none;
+}
+
+/* Glow/pulse animation for busy dot in WorkerManagementPanel lists */
+@keyframes worker-dot-pulse {
+  0%, 100% {
+    box-shadow: 0 0 4px 0 rgba(166, 227, 161, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 8px 3px rgba(166, 227, 161, 0.6);
+  }
+}
+.worker-dot-busy {
+  animation: worker-dot-pulse 1.5s ease-in-out infinite;
+}
+
+/* ── No-worker selected state ────────────────────────────── */
+.worker-output-no-selection {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-family: var(--font-sans);
+}
+.worker-output-no-selection-text {
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  padding: 1rem;
+}
+
+/* ── Token state warning banner ──────────────────────────────────────── */
+.worker-output-warning-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  font-size: 0.82rem;
+  font-family: var(--font-sans);
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.worker-output-warning-banner-warning {
+  background: rgba(249, 226, 175, 0.12);
+  color: #f9e2af;
+  border-bottom-color: rgba(249, 226, 175, 0.3);
+}
+
+.worker-output-warning-banner-critical {
+  background: rgba(243, 139, 168, 0.12);
+  color: #f38ba8;
+  border-bottom-color: rgba(243, 139, 168, 0.3);
+}
+
+.worker-output-warning-banner-icon {
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+.worker-output-warning-banner-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.worker-output-warning-banner-text strong {
+  font-weight: 700;
+}
+
+.worker-output-warning-banner-ctx {
+  font-size: 0.78rem;
+  font-family: var(--font-mono);
+  opacity: 0.8;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+
+
+/* ──────────────────────────────────────────────────────────────────────────
    Scrollbar (Webkit)
    ────────────────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar {
@@ -838,11 +1316,14 @@ body {
   flex-shrink: 0;
   position: relative;
   z-index: 10;
-  transition: background 0.15s;
+  transition: background 0.15s, border-color 0.15s;
+  /* Always-visible dividing line so users know where to grab */
+  border-left: 1px solid var(--border);
 }
 
 .resize-handle:hover {
   background: var(--accent);
+  border-color: var(--accent);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -905,6 +1386,10 @@ body {
   border-bottom: 3px solid #f1c40f;
 }
 
+.tab-item.paused {
+  border-bottom: 3px solid #f39c12;
+}
+
 .tab-item.idle {
   border-bottom: 3px solid #3498db;
 }
@@ -954,6 +1439,36 @@ body {
   border-color: var(--accent);
 }
 
+.tab-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.tab-action-btn {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+  font-size: 0.78rem;
+  transition: background 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+
+.tab-action-btn:hover {
+  border-color: var(--accent);
+}
+
+.tab-action-btn.active {
+  background: var(--accent);
+  color: var(--bg-primary);
+  border-color: var(--accent);
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
    Multi-tab additions
    ────────────────────────────────────────────────────────────────────────── */
@@ -971,6 +1486,20 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 0;  /* allow flex child to shrink below content height */
+}
+
+/* Keep-mounted session deck: one pane per visited tab. Only the ACTIVE
+   pane is visible; visited-but-inactive panes stay mounted (in-memory state
+   like query drafts survives tab switches) but are hidden from view. */
+.session-tab-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.session-tab-pane-hidden {
+  display: none;
 }
 
 .session-tab-content {
@@ -1024,6 +1553,135 @@ body {
 .deferred-placeholder-message:hover {
   opacity: 1;
   border-color: var(--accent-color, #888);
+}
+
+
+/* ── Session header (rename button + inline input) ─────────── */
+.session-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.75rem;
+  background: var(--bg-secondary, #2a2a2a);
+  border-bottom: 1px solid var(--border-color, #444);
+  flex-shrink: 0;
+}
+
+.session-header-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-primary, #e0e0e0);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.session-header-rename-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-secondary, #999);
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 0.125rem 0.375rem;
+  border-radius: 4px;
+  transition: background 0.15s, border-color 0.15s;
+  line-height: 1;
+}
+
+.session-header-rename-btn:hover {
+  background: var(--bg-hover, #3a3a3a);
+  border-color: var(--border-color, #555);
+  color: var(--text-primary, #e0e0e0);
+}
+
+.session-header-spacer {
+  flex: 1;
+}
+
+.session-header-btn {
+  background: none;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 3px 8px;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.session-header-btn:hover {
+  background: var(--bg-hover, rgba(128,128,128,0.1));
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+
+.session-header-save-btn {
+  color: var(--accent, #4a9eff);
+}
+
+.session-header-save-btn:hover {
+  background: color-mix(in srgb, var(--accent, #4a9eff) 10%, transparent);
+  border-color: var(--accent, #4a9eff);
+}
+
+.session-header-delete-btn {
+  color: var(--danger, #e74c3c);
+}
+
+.session-header-delete-btn:hover {
+  background: color-mix(in srgb, var(--danger, #e74c3c) 10%, transparent);
+  border-color: var(--danger, #e74c3c);
+}
+
+.session-header-delete-confirm {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.78rem;
+}
+
+.session-header-delete-warn {
+  color: var(--danger, #e74c3c);
+  font-weight: 600;
+  margin-right: 2px;
+}
+
+.session-header-confirm-delete-btn {
+  color: var(--danger, #e74c3c) !important;
+  font-weight: 600;
+}
+
+.session-header-confirm-delete-btn:hover {
+  background: color-mix(in srgb, var(--danger, #e74c3c) 15%, transparent) !important;
+  border-color: var(--danger, #e74c3c) !important;
+}
+
+.session-header-cancel-btn {
+  color: var(--text-secondary);
+}
+
+.session-header-cancel-btn:hover {
+  background: var(--bg-hover, rgba(128,128,128,0.1));
+  border-color: var(--border);
+}
+
+.session-header-input {
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 0.125rem 0.375rem;
+  border: 1px solid var(--accent-color, #6af);
+  border-radius: 4px;
+  background: var(--bg-primary, #1e1e2e);
+  color: var(--text-primary, #e0e0e0);
+  outline: none;
+  max-width: 300px;
+  flex: 1;
+}
+
+.session-header-input:focus {
+  box-shadow: 0 0 0 2px rgba(100, 170, 255, 0.2);
 }
 
 
@@ -1261,180 +1919,7 @@ body {
   font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-   Session Actions Panel (slide-in from right)
-   ────────────────────────────────────────────────────────────────────────── */
-
-.session-actions-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  background: rgba(0, 0, 0, 0.4);
-  z-index: 200;
-}
-
-.session-actions-panel {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 300px;
-  background: var(--bg-surface);
-  border-left: 1px solid var(--border);
-  box-shadow: -4px 0 20px rgba(0, 0, 0, 0.3);
-  z-index: 201;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  animation: session-actions-slide-in 0.2s ease-out;
-}
-
-@keyframes session-actions-slide-in {
-  from {
-    transform: translateX(100%);
-  }
-  to {
-    transform: translateX(0);
-  }
-}
-
-.session-actions-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0.75rem 1rem;
-  border-bottom: 1px solid var(--border);
-}
-
-.session-actions-header h3 {
-  font-size: 1rem;
-  font-weight: 600;
-}
-
-.session-actions-close {
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: 1rem;
-  color: var(--text-secondary);
-  padding: 0.2rem 0.4rem;
-  border-radius: 4px;
-  transition: background 0.15s, color 0.15s;
-  line-height: 1;
-}
-
-.session-actions-close:hover {
-  background: var(--danger);
-  color: #fff;
-}
-
-.session-actions-section {
-  padding: 0.75rem 1rem;
-  border-bottom: 1px solid var(--border);
-}
-
-.session-actions-section h4 {
-  font-size: 0.85rem;
-  font-weight: 600;
-  margin-bottom: 0.5rem;
-  color: var(--text-secondary);
-}
-
-.session-actions-section-grow {
-  flex: 1;
-  overflow-y: auto;
-  border-bottom: none;
-}
-
-.session-actions-save-form {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.session-actions-input {
-  padding: 0.4rem 0.6rem;
-  background: var(--bg-primary);
-  color: var(--text-primary);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font-size: 0.85rem;
-  outline: none;
-}
-
-.session-actions-input:focus {
-  border-color: var(--accent);
-}
-
-.session-actions-save-form-buttons {
-  display: flex;
-  gap: 0.4rem;
-}
-
-.session-actions-delete-confirm p {
-  font-size: 0.85rem;
-  color: var(--text-secondary);
-  margin-bottom: 0.5rem;
-  line-height: 1.4;
-}
-
-.session-actions-delete-confirm-buttons {
-  display: flex;
-  gap: 0.4rem;
-}
-
-.session-actions-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
-}
-
-.session-actions-empty {
-  font-size: 0.85rem;
-  color: var(--text-secondary);
-  font-style: italic;
-  text-align: center;
-  padding: 1rem 0;
-}
-
-.session-actions-item {
-  display: flex;
-  flex-direction: column;
-  gap: 0.15rem;
-  padding: 0.4rem 0.6rem;
-  background: var(--bg-primary);
-  border-radius: 4px;
-  border: 1px solid transparent;
-  cursor: pointer;
-  transition: border-color 0.15s, background 0.15s;
-}
-
-.session-actions-item:hover {
-  border-color: var(--border);
-  background: var(--bg-secondary);
-}
-
-.session-actions-item-active {
-  border-color: var(--accent) !important;
-}
-
-.session-actions-item-name {
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: var(--text-primary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.session-actions-item-date {
-  font-size: 0.7rem;
-  color: var(--text-secondary);
-}
-
-/* ── Button variants for panel ──────────────────────────── */
+/* ── Button variants ───────────────────────────────────────── */
 .btn-accent {
   background: var(--accent);
   color: var(--bg-primary);
@@ -1518,5 +2003,593 @@ body {
 
 .toggle-switch input:focus + .toggle-slider {
   box-shadow: 0 0 1px var(--accent, #89b4fa);
+}
+
+
+
+/* ──────────────────────────────────────────────────────────────────────────────
+   Logging Panel
+   ──────────────────────────────────────────────────────────────────────────── */
+.logging-panel {
+  width: 300px;
+  min-width: 280px;
+  height: 100%;
+  padding: 1rem;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  flex-shrink: 0;
+}
+
+.logging-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 1rem;
+  font-weight: 600;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.logging-panel-close {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+.logging-panel-close:hover {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+.logging-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.logging-section-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.logging-section-desc {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.2rem;
+}
+
+.logging-select {
+  padding: 0.4rem 0.5rem;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.logging-select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.logging-input {
+  padding: 0.4rem 0.5rem;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  width: 100%;
+}
+.logging-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.logging-truncation-table {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.logging-truncation-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.logging-truncation-key {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.logging-truncation-value {
+  width: 70px;
+  padding: 0.25rem 0.4rem;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  text-align: right;
+  font-family: var(--font-mono);
+}
+.logging-truncation-value:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.logging-save-indicator {
+  font-size: 0.75rem;
+  color: var(--success);
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.logging-save-indicator.visible {
+  opacity: 1;
+}
+
+.logging-raw-toggle {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.8rem;
+  text-align: left;
+  padding: 0;
+  font-family: var(--font-sans);
+}
+.logging-raw-toggle:hover {
+  text-decoration: underline;
+}
+
+.logging-raw-json {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+
+
+
+/* --- Vault health banner (shared: landing + workspace pages) --- */
+.vault-health-banner { border-radius: 8px; padding: 0.6rem 0.9rem; font-size: 0.85rem; margin: 1rem 1.5rem 0; }
+.vault-health-ok { background: rgba(166, 227, 161, 0.12); border: 1px solid #a6e3a1; color: #a6e3a1; }
+.vault-health-error { background: rgba(243, 139, 168, 0.12); border: 1px solid #f38ba8; color: #f38ba8; }
+.vault-health-degraded { background: rgba(249, 226, 175, 0.12); border: 1px solid #f9e2af; color: #f9e2af; }
+.vault-health-title { font-weight: 600; margin-bottom: 0.4rem; }
+.vault-health-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem 0.7rem;
+  width: 100%;
+  padding: 0;
+  margin: 0;
+  background: none;
+  border: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.vault-health-toggle:hover .vault-health-summary { text-decoration: underline; }
+.vault-health-toggle:focus-visible { outline: 1px solid #89b4fa; outline-offset: 2px; border-radius: 4px; }
+.vault-health-summary { font-size: 0.8rem; }
+.vault-health-chevron { font-size: 0.7rem; margin-left: auto; }
+.vault-health-list {
+  margin: 0.35rem 0 0;
+  padding: 0 0.4rem 0 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 14em;
+  overflow-y: auto;
+}
+.vault-health-issue { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: baseline; font-size: 0.8rem; }
+.vault-health-severity { border-radius: 10px; padding: 0 0.45rem; font-size: 0.68rem; font-weight: 600; text-transform: uppercase; }
+.vault-health-severity.critical, .vault-health-severity.high { background: #f38ba8; color: #1e1e2e; }
+.vault-health-severity.medium { background: #f9e2af; color: #1e1e2e; }
+.vault-health-severity.low { background: #a6e3a1; color: #1e1e2e; }
+.vault-health-file { font-family: monospace; }
+.vault-health-action { color: #f9e2af; }
+
+
+
+/* ──────────────────────────────────────────────────────────────────────────
+   ContainerListPanel (feature C.1 — session-panel container view)
+   ────────────────────────────────────────────────────────────────────────── */
+.container-list-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.container-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.container-group-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.container-empty {
+  color: var(--text-secondary);
+  font-style: italic;
+  font-size: 0.8rem;
+  padding: 0.35rem 0;
+}
+
+.container-list-error {
+  color: var(--danger);
+  font-size: 0.8rem;
+}
+
+.container-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.5rem;
+  background: var(--bg-surface);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+}
+
+.container-row-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.container-row-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.container-state-chip {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.container-state-chip--oom {
+  background: rgba(243, 139, 168, 0.18);
+  color: var(--danger);
+}
+
+.container-shared-chip {
+  font-size: 0.7rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  background: rgba(137, 180, 250, 0.18);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.permission-badge {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.container-drift {
+  font-size: 0.72rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  white-space: normal;
+}
+
+.container-drift--red {
+  background: rgba(243, 139, 168, 0.15);
+  color: var(--danger);
+}
+
+.container-drift--neutral {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+
+.container-row-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.container-resources-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.container-resources-label {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+
+.container-resources-mem {
+  width: 5rem;
+  padding: 0.2rem 0.4rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  outline: none;
+}
+
+.container-resources-mem:focus {
+  border-color: var(--accent);
+}
+
+.container-action {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.container-action:hover {
+  background: var(--border);
+}
+
+.container-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.container-inflight {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.container-inflight-spinner {
+  width: 0.7rem;
+  height: 0.7rem;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: container-inflight-spin 0.7s linear infinite;
+}
+
+@keyframes container-inflight-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.container-confirm-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.container-confirm-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  max-width: 360px;
+  width: 100%;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.container-confirm-message {
+  margin-bottom: 1rem;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.container-confirm-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.btn-cancel {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Worker blueprint editor (feature C.2)
+   ────────────────────────────────────────────────────────────────────────── */
+.worker-blueprint-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.blueprint-load-error {
+  background: rgba(243, 139, 168, 0.12);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  color: var(--danger);
+  font-size: 0.8rem;
+  padding: 0.4rem 0.6rem;
+}
+
+.blueprint-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.blueprint-empty {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  padding: 0.5rem 0;
+}
+
+.blueprint-row {
+  align-items: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+}
+
+.blueprint-row:hover {
+  border-color: var(--accent);
+}
+
+.blueprint-row--selected {
+  border-color: var(--accent);
+  background: rgba(137, 180, 250, 0.12);
+}
+
+.blueprint-row-name {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.blueprint-row-description {
+  color: var(--text-secondary);
+  flex: 1;
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.blueprint-row-thresholds {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.blueprint-edit-form {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+}
+
+.blueprint-edit-title {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.blueprint-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.blueprint-field-label {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.blueprint-field-input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+  outline: none;
+  padding: 0.35rem 0.45rem;
+  width: 100%;
+}
+
+.blueprint-field-input:focus {
+  border-color: var(--accent);
+}
+
+.blueprint-field-input--multiline {
+  font-family: var(--font-mono);
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.blueprint-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.blueprint-error {
+  background: rgba(243, 139, 168, 0.12);
+  border: 1px solid var(--danger);
+  border-radius: 4px;
+  color: var(--danger);
+  font-size: 0.8rem;
+  padding: 0.35rem 0.5rem;
+}
+
+.restart-to-apply-hint {
+  color: var(--warning);
+  font-size: 0.75rem;
 }
 

@@ -1,0 +1,372 @@
+# tools/host_bash_tool.py
+"""Supervised host-shell execution tool.
+
+``host_bash`` runs a shell command on the host machine (outside the Docker
+sandbox) under explicit operator control.  It is disabled by default and
+gated on TWO independent layers:
+
+* the workspace operator policy ``allow_host_resources``
+  (``workspaces/<id>/config.json``, read in-tool via
+  ``tools.host_resource_policy``) must be true -- checked before the
+  grain/approval flow and fail-closed when the config is missing or
+  unreadable; and
+* the effective permission grain for ``host_bash`` must be ``"ask"`` or
+  ``"allow"`` (``effective_permissions['host_bash']`` /
+  ``session_permissions['host_bash']``).  When unset the grain defaults to
+  ``"banned"`` (fail closed).
+
+The workspace top-level ``allow_host_resources`` key is the operator
+ceiling, enforced in-tool; it also applies to other host-execution surfaces
+via ``tools.host_resource_policy``.  The legacy session-level
+``allow_host_resources`` flag is not consulted.  host_bash is never
+defaulted open.
+
+Every invocation is written to ``<log_root>/host_bash_audit.jsonl`` as a
+JSONL record with exactly six fields: ``timestamp``, ``workspace_id``,
+``session_id``, ``command`` (redacted), ``outcome`` and ``reason``.
+Secret-looking values from ``os.environ`` (length >= 6) are redacted from the
+audit record.
+
+Audit mapping (``outcome``, ``reason``):
+
+* empty command               -> (``"deny"``, ``"empty command"``)
+* permission grain not ask/allow
+                              -> (``"deny"``, ``"<grain> not allowed ..."``)
+* workspace denies host resources
+                              -> (``"deny"``, ``"Host execution is disabled for this workspace (allow_host_resources=false)"``)
+* approval rejected           -> (``"deny"``, ``"host_bash: command rejected by user"``)
+* approval timed out          -> (``"deny"``, ``"host_bash: security approval timed out"``)
+* command executed            -> (``"allow"``, ``""``)
+* subprocess timeout          -> (``"timeout"``, ``"subprocess timeout after <n>s"``)
+* unexpected execution error  -> (``"allow"``, ``"execution error: <exc>"``)
+"""
+
+import json
+import os
+import queue
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, ClassVar, Dict, List, Literal, Optional
+
+from pydantic import Field
+
+from thoughtmachine.host_port import host_run
+
+from .base import ToolBase
+
+# Localized defaults.  The shared ``agent.config.defaults`` module is not
+# present in every deployment, so the values live here (exported under the
+# historical names so existing importers keep seeing them on this module).
+HOST_BASH_TIMEOUT = 120
+HOST_BASH_APPROVAL_TIMEOUT = 120.0
+
+
+class HostBashTool(ToolBase):
+    """Run a supervised shell command on the host machine."""
+
+    # Stable tool identifier: matches the internal ``tool`` Literal and is
+    # used in LLM schemas, preset lists and the /api/tools endpoint.
+    name: ClassVar[str] = "host_bash"
+
+    tool: Literal["host_bash"] = "host_bash"
+    command: str = Field(description="Shell command to execute on the host machine.")
+    audit_log_path: Optional[str] = Field(
+        default=None,
+        description="Explicit JSONL audit file path (overrides default vault log root; tests inject tmp_path).",
+    )
+
+    # Outer-gate categories: the security gate resolves a ``host_bash``
+    # requirement against the effective host_bash grain.  The value part is
+    # mandatory: ``check_required_categories`` SKIPS any entry lacking ``":"``
+    # (security_gate.py:1483-1485), so a bare ``["host_bash"]`` would gate
+    # nothing.  ``host_bash`` is absent from the shared rank tables
+    # (``GRANT_LEVEL_RANKS``, ``WORKSPACE_CEILING_LEVELS_RANKS``), so the value
+    # must be the literal ``"allow"``: required ``"allow"`` resolves via the
+    # gate's exact-string-match fallback -- banned denies, ask prompts, allow
+    # passes.  See ``TestCheckRequiredCategoriesHostBash`` in
+    # tests/security/test_security_gate.py.
+    required_categories: ClassVar[List[str]] = ["host_bash:allow"]
+
+    # -- helpers -----------------------------------------------------------
+
+    def _audit_dir(self) -> Optional[Path]:
+        """Return the directory the host_bash audit trail is written to.
+
+        Shared with the host port, so both trails (this tool's
+        ``host_bash_audit.jsonl`` and the port's own
+        ``host_port_audit.jsonl``) land in the same operator-visible
+        location.  ``None`` means "unresolvable": the port then falls back
+        to its own default.  Never raises.
+        """
+        try:
+            if self.audit_log_path:
+                return Path(self.audit_log_path).expanduser().parent
+            log_dir = (self.agent_config or {}).get("log_dir")
+            if log_dir:
+                return Path(log_dir).expanduser()
+            from agent._log_root import get_log_root
+
+            root = get_log_root()
+            return Path(root).expanduser() if root is not None else None
+        except (OSError, TypeError, ValueError, ImportError):
+            return None
+
+    def _workspace_id(self) -> str:
+        """Best-effort workspace id for audit/flag context ('' when unknown).
+
+        Resolution order: injected ``agent_config['workspace_id']``, then the
+        session registry for ``session_id``, then ``''``.
+        """
+        ws_id = (self.agent_config or {}).get("workspace_id")
+        if ws_id:
+            return str(ws_id)
+        if self.session_id:
+            try:
+                from session.session_registry import SessionRegistry
+
+                session_info = SessionRegistry.get_default().get(self.session_id)
+                if session_info and session_info.get("workspace_id"):
+                    return str(session_info["workspace_id"])
+            except Exception:
+                pass
+        return ""
+
+    def _redact_command(self, command: str) -> str:
+        """Redact environment values (len >= 6) from the command for audit."""
+        for value in os.environ.values():
+            if isinstance(value, str) and len(value) >= 6 and value and value in command:
+                command = command.replace(value, "<redacted>")
+        return command.replace("\n", "\\n")
+
+    def _audit_log(self, outcome: str, reason: str, command: str) -> None:
+        """Append one JSONL audit record (best-effort, never raises).
+
+        Record fields (exactly): timestamp, workspace_id, session_id,
+        command (redacted), outcome, reason.
+        """
+        try:
+            directory = self._audit_dir()
+            if directory is None:
+                return
+            directory.mkdir(parents=True, exist_ok=True)
+            if self.audit_log_path:
+                path = Path(self.audit_log_path).expanduser()
+            else:
+                path = directory / "host_bash_audit.jsonl"
+            record = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "workspace_id": self._workspace_id(),
+                "session_id": self.session_id or "",
+                "command": self._redact_command(command),
+                "outcome": outcome,
+                "reason": reason,
+            }
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            try:
+                self._log_tool_warning(f"host_bash audit write failed: {exc}")
+            except Exception:
+                pass
+
+    def _request_approval(self, command: str) -> str:
+        """Ask the operator for approval; returns ``approved``/``denied``/``timeout``.
+
+        Registers a one-shot response queue in the shared security registry
+        (``thoughtmachine.security._pending_security_requests``), publishes a
+        ``SecurityPromptEvent`` on the global event bus, and waits for
+        ``resolve_security_prompt(request_id, approved, ...)`` to answer.
+        The registry entry is always removed afterwards (one-time per command).
+        """
+        from agent.events import SecurityPromptEvent, global_event_bus
+        from thoughtmachine.security import _pending_requests_lock, _pending_security_requests
+
+        request_id = str(uuid.uuid4())
+        response_queue = queue.Queue()
+        with _pending_requests_lock:
+            _pending_security_requests[request_id] = response_queue
+        agent_id = str((self.agent_config or {}).get("agent_id") or "0")
+        session_id = self.session_id or ""
+        ws_id = self._workspace_id()
+        description = (
+            f"Run host shell command: {command} "
+            f"(workspace: {ws_id or 'unknown'}, session: {session_id or 'unknown'})"
+        )
+        event = SecurityPromptEvent(
+            data={
+                "request_id": request_id,
+                "agent_id": agent_id,
+                "tool_name": "host_bash",
+                "capabilities": ["host_bash:execute"],
+                "arguments": {"command": command},
+                "session_id": session_id,
+                "description": description,
+            }
+        )
+        try:
+            global_event_bus.publish(event)
+        except Exception as exc:
+            with _pending_requests_lock:
+                _pending_security_requests.pop(request_id, None)
+            try:
+                self._log_tool_warning(f"host_bash approval publish failed: {exc}")
+            except Exception:
+                pass
+            return "denied"
+        try:
+            response = response_queue.get(
+                timeout=float(os.environ.get("HOST_BASH_APPROVAL_TIMEOUT", str(HOST_BASH_APPROVAL_TIMEOUT)))
+            )
+            return "approved" if response.get("approved") else "denied"
+        except queue.Empty:
+            return "timeout"
+        finally:
+            with _pending_requests_lock:
+                _pending_security_requests.pop(request_id, None)
+
+    # -- execute -----------------------------------------------------------
+
+    def execute(self) -> str:
+        cmd = (self.command or "").strip()
+
+        def denied_json(message: str, grain: Optional[str], outcome: str = "denied") -> str:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": message,
+                    "command": cmd,
+                    "permission_level": grain,
+                    "outcome": outcome,
+                },
+                default=str,
+            )
+
+        if not cmd:
+            self._audit_log("deny", "empty command", cmd)
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "host_bash: empty command",
+                    "permission_level": None,
+                    "outcome": "error",
+                },
+                default=str,
+            )
+
+        # host_bash requires BOTH the effective host_bash permission grain
+        # (ask/allow; default 'banned') AND the workspace operator's
+        # allow_host_resources policy (workspaces/<id>/config.json, read via
+        # tools.host_resource_policy).  The workspace check runs first, so a
+        # workspace denial precedes the grain/approval flow; when no
+        # workspace is resolvable the grain gate alone applies.
+        # The grain is read ONLY from the executor-injected
+        # ``effective_permissions`` (the per-call disk-authoritative merge);
+        # the session-start mirror in ``session_permissions`` is never
+        # consulted, so a stale session mirror can never re-open host
+        # execution.  Absent / missing ``host_bash`` resolves to "banned".
+        grain = (self.effective_permissions or {}).get("host_bash")
+        if grain is None:
+            grain = "banned"
+        ws_id = self._workspace_id()
+        if ws_id:
+            try:
+                from tools.host_resource_policy import workspace_allows_host_resources
+
+                ws_ok = workspace_allows_host_resources(ws_id)
+            except Exception:
+                ws_ok = False
+            if not ws_ok:
+                msg = "Host execution is disabled for this workspace (allow_host_resources=false)"
+                self._audit_log("deny", msg, cmd)
+                return denied_json(msg, grain)
+        if grain not in ("ask", "allow"):
+            self._audit_log(
+                "deny",
+                f"host_bash permission level '{grain}' not allowed (requires ask or allow)",
+                cmd,
+            )
+            return denied_json(
+                f"host_bash permission level '{grain}' not allowed (requires ask or allow)",
+                grain,
+            )
+        if grain == "ask":
+            if self.is_worker_context:
+                # Worker context: no interactive operator exists to answer a
+                # SecurityPromptEvent, so asking would strand the request or
+                # leak it to a main-session operator prompt.  Deny in-tool
+                # with the same standardized worker-ask message the outer
+                # gate uses for category-gated tools.
+                msg = "host_bash: ask requires interactive approval; not available in worker context"
+                self._audit_log("deny", msg, cmd)
+                return denied_json(msg, grain)
+            decision = self._request_approval(cmd)
+            if decision == "denied":
+                self._audit_log("deny", "host_bash: command rejected by user", cmd)
+                return denied_json("host_bash: command rejected by user", grain)
+            if decision == "timeout":
+                self._audit_log("deny", "host_bash: security approval timed out", cmd)
+                return denied_json("host_bash: security approval timed out", grain, outcome="approval_timeout")
+
+        timeout = int(os.environ.get("HOST_BASH_TIMEOUT", str(HOST_BASH_TIMEOUT)))
+        # Execution is delegated to the shared host port
+        # (``thoughtmachine/host_port.py``), which re-checks identity, grain and
+        # workspace policy, writes its own PRE/POST ``host_port_audit.jsonl``
+        # trail and raises PermissionError for anything it cannot authorize.
+        # This tool keeps its own independent six-field audit record on top.
+        try:
+            result = host_run(
+                cmd,
+                workspace_id=ws_id,
+                session_id=self.session_id or "",
+                grain="host_bash",
+                shell=True,
+                timeout=timeout,
+                effective_permissions=self.effective_permissions,
+                audit_dir=self._audit_dir(),
+            )
+            if result.timed_out:
+                self._audit_log("timeout", f"subprocess timeout after {timeout}s", cmd)
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"host_bash: command timed out after {timeout}s",
+                        "command": cmd,
+                        "stdout": result.stdout or "",
+                        "stderr": result.stderr or "",
+                        "exit_code": None,
+                        "permission_level": grain,
+                        "outcome": "error",
+                    },
+                    default=str,
+                )
+            self._audit_log("allow", "", cmd)
+            return json.dumps(
+                {
+                    "success": True,
+                    "command": cmd,
+                    "stdout": result.stdout or "",
+                    "stderr": result.stderr or "",
+                    "exit_code": result.exit_code,
+                    "permission_level": grain,
+                    "outcome": "executed",
+                },
+                default=str,
+            )
+        except PermissionError as exc:
+            msg = f"host_bash: host port refused execution: {exc}"
+            self._audit_log("deny", msg, cmd)
+            return denied_json(msg, grain)
+        except Exception as exc:
+            self._audit_log("allow", f"execution error: {exc}", cmd)
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"host_bash: execution error: {exc}",
+                    "command": cmd,
+                    "permission_level": grain,
+                    "outcome": "error",
+                },
+                default=str,
+            )
+

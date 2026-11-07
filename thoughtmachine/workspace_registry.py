@@ -1,0 +1,456 @@
+"""
+workspace_registry.py — Persistent workspace registry.
+
+Manages a JSON file at ``~/.thoughtmachine/state/workspace_registry.json`` that
+tracks all known workspaces.  This replaces ad-hoc directory scanning with
+an explicit registry.
+
+Public API
+----------
+- ``WorkspaceRegistryEntry`` — dataclass for a single workspace entry.
+- ``WorkspaceRegistry`` — manages the JSON registry file.
+- ``WorkspaceRegistryUnavailable`` — raised by the registry's default
+  (fail-closed) reads when the registry file is corrupt, distinguishing
+  corruption from an empty registry.  Callers may opt in to lenient reads via
+  ``_load(allow_corrupt=True)``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from thoughtmachine.vault import vault_root
+
+logger = logging.getLogger(__name__)
+
+
+class WorkspaceRegistryUnavailable(RuntimeError):
+    """The registry file exists but cannot be read as a JSON object.
+
+    This signals *corruption*: malformed JSON, an unreadable file, or valid
+    JSON that is not an object.  A *missing* registry file is NOT corruption —
+    it is the legitimate "no workspaces registered yet" state and is reported
+    as an empty registry by design.
+    """
+
+
+#: Workspace ids the vault claims for its own namespaces.  ``global`` is the
+#: vault-wide scope (``<vault_root>/credentials/global/``,
+#: ``<vault_root>/global/``): a workspace with that id would resolve the global
+#: store as if it were its own scope.  Same shape as ``HEAD`` in git.
+RESERVED_WORKSPACE_IDS: frozenset = frozenset({"global"})
+
+
+def generate_human_id() -> str:
+    """Generate a short, human-readable workspace ID using random words + digits.
+
+    Format: ``{adjective}-{noun}-{digits}`` where adjective and noun are drawn
+    from small built-in word lists.  The result is ~8--12 chars.
+    Returns a string like ``'blue-fox-42'`` or ``'swift-eagle-91'``.
+    """
+    import random
+
+    adjectives = [
+        "bright", "calm", "dark", "eager", "fierce", "gentle", "happy", "keen",
+        "lively", "mellow", "noble", "proud", "quick", "sharp", "swift", "warm",
+        "brave", "clear", "crisp", "divine", "eagle", "fancy", "golden", "holy",
+        "jolly", "kindly", "lithe", "merry", "neat", "quiet", "royal", "shiny",
+    ]
+    nouns = [
+        "bear", "bird", "cat", "deer", "eagle", "frog", "goat", "hare", "ibis",
+        "jay", "koala", "lion", "moth", "newt", "owl", "panda", "quail", "rook",
+        "seal", "toad", "urus", "vole", "wolf", "yak", "zebra", "crane", "dove",
+        "finch", "gecko", "heron", "impala", "jaguar", "kraken", "lemur", "moose",
+    ]
+    adj = random.choice(adjectives)
+    noun = random.choice(nouns)
+    num = random.randint(10, 99)
+    return f"{adj}-{noun}-{num}"
+
+
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+
+def _user_dir() -> Path:
+    """Return the user data directory (lazily resolved, env-aware).
+
+    Uses ``vault_root()`` so ``THOUGHTMACHINE_VAULT_ROOT`` is honoured; falls
+    back to ``Path.home() / ".thoughtmachine"`` when the env var is unset
+    (tests patching ``Path.home`` continue to work).
+    """
+    return vault_root()
+
+
+def _registry_path() -> Path:
+    """Return the path to the workspace registry JSON file."""
+    return _user_dir() / "state" / "workspace_registry.json"
+
+
+def _normalize_path(p: str) -> str:
+    """Normalise a filesystem path for case-insensitive comparison.
+
+    Applies ``os.path.abspath`` (resolve to absolute), ``os.path.normcase``
+    (lowercase on Windows, no-op on POSIX), converts backslashes to forward
+    slashes, and strips trailing slashes.
+
+    This ensures Windows paths like ``C:\\Users\\Foo`` and
+    ``c:\\users\\foo`` are treated as equal.
+    """
+    return os.path.normcase(os.path.abspath(p)).replace("\\", "/").rstrip("/")
+
+
+def _now_iso() -> str:
+    """Return current UTC time as an ISO 8601 string."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ── Entry dataclass ─────────────────────────────────────────────────────
+
+
+@dataclass
+class WorkspaceRegistryEntry:
+    """A single workspace entry in the registry.
+
+    Fields
+    ------
+    id:
+        Unique workspace identifier.
+    root_path:
+        Absolute filesystem path to the workspace root.
+    label:
+        Human-readable label (optional).
+    created_at:
+        ISO 8601 timestamp of when the workspace was registered.
+    updated_at:
+        ISO 8601 timestamp of the last update.
+    last_opened:
+        ISO 8601 timestamp of the last time the workspace was opened/used.
+    metadata:
+        Arbitrary extra key-value data.
+    """
+
+    id: str
+    root_path: str
+    label: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    last_opened: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serialisable dictionary."""
+        return {
+            "id": self.id,
+            "root_path": self.root_path,
+            "label": self.label,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "last_opened": self.last_opened,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WorkspaceRegistryEntry":
+        """Reconstruct from a dictionary (missing keys get defaults)."""
+        return cls(
+            id=data.get("id", ""),
+            root_path=data.get("root_path", ""),
+            label=data.get("label", ""),
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
+            last_opened=data.get("last_opened", ""),
+            metadata=data.get("metadata", {}),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"WorkspaceRegistryEntry(id={self.id!r}, root_path={self.root_path!r}, "
+            f"label={self.label!r})"
+        )
+
+
+# ── Registry ────────────────────────────────────────────────────────────
+
+_VALID_UPDATE_FIELDS = {"root_path", "label", "last_opened", "metadata"}
+
+
+class WorkspaceRegistry:
+    """Persistent workspace registry backed by a JSON file.
+
+    Thread-safe: all public methods acquire an internal lock.
+    """
+
+    _instances: Dict[str, "WorkspaceRegistry"] = {}
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        """Create or open a registry at *path*.
+
+        If *path* is ``None``, the default ``~/.thoughtmachine/state/workspace_registry.json``
+        is used.
+        """
+        self._path = path or _registry_path()
+        self._lock = threading.Lock()
+
+    # ── Singleton / default instance ────────────────────────────────
+
+    @classmethod
+    def get_default(cls) -> "WorkspaceRegistry":
+        """Return a cached default instance for the standard registry path."""
+        path = str(_registry_path())
+        if path not in cls._instances:
+            cls._instances[path] = cls(Path(path))
+        return cls._instances[path]
+
+    # ── Internal I/O ────────────────────────────────────────────────
+
+    def _load(self, *, allow_corrupt: bool = False) -> Dict[str, Any]:
+        """Load the raw registry data from disk.
+
+        The single canonical loader.  Its **default is fail-closed**:
+
+        * a *missing* file is the legitimate "no workspaces registered yet"
+          state and returns ``{}``;
+        * malformed JSON, an ``OSError`` on read, or valid JSON whose top level
+          is not an object *raise* :class:`WorkspaceRegistryUnavailable`.
+
+        ``allow_corrupt=True`` is an explicit, named opt-in to the legacy
+        *lenient* behaviour: every one of those faults collapses to ``{}`` and
+        a warning is logged instead of raising.  It is deliberately NOT the
+        default, so a caller must name it at the call site.
+        """
+        if not self._path.exists():
+            logger.info(
+                "Workspace registry %s does not exist; treating as a "
+                "legitimately-empty registry.",
+                self._path,
+            )
+            return {}
+
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            if allow_corrupt:
+                logger.warning(
+                    "Failed to load registry %s: %s; resetting.",
+                    self._path,
+                    exc,
+                )
+                return {}
+            raise WorkspaceRegistryUnavailable(
+                f"Workspace registry {self._path} could not be read: {exc}"
+            ) from exc
+
+        if not isinstance(raw, dict):
+            if allow_corrupt:
+                logger.warning(
+                    "Registry file %s is not a JSON object; resetting.",
+                    self._path,
+                )
+                return {}
+            raise WorkspaceRegistryUnavailable(
+                f"Workspace registry {self._path} is not a JSON object."
+            )
+
+        return raw
+
+    def _save(self, data: Dict[str, Any]) -> None:
+        """Atomically write *data* to the registry JSON file."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(data, indent=2, default=str),
+            encoding="utf-8",
+        )
+        os.replace(str(tmp_path), str(self._path))
+
+    # ── Public API ──────────────────────────────────────────────────
+
+    def list_workspaces(self) -> List[WorkspaceRegistryEntry]:
+        """Return all registered workspaces, sorted by label then id.
+
+        Raises
+        ------
+        WorkspaceRegistryUnavailable
+            If the registry file exists but is corrupt (malformed JSON, an
+            unreadable file, or valid JSON that is not an object).  A missing
+            registry file is a legitimate empty registry and returns ``[]``.
+        """
+        with self._lock:
+            raw = self._load()
+            entries = [
+                WorkspaceRegistryEntry.from_dict(v)
+                for v in raw.values()
+                if isinstance(v, dict)
+            ]
+            entries.sort(key=lambda e: (e.label or "", e.id or ""))
+            return entries
+
+    def get_workspace(self, workspace_id: str) -> Optional[WorkspaceRegistryEntry]:
+        """Return the entry for *workspace_id*, or ``None``."""
+        with self._lock:
+            raw = self._load()
+            raw_entry = raw.get(workspace_id)
+            if raw_entry is None or not isinstance(raw_entry, dict):
+                return None
+            return WorkspaceRegistryEntry.from_dict(raw_entry)
+
+    def register_workspace(
+        self,
+        workspace_id: str,
+        root_path: str,
+        label: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> WorkspaceRegistryEntry:
+        """Register a new workspace.
+
+        Raises ``ValueError`` if *workspace_id* is reserved by the vault or
+        already exists.
+        """
+        with self._lock:
+            if workspace_id in RESERVED_WORKSPACE_IDS:
+                raise ValueError(
+                    f"Workspace id {workspace_id!r} is reserved: the vault already "
+                    f"uses 'global' for its vault-wide scope "
+                    f"(credentials/global, global/), so a workspace with that id "
+                    f"would read the global store as if it were its own."
+                )
+
+            raw = self._load()
+            if workspace_id in raw:
+                raise ValueError(
+                    f"Workspace {workspace_id!r} is already registered."
+                )
+
+            now = _now_iso()
+            entry = WorkspaceRegistryEntry(
+                id=workspace_id,
+                root_path=_normalize_path(root_path),
+                label=label,
+                created_at=now,
+                updated_at=now,
+                metadata=metadata or {},
+            )
+            raw[workspace_id] = entry.to_dict()
+            self._save(raw)
+            return entry
+
+    def register_by_root(
+        self,
+        root_path: str,
+        label: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> WorkspaceRegistryEntry:
+        """Register a workspace by its root path, auto-generating a human-readable ID.
+
+        If a workspace already exists for this root path, returns the existing entry
+        (no-op).  Otherwise, generates a new ID via :func:`generate_human_id` and
+        registers it.
+
+        Args:
+            root_path: Absolute or relative filesystem path to the workspace root.
+            label: Optional human-readable label.
+            metadata: Optional dict of arbitrary key-value data.
+
+        Returns:
+            The existing or newly created :class:`WorkspaceRegistryEntry`.
+        """
+        existing = self.resolve_by_root(root_path)
+        if existing is not None:
+            return existing
+
+        ws_id = generate_human_id()
+        # Ensure uniqueness in the unlikely event of a collision
+        while self.get_workspace(ws_id) is not None:
+            ws_id = generate_human_id()
+
+        # ── Derive label from folder name if not explicitly provided ──
+        if not label or label == "default":
+            label = os.path.basename(os.path.abspath(root_path).rstrip("/\\"))
+        if not label:
+            label = ws_id  # fallback to generated ID if basename is empty
+
+        return self.register_workspace(ws_id, root_path, label=label, metadata=metadata)
+
+    def unregister_workspace(self, workspace_id: str) -> bool:
+        """Remove a workspace from the registry.
+
+        Returns ``True`` if the entry was removed, ``False`` if it did not exist.
+        """
+        with self._lock:
+            raw = self._load()
+            if workspace_id not in raw:
+                return False
+            del raw[workspace_id]
+            self._save(raw)
+            return True
+
+    def update_workspace(
+        self,
+        workspace_id: str,
+        **updates: Any,
+    ) -> Optional[WorkspaceRegistryEntry]:
+        """Update fields on an existing workspace entry.
+
+        Accepts only valid field names: ``root_path``, ``label``, ``last_opened``,
+        ``metadata``.
+
+        Returns the updated entry, or ``None`` if the workspace does not exist.
+        """
+        invalid = set(updates) - _VALID_UPDATE_FIELDS
+        if invalid:
+            raise ValueError(
+                f"Invalid update fields: {', '.join(sorted(invalid))}. "
+                f"Allowed: {', '.join(sorted(_VALID_UPDATE_FIELDS))}."
+            )
+
+        with self._lock:
+            raw = self._load()
+            raw_entry = raw.get(workspace_id)
+            if raw_entry is None or not isinstance(raw_entry, dict):
+                return None
+
+            entry = WorkspaceRegistryEntry.from_dict(raw_entry)
+
+            for key, value in updates.items():
+                if key == "root_path":
+                    entry.root_path = _normalize_path(str(value))
+                elif key == "label":
+                    entry.label = str(value)
+                elif key == "last_opened":
+                    entry.last_opened = str(value)
+                elif key == "metadata":
+                    if not isinstance(value, dict):
+                        raise TypeError("metadata must be a dict")
+                    entry.metadata = value
+
+            entry.updated_at = _now_iso()
+            raw[workspace_id] = entry.to_dict()
+            self._save(raw)
+            return entry
+
+    def resolve_by_root(self, root_path: str) -> Optional[WorkspaceRegistryEntry]:
+        """Resolve a filesystem path to a workspace entry.
+
+        The *root_path* is normalised via :func:`_normalize_path` before
+        matching (case-insensitive on Windows).
+        Returns the first matching entry, or ``None``.
+        """
+        normalised = _normalize_path(root_path)
+        with self._lock:
+            raw = self._load()
+            for raw_entry in raw.values():
+                if not isinstance(raw_entry, dict):
+                    continue
+                entry_root = _normalize_path(raw_entry.get("root_path", ""))
+                if entry_root == normalised:
+                    return WorkspaceRegistryEntry.from_dict(raw_entry)
+            return None

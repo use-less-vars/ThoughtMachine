@@ -11,48 +11,70 @@
  *   onSessionSaved — called with (sessionId) so App can track new sessions
  *   onNewSession   — called with (sessionId) when a new session is created
  *
- * State (local — not in Zustand):
- *   status, history, tokensIn/Out, contextLength, isRunning, config
+ * State (session-scoped — in Zustand store, sub-step 2.2):
+ *   status, history, tokensIn/Out, contextLength, isRunning, config,
+ *   providers, availableTools — keyed by sessionId, read via selectors
  *
- * Child components receive session state as props instead of reading
- * from the global store.
+ * Child components receive session state as props sourced from store
+ * selectors; prop-drilling removal is sub-step 2.4.
  */
 
-import React, { useEffect, useRef, useState, useCallback } from 'react'
+import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react'
+import useStore from '../store/useStore'
 import ChatPanel from './ChatPanel'
 import QueryBar from './QueryBar'
 import StatusBar from './StatusBar'
 import ConfigPanel from './ConfigPanel'
 import SecurityDialog from './SecurityDialog'
+import SessionSidebar from './SessionSidebar'
+import { wsUrl } from '../apiBase'
 
 const CONFIG_PANEL_MIN_WIDTH = 200
 const CONFIG_PANEL_MAX_WIDTH = 500
 const CONFIG_PANEL_DEFAULT_WIDTH = 280
 
-const WS_URL = `ws://${window.location.hostname}:8000/ws`
+// ── Fix 3a: stable empty array + memoized equality for sessionMessages ──
+// SessionTab re-renders on ANY store slice change (status, tokens, etc.);
+// without a stable messages reference, React.memo(ChatPanel) is defeated and
+// ChatPanel re-renders (and re-runs its scroll effects) on every update.
+const EMPTY_MESSAGES = []
+// Chat messages carry no id/message_id in this app (verified: only session /
+// workspace metadata has ids), so compare role + content of the FIRST and
+// LAST messages. Length + first/last-message equality matches the store's
+// update pattern (streaming mutates the LAST message; earlier messages are
+// immutable, so the first message pins the conversation start).
+function messagesEqual(a, b) {
+  if (a === b) return true
+  if (!a || !b) return false
+  if (a.length !== b.length) return false
+  if (a.length === 0) return true
+  const fa = a[0]
+  const fb = b[0]
+  const la = a[a.length - 1]
+  const lb = b[b.length - 1]
+  return !!(fa && fb && la && lb) &&
+    fa.role === fb.role && fa.content === fb.content &&
+    la.role === lb.role && la.content === lb.content
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Initial per-tab state
 // ────────────────────────────────────────────────────────────────────────────
-const INITIAL_STATE = {
-  status: 'IDLE',
-  history: [],
-  tokensIn: 0,
-  tokensOut: 0,
-  contextLength: 0,
-  isRunning: false,
-  config: null,
-  workspaceId: null,
-}
+// Session-scoped initial values now live in the Zustand store
+// (see DEFAULT_SESSION_CONFIG / DEFAULT_SESSION_STATE in useStore.js).
 
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed }) {
-  const [state, setState] = useState(INITIAL_STATE)
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, onSessionAdopted, selectedWorker, onSelectWorker, onWorkerEvent, onWorkspaceKnown, onLoggingConfigChanged, routeWorkspaceId }) {
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
-  const [providers, setProviders] = useState([])
-  const [availableTools, setAvailableTools] = useState([])
+  const [isRenaming, setIsRenaming] = useState(false)
+  const renameInputRef = useRef(null)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(false) // session details slide-out panel
+  const deleteConfirmRef = useRef(null)
+  const currentSessionIdRef = useRef(currentSessionId)
+  const [workspaceId, setWorkspaceId] = useState(null) // session metadata; no store slice yet (kept local)
   const wsRef = useRef(null)
   const closedRef = useRef(false)  // prevent double-close
   const tabConnectingRef = useRef(false)  // prevent StrictMode duplicate
@@ -60,20 +82,105 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const connectSessionWsRef = useRef(null)  // ref to avoid circular deps in sendCommand
   const [wsConnected, setWsConnected] = useState(false)
   const [defaultConfigSaveStatus, setDefaultConfigSaveStatus] = useState(null) // null | 'ok' | 'error'
-  const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
   const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
   const [containerRebuildResult, setContainerRebuildResult] = useState(null) // null | { status, buildLog }
+  const [sessionReady, setSessionReady] = useState(false) // true after session_loaded confirms session is ready
+  // Fix 3b: stale-session recovery (backend restart). staleSessionRef gates
+  // sendCommand (must be a ref — sendCommand is a []-deps callback); the state
+  // drives banner rendering. pendingAdoptRef stashes the replacement session
+  // the backend created for the dead id so 'Start New Session' can adopt it
+  // through the same acceptance path a fresh tab uses.
+  const [staleSession, setStaleSession] = useState(false)
+  const staleSessionRef = useRef(false)
+  const pendingAdoptRef = useRef(null)
+  // Fix 3C: brief pulse on the existing recovery banner when a send is blocked
+  // by the stale-session gate, so a dead click gives visible feedback.
+  const [staleClickPulse, setStaleClickPulse] = useState(false)
+  const staleClickPulseTimerRef = useRef(null)
+  useEffect(() => () => clearTimeout(staleClickPulseTimerRef.current), [])
+  // Fix 4d: set while awaiting the reply to a recovery new_session (load_error
+  // path). The reply carries a DIFFERENT id than the dead one this tab was
+  // waiting for — the flag makes the handler accept it via the normal path
+  // instead of re-triggering stale-session detection.
+  const expectingNewSessionRef = useRef(false)
   const [isDeferred, setIsDeferred] = useState(false) // true = load skipped; waiting for activation
   const [totalMessages, setTotalMessages] = useState(0) // total messages in the session
   const [hasMore, setHasMore] = useState(false) // true if older messages are available
+  const [scrollToBottomKey, setScrollToBottomKey] = useState(0) // incremented to force scroll to bottom (R3)
   const loadSentRef = useRef(false) // true once load_session has been sent (by any path)
   const dataReceivedRef = useRef(false) // true once we've received a response to our load
+  // ── Streaming assistant text (feat/token-streaming) ──────────────────────
+  // The in-flight assistant bubble lives ONLY in this component's local state:
+  // a delta-only message must never be persisted to the store. It is built from
+  // coalesced `assistant_delta` events and reconciled (replaced) by the terminal
+  // `conversation_changed` for the same turn.
+  const [inFlight, setInFlight] = useState(null) // null | { content, reasoning_content }
+  // Chunks received since the last flush, keyed by the field they land in, so
+  // thinking and answer text coalesce independently and never interleave.
+  const streamBufferRef = useRef({ content: '', reasoning_content: '' })
+  const streamFrameRef = useRef(null)  // pending rAF/timeout handle
+  // Cancel a pending coalescing frame on unmount (no setState after unmount).
+  useEffect(() => () => {
+    if (streamFrameRef.current != null) {
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(streamFrameRef.current)
+      else clearTimeout(streamFrameRef.current)
+      streamFrameRef.current = null
+    }
+  }, [])
+  // Read mode from the store (sessionModes is keyed by sessionId; the prop
+  // was removed — SessionTab reads it directly like other consumers).
+  const mode = useStore((s) => (sessionId ? (s.sessionModes[sessionId] || null) : null))
+  const modeRef = useRef(mode)
+  modeRef.current = mode
+  // ── Store subscriptions (sub-step 2.2): session-scoped state lives in Zustand ──
+  const storeKey = currentSessionId || sessionId
+  // Single source of truth for the display name: store.sessions (refreshed by
+  // sessions_list, upserted immediately via updateSessionName on load/rename).
+  const sessionName = useStore((s) =>
+    storeKey ? (s.sessions.find((x) => x.session_id === storeKey)?.name || '') : ''
+  )
+  const sessionConfig = useStore((s) => s.sessionConfigs[storeKey])
+  const sessionMessages = useStore((s) => s.sessionMessages[storeKey], messagesEqual)
+  const sessionState = useStore((s) => s.sessionStates[storeKey])
+  const sessionError = useStore((s) => (storeKey ? (s.sessionErrors[storeKey] || '') : ''))
+  const config = sessionConfig?.config ?? null
+  const providers = sessionConfig?.providers ?? []
+  const availableTools = sessionConfig?.tools ?? []
+  const history = sessionMessages ?? EMPTY_MESSAGES
+  // Streaming view: history plus (only while a turn is streaming) the in-flight
+  // assistant bubble. Kept out of `history` because the store may not hold a
+  // delta-only message and because `history.length` is the pagination offset.
+  const viewMessages = useMemo(() => {
+    if (!inFlight) return history
+    const content = inFlight.content || ''
+    const reasoningContent = inFlight.reasoning_content || ''
+    // Reasoning-only: a model can think for many frames before the first token
+    // of answer text, and that phase must be visible too.
+    if (!content && !reasoningContent) return history
+    return [...history, {
+      role: 'assistant',
+      content,
+      reasoning_content: reasoningContent,
+      // Drives the cheap plain-text render path in MessageBubble (no Markdown
+      // re-parse per frame). The reconciled/persisted message has no such flag.
+      is_streaming: true,
+    }]
+  }, [history, inFlight])
+  const status = sessionState?.state ?? 'IDLE'
+  const isRunning = sessionState?.isRunning ?? false
+  const contextLength = sessionState?.contextLength ?? 0
+  const tokensIn = sessionState?.tokensIn ?? 0
+  const tokensOut = sessionState?.tokensOut ?? 0
   const isActiveRef = useRef(isActive)
   isActiveRef.current = isActive
+  const prevIsActiveRef = useRef(isActive)
   const providersRef = useRef(providers)
   providersRef.current = providers
+  const configRef = useRef(config)
+  configRef.current = config
   const availableToolsRef = useRef(availableTools)
   availableToolsRef.current = availableTools
+  const availableToolsModeRef = useRef(null)
   const isWsConnectedOrConnecting = () => {
     const ws = wsRef.current
     return ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)
@@ -81,21 +188,27 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
   // ── Config panel resize state (persisted per tab) ──────────────────
   const [configPanelWidth, setConfigPanelWidth] = useState(() => {
-    if (tabId) {
-      const saved = localStorage.getItem(`config-panel-width:${tabId}`)
+    // R7: key the persisted width by sessionId (stable across reloads); the
+    // tabId is ephemeral (regenerated on every page load). Fall back to tabId
+    // when sessionId is not known yet (fresh tab).
+    const widthKey = sessionId || tabId
+    if (widthKey) {
+      const saved = localStorage.getItem(`config-panel-width:${widthKey}`)
       if (saved) return Math.max(CONFIG_PANEL_MIN_WIDTH, Math.min(CONFIG_PANEL_MAX_WIDTH, Number(saved)))
     }
     return CONFIG_PANEL_DEFAULT_WIDTH
   })
   const dragRef = useRef(null) // { startX, startWidth }
 
-  // Persist width changes
+  // Persist width changes (R7: keyed by sessionId so widths survive reloads;
+  // fall back to tabId while sessionId is unknown).
   const handleWidthChange = useCallback((newWidth) => {
     setConfigPanelWidth(newWidth)
-    if (tabId) {
-      localStorage.setItem(`config-panel-width:${tabId}`, String(newWidth))
+    const widthKey = sessionId || tabId
+    if (widthKey) {
+      localStorage.setItem(`config-panel-width:${widthKey}`, String(newWidth))
     }
-  }, [tabId])
+  }, [sessionId, tabId])
 
   const handleResizeStart = useCallback((e) => {
     e.preventDefault()
@@ -132,33 +245,40 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       setIsDeferred(false)
       loadSentRef.current = true
     }
-  }, [isDeferred, state.history])
+  }, [isDeferred, history])
 
   // ── Derived helpers ─────────────────────────────────────────────────────
-  const update = useCallback((patch) => {
-    setState((prev) => ({
-      ...prev,
-      ...(typeof patch === 'function' ? patch(prev) : patch),
-    }))
-  }, [])
-
-  // ── Notify parent when running state changes (for tab color) ────────
+  // ── Keep currentSessionIdRef in sync (avoids stale closure in handleEvent) ──
   useEffect(() => {
-    onRunningChange?.(tabId, state.status)
-  }, [state.status, tabId, onRunningChange])
+    currentSessionIdRef.current = currentSessionId
+  }, [currentSessionId])
 
-  // ── Debug: log whenever history changes ─────────────────────────────
+  // ── Report running state to the store (for tab color) ────────────────
+  // Written directly to Zustand (keyed by sessionId); previously went via
+  // the onRunningChange prop keyed by tabId.
   useEffect(() => {
-    console.log('[SessionTab] history updated, length:', state.history.length,
-      'first role:', state.history[0]?.role,
-      'last role:', state.history[state.history.length - 1]?.role)
-  }, [state.history])
+    const sid = currentSessionIdRef.current || sessionId
+    if (sid) {
+      useStore.getState().setTabRunningState(sid, status)
+    }
+  }, [status, sessionId])
 
   // ── sendCommand — sends over this tab's WebSocket with auto-queue ───
   // If the WS is not OPEN, the command is queued and resent once the
   // connection is re-established.
   const sendCommandRef = useRef(null)
   const sendCommand = useCallback((command, payload = {}) => {
+    // Fix 3b: stale session — block ALL further commands (load_more, rename,
+    // delete, security responses, config apply, query sends, ...) until the
+    // user starts a new session.
+    if (staleSessionRef.current) {
+      console.warn('[SessionTab] Stale session — command blocked:', command)
+      // Fix 3C: pulse the existing recovery banner so the blocked click is visible.
+      setStaleClickPulse(true)
+      if (staleClickPulseTimerRef.current) clearTimeout(staleClickPulseTimerRef.current)
+      staleClickPulseTimerRef.current = setTimeout(() => setStaleClickPulse(false), 400)
+      return
+    }
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.warn('[SessionTab] WebSocket not connected. Command queued for retry.')
@@ -173,6 +293,15 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     }
     console.log(`[SessionTab] Sending command: ${command}`, JSON.stringify({ command, ...payload }))
     ws.send(JSON.stringify({ command, ...payload }))
+    // Fix 3a: force ChatPanel scroll to bottom when the user sends a query.
+    // Scoped to the two query-send commands ONLY — sendCommand is generic and
+    // also serves get_providers / get_available_tools / load_more_messages /
+    // rename_session / delete_session, which must NOT yank the viewport.
+    // setScrollToBottomKey is a stable useState setter, so this stays valid
+    // inside the []-deps callback.
+    if (command === 'start_session' || command === 'continue_session') {
+      setScrollToBottomKey(k => k + 1)
+    }
   }, [])
   sendCommandRef.current = sendCommand
 
@@ -184,6 +313,12 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   onRegisterRef.current = onRegister
   const loadOnConnectRef = useRef(loadOnConnect)
   loadOnConnectRef.current = loadOnConnect
+  const onWorkerEventRef = useRef(onWorkerEvent)
+  onWorkerEventRef.current = onWorkerEvent
+  const onLoggingConfigChangedRef = useRef(onLoggingConfigChanged)
+  onLoggingConfigChangedRef.current = onLoggingConfigChanged
+  const onWorkspaceKnownRef = useRef(onWorkspaceKnown)
+  onWorkspaceKnownRef.current = onWorkspaceKnown
 
   const connectSessionWs = useCallback(() => {
     // Guard: prevent duplicate connections from StrictMode double-mount
@@ -204,61 +339,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
     if (closedRef.current) return  // component unmounted (may be set during clearTimeout)
 
-    const ws = new WebSocket(WS_URL)
+    const ws = new WebSocket(wsUrl())
     wsRef.current = ws
 
-    ws.onopen = () => {
-      console.log(`[SessionTab ${sessionId || 'new'}] WS onopen, isActive=${isActiveRef.current}, loadOnConnect=${loadOnConnectRef.current}, sessionId=${sessionIdRef.current}`)
-      tabConnectingRef.current = false
-      setWsConnected(true)
-
-      // Drain any commands that were queued while disconnected
-      const pending = pendingCommandsRef.current
-      pendingCommandsRef.current = []
-      for (const cmd of pending) {
-        console.log(`[SessionTab] Sending queued command: ${cmd.command}`)
-        ws.send(JSON.stringify({ command: cmd.command, ...cmd.payload }))
-      }
-
-      // Register sendCommand with parent (use ref to avoid stale closure)
-      onRegisterRef.current?.({ sendCommand: sendCommandRef.current, getSessionId: () => currentSessionId })
-
-      // If we have a sessionId, load it immediately (active tab) or defer (inactive tab)
-      const sid = sessionIdRef.current
-      if (sid) {
-        if (loadOnConnectRef.current) {
-          ws.send(JSON.stringify({
-            command: 'load_session',
-            session_id: sid
-          }))
-          console.log(`[SessionTab ${sid}] Sent load_session (active tab)`)
-        } else {
-          // Check if load_session was already queued by App trigger (user clicked tab before WS connected)
-          const hasQueuedLoad = pending.some(cmd => cmd.command === 'load_session')
-          if (!hasQueuedLoad) {
-            setIsDeferred(true)
-            console.log(`[SessionTab ${sid}] Deferred load (inactive tab)`)
-          } else {
-            console.log(`[SessionTab ${sid}] Load already queued, skipping deferred placeholder`)
-          }
-        }
-      } else {
-        ws.send(JSON.stringify({ command: 'new_session' }))
-      }
-
-      // Fetch providers and tools list only if not already cached
-      if (!providersRef.current || providersRef.current.length === 0) {
-        sendCommand('get_providers')
-      } else {
-        console.log('[SessionTab] Skipping get_providers (already cached)')
-      }
-      if (!availableToolsRef.current || availableToolsRef.current.length === 0) {
-        sendCommand('get_available_tools')
-      } else {
-        console.log('[SessionTab] Skipping get_available_tools (already cached)')
-      }
-    }
-
+    // Listener-ordering fix: register message/close/error listeners BEFORE
+    // onopen so no event can be missed if the connection opens before the
+    // onopen handler is installed (reconnects, StrictMode remounts, or any
+    // WS implementation that fires `open` synchronously). onopen is the only
+    // handler that sends commands, so it is attached last.
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
@@ -271,6 +359,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     ws.onclose = (e) => {
       tabConnectingRef.current = false
       setWsConnected(false)
+      // Fix 4b: reset one-shot guards so a reconnect can send load_session
+      // again (the connection is fresh; the per-connection dedup restarts).
+      loadSentRef.current = false
+      dataReceivedRef.current = false
       // 1001 = normal close (component unmounting), don't reconnect
       if (e.code !== 1001 && !closedRef.current) {
         const delay = 1000 + Math.random() * 3000  // 1–4s jitter
@@ -282,6 +374,93 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     ws.onerror = () => {
       // onclose fires right after onerror, so we let onclose handle reconnection
     }
+
+    ws.onopen = () => {
+      console.log(`[SessionTab ${sessionId || 'new'}] WS onopen, isActive=${isActiveRef.current}, loadOnConnect=${loadOnConnectRef.current}, sessionId=${sessionIdRef.current}`)
+      tabConnectingRef.current = false
+      setWsConnected(true)
+
+      // Fix 3b: stale session — don't re-load the dead session or re-drain
+      // queued commands on reconnect (raw ws.send below bypasses sendCommand).
+      if (staleSessionRef.current) {
+        console.warn('[SessionTab] Stale session — skipping load_session / queued drain on reconnect')
+        return
+      }
+
+      // Drain any commands that were queued while disconnected
+      const pending = pendingCommandsRef.current
+      pendingCommandsRef.current = []
+      for (const cmd of pending) {
+        console.log(`[SessionTab] Sending queued command: ${cmd.command}`)
+        try {
+          wsRef.current?.send(JSON.stringify({ command: cmd.command, ...cmd.payload }))
+        } catch (err) {
+          console.warn(`[SessionTab] queued command send failed (socket closed): ${cmd.command}`, err.message)
+        }
+      }
+
+      // Register sendCommand with parent (use ref to avoid stale closure)
+      onRegisterRef.current?.({ sendCommand: sendCommandRef.current, getSessionId: () => currentSessionId })
+
+      // If we have a sessionId, load it immediately (active tab) or defer (inactive tab)
+      // Fix 4b: the tab owns the single, deduped load path. On EVERY connect
+      // (initial or reconnect) we send load_session for an existing session —
+      // active tabs reload immediately, and inactive tabs still send it so
+      // their session state refreshes after a disconnect. The ONLY skip is a
+      // stale session (Fix 3b, above) or a closing/unmounting tab.
+      const sid = sessionIdRef.current
+      if (sid) {
+        // Defer load_session by one tick so the parent's synchronous setup (handlers, etc.) completes first
+        setTimeout(() => {
+          if (loadSentRef.current) return  // Fix 4b: one load_session per connection
+          loadSentRef.current = true
+          try {
+            wsRef.current?.send(JSON.stringify({
+              command: 'load_session',
+              session_id: sid
+            }))
+          } catch (err) {
+            console.warn('[SessionTab] load_session send failed (socket closed):', err.message)
+          }
+        }, 0)
+        if (loadOnConnectRef.current) {
+          console.log(`[SessionTab ${sid}] Sent load_session (active tab)`)
+        } else {
+          // Fix 4b: inactive tabs still send load_session (state may have
+          // changed while disconnected); keep the placeholder until the
+          // response (or activation) clears it.
+          setIsDeferred(true)
+          console.log(`[SessionTab ${sid}] Sent load_session (deferred tab)`)
+        }
+      } else {
+        if (loadSentRef.current) return  // Fix 4b: one new_session per connection
+        loadSentRef.current = true
+        try {
+          wsRef.current?.send(JSON.stringify({
+            command: 'new_session',
+            mode: modeRef.current || 'custom',
+          }))
+        } catch (err) {
+          console.warn('[SessionTab] new_session send failed (socket closed):', err.message)
+        }
+      }
+
+      // Fetch providers and tools list only if not already cached
+      if (!providersRef.current || providersRef.current.length === 0) {
+        sendCommand('get_providers')
+      } else {
+        console.log('[SessionTab] Skipping get_providers (already cached)')
+      }
+      if (!availableToolsRef.current || availableToolsRef.current.length === 0) {
+        sendCommand('get_available_tools', { mode: mode || 'custom' })
+        if (mode) {
+          availableToolsModeRef.current = mode
+        }
+      } else {
+        console.log('[SessionTab] Skipping get_available_tools (already cached)')
+      }
+    }
+
   }, [])  // all external values via refs — no cascade on sessionId/onRegister change
   connectSessionWsRef.current = connectSessionWs
 
@@ -312,9 +491,19 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   // ── Activation safety net (reconnect on tab switch) ────────────────────
   // This fires when the user clicks an inactive tab. If the tab somehow lost
   // its WebSocket (e.g. server restart), this reconnects it.
+  // NOTE: On initial mount, the mount effect (hubReady + staggerMs) handles
+  // the first connection attempt. This effect only activates on isActive
+  // *transitions* (false → true), not on the initial mount where isActive
+  // is already true.
   useEffect(() => {
-    console.log(`[DEBUG SessionTab Activate effect] tabId=${tabId}, sessionId=${sessionId}, isActive=${isActive}, hubReady=${hubReady}, wsConnected=${isWsConnectedOrConnecting()}, tabConnecting=${tabConnectingRef.current}`)
-    if (!hubReady || !isActive) return
+    const prevIsActive = prevIsActiveRef.current
+    prevIsActiveRef.current = isActive
+    console.log(`[DEBUG SessionTab Activate effect] tabId=${tabId}, sessionId=${sessionId}, isActive=${isActive}, prevIsActive=${prevIsActive}, hubReady=${hubReady}, wsConnected=${isWsConnectedOrConnecting()}, tabConnecting=${tabConnectingRef.current}`)
+    // Skip on initial mount — mount effect handles the first connection
+    if (prevIsActive === isActive) return
+    // Only reconnect on inactive → active transitions (user clicked tab)
+    if (!isActive) return
+    if (!hubReady) return
     if (isWsConnectedOrConnecting()) {
       console.log(`[DEBUG SessionTab Activate effect] tab ${tabId} already connected — skipping`)
       return
@@ -325,6 +514,45 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     closedRef.current = false
     connectSessionWsRef.current()
   }, [hubReady, isActive])
+
+  // ── Streaming deltas: rAF coalescing + in-flight bubble ──────────────────
+  // Deltas arrive once per token; flushing each one straight into React state
+  // would re-render the chat per token, so text received since the last frame
+  // is buffered and flushed once per animation frame (≈60 Hz — the display
+  // rate, nothing faster is observable). Coalescing lives here rather than in
+  // the bridge: a bridge-side timer would have to be flushed before the
+  // terminal `turn` conversation_changed, or a late delta could land AFTER the
+  // replace and resurrect the bubble.
+  const clearInFlight = () => {
+    if (streamFrameRef.current != null) {
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(streamFrameRef.current)
+      else clearTimeout(streamFrameRef.current)
+      streamFrameRef.current = null
+    }
+    streamBufferRef.current = { content: '', reasoning_content: '' }
+    setInFlight(null)
+  }
+
+  const flushDeltas = () => {
+    streamFrameRef.current = null
+    const pending = streamBufferRef.current
+    streamBufferRef.current = { content: '', reasoning_content: '' }
+    if (!pending.content && !pending.reasoning_content) return
+    setInFlight((prev) => ({
+      content: ((prev && prev.content) || '') + pending.content,
+      reasoning_content: ((prev && prev.reasoning_content) || '') + pending.reasoning_content,
+    }))
+  }
+
+  // `target` names the in-flight field to append to: 'content' for assistant
+  // text, 'reasoning_content' for the thinking phase.
+  const pushDelta = (target, text) => {
+    if (!text) return
+    streamBufferRef.current[target] = (streamBufferRef.current[target] || '') + text
+    if (streamFrameRef.current != null) return
+    if (typeof requestAnimationFrame === 'function') streamFrameRef.current = requestAnimationFrame(flushDeltas)
+    else streamFrameRef.current = setTimeout(flushDeltas, 16)
+  }
 
   // ── Event router ─────────────────────────────────────────────────────────
   function handleEvent(msg) {
@@ -338,24 +566,103 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     }
     switch (msg.type) {
       case 'state_changed':
-        update({
-          status: msg.state,
-          isRunning: msg.is_running !== false,
-        })
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] state_changed for different session, ignoring:', msg.session_id)
+          break
+        }
+        useStore.getState().receiveStateChanged(msg.session_id || currentSessionIdRef.current, msg.state)
+        // Crash tolerance: the run is over without a terminal conversation_changed
+        // for the streamed turn, so drop the half-streamed bubble rather than
+        // leaving phantom text on screen.
+        if (msg.is_running === false) clearInFlight()
         break
 
       case 'tokens_updated':
-        update({
-          tokensIn: msg.input ?? 0,
-          tokensOut: msg.output ?? 0,
-        })
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] tokens_updated for different session, ignoring:', msg.session_id)
+          break
+        }
+        console.log('[TOKEN_PIPELINE] SessionTab: tokens_updated arrived', { type: msg.type, input: msg.input, output: msg.output, source: msg.source })
+        useStore.getState().receiveTokensUpdated(msg.session_id || currentSessionIdRef.current, msg)
+        // Forward to worker panel if this is a worker-sourced token update
+        // IMPORTANT: Use currentSessionIdRef to avoid stale closure (connectSessionWs has [] deps)
+        if (msg.source === 'worker') {
+          const effectiveSessionId = currentSessionIdRef.current || sessionId
+          console.log('[TOKEN_PIPELINE] SessionTab: forwarding tokens_updated to worker panel', { sessionId: effectiveSessionId })
+          onWorkerEventRef.current?.(effectiveSessionId, msg)
+        }
         break
 
       case 'context_updated':
-        update({ contextLength: msg.context_length ?? 0 })
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] context_updated for different session, ignoring:', msg.session_id)
+          break
+        }
+        console.log('[TOKEN_PIPELINE] SessionTab: context_updated arrived', { context_length: msg.context_length, source: msg.source, worker_name: msg.worker_name })
+        useStore.getState().updateContextLength(msg.session_id || currentSessionIdRef.current, msg.context_length ?? 0)
+        // Forward to worker panel if this is a worker-sourced context update
+        // IMPORTANT: Use currentSessionIdRef to avoid stale closure (connectSessionWs has [] deps)
+        if (msg.source === 'worker') {
+          const effectiveSessionId = currentSessionIdRef.current || sessionId
+          console.log('[TOKEN_PIPELINE] SessionTab: forwarding context_updated to worker panel', { sessionId: effectiveSessionId, worker_name: msg.worker_name })
+          onWorkerEventRef.current?.(effectiveSessionId, msg)
+        }
         break
 
+      case 'assistant_delta': {
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] assistant_delta for different session, ignoring:', msg.session_id)
+          break
+        }
+        // Append to the in-flight bubble (coalesced per frame). Never a store
+        // write, and never a list replace.
+        pushDelta('content', msg.text || '')
+        break
+      }
+
+      case 'reasoning_delta': {
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] reasoning_delta for different session, ignoring:', msg.session_id)
+          break
+        }
+        // Thinking phase: same per-frame coalescing as assistant text, but into
+        // the reasoning buffer so it renders in the bubble's Thinking block and
+        // never mixes with the answer.
+        pushDelta('reasoning_content', msg.text || '')
+        break
+      }
+
+      case 'addendum_updated': {
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] addendum_updated for different session, ignoring:', msg.session_id)
+          break
+        }
+        // Tier-1 addendum write (design doc §7.3, ruling D-6). The payload
+        // carries entry_id/ts plus the FULL resulting entry set, so the store
+        // merges by entry_id: a duplicate or out-of-order event overwrites the
+        // same keys and converges on the same display instead of replaying a
+        // diff. Stored only - rendering the addendum is a later slice.
+        useStore.getState().receiveAddendumUpdated(msg.session_id || currentSessionIdRef.current, msg)
+        break
+      }
+
+      case 'runtime_notice': {
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] runtime_notice for different session, ignoring:', msg.session_id)
+          break
+        }
+        // Tier-2 notice for a REJECTED addendum write (design doc §7.3). Stored
+        // next to the entries so the rejection is visible rather than silent;
+        // no render here (the addendum panel is a later slice).
+        useStore.getState().receiveRuntimeNotice(msg.session_id || currentSessionIdRef.current, msg)
+        break
+      }
+
       case 'conversation_changed':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] conversation_changed for different session, ignoring:', msg.session_id)
+          break
+        }
         console.log('conversation_changed RAW:', msg)
         // Mark that we've received a response (even if empty) so deferred
         // tabs can exit their placeholder state.
@@ -367,113 +674,361 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           ...m,
           is_system_notification: m.is_system_notification || false,
         }));
-        const notes = mergedMessages.filter(m => m.is_system_notification);
+        // TODO: Backend dedup tracked for cleanup sprint — the backend re-emits
+        // "[SYSTEM NOTIFICATION] Configuration updated: provider_id=..." on every
+        // query when a pending config is re-applied, even when the provider is
+        // unchanged from what this tab already displays.  Suppress the
+        // user-visible bubble here; proper dedup belongs on the backend.
+        const activeProvider = configRef.current?.provider || configRef.current?.provider_id
+        const visibleMessages = mergedMessages.filter((m) => {
+          if (!m.is_system_notification) return true
+          const text = m.content || ''
+          if (!text.startsWith('[SYSTEM NOTIFICATION] Configuration updated')) return true
+          if (!activeProvider) return true
+          const provMatch = text.match(/(?:provider_id|provider)=([^\s,]+)/)
+          return !(provMatch && provMatch[1] === String(activeProvider))
+        })
+        const notes = visibleMessages.filter(m => m.is_system_notification);
         if (notes.length > 0) console.log('🔔 SYSTEM NOTIFICATIONS:', notes);
-        update({ history: mergedMessages })
+        // Detect context compaction messages — force scroll to bottom (R3)
+        if (notes.some(m => {
+          const text = (m.content || '').toLowerCase()
+          return text.includes('context now free') ||
+                 text.includes('summar') ||
+                 text.includes('compact') ||
+                 text.includes('messages removed')
+        })) {
+          setScrollToBottomKey(k => k + 1)
+        }
+        // Server-authoritative replace, but client-only notices (e.g. the
+        // CASE-3 cold-start status notice) are not part of the server payload,
+        // so keep them instead of letting this replace wipe them.
+        useStore.getState().receiveConversationChanged(
+          msg.session_id || currentSessionIdRef.current,
+          visibleMessages,
+          { mode: 'replace', preserveClientOnly: true }
+        )
         // Pagination metadata from the server
         if (msg.total_count !== undefined) {
           setTotalMessages(msg.total_count)
         }
         setHasMore(msg.has_more === true)
+        // The terminal turn event for the streamed text has arrived: the server
+        // history now owns those characters, so drop the in-flight bubble in the
+        // same handler (no duplicate render, no resurrect-on-late-delta).
+        clearInFlight()
         break
 
       case 'more_messages':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] more_messages for different session, ignoring:', msg.session_id)
+          break
+        }
         // Prepend older messages to the current history
         console.log('[SessionTab] more_messages:', msg.messages?.length, 'messages, offset:', msg.offset, 'has_more:', msg.has_more)
         const olderMessages = (msg.messages ?? []).map((m) => ({
           ...m,
           is_system_notification: m.is_system_notification || false,
         }))
-        update((prev) => ({
-          history: [...olderMessages, ...prev.history],
-        }))
+        {
+          const key = msg.session_id || currentSessionIdRef.current
+          useStore.getState().receiveConversationChanged(key, olderMessages, { mode: 'prepend' })
+        }
         setHasMore(msg.has_more === true)
         break
 
       case 'config_changed':
+        // Defensive guard: apply_config must NEVER trigger tab creation or
+        // session switching.  If a config_changed event ever carries a
+        // session_id for a DIFFERENT session, ignore it here — tab management
+        // is driven exclusively by new_session / session_loaded.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] config_changed for different session, ignoring:', msg.session_id)
+          break
+        }
         // Replace config entirely with what the backend sends.
         // The backend is now the single source of truth; it always sends
         // a complete frontend-format config (including tools, provider, etc.).
-        update({ config: msg.config })
+        useStore.getState().receiveConfigChanged(msg.session_id || currentSessionIdRef.current, msg)
+        // Re-fetch available tools if the mode changed (e.g. session loaded
+        // from disk where mode wasn't known at initial WS connection time).
+        if (msg.config?.mode && msg.config.mode !== (availableToolsModeRef.current || 'custom')) {
+          availableToolsModeRef.current = msg.config.mode
+          sendCommand('get_available_tools', { mode: msg.config.mode })
+        }
+        break
+
+      case 'config_queued':
+        // Controller was busy → the config is queued on the bridge and will be
+        // applied automatically when the agent goes idle.  Track the queued
+        // state so ConfigPanel does NOT fire its 6s 'Apply timed out' error.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] config_queued for different session, ignoring:', msg.session_id)
+          break
+        }
+        useStore.getState().receiveConfigQueued(msg.session_id || currentSessionIdRef.current)
+        break
+
+      case 'config_apply_failed':
+        // The (possibly queued) apply failed — clear the queued state and hand
+        // the real server error to ConfigPanel instead of a false timeout.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] config_apply_failed for different session, ignoring:', msg.session_id)
+          break
+        }
+        useStore.getState().receiveConfigApplyFailed(
+          msg.session_id || currentSessionIdRef.current,
+          msg.text || 'Config apply failed'
+        )
         break
 
       case 'rebuild_result':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] rebuild_result for different session, ignoring:', msg.session_id)
+          break
+        }
         setContainerRebuildResult({ status: msg.status, buildLog: msg.build_log })
         break
 
       case 'status_message':
-        update((prev) => ({
-          history: [
-            ...prev.history,
-            { role: 'system', content: msg.text ?? '', is_system_notification: true },
-          ],
-        }))
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] status_message for different session, ignoring:', msg.session_id)
+          break
+        }
+        {
+          const key = msg.session_id || currentSessionIdRef.current
+          // Client-only notice: the server never echoes it back in a
+          // conversation_changed payload, so it is flagged `client_only` and
+          // preserved across a later server-driven replace.
+          useStore.getState().receiveConversationChanged(
+            key,
+            [
+              { role: 'system', content: msg.text ?? '', is_system_notification: true, client_only: true },
+            ],
+            { mode: 'append' }
+          )
+        }
         break
 
       case 'session_loaded':
-        // Debug: log the full message payload to see what backend sends
         dataReceivedRef.current = true;
-        // Track the session ID so subsequent continue_session calls use it
-        if (msg.session_id) {
-          setCurrentSessionId(msg.session_id)
-        }
-        // Capture workspace_id for the WorkspacePanel.
-        // Only set when the backend sends a real workspace_id; otherwise
-        // workspaceId stays null and WorkspacePanel shows its graceful
-        // "No workspace loaded" message.
         if (msg.workspace_id) {
-          update({ workspaceId: msg.workspace_id })
+          // Session metadata — no dedicated store slice yet (kept local).
+          setWorkspaceId(msg.workspace_id)
+          // Tell App which workspace this session belongs to (R7 restore).
+          onWorkspaceKnownRef.current?.(msg.session_id, msg.workspace_id)
         }
-        // If this is a new session (tab had no sessionId), notify parent
-        if (msg.session_id && !sessionId) {
-          onNewSession?.(msg.session_id, msg.session_name)
+        if (msg.session_id) {
+          const expectedSessionId = currentSessionIdRef.current
+          // Fix 4d: captured before the branches below so the normal path can
+          // tell "fresh new_session reply" from "ordinary load" (used to route
+          // onNewSession when the sessionId prop still points at the dead id).
+          const wasExpectingNew = expectingNewSessionRef.current
+          // Fix 4d: load_error — the backend could not load the requested
+          // session (dead id after a restart). The payload carries the SAME id
+          // the tab requested, so this sits in the id-matching path. Show the
+          // recovery banner and block further commands; 'Start New Session'
+          // creates a fresh one.
+          if (msg.load_error) {
+            console.warn('[SessionTab] LOAD ERROR: session', msg.session_id, 'could not be loaded')
+            staleSessionRef.current = true
+            setStaleSession(true)
+            setSessionReady(false)
+            pendingAdoptRef.current = null
+            useStore.getState().setSessionError(
+              storeKey,
+              'Session could not be loaded (it was lost in a restart).'
+            )
+            break
+          }
+          // Fix 3b: stale-session detection. After a backend restart, old
+          // session ids are invalid: load_session on a dead id makes the
+          // backend create a REPLACEMENT session and reply session_loaded with
+          // a DIFFERENT session_id. That must never silently rebind this tab to
+          // another session's data — show a recovery banner instead.
+          // A fresh tab (currentSessionIdRef null/undefined) accepts any
+          // session id (normal new-session creation).
+          if (expectingNewSessionRef.current) {
+            // Fix 4d: we asked the backend for a NEW session (load-error
+            // recovery) — whatever id it replies with is authoritative, so skip
+            // the stale detection that would otherwise fire for the dead id.
+            expectingNewSessionRef.current = false
+            staleSessionRef.current = false
+            setStaleSession(false)
+            useStore.getState().clearSessionError(storeKey)
+          } else if (expectedSessionId && expectedSessionId !== msg.session_id) {
+            // Intentional replacement (e.g. workspace switch via apply_config):
+            // the backend created a NEW session for this tab on purpose and
+            // flagged the session_loaded with `replacement: true`. Adopt it
+            // SILENTLY — no stale banner, no purge of the old session's store
+            // slices (the old session still exists server-side and may be
+            // reopened from the sidebar).
+            if (msg.replacement) {
+              console.log('[SessionTab] Adopting replacement session:', msg.session_id)
+              staleSessionRef.current = false
+              setStaleSession(false)
+              pendingAdoptRef.current = null
+              useStore.getState().clearSessionError(expectedSessionId)
+              useStore.getState().registerSession(msg.session_id)
+              useStore.getState().receiveSessionLoaded(msg.session_id, msg)
+              // F2 parity: re-request providers if the fresh session has none
+              // cached yet so the provider dropdown populates.
+              {
+                const loadedConfig = useStore.getState().sessionConfigs[msg.session_id]
+                const loadedProviders = loadedConfig?.providers
+                if (!loadedProviders || loadedProviders.length === 0) {
+                  sendCommand('get_providers')
+                }
+              }
+              setCurrentSessionId(msg.session_id)
+              if (msg.session_name) useStore.getState().updateSessionName(msg.session_id, msg.session_name)
+              setSessionReady(true)
+              // Notify App so the tab entry and the persisted activeSessionId
+              // follow the tab to its new session id (NOT onNewSession — that
+              // is reserved for fresh tabs whose sessionId prop was null).
+              onSessionAdopted?.(msg.session_id)
+              break
+            }
+            console.warn('[SessionTab] STALE SESSION: expected', expectedSessionId, 'got', msg.session_id, '— backend may have restarted')
+            // Fix 4c: purge the dead session's store slices (config, messages,
+            // state, mode, running state, sessions list, ...) so none of its
+            // data can leak into the replacement session.
+            useStore.getState().removeSession(expectedSessionId)
+            staleSessionRef.current = true
+            setStaleSession(true)
+            setSessionReady(false)
+            // Stash the replacement so 'Start New Session' can adopt it via the
+            // same path a fresh tab uses (register + receiveSessionLoaded +
+            // setCurrentSessionId + onNewSession).
+            pendingAdoptRef.current = msg
+            useStore.getState().setSessionError(
+              expectedSessionId,
+              'This session is no longer available (backend may have restarted).'
+            )
+            break
+          }
+          // Normal path: fresh tab or confirmed same session.
+          pendingAdoptRef.current = null
+          useStore.getState().registerSession(msg.session_id)
+          useStore.getState().receiveSessionLoaded(msg.session_id, msg)
+          // F2: the onopen-time get_providers reply may have landed before
+          // session_loaded (routed under a null/stale key because the backend
+          // reply had no session_id yet). If the freshly loaded session has no
+          // providers cached, re-request so the reply carries the real
+          // session_id and the provider dropdown populates.
+          {
+            const loadedConfig = useStore.getState().sessionConfigs[msg.session_id]
+            const loadedProviders = loadedConfig?.providers
+            if (!loadedProviders || loadedProviders.length === 0) {
+              sendCommand('get_providers')
+            }
+          }
+          setCurrentSessionId(msg.session_id)
+          if (msg.session_name) useStore.getState().updateSessionName(msg.session_id, msg.session_name)
+          setSessionReady(true)
+          // Notify parent that this tab now has a real sessionId. wasExpectingNew
+          // (load-error recovery) is treated like a fresh tab: the sessionId prop
+          // still points at the dead id, but App must follow the new one.
+          if (!sessionId || wasExpectingNew) {
+            onNewSession?.(msg.session_id, msg.session_name)
+          }
         }
         break
 
       case 'providers_list':
-        setProviders(msg.providers || [])
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] providers_list for different session, ignoring:', msg.session_id)
+          break
+        }
+        useStore.getState().receiveProvidersList(msg.session_id || currentSessionIdRef.current, msg.providers || [])
         break
 
       case 'provider_saved':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] provider_saved for different session, ignoring:', msg.session_id)
+          break
+        }
         console.log('[SessionTab] Provider saved:', msg.provider?.id)
+        // Refresh providers from the backend (it will push a fresh providers_list)
+        sendCommand('get_providers')
         break
 
       case 'provider_deleted':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] provider_deleted for different session, ignoring:', msg.session_id)
+          break
+        }
         console.log('[SessionTab] Provider deleted:', msg.provider_id)
         break
 
       case 'tools_list':
-        setAvailableTools(msg.tools || [])
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] tools_list for different session, ignoring:', msg.session_id)
+          break
+        }
+        useStore.getState().receiveToolsList(msg.session_id || currentSessionIdRef.current, msg.tools || [])
         break
 
       case 'default_config_saved':
-        setDefaultConfigSaveStatus(msg.status)
-        setDefaultConfigSaveMessage(msg.message || '')
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] default_config_saved for different session, ignoring:', msg.session_id)
+          break
+        }
+        setDefaultConfigSaveStatus({
+          status: msg.status,
+          saved_keys: msg.saved_keys ?? [],
+          dropped_keys: msg.dropped_keys ?? [],
+          session_id: msg.session_id ?? null,
+          message: msg.message ?? null,
+        })
         break
 
       case 'session_saved':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] session_saved for different session, ignoring:', msg.session_id)
+          break
+        }
         onSessionSaved?.()
         break
 
       case 'session_renamed':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] session_renamed for different session, ignoring:', msg.session_id)
+          break
+        }
         // The session was renamed; update our currentSessionId if needed
         if (msg.session_id) {
           setCurrentSessionId(msg.session_id)
         }
+        if (msg.new_name) useStore.getState().updateSessionName(msg.session_id, msg.new_name)
         onSessionRenamed?.(msg.session_id, msg.new_name)
         break
 
       case 'session_closed':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] session_closed for different session, ignoring:', msg.session_id)
+          break
+        }
         closedRef.current = true
+        setSessionReady(false)
         onClose?.()
         break
 
       case 'session_deleted':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] session_deleted for different session, ignoring:', msg.session_id)
+          break
+        }
         // Session was deleted from the store — close the tab
+        setSessionReady(false)
         onClose?.()
         break
 
       case 'security_prompt':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] security_prompt for different session, ignoring:', msg.session_id)
+          break
+        }
         // Show the security approval dialog (tool permission request)
         console.log('[SessionTab] security_prompt:', msg)
         setSecurityPrompt({
@@ -483,6 +1038,122 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           arguments: msg.arguments || {},
           description: msg.description || `Tool '${msg.tool_name || 'unknown'}' requires your approval.`,
         })
+        break
+
+      // ── Worker lifecycle events + per-worker bus events (real-time from bridge) ──
+      case 'worker:tool_call_start':
+      case 'worker:tool_call':
+      case 'worker:tool_result':
+      // worker:token_warning/turn_warning/time_warning now come via per-worker bus (not global bus)
+      case 'worker:token_warning':
+      case 'worker:turn_warning':
+      case 'worker:time_warning':
+      case 'worker:assistant_message':
+      case 'worker:worker_spawned':
+      case 'worker:worker_status':
+      case 'worker:worker_completed':
+      case 'worker:worker_error':
+      case 'worker:worker_paused':
+      case 'worker:worker_resumed':
+      case 'worker:system_notification':
+      case 'worker:user_message':
+      case 'worker:worker_message':
+      case 'worker:tokens_updated':
+      case 'worker:context_updated':
+      case 'worker:context_summarized':
+      case 'worker:context_cleared':
+      case 'worker:token_recovery':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] worker event for different session, ignoring:', msg.session_id)
+          break
+        }
+        // For worker:tokens_updated, also update the token counter display
+        // (belt-and-suspenders — the bridge should flatten to 'tokens_updated',
+        //  but if it doesn't, this ensures the counter still updates).
+        if (msg.type === 'worker:tokens_updated') {
+          useStore.getState().receiveTokensUpdated(msg.session_id || currentSessionIdRef.current, {
+            input: msg.data?.total_input ?? 0,
+            output: msg.data?.total_output ?? 0,
+          })
+        }
+        // Use refs to avoid stale closure (connectSessionWs has [] deps)
+        if (onWorkerEventRef.current) {
+          onWorkerEventRef.current(currentSessionIdRef.current || currentSessionId, msg)
+        }
+        break
+
+      case 'logging_config_changed':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] logging_config_changed for different session, ignoring:', msg.session_id)
+          break
+        }
+        if (onLoggingConfigChangedRef.current) {
+          onLoggingConfigChangedRef.current(msg.config)
+        }
+        break
+
+      case 'error':
+        // bridge.py broadcasts {"type":"error","error_type":...,"message":...,"traceback":...}
+        // via EventForwarder, which does NOT inject session_id into the payload.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] error for different session, ignoring:', msg.session_id)
+          break
+        }
+        useStore.getState().setSessionError(msg.session_id || currentSessionIdRef.current, msg.error || msg.message || 'Unknown error')
+        break
+
+      case 'interrupted': {
+        // Hard stop: the backend truncated the stream mid-answer and committed
+        // whatever text had already been produced. Fold that partial text into
+        // the transcript as a FINAL assistant message and drop the in-flight
+        // bubble, so the text the user watched stream in does not vanish and
+        // no spinner is left running. The server may already have shipped the
+        // same partial in a conversation_changed, so de-duplicate against the
+        // tail of the history instead of trusting arrival order.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] interrupted for different session, ignoring:', msg.session_id)
+          break
+        }
+        const interruptedKey = msg.session_id || currentSessionIdRef.current
+        const partial = typeof msg.text === 'string' ? msg.text : ''
+        if (partial && interruptedKey) {
+          const existing = useStore.getState().sessionMessages[interruptedKey] || []
+          const tail = existing[existing.length - 1]
+          const alreadyRetained = !!(tail && tail.role === 'assistant' && tail.content === partial)
+          if (!alreadyRetained) {
+            useStore.getState().receiveConversationChanged(
+              interruptedKey,
+              [{ role: 'assistant', content: partial }],
+              { mode: 'append' }
+            )
+          }
+        }
+        // Always clear, even when the halt produced no text: no stuck spinner,
+        // and no blank bubble because nothing is appended above.
+        clearInFlight()
+        break
+      }
+
+      case 'session_stop':
+        // Defensive: the bridge normally folds session_stop into state_changed
+        // + conversation_changed and never forwards the raw type, but handle it
+        // here so the tab can never stay stuck in RUNNING. Only surface a
+        // banner when the stop was abnormal (not 'completed'/'ok').
+        useStore.getState().receiveStateChanged(msg.session_id || currentSessionIdRef.current, 'IDLE')
+        if (msg.stop_reason && msg.stop_reason !== 'completed' && msg.stop_reason !== 'ok') {
+          useStore.getState().setSessionError(msg.session_id || currentSessionIdRef.current, `Session stopped: ${msg.stop_reason}`)
+        }
+        break
+
+      case 'session_cleared':
+        // bridge.py broadcasts session_cleared ({} — no session_id) on
+        // close_session; the conversation is gone, so drop it and any error.
+        useStore.getState().receiveConversationChanged(
+          msg.session_id || currentSessionIdRef.current,
+          [],
+          { mode: 'replace' }
+        )
+        useStore.getState().clearSessionError(msg.session_id || currentSessionIdRef.current)
         break
 
       default:
@@ -523,9 +1194,47 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
   // ── Load more (pagination) ────────────────────────────────────────────────
   const loadMore = useCallback(() => {
-    const offset = state.history.length
+    const offset = history.length
     sendCommand('load_more_messages', { offset, limit: 20 })
-  }, [state.history.length, sendCommand])
+  }, [history.length, sendCommand])
+
+  // ── Start New Session (stale-session recovery) ─────────────────────────────
+  // Fix 3b: adopt the replacement session the backend created for the dead id
+  // (stashed by the stale branch of session_loaded) using the exact acceptance
+  // sequence a fresh tab uses, then notify App via the onNewSession prop (same
+  // mechanism as normal new-session creation).
+  const startNewSession = useCallback(() => {
+    staleSessionRef.current = false
+    setStaleSession(false)
+    const pending = pendingAdoptRef.current
+    pendingAdoptRef.current = null
+    if (!pending?.session_id) {
+      // Fix 4d: no stashed replacement (load_error path) — ask the backend for
+      // a brand new session, exactly like a fresh tab does on open. The reply
+      // session_loaded carries a different id than the dead one; the
+      // expectingNewSessionRef flag makes the handler accept it.
+      console.warn('[SessionTab] startNewSession: no stashed replacement session — creating a new one')
+      useStore.getState().clearSessionError(storeKey)
+      expectingNewSessionRef.current = true
+      sendCommand('new_session', { mode: modeRef.current || 'custom' })
+      return
+    }
+    if (pending.workspace_id) setWorkspaceId(pending.workspace_id)
+    useStore.getState().registerSession(pending.session_id)
+    useStore.getState().receiveSessionLoaded(pending.session_id, pending)
+    setCurrentSessionId(pending.session_id)
+    if (pending.session_name) useStore.getState().updateSessionName(pending.session_id, pending.session_name)
+    setSessionReady(true)
+    useStore.getState().clearSessionError(storeKey)
+    onNewSession?.(pending.session_id, pending.session_name)
+  }, [storeKey, onNewSession, sendCommand])
+
+  // ── Auto-focus delete confirm button ────────────────────────────────────────
+  useEffect(() => {
+    if (showDeleteConfirm && deleteConfirmRef.current) {
+      deleteConfirmRef.current.focus()
+    }
+  }, [showDeleteConfirm])
 
   // ── Render ───────────────────────────────────────────────────────────────
   // When deferred, show a placeholder instead of the full tab UI
@@ -542,30 +1251,144 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   // Pass per-tab state to children as props
   return (
     <div className="session-tab-content">
+      {/* ── Inline rename header ──────────────────────── */}
+      <div className="session-header">
+        {currentSessionId ? (
+          isRenaming ? (
+            <input
+              ref={renameInputRef}
+              className="session-header-input"
+              defaultValue={sessionName}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  const newName = e.target.value.trim()
+                  if (newName && newName !== sessionName) {
+                    sendCommand('rename_session', { session_id: currentSessionId, new_name: newName })
+                    useStore.getState().updateSessionName(currentSessionId, newName)
+                    onSessionRenamed?.(currentSessionId, newName)
+                  }
+                  setIsRenaming(false)
+                } else if (e.key === 'Escape') {
+                  setIsRenaming(false)
+                }
+              }}
+              onBlur={(e) => {
+                const newName = e.target.value.trim()
+                if (newName && newName !== sessionName) {
+                  sendCommand('rename_session', { session_id: currentSessionId, new_name: newName })
+                  useStore.getState().updateSessionName(currentSessionId, newName)
+                  onSessionRenamed?.(currentSessionId, newName)
+                }
+                setIsRenaming(false)
+              }}
+              autoFocus
+            />
+          ) : (
+            <>
+              <span className="session-header-name">{sessionName || 'Untitled'}</span>
+              <button
+                className="session-header-rename-btn"
+                onClick={() => {
+                  setIsRenaming(true)
+                  setTimeout(() => renameInputRef.current?.focus(), 0)
+                }}
+                title="Rename session"
+              >
+                Rename
+              </button>
+              <div className="session-header-spacer" />
+              <button
+                className="session-header-btn session-header-details-btn"
+                onClick={() => setSidebarOpen((v) => !v)}
+                title="Toggle session details panel"
+              >
+                Details
+              </button>
+
+              {showDeleteConfirm ? (
+                <span className="session-header-delete-confirm">
+                  <span className="session-header-delete-warn">Delete?</span>
+                  <button
+                    ref={deleteConfirmRef}
+                    className="session-header-btn session-header-confirm-delete-btn"
+                    onClick={() => {
+                      sendCommand('delete_session', { session_id: currentSessionId })
+                      setShowDeleteConfirm(false)
+                    }}
+                  >
+                    Yes
+                  </button>
+                  <button
+                    className="session-header-btn session-header-cancel-btn"
+                    onClick={() => setShowDeleteConfirm(false)}
+                  >
+                    No
+                  </button>
+                </span>
+              ) : (
+                <button
+                  className="session-header-btn session-header-delete-btn"
+                  onClick={() => {
+                    setShowDeleteConfirm(true)
+                    setTimeout(() => deleteConfirmRef.current?.focus(), 0)
+                  }}
+                  title="Delete session"
+                >
+                  Delete
+                </button>
+              )}
+            </>
+          )
+        ) : null}
+      </div>
+      {sessionError ? (
+        <div
+          className={`session-error-banner${staleClickPulse ? ' session-error-banner--pulse' : ''}`}
+          role="alert"
+        >
+          <span className="session-error-banner-text">⚠ {sessionError}</span>
+          {staleSession ? (
+            <button
+              className="session-error-banner-action"
+              onClick={startNewSession}
+            >Start New Session</button>
+          ) : (
+            <button
+              className="session-error-banner-dismiss"
+              onClick={() => useStore.getState().clearSessionError(storeKey)}
+              title="Dismiss"
+            >✕</button>
+          )}
+        </div>
+      ) : null}
       <StatusBar
-        status={state.status}
-        tokensIn={state.tokensIn}
-        tokensOut={state.tokensOut}
-        contextLength={state.contextLength}
+        status={status}
+        tokensIn={tokensIn}
+        tokensOut={tokensOut}
+        contextLength={contextLength}
       />
       <div className="app-main">
         <ConfigPanel
-          config={state.config}
+          mode={mode}
+          config={config}
           sendCommand={sendCommand}
           providers={providers}
           availableTools={availableTools}
           panelWidth={configPanelWidth}
           wsConnected={wsConnected}
-          workspaceId={state.workspaceId}
+          workspaceId={workspaceId}
           sessionId={currentSessionId}
+          configQueued={sessionConfig?.configQueued ?? false}
+          applyFailed={sessionConfig?.applyFailed ?? null}
           defaultConfigSaveStatus={defaultConfigSaveStatus}
-          defaultConfigSaveMessage={defaultConfigSaveMessage}
           onClearDefaultSaveStatus={() => {
             setDefaultConfigSaveStatus(null)
-            setDefaultConfigSaveMessage('')
           }}
           containerRebuildResult={containerRebuildResult}
           onClearRebuildResult={() => setContainerRebuildResult(null)}
+          selectedWorker={selectedWorker}
+          onSelectWorker={onSelectWorker}
+          isActive={isActive}
         />
         <div
           className="resize-handle"
@@ -580,23 +1403,35 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
               onDismiss={() => setSecurityPrompt(null)}
             />
           )}
-          <ChatPanel messages={state.history} loadMore={loadMore} hasMore={hasMore} />
+          <ChatPanel messages={viewMessages} loadMore={loadMore} hasMore={hasMore} scrollToBottomKey={scrollToBottomKey} />
           <QueryBar
             sendCommand={sendCommand}
-            status={state.status}
-            isRunning={state.isRunning}
-            config={state.config}
+            status={status}
+            isRunning={isRunning}
+            config={config}
+            mode={mode}
             sessionId={currentSessionId}
+            sessionReady={sessionReady}
           />
         </div>
         {/* Session list is rendered by App, not per-tab */}
       </div>
+      {sidebarOpen && (
+        <SessionSidebar
+          workspaceId={workspaceId}
+          config={config}
+          tools={availableTools}
+          sendCommand={sendCommand}
+          onClose={() => setSidebarOpen(false)}
+        />
+      )}
     </div>
   )
 }
 
 export default React.memo(SessionTab, (prevProps, nextProps) => {
   // Only re-render if session-specific props change
+  // or selectedWorker changes (affects worker highlighting)
   // Ignore changes to callback props (onClose, onRegister, etc.)
   // which create new references on every parent render
   return (
@@ -604,6 +1439,10 @@ export default React.memo(SessionTab, (prevProps, nextProps) => {
     prevProps.hubReady === nextProps.hubReady &&
     prevProps.staggerMs === nextProps.staggerMs &&
     prevProps.loadOnConnect === nextProps.loadOnConnect &&
-    prevProps.isActive === nextProps.isActive
+    prevProps.isActive === nextProps.isActive &&
+    prevProps.selectedWorker?.name === nextProps.selectedWorker?.name &&
+    prevProps.selectedWorker?.workspaceId === nextProps.selectedWorker?.workspaceId &&
+    prevProps.selectedWorker?.instance_id === nextProps.selectedWorker?.instance_id &&
+    prevProps.onLoggingConfigChanged === nextProps.onLoggingConfigChanged
   )
 })

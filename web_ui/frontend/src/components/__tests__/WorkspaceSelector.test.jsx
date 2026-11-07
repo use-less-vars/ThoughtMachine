@@ -1,0 +1,491 @@
+// @vitest-environment jsdom
+// --- WorkspaceSelector.test.jsx ---
+// Global Management landing view: summary-driven sections, host risk tags,
+// session navigation, vault health banner, credentials/resources rendering,
+// refresh and the custom-workspace modal flow.
+
+import React from 'react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
+import '@testing-library/jest-dom/vitest'
+import WorkspaceSelector from '../WorkspaceSelector'
+import useWorkspaceStore from '../../store/workspaceStore'
+
+vi.mock('../../globalApi', async (importOriginal) => {
+  const actual = await importOriginal()
+  return {
+    ...actual,
+    fetchVaultRepairStatus: vi.fn().mockResolvedValue(null),
+    fetchVaultRepairApply: vi.fn().mockResolvedValue(null),
+  }
+})
+
+function jsonOk(data, status = 200) {
+  return { ok: true, status, json: async () => data, text: async () => JSON.stringify(data) }
+}
+
+function stubFetchByUrl(routes) {
+  const calls = []
+  const fetchMock = vi.fn(async (input, init) => {
+    const url = typeof input === 'string' ? input : String(input)
+    calls.push(url)
+    const func = routes.find((r) => typeof r.match === 'function' && r.match(url, init))
+    const str = routes
+      .filter((r) => typeof r.match === 'string' && url.includes(r.match))
+      .sort((a, b) => b.match.length - a.match.length)[0]
+    const route = func || str
+    if (!route) return { ok: true, status: 200, json: async () => ({}), text: async () => '' }
+    const value = typeof route.value === 'function' ? route.value(url, init) : route.value
+    return value
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return { fetchMock, calls }
+}
+
+const SUMMARY = {
+  workspaces: [
+    {
+      id: 'ws-a',
+      label: 'Alpha Workspace',
+      active_sessions_count: 2,
+      total_workers: 3,
+      last_active: '2026-08-01T10:00:00Z',
+      status: 'running',
+      allow_host_resources: true,
+    },
+    {
+      id: 'ws-b',
+      label: 'Beta Workspace',
+      active_sessions_count: 0,
+      total_workers: 0,
+      last_active: null,
+      status: 'idle',
+      allow_host_resources: false,
+    },
+  ],
+  active_sessions: [
+    {
+      session_id: 'sess-1',
+      workspace_id: 'ws-a',
+      name: 'Refactor Session',
+      mode: 'engineer',
+      worker_count: 2,
+      started_at: '2026-08-30T12:00:00Z',
+    },
+    {
+      session_id: 'sess-2',
+      workspace_id: 'ws-b',
+      name: 'Research Session',
+      mode: 'research',
+      worker_count: 1,
+      started_at: '2026-08-29T08:00:00Z',
+    },
+  ],
+  containers_in_use: [
+    { name: 'alpha-ctr', type: 'free_use', workspace_id: 'ws-a', status: 'running' },
+    { name: 'beta-ctr', type: 'resource', workspace_id: 'ws-b', status: 'stopped' },
+  ],
+  containers_listed: 2,
+  providers: [],
+}
+
+const RESOURCE = {
+  id: 'npm_cache',
+  display_name: 'npm cache',
+  description: 'Shared npm cache',
+  permission_grain_set: ['read', 'write'],
+  execution_mode: 'container',
+  tools: ['npm'],
+  dockerfile_reference: 'cache.Dockerfile',
+}
+
+const ROUTES = [
+  { match: '/api/global/summary', value: jsonOk(SUMMARY) },
+  { match: '/api/vault/status', value: jsonOk({ ok: true }) },
+  { match: '/api/credentials', value: jsonOk({ credentials: [{ name: 'github_token' }, { name: 'openai_api_key' }] }) },
+  { match: '/api/resource-catalog', value: jsonOk({ items: [RESOURCE] }) },
+  { match: '/api/prompts', value: jsonOk([]) },
+]
+
+const MODAL_ROUTES = [
+  ...ROUTES,
+  { match: '/api/user-home', value: jsonOk({ home: '/home/test' }) },
+  {
+    match: (url) => url.startsWith('/api/browse'),
+    value: (url) => {
+      const p = new URL(url, 'http://x').searchParams.get('path')
+      return jsonOk({ success: true, current_path: p, entries: p === '/home/test' ? [{ name: 'project-a', is_dir: true }] : [] })
+    },
+  },
+  { match: '/api/workspace/resolve', value: jsonOk({ workspace_id: 'ws-custom', root: '/home/test/project-a' }) },
+]
+
+beforeEach(() => {
+  localStorage.clear()
+  window.location.hash = ''
+  useWorkspaceStore.getState().reset()
+})
+
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+})
+
+describe('WorkspaceSelector', () => {
+  it('renders all global management sections and fetches the summary', async () => {
+    const { calls } = stubFetchByUrl(ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    expect(screen.getByRole('heading', { name: 'Workspaces' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Active Sessions' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Active Containers' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Global Resources' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Global Credentials' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Global Sysprompts' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Providers' })).toBeInTheDocument()
+
+    expect(calls.some((u) => u.includes('/api/global/summary'))).toBe(true)
+  })
+
+  it('shows host allow/forbid tags', async () => {
+    stubFetchByUrl(ROUTES)
+    const { container } = render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    expect(screen.getByText('Host: allowed')).toBeInTheDocument()
+    expect(screen.getByText('Host: forbidden')).toBeInTheDocument()
+    expect(container.querySelector('.ws-card .ws-risk.allow').textContent).toBe('Host: allowed')
+    expect(container.querySelector('.ws-card .ws-risk.forbid').textContent).toBe('Host: forbidden')
+  })
+
+  it('navigates to a workspace when a card is clicked', async () => {
+    stubFetchByUrl(ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('heading', { level: 4, name: 'Alpha Workspace' }).closest('.ws-card'))
+    expect(window.location.hash).toBe('#/workspace/ws-a')
+  })
+
+  it('navigates to a session when a session row is clicked', async () => {
+    stubFetchByUrl(ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByText('Refactor Session')
+
+    fireEvent.click(screen.getByRole('button', { name: /Refactor Session/ }))
+    expect(window.location.hash).toBe('#/session/sess-1')
+  })
+
+  it('shows vault healthy banner', async () => {
+    stubFetchByUrl(ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByText('✓ Vault healthy')
+  })
+
+  it('masks credentials and renders resources', async () => {
+    stubFetchByUrl(ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByText('github_token')
+    expect(screen.getByText('openai_api_key')).toBeInTheDocument()
+    expect(screen.getAllByText('••••••••').length).toBe(2)
+    expect(screen.queryByText(/sk-secret|abc123/)).toBeNull()
+
+    await screen.findByText('npm cache')
+    expect(screen.getByText('Shared npm cache')).toBeInTheDocument()
+    expect(screen.getByText('Containerized')).toBeInTheDocument()
+    expect(screen.getByText('Context: container')).toBeInTheDocument()
+  })
+
+  it('Refresh refetches the summary', async () => {
+    const { calls } = stubFetchByUrl(ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(calls.filter((u) => u.includes('/api/global/summary')).length).toBe(2))
+  })
+
+  it('opens the custom workspace modal', async () => {
+    stubFetchByUrl(MODAL_ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Workspace' }))
+    expect(screen.getByRole('dialog', { name: 'Create custom workspace' })).toBeInTheDocument()
+  })
+
+  it('custom modal resolves a folder and navigates', async () => {
+    stubFetchByUrl(MODAL_ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Workspace' }))
+    await screen.findByText('Select This Folder')
+
+    fireEvent.click(screen.getByText(/project-a/))
+    await waitFor(() => expect(screen.getByText('Select This Folder')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText('Select This Folder'))
+    await waitFor(() => expect(window.location.hash).toBe('#/workspace/ws-custom'))
+    expect(localStorage.getItem('thoughtmachine_last_workspace')).toBe('/home/test/project-a')
+  })
+
+  it('creates a session through the chooser when several workspaces exist', async () => {
+    const createBodies = []
+    stubFetchByUrl([
+      ...ROUTES,
+      { match: '/api/session/list?workspace_id=ws-b', value: jsonOk([]) },
+      {
+        match: '/api/session/create',
+        value: (url, init) => {
+          createBodies.push(JSON.parse(init.body))
+          return jsonOk({ session_id: 's-x', mode: 'engineer' })
+        },
+      },
+    ])
+    render(<WorkspaceSelector />)
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Session' }))
+    const chooser = screen.getByRole('dialog', { name: /choose workspace/ })
+    expect(chooser).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('Workspace'), { target: { value: 'ws-b' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create Session' }))
+
+    // The chooser closes and the real session modal opens targeted at ws-b.
+    const modal = await screen.findByRole('dialog', { name: /^New session$/ })
+    expect(screen.queryByRole('dialog', { name: /choose workspace/ })).toBeNull()
+    expect(modal).toHaveTextContent('Beta Workspace')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create Session' }))
+    await waitFor(() => expect(createBodies.length).toBe(1))
+    // ws objects in the summary carry no root; no name typed -> plain body.
+    expect(createBodies[0]).toEqual({ mode: 'engineer', workspace_id: 'ws-b' })
+    expect(await screen.findByText('Session created.')).toBeInTheDocument()
+  })
+
+  it('opens the session modal directly when exactly one workspace exists', async () => {
+    stubFetchByUrl(
+      ROUTES.map((r) =>
+        r.match === '/api/global/summary'
+          ? { match: r.match, value: jsonOk({ ...SUMMARY, workspaces: [SUMMARY.workspaces[0]] }) }
+          : r
+      ).concat([{ match: '/api/session/list?workspace_id=ws-a', value: jsonOk([]) }])
+    )
+    render(<WorkspaceSelector />)
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Session' }))
+    const modal = await screen.findByRole('dialog', { name: /^New session$/ })
+    expect(screen.queryByRole('dialog', { name: /choose workspace/ })).toBeNull()
+    expect(modal).toHaveTextContent('Alpha Workspace')
+  })
+
+  it('hides the New Session button when there are no workspaces', async () => {
+    stubFetchByUrl(
+      ROUTES.map((r) =>
+        r.match === '/api/global/summary'
+          ? { match: r.match, value: jsonOk({ ...SUMMARY, workspaces: [], active_sessions: [] }) }
+          : r
+      )
+    )
+    render(<WorkspaceSelector />)
+    await screen.findByText('No workspaces yet. Create one to get started.')
+    expect(screen.queryByRole('button', { name: '+ New Session' })).toBeNull()
+  })
+
+  it('surfaces a notice when a prompt is selected from the library', async () => {
+    stubFetchByUrl(
+      ROUTES.map((r) =>
+        r.match === '/api/prompts'
+          ? { match: r.match, value: jsonOk([{ name: 'summarize', content: 'Summarize the text.' }]) }
+          : r
+      )
+    )
+    render(<WorkspaceSelector />)
+    await screen.findByText('summarize')
+    fireEvent.click(screen.getByText('summarize'))
+    expect(screen.getByText('Prompt selected - open a session to apply it')).toBeInTheDocument()
+  })
+
+  it('saves a new provider through the REST provider API', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers') && (init?.method || 'GET').toUpperCase() === 'POST',
+        value: jsonOk({ created: true, provider: { id: 'test-provider-1' } }),
+      },
+    ]
+    const { fetchMock } = stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    // Open the modal: this button label cannot collide with the modal's own
+    // 'Manage Providers' header (that is a <strong>, not a button).
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+
+    // List view -> '+ Add Provider' opens the create form.
+    fireEvent.click(await screen.findByRole('button', { name: /Add Provider/i }))
+
+    fireEvent.change(screen.getByPlaceholderText('e.g., openai, my-custom-vllm'), {
+      target: { value: 'test-provider-1' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('e.g., OpenAI GPT-4, My Local vLLM'), {
+      target: { value: 'Test Provider' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('https://api.openai.com/v1'), {
+      target: { value: 'https://example.test/v1' },
+    })
+
+    // The create form replaces the list, so the footer '+ Add Provider' is gone;
+    // the only remaining 'Add Provider' button is the form's submit.
+    fireEvent.click(screen.getByRole('button', { name: /^Add Provider$/ }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const postCalls = fetchMock.mock.calls
+      .map(([input, init]) => ({
+        url: typeof input === 'string' ? input : String(input),
+        method: (init?.method || 'GET').toUpperCase(),
+        body: init?.body,
+      }))
+      .filter((c) => c.method === 'POST' && c.url.endsWith('/api/providers'))
+
+    expect(postCalls.length).toBe(1)
+    const sent = JSON.parse(postCalls[0].body)
+    expect(sent.id ?? sent.provider?.id).toBe('test-provider-1')
+  })
+
+  it('deletes a provider through the REST provider API', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([{ id: 'x', label: 'X' }]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers/') && (init?.method || 'GET').toUpperCase() === 'DELETE',
+        value: jsonOk({ deleted: true }),
+      },
+    ]
+    const { fetchMock } = stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+
+    // Row 'Delete' (scoped by its title) swaps the list for the confirm overlay;
+    // the overlay's own 'Delete' lives in the 'Delete Provider' panel.
+    fireEvent.click(await screen.findByTitle('Delete provider'))
+    const confirmPanel = screen.getByText('Delete Provider').parentElement
+    fireEvent.click(within(confirmPanel).getByRole('button', { name: 'Delete' }))
+
+    await waitFor(() => {
+      const delCalls = fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          (init?.method || 'GET').toUpperCase() === 'DELETE' &&
+          (typeof input === 'string' ? input : String(input)).endsWith('/api/providers/x')
+      )
+      expect(delCalls.length).toBe(1)
+    })
+  })
+
+  it('alerts when the REST provider API rejects a save', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers') && (init?.method || 'GET').toUpperCase() === 'POST',
+        value: { ok: false, status: 500, json: async () => ({}), text: async () => '' },
+      },
+    ]
+    stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /Add Provider/i }))
+
+    fireEvent.change(screen.getByPlaceholderText('e.g., openai, my-custom-vllm'), {
+      target: { value: 'test-provider-1' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('e.g., OpenAI GPT-4, My Local vLLM'), {
+      target: { value: 'Test Provider' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('https://api.openai.com/v1'), {
+      target: { value: 'https://example.test/v1' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /^Add Provider$/ }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('Could not save provider.')
+  })
+
+  it('alerts when the REST provider API rejects a delete', async () => {
+    const providerRoutes = [
+      ...ROUTES,
+      { match: '/api/providers', value: jsonOk([{ id: 'x', label: 'X' }]) },
+      {
+        match: (url, init) =>
+          url.includes('/api/providers/') && (init?.method || 'GET').toUpperCase() === 'DELETE',
+        value: { ok: false, status: 500, json: async () => ({}), text: async () => '' },
+      },
+    ]
+    stubFetchByUrl(providerRoutes)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage Providers/i }))
+    fireEvent.click(await screen.findByTitle('Delete provider'))
+    const confirmPanel = screen.getByText('Delete Provider').parentElement
+    fireEvent.click(within(confirmPanel).getByRole('button', { name: 'Delete' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('Could not delete provider.')
+  })
+
+  it('clamps a long workspace label inside the card and keeps the full text in title', async () => {
+    // workspace_registry derives the label from the folder basename and never
+    // truncates it, so the card must clamp it in CSS. One unbroken 64-char
+    // token is the worst case: it is the element's min-content width.
+    const longLabel = 'x'.repeat(64)
+    stubFetchByUrl(
+      ROUTES.map((r) =>
+        r.match === '/api/global/summary'
+          ? {
+              match: r.match,
+              value: jsonOk({
+                ...SUMMARY,
+                workspaces: [{ ...SUMMARY.workspaces[0], label: longLabel }, SUMMARY.workspaces[1]],
+              }),
+            }
+          : r
+      )
+    )
+    const { container } = render(<WorkspaceSelector />)
+
+    const title = await screen.findByRole('heading', { level: 4, name: longLabel })
+    expect(title).toHaveClass('ws-card-title')
+    // The heading is clipped, so the untruncated label must be reachable here.
+    expect(title).toHaveAttribute('title', longLabel)
+    // ...and the host badge sharing that flex row is still rendered.
+    expect(container.querySelector('.ws-card .ws-risk.allow').textContent).toBe('Host: allowed')
+  })
+})

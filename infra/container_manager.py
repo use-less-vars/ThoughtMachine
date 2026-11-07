@@ -1,0 +1,6002 @@
+"""Per-workspace Docker container manager for the ThoughtMachine agent.
+
+``ContainerManager`` is a thin, security-hardened wrapper around the Docker
+SDK that owns the containers for ONE session. It replaces the old
+per-execute ``importlib.reload(docker_executor)`` pattern used by
+``tools.docker_code_runner``: ``docker_executor`` is imported ONCE per
+process (cached behind a lock) — never reloaded.
+
+Lifecycle
+---------
+1. ``start()`` — reuse a container from the in-memory registry or via label
+   lookup, or create a fresh one from the session workspace/permissions.
+2. ``exec()``  — run one command inside the container with a timeout.
+3. ``stop()``  — stop the container (idempotent, never raises).
+
+Containers are scoped to the WORKSPACE, not the session: they survive session
+close and are swept by the module-level ``cleanup_workspace()`` when a
+workspace is decommissioned.
+
+Security posture (identical to docker_executor.DockerExecutor)
+--------------------------------------------------------------
+- network disabled unless the session permissions allow a bridge network
+  (decided by the shared ``security.security_gate.resolve_container_config`` gate)
+- all capabilities dropped, no-new-privileges, read-only root filesystem
+- non-root user (1000:1000), tight memory + CPU quotas
+- bind-mounts the host session workspace at ``/workspace`` (read-only when
+  the session lacks write permission); a per-workspace package volume
+  (``tm-packages-<workspace_id>``) is mounted at ``/home/agent/.local``
+  (with ``PYTHONUSERBASE`` set) — no named *workspace* volumes are used
+
+Label scheme
+------------
+Every container created by this module carries:
+- ``thoughtmachine.container_name=<name>``
+- ``thoughtmachine.workspace_id=<workspace_id>``
+Used for label-based reuse lookups and ``cleanup_workspace()`` sweeps.
+
+Containers created on behalf of a worker sub-agent (``start(worker_name=...)``)
+additionally carry ``thoughtmachine.worker=<worker owner identity>`` on
+FRESH creates. The identity format (``<session_id or 'unknown'>:<worker_name>``)
+is decided by tools/workspace/worker.py and stamped VERBATIM. Workers stop/
+remove their labelled containers at teardown by comparing the label value
+EXACTLY to their own identity (stale/mismatched values are ignored) and
+never touch resource containers (see tools/workspace/worker.py). Reuse
+paths never re-label an existing container: the worker label is only
+stamped at create.
+
+Sticky notes (a container RECORD field)
+---------------------------------------
+A container's sticky note lives on its container RECORD -- the ``notes`` field
+of ``<vault_root>/workspaces/<workspace_id>/containers/<record_id>.json`` --
+keyed by the record id carried in the ``thoughtmachine.container_id`` Docker
+label. The record store owns the note, so it survives container recreation and
+is shared by every manager/session for the same workspace. Notes are NOT
+written to Docker labels (labels are immutable after create on stock daemons -
+there is no label-update API). A legacy per-workspace ``container_notes.json``
+sidecar (``<vault_root>/workspaces/<workspace_id>/container_notes.json``) is
+treated as READ-ONLY history: its entries are adopted onto records once (see
+``_migrate_legacy_notes_once``) and never written again.
+
+No-reload guarantee
+-------------------
+``docker_executor`` is imported once per process and cached; there is no
+``importlib.reload`` anywhere in this module or in docker_code_runner's
+execution path anymore.
+"""
+
+import hashlib
+import json
+import os
+import queue
+import re
+import shutil
+import sys
+import tempfile
+import threading
+import time
+from collections import OrderedDict, namedtuple
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import docker
+    from docker.errors import APIError, ImageNotFound, NotFound
+    from docker.types import Mount
+    DOCKER_AVAILABLE = True
+except ImportError:
+    DOCKER_AVAILABLE = False
+    docker = None
+    APIError = Exception
+    ImageNotFound = Exception
+    NotFound = Exception
+    Mount = None
+
+from agent.logging import log
+from agent.logging.lifecycle import log_container_event
+from infra.container_destroy_audit import (
+    CONTAINER_DESTROY,
+    emit_destroy_audit,
+    record_id_from_container,
+)
+from thoughtmachine.audit_logger import audit_event
+
+_audit = lambda event, data: audit_event(event, data)
+
+
+def _redact_permission_shape(permissions) -> str:
+    """Shape-only view of a session-permissions mapping for the audit log.
+
+    The plaintext audit log must never disclose permission *values*, so this
+    returns only a count plus the sorted permission category names — enough for
+    an operator to correlate a config change, nothing that leaks a grant.
+    """
+    if not isinstance(permissions, dict) or not permissions:
+        return "count=0 categories=none"
+    categories = ",".join(sorted(str(k) for k in permissions))
+    return "count={} categories={}".format(len(permissions), categories)
+
+from infra.container_env import merge_container_identity_env, workspace_git_identity
+from infra.container_lifecycle import ContainerIntent, ContainerLifecycle
+from infra.container_create import (
+    ContainerCreateSpec,
+    HardeningRecipe as _HardeningRecipe,
+    MountSpec,
+    _expected_hardening_recipe,
+    _hardening_conformance,
+    create_hardened_container,
+    git_shadow_for_workspace,
+)
+from thoughtmachine.workspace_capabilities import git_shadow_mask_path
+from thoughtmachine.container_record import (
+    attach_container,
+    ContainerRecordError,
+    consumes_workspace_slot,
+    LIFECYCLE_EPHEMERAL,
+    LIFECYCLE_PERSISTENT,
+    LIFECYCLE_RESOURCE,
+    LIFECYCLE_SERVICE,
+    RECORD_LABEL_KEY,
+    RESOURCE_LABEL,
+    RESOURCE_NAME_PREFIX,
+    STATE_RUNNING,
+    RecordLocked,
+    RecordNotFound,
+    UnknownLifecycleClass,
+    delete_record,
+    docker_restart_policy,
+    find_by_docker_label,
+    is_resource_like,
+    lifecycle_class_from_labels,
+    list_records,
+    load_record,
+    mem_limit_bytes,
+    normalise_restart_policy,
+    policy_for,
+    rebuild_config_from_snapshot,
+    record_label,
+    snapshot_from_attrs,
+    snapshot_has_evidence,
+    update_record,
+)
+from thoughtmachine.container_record import drift
+from thoughtmachine.container_record.drift import (
+    EVENT_CONTAINER_RECORD_AUTO_RECREATED,
+    EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED,
+)
+from thoughtmachine.container_record import storage
+from thoughtmachine.container_record.hook import (
+    CREATED_BY_LABEL,
+    agent_created_by,
+    record_creation,
+)
+
+# Admission control (phase 2): the legacy (registry-inactive) fresh create is a
+# terminal container-create site, so it consults the pure admission gate before
+# touching the daemon (a Deny returns an error dict; a Transform narrows the
+# network_mode).  When the registry is active this code is unreachable -- the
+# registry already applies admission on its own create path.
+from security.admission_gate import (
+    AdmissionRequest,
+    ClientProbes,
+    ContainerSpec,
+    Deny,
+    REASON_UNKNOWN_LIFECYCLE_CLASS,
+    Transform,
+    admit,
+)
+
+# ── Output truncation (mirrors DockerCodeRunner._truncate_output) ──────────
+from agent.config.defaults import (
+    CONTAINER_NAME_LABEL,
+    CONTAINER_TYPE_FREE_USE,
+    CONTAINER_TYPE_LABEL,
+    CONTAINER_TYPE_RESOURCE,
+    DEFAULT_CPU_QUOTA,
+    DEFAULT_IMAGE,
+    DEFAULT_MAX_CONTAINERS,
+    DEFAULT_MEM_LIMIT,
+    EXEC_OUTPUT_LIMIT_BYTES,
+    EXEC_TMPFS_OPTIONS,
+    host_user,
+    _host_ids,
+)
+_TRUNCATION_NOTICE = "\n...[output truncated at 100KB]..."
+
+_docker_executor_module = None
+_docker_executor_lock = threading.Lock()
+
+
+def _load_docker_executor():
+    """Import (and cache) docker_executor — once per process, never reloaded.
+
+    The module lives at the repo root; it is added to ``sys.path`` when not
+    already importable (this mirrors the old inline sys.path hack, minus the
+    reload). The module-level MODULE_LOAD audit therefore fires exactly once
+    per process instead of once per execute() call.
+    """
+    global _docker_executor_module
+    if _docker_executor_module is not None:
+        return _docker_executor_module
+    with _docker_executor_lock:
+        if _docker_executor_module is None:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+            import infra.containers.executor as docker_executor  # noqa: F401 — deliberately NOT reloaded
+            _docker_executor_module = docker_executor
+        return _docker_executor_module
+
+
+# ── Exec-path drift admission ─────────────────────────────────────────────────────────
+# ``exec()`` refuses to run a command when the LIVE container's network/workspace
+# isolation is MORE PERMISSIVE than the session policy desires (a command must
+# never run under weaker isolation than the gate asked for).  A container that
+# differs but is NOT more permissive — or whose isolation cannot be read — is
+# WARNING-logged and allowed through, preserving today's behaviour.
+#
+# The drift EVENT + WARNING + audit fire ONCE per distinct signature.  Because a
+# fresh ``ContainerManager`` is built for every tool call, the "already reported"
+# memo lives at MODULE scope so deduplication actually holds across calls.  The
+# DECISION, by contrast, is applied on every call (a drifted container keeps
+# being denied).
+_EXEC_DRIFT_MEMO_MAX = 256
+_EXEC_DRIFT_SEEN = OrderedDict()  # (container_id, signature) -> True, oldest evicted
+_EXEC_DRIFT_LOCK = threading.Lock()
+_EXEC_DRIFT_EVENT = "drift.exec_on_drifted_container"
+_EXEC_DRIFT_ACTOR = "infra.container_manager.exec"
+_EXEC_DRIFT_AUDIT = "CONTAINER_EXEC_DRIFT"
+_EXEC_DRIFT_EXIT_CODE = 126  # distinct from -2 (timeout) and -1 (generic error)
+
+# OOM observability: a command that exits 137 (128 + SIGKILL) is the OOM
+# signature.  This emits a DISTINCT record event -- deliberately NOT folded
+# into the exec-drift signal (``drift.exec_on_drifted_container``) nor the
+# start-path ``drift.container_absent`` -- so an OOM kill is greppable on its
+# own and never mistaken for an isolation refusal.
+_EXEC_OOM_EXIT_CODE = 137  # 128 + SIGKILL: the OOM-kill signature
+_EXEC_OOM_EVENT = "container.command_oom_killed"
+_EXEC_OOM_ACTOR = "infra.container_manager.exec"
+
+# Removal-path stop grace.  ``remove()`` force-removes the container immediately
+# after the stop, so a long graceful-exit wait is pure latency: the exit it waits
+# for is discarded.  ``_stop_container`` therefore takes the grace as a
+# parameter -- the full 5s SIGTERM ceiling for a user-facing ``stop`` (whose
+# container is expected to keep running) and the short one for a removal that is
+# about to destroy the container anyway.
+_STOP_GRACE_SECONDS = 5
+_REMOVE_GRACE_SECONDS = 1
+
+# Start-path drift admission (mirrors the exec-path memo above): ``start()`` no
+# longer MUTATES a drifted container (no remove/recreate).  A container whose
+# live isolation differs from the resolved policy but is NOT more permissive is
+# REUSED with the drift attached to the response; a container that IS more
+# permissive is REFUSED (an error response carrying the drift detail) WITHOUT
+# touching it.  Same module-scope memo discipline as exec: the drift EVENT +
+# WARNING + audit fire ONCE per distinct signature, while the DECISION is
+# applied on every call.
+_START_DRIFT_SEEN = OrderedDict()  # (container_id, signature) -> True, oldest evicted
+_START_DRIFT_LOCK = threading.Lock()
+_START_DRIFT_EVENT = "drift.start_on_drifted_container"
+_START_DRIFT_ACTOR = "infra.container_manager.start"
+_START_DRIFT_AUDIT = "CONTAINER_START_DRIFT"
+
+# Restart-policy drift (third admission axis on the start path).  A reused
+# container whose live Docker restart policy is MORE permissive than the
+# resolved lifecycle policy is REFUSED; a less-permissive difference is a
+# WARNING-only drift.  Its own event/audit codes so the signal is greppable.
+_START_DRIFT_RESTART_EVENT = "drift.restart_policy_mismatch"
+_START_DRIFT_RESTART_ACTOR = "infra.container_manager.start"
+_START_DRIFT_RESTART_AUDIT = "CONTAINER_RESTART_DRIFT"
+
+# Missing-container auto-heal (agent-facing counterpart to the operator-only
+# ``allow_fresh`` recreate).  A record that names a ``docker_id`` with no live
+# container is rebuilt ONCE for the agent path; the attempt is memoised per
+# ``(record_id, stale_docker_id)`` so a persistently failing heal refuses
+# thereafter instead of looping.  MODULE scope (like the drift memos above) so
+# the memo holds across the fresh ContainerManager built for every tool call.
+_HEAL_MEMO_MAX = 256
+_HEAL_ATTEMPTED = OrderedDict()  # (record_id, stale_docker_id) -> True, oldest evicted
+_HEAL_LOCK = threading.Lock()
+_HEAL_ACTOR = "infra.container_manager.start"
+_HEAL_REASON = "container_missing"
+_HEAL_AUDIT_HEALED = "CONTAINER_START_MISSING_HEAL"
+_HEAL_AUDIT_REFUSED = "CONTAINER_START_MISSING_HEAL_FAILED"
+
+# W3-4: the SINGLE SOURCE OF TRUTH for the three heal-outcome refusal codes
+# produced by ``start()`` on the missing/absent-container branches.  Producers
+# and every consumer must agree on these byte-for-byte values; the frozen set
+# lets a test pin the declared vocabulary.
+HEAL_OUTCOME_UNBOUND = "container_record_unbound"
+HEAL_OUTCOME_NOT_HEALABLE = "container_record_not_healable"
+HEAL_OUTCOME_CONTAINER_MISSING = "container_record_container_missing"
+HEAL_OUTCOME_CODES = frozenset({
+    HEAL_OUTCOME_UNBOUND,
+    HEAL_OUTCOME_NOT_HEALABLE,
+    HEAL_OUTCOME_CONTAINER_MISSING,
+})
+
+# W3-5: dedup for the affirmative ``container_reused`` RECORD event emitted from
+# the three reuse-continue sites of ``start()``.  MODULE scope (like the drift
+# memos above) so the once-per-``(record_id, docker_id)`` guarantee holds across
+# the fresh ``ContainerManager`` built for every tool call.
+_CONTAINER_REUSED_SEEN = OrderedDict()  # (record_id, docker_id) -> True, oldest evicted
+_CONTAINER_REUSED_LOCK = threading.Lock()
+_CONTAINER_REUSED_EVENT = "container_reused"
+_CONTAINER_REUSED_ACTOR = "infra.container_manager.start"
+
+# Sticky-note migration/warning memos (module scope so dedup holds across the
+# fresh ContainerManager instances built for every tool call). ``_NOTES_WARNED``
+# dedupes the once-per-condition WARNINGs (a legacy sidecar note served, a write
+# refused for lack of a record); ``_NOTES_MIGRATED`` records the workspaces whose
+# legacy container_notes.json has already been adopted onto records (so the
+# one-shot migration is idempotent).
+_NOTES_MEMO_LOCK = threading.Lock()
+_NOTES_WARNED = set()
+_NOTES_MIGRATED = set()
+
+# Container-name index memos (module scope, same dedup discipline as the notes
+# memos above). ``_NAME_INDEX`` maps ``(workspace_id, name) -> record id`` and is
+# built from ``list_records`` ONCE per workspace (``_NAME_INDEX_BUILT``) so it is
+# never a boot cost; ``_NAME_INDEX_COLLISIONS`` records ``(workspace_id, name)``
+# keys claimed by two-or-more records (ambiguous identity -> start refuses);
+# ``_NAME_MIGRATED`` records the workspaces whose v1/v2 records have already
+# been name-backfilled (one-shot, idempotent).
+_NAME_INDEX_LOCK = threading.Lock()
+_NAME_INDEX = {}
+_NAME_INDEX_COLLISIONS = set()
+_NAME_INDEX_BUILT = set()
+_NAME_MIGRATED = set()
+
+
+def _name_index_forget(record_id):
+    """Drop every ``(workspace, name)`` index entry pointing at *record_id*.
+
+    Module-scope so callers without a ``ContainerManager`` instance (the
+    orphan-record sweeper) can keep the in-memory name index consistent after
+    deleting a record.  Never raises.
+    """
+    if not record_id:
+        return
+    with _NAME_INDEX_LOCK:
+        for key in [k for k, v in _NAME_INDEX.items() if v == record_id]:
+            _NAME_INDEX.pop(key, None)
+
+# Isolation ranks: higher == more permissive.  Network "default" is normalized
+# to "bridge" upstream (see ContainerManager._normalize_network_mode); any other
+# PRESENT network mode (host / container:<id> / ...) is treated as the most
+# permissive.  For the workspace bind: ro(0) < rw(1) < absent(2) — an absent
+# /workspace bind is MORE permissive because writes then land on the container's
+# own layer instead of the (read-only) host bind.
+_EXEC_NETWORK_RANK = {"none": 0, "bridge": 1}
+_EXEC_WORKSPACE_RANK = {"ro": 0, "rw": 1, "absent": 2}
+
+# Restart-policy ranks: higher == more permissive (keeps the container alive
+# across failures/daemon restarts more aggressively).  "no"(0) is the most
+# restrictive; anything unknown is treated as the most permissive (3).
+_RESTART_POLICY_RANK = {"no": 0, "on-failure": 1, "unless-stopped": 2, "always": 3}
+
+
+def _exec_network_rank(network_mode):
+    """Isolation rank for a network mode (None -> None, unknown -> 2)."""
+    if network_mode is None:
+        return None
+    normalized = ContainerManager._normalize_network_mode(network_mode)
+    return _EXEC_NETWORK_RANK.get(normalized, 2)
+
+
+def _exec_workspace_rank(workspace_mode):
+    """Isolation rank for a workspace mode (None -> None, unknown -> 2)."""
+    if workspace_mode is None:
+        return None
+    return _EXEC_WORKSPACE_RANK.get(workspace_mode, 2)
+
+
+def _exec_live_isolation(container, *, strict=False):
+    """Read (live_network_mode, live_workspace_mode) from a container's attrs.
+
+    A key that is STRUCTURALLY ABSENT (no ``HostConfig`` dict, no ``Mounts``
+    list) yields ``None`` for that axis — the attrs are LEGIBLE but the field is
+    missing, i.e. no observable drift, so callers whose fakes omit these keys
+    are unaffected.  A present ``Mounts`` list without a ``/workspace``
+    destination yields ``"absent"``.
+
+    RULING: we do not run what we cannot prove is allowed.  With ``strict=True``
+    (the exec gate) an attrs read that RAISES PROPAGATES — "the read failed, so
+    we cannot tell" is NOT the same as "the fields are structurally absent"
+    (a deliberate, non-jurisdiction RUN case).  With ``strict=False`` (default;
+    the start-path caller) a read error keeps the legacy ``(None, None)``
+    "cannot determine" behaviour.
+    """
+    try:
+        attrs = getattr(container, "attrs", None)
+    except Exception:
+        if strict:
+            raise
+        return None, None
+    if not isinstance(attrs, dict):
+        return None, None
+
+    live_net = None
+    host_config = attrs.get("HostConfig")
+    if isinstance(host_config, dict):
+        raw_net = host_config.get("NetworkMode")
+        if raw_net is not None:
+            live_net = ContainerManager._normalize_network_mode(raw_net)
+
+    live_ws = None
+    mounts = attrs.get("Mounts")
+    if isinstance(mounts, list):
+        live_ws = "absent"
+        for mount in mounts:
+            if isinstance(mount, dict) and mount.get("Destination") == "/workspace":
+                live_ws = "rw" if mount.get("RW") else "ro"
+                break
+    return live_net, live_ws
+
+
+def _live_user(container):
+    """Read the container's live ``Config.User``, or ``None`` when undeterminable.
+
+    A STRUCTURALLY ABSENT / blank user reads as ``None`` (no observable drift),
+    mirroring the restart-policy axis, so fakes that predate this axis are
+    unaffected.
+    """
+    try:
+        attrs = getattr(container, "attrs", None)
+    except Exception:
+        return None
+    if not isinstance(attrs, dict):
+        return None
+    cfg = attrs.get("Config")
+    if not isinstance(cfg, dict):
+        return None
+    user = cfg.get("User")
+    if not isinstance(user, str) or not user:
+        return None
+    return user
+
+
+def _user_drift_axis(container, policy_user):
+    """Return ``("deny", reason, detail)`` when live user != policy user.
+
+    An unreadable/absent live user is NOT drift (cannot prove a mismatch); a
+    PRESENT user that differs from ``policy_user`` runs the container as a user
+    the host policy did not intend, so it is treated as MORE permissive and
+    DENIED.
+    """
+    live = _live_user(container)
+    if live is None or policy_user is None:
+        return None
+    if live == policy_user:
+        return None
+    return "deny", "user_mismatch", {"expected": policy_user, "actual": live}
+
+
+# ── Mount conversion for the spec-based create primitive ────────────────────
+# The canonical docker-HARDENING recipe (``_expected_hardening_recipe``) and the
+# conformance predicate (``_hardening_conformance``) now live in
+# ``infra.container_create`` and are imported at module top; this module no
+# longer keeps a duplicate copy.
+def _mount_specs_from_docker_mounts(mounts):
+    """Convert docker ``Mount`` objects into a tuple of ``MountSpec``.
+
+    ``docker.types.Mount`` is a ``dict`` subclass keyed ``Target``/``Source``/
+    ``Type``/``ReadOnly`` and exposes NO matching attribute accessors, whereas
+    ``ContainerCreateSpec`` reads ``MountSpec`` by ATTRIBUTE.  An empty or
+    ``None`` ``mounts`` yields an empty tuple (the create then attaches none).
+
+    Accepted entry shapes: a ``docker.types.Mount`` (or any mapping) carrying
+    ``Source`` and ``Target`` keys (``Type``/``ReadOnly`` optional).  Shorthand
+    strings such as ``"src:tgt:ro"`` are NOT accepted here: the ``mounts=``
+    boundary the docker SDK exposes performs NO per-entry parsing, so shorthand
+    is only valid on the separate ``volumes=``/binds path.  Any entry that is
+    not such a mapping (a ``str``, an ``int``, a non-mapping object, or a
+    mapping missing the required keys) raises a self-describing ``TypeError``
+    naming the offending object instead of leaking a low-level ``string indices
+    must be integers`` error.
+    """
+    if not mounts:
+        return ()
+    specs = []
+    for m in mounts:
+        try:
+            source = m["Source"]
+            target = m["Target"]
+        except (TypeError, KeyError) as exc:
+            raise TypeError(
+                "mounts entries must be docker.types.Mount mappings with "
+                "Source/Target keys; got "
+                f"{type(m).__name__}: {m!r}"
+            ) from exc
+        specs.append(
+            MountSpec(
+                source=source,
+                target=target,
+                type=m.get("Type") or "bind",
+                read_only=bool(m.get("ReadOnly")),
+            )
+        )
+    return tuple(specs)
+
+
+
+def _exec_drift_decision(live_net, live_ws, want_net, want_ws):
+    """Classify live isolation vs desired policy; returns (decision, reason).
+
+    * ``("run", None)``  — nothing determinable.
+    * ``("deny", "<axis>_more_permissive")`` — live is MORE permissive on at
+      least one axis (network checked first, then workspace).
+    * ``("warn", "config_differs_not_more_permissive")`` — diff the other way.
+
+    A ``None``/unknown WANT on an axis means "no opinion" on that axis: it can
+    never prove live is MORE permissive, so it never forces a deny.  The
+    comparison is therefore total — it never relies on ``int > None`` raising.
+    """
+    net_known = live_net is not None
+    ws_known = live_ws is not None
+    if not net_known and not ws_known:
+        return "run", None
+
+    # A ``None``/unknown WANT rank (or an unknown WANT mode) is "no opinion":
+    # that axis cannot make live MORE permissive, so it never forces a deny.
+    want_net_rank = _exec_network_rank(want_net)
+    want_ws_rank = _exec_workspace_rank(want_ws)
+    net_more = (
+        net_known and want_net_rank is not None
+        and _exec_network_rank(live_net) > want_net_rank
+    )
+    ws_more = (
+        ws_known and want_ws_rank is not None
+        and _exec_workspace_rank(live_ws) > want_ws_rank
+    )
+    if net_more or ws_more:
+        reason = "network_more_permissive" if net_more else "workspace_more_permissive"
+        return "deny", reason
+    return "warn", "config_differs_not_more_permissive"
+
+
+def _restart_policy_rank(restart_policy):
+    """Permissiveness rank for a restart policy (None -> None, unknown -> 3)."""
+    if restart_policy is None:
+        return None
+    return _RESTART_POLICY_RANK.get(str(restart_policy).strip(), 3)
+
+
+def _live_restart_policy(container):
+    """Read the container's live Docker restart policy name from its attrs.
+
+    Returns ``None`` when it cannot be determined: unreadable/absent attrs, no
+    ``HostConfig`` dict, or a STRUCTURALLY ABSENT ``RestartPolicy`` key.  The
+    absent-key case is deliberate: fakes that predate this axis omit the key,
+    which must read as "no observable drift" rather than a mismatch.
+    """
+    try:
+        attrs = getattr(container, "attrs", None)
+    except Exception:
+        return None
+    if not isinstance(attrs, dict):
+        return None
+    host_config = attrs.get("HostConfig")
+    if not isinstance(host_config, dict):
+        return None
+    if "RestartPolicy" not in host_config:
+        return None
+    policy = host_config.get("RestartPolicy")
+    if policy is None:
+        return "no"
+    if isinstance(policy, dict):
+        return normalise_restart_policy(policy.get("Name"))
+    return normalise_restart_policy(policy)
+
+
+def _truncate_output(output):
+    """Byte-truncate utf-8 output to EXEC_OUTPUT_LIMIT_BYTES + notice."""
+    if output is None:
+        return output
+    try:
+        data = output.encode("utf-8", errors="replace")
+    except AttributeError:
+        return output
+    if len(data) <= EXEC_OUTPUT_LIMIT_BYTES:
+        return output
+    return data[:EXEC_OUTPUT_LIMIT_BYTES].decode("utf-8", errors="replace") + _TRUNCATION_NOTICE
+
+
+def _split_docker_log_streams(raw):
+    """Split docker-py's multiplexed log stream into (stdout_bytes, stderr_bytes).
+
+    When ``stdout=True`` and ``stderr=True`` are requested together, the Docker
+    API multiplexes both streams into one byte stream of 8-byte frames:
+
+        byte 0    = stream id (1 = stdout, 2 = stderr)
+        bytes 1-3 = unused
+        bytes 4-7 = payload length, big-endian
+        payload   = that many bytes of log output
+
+    If the data does not look like a valid multiplexed stream (e.g. the
+    container was created with ``tty=True``, in which case docker returns raw
+    output with no frame headers), the whole payload is treated as stdout.
+    """
+    stdout_chunks, stderr_chunks = [], []
+    offset = 0
+    length = len(raw)
+    while offset + 8 <= length:
+        header = raw[offset:offset + 8]
+        stream_id = header[0]
+        payload_len = int.from_bytes(header[4:8], "big")
+        if stream_id not in (0, 1, 2) or payload_len > length - offset - 8:
+            # Malformed frame (or raw tty output with no headers) — keep the
+            # remainder as stdout rather than dropping it.
+            stdout_chunks.append(raw[offset:])
+            break
+        payload = raw[offset + 8:offset + 8 + payload_len]
+        if stream_id == 2:
+            stderr_chunks.append(payload)
+        else:
+            # stream 1 = stdout, stream 0 = init/stdin output — fold into stdout.
+            stdout_chunks.append(payload)
+        offset += 8 + payload_len
+    if offset == 0:
+        return raw, b""
+    return b"".join(stdout_chunks), b"".join(stderr_chunks)
+
+
+def _safe_session_tag(session_id):
+    """Return a docker-safe short tag for a session id (container names).
+
+    Strips unsafe characters (keeps [a-zA-Z0-9_.-], max 16 chars); falls back
+    to a sha256 prefix when nothing safe remains; 'anon' for None.
+    """
+    if session_id is None:
+        return "anon"
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "", str(session_id))[:16]
+    if cleaned:
+        return cleaned
+    return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:8]
+
+
+def _load_capabilities(workspace_id):
+    """Best-effort load of a workspace's capabilities for admission.
+
+    Runtime import so a test that monkeypatches
+    ``security.security_gate.get_workspace_capabilities`` is honoured.  Any
+    failure returns ``None``; admission then fails closed on the
+    ``capabilities_required`` code (mirrors the fail-closed network resolver).
+    """
+    try:
+        from security.security_gate import get_workspace_capabilities
+
+        return get_workspace_capabilities(workspace_id)
+    except Exception:  # noqa: BLE001 - admission fails closed on None
+        return None
+
+
+class _ComputedContainerConfig(tuple):
+    """``(network_mode, workspace_mode)`` plus the resolved ``effective`` profile.
+
+    A 2-tuple SUBCLASS so that every existing consumer keeps working
+    byte-for-byte: two-name unpacking still yields the two modes, and
+    equality against ``("none", "ro")`` still holds.  The resolved
+    six-category ``effective`` profile rides along as an attribute so
+    callers never need a second ``resolve_container_config`` call.
+    """
+
+    def __new__(cls, network_mode, workspace_mode, effective=None):
+        obj = super().__new__(cls, (network_mode, workspace_mode))
+        obj.effective = effective
+        return obj
+
+
+# ── effective-intent re-observation ─────────────────────────────────────────
+# ``intent_snapshot`` is FILL-ONCE: the intent authored at create time (the
+# operator resize PATCH, or the hook's derived snapshot) is the truth and a
+# later observation must never overwrite it.  That rule has one blind spot: a
+# container that is RE-created keeps the authored snapshot even when what
+# actually came up differs from it (Docker normalises a value, or admission
+# rewrites ``network_mode``), leaving a record that describes a container that
+# no longer exists.  The helper below repairs only that: right after a
+# container is created/attached it re-reads the live inspect payload and
+# reconciles the observable keys, value-by-value.
+_EFFECTIVE_INTENT_KEYS = (
+    "network_mode",
+    "workspace_mode",
+    "mem_limit",
+    "cpu_quota",
+    "pids_limit",
+    "restart_policy",
+)
+
+
+def _mem_bytes(value):
+    """Return *value* (``'512m'``, ``'1g'``, ``1073741824``) in bytes, or None.
+
+    Thin alias for the shared parser -- ``mem_limit_bytes`` in
+    ``thoughtmachine.container_record.snapshot`` is the ONE definition of the
+    ``mem_limit`` grammar, because drift detection needs the very same
+    comparison (record ``'1g'`` vs live ``'1073741824'``) to avoid reporting a
+    permanent false runtime drift.  Junk and negative values return ``None`` so
+    they never compare equal by accident.
+    """
+    return mem_limit_bytes(value)
+
+
+def _reobserve_effective_intent(workspace_id, record_id, container):
+    """Reconcile a record's ``intent_snapshot`` with the live *container*.
+
+    Called right after a container has been created for / attached to a record.
+    For every key in :data:`_EFFECTIVE_INTENT_KEYS` that the record ALREADY
+    carries and whose live value is present in the inspect payload, the
+    snapshot keeps its current value when the two AGREE — including
+    ``mem_limit``, where ``'1g'`` and ``'1073741824'`` are the same limit and the
+    authored spelling is preserved — and takes the OBSERVED value when they
+    genuinely differ.  Keys the payload does not report (an empty
+    ``''``/``None``) are left alone, and a key the record never carried is never
+    ADDED: fill-once still decides what the record describes, this only corrects
+    a value the record claims that the live container does not implement.
+
+    This does not weaken fill-once: the snapshot is only ever reconciled
+    against the container that was just created FROM that intent, so an authored
+    value that the container actually implements is untouched.
+
+    Best-effort by construction — any storage/inspect fault is logged and
+    swallowed; this must never fail a container create.  Returns the merged
+    snapshot, or ``None`` when there was nothing to do/failed.
+    """
+    try:
+        if not workspace_id or not record_id:
+            return None
+        record = load_record(workspace_id, record_id)
+        if record is None:
+            return None
+        existing = dict(getattr(record, "intent_snapshot", None) or {})
+        live = snapshot_from_attrs(getattr(container, "attrs", None))
+        if not live:
+            return None
+        merged = dict(existing)
+        for key in _EFFECTIVE_INTENT_KEYS:
+            observed = live.get(key)
+            if observed is None or observed == "":
+                continue
+            if key not in existing:
+                # Fill-once owns the key SET: never invent a key the record's
+                # authored snapshot does not describe.
+                continue
+            current = existing.get(key)
+            if key == "mem_limit":
+                current_bytes = _mem_bytes(current)
+                if current_bytes is not None and current_bytes == _mem_bytes(observed):
+                    # Same limit, different spelling: keep the authored one.
+                    continue
+            merged[key] = observed
+        if merged != existing:
+            update_record(workspace_id, record_id, intent_snapshot=merged)
+        return merged
+    except Exception as exc:  # noqa: BLE001 - never fail a container create
+        log("WARNING", "docker.container_manager",
+            f"effective-intent re-observation skipped for record {record_id}: {exc}")
+        return None
+
+
+def _local_image_present(client, image):
+    """Probe whether ``image`` exists LOCALLY -- never pulling it.
+
+    ``docker-py``'s ``containers.run`` implicitly PULLS the image when the
+    daemon reports ``ImageNotFound``, so without this probe a create is
+    silently remote-first: an absent image is fetched from a registry instead
+    of failing.  ``images.get`` never pulls, so probing here is what makes
+    container start LOCAL-FIRST: an absent image is refused (with a precise
+    message) before any create is attempted.
+
+    Returns ``True`` when the image is present locally, ``False`` when the
+    daemon reports it absent (``ImageNotFound``), and ``None`` when the probe
+    itself is unavailable (a client without ``images``, a daemon hiccup, ...).
+    ``None`` is NOT a refusal: an unprobeable client keeps the historical
+    behaviour rather than blocking a start that used to work.
+    """
+    try:
+        client.images.get(image)
+        return True
+    except ImageNotFound:
+        return False
+    except Exception:
+        return None
+
+
+class ContainerManager:
+    """Owns the Docker containers for one session (start -> exec -> stop)."""
+
+    def __init__(
+        self,
+        workspace_path,
+        session_id=None,
+        workspace_id=None,
+        session_permissions=None,
+        image=DEFAULT_IMAGE,
+        mem_limit=DEFAULT_MEM_LIMIT,
+        cpu_quota=DEFAULT_CPU_QUOTA,
+        vault_root=None,
+        session_config=None,
+    ):
+        if docker is None:
+            raise RuntimeError(
+                "Docker Python SDK not installed. Install with 'pip install docker'."
+            )
+        self.workspace_path = os.path.abspath(workspace_path).rstrip("/")
+        self.session_id = session_id
+        self.session_permissions = session_permissions
+        # Per-session config (e.g. container_limits.max_containers); falls back to workspace config.
+        self._session_config = session_config
+        self.image = image
+        self.mem_limit = mem_limit
+        self.cpu_quota = cpu_quota
+
+        # In-memory registry: container name -> container id (per-manager).
+        self._containers = {}
+
+        # Borrow the shared decision helpers from docker_executor —
+        # single source of truth, imported once (never reloaded).
+        dex = _load_docker_executor()
+        self._resolve_workspace_id = dex._resolve_workspace_id
+        if workspace_id is None:
+            workspace_id = self._resolve_workspace_id(self.workspace_path)
+        self.workspace_id = str(workspace_id) if workspace_id is not None else "default"
+
+        # Vault root: per-workspace config + sticky-note bulletin board live
+        # under <vault_root>/workspaces/<workspace_id>/.
+        self.vault_root = self._resolve_vault_root(vault_root)
+
+        # Phase 2: per-workspace config (max_containers, disk_quota_mb) loaded
+        # from <vault_root>/workspaces/<workspace_id>/config.json.
+        self.workspace_config = self._load_workspace_config()
+        self.max_containers = self.workspace_config.get(
+            "max_containers", DEFAULT_MAX_CONTAINERS
+        )
+
+        self.client = docker.from_env()
+
+    def _load_workspace_config(self):
+        """Load per-workspace config; returns a dict and NEVER raises.
+
+        Reads ``<vault_root>/workspaces/<workspace_id>/config.json``.
+        Missing file -> defaults in memory (nothing written to disk — construction
+        performs no I/O). Corrupt file -> defaults in memory (file untouched).
+        """
+        defaults = {"max_containers": DEFAULT_MAX_CONTAINERS, "disk_quota_mb": 4096}
+        config_dir = Path(self.vault_root) / "workspaces" / str(self.workspace_id)
+        config_path = config_dir / "config.json"
+        self.workspace_config_path = config_path
+        try:
+            if config_path.exists():
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+                    log("WARNING", "docker.container_manager",
+                        f"Workspace config {config_path} is not a JSON object; using defaults")
+                except (ValueError, OSError) as e:
+                    log("WARNING", "docker.container_manager",
+                        f"Failed to read workspace config {config_path}: {e}; using defaults")
+                return dict(defaults)
+            return dict(defaults)
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"Unexpected error loading workspace config {config_path}: {e}")
+            return dict(defaults)
+
+    def _save_workspace_config(self):
+        """Atomically persist the workspace config; NEVER raises.
+
+        Writes ``self.workspace_config`` to ``self.workspace_config_path``
+        (parent directory created on demand).  Failures are logged, never
+        raised.
+        """
+        config_path = getattr(self, "workspace_config_path", None)
+        if config_path is None:
+            return
+        try:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = config_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(getattr(self, "workspace_config", {}) or {}, f, indent=2)
+            os.replace(tmp_path, config_path)
+        except (OSError, ValueError) as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to write workspace config {config_path}: {e}")
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"Unexpected error writing workspace config {config_path}: {e}")
+
+    def _get_max_containers(self) -> int:
+        """Effective per-workspace container limit.
+
+        Precedence: session config (``container_limits.max_containers``) ->
+        workspace config (``self.max_containers``, which the workspace
+        config.json or tests may override). Never raises: invalid values fall
+        back to the default, and values below 1 clamp to 1.
+        """
+        default = self.max_containers
+        try:
+            limits = (self._session_config or {}).get("container_limits", {})
+            value = int(limits.get("max_containers", default))
+        except (AttributeError, TypeError, ValueError):
+            return default
+        if value < 1:
+            log("WARNING", "docker.container_manager",
+                f"Configured max_containers ({value}) is invalid; clamping to 1")
+            return 1
+        return value
+
+    def _counts_toward_limit(self, entry) -> bool:
+        """Whether a container entry occupies a persistent-ceiling slot.
+
+        Two independent filters must both pass:
+        * terminal states (exited/dead/removing) free a slot so a stuck or
+          crashed container never blocks a fresh create; and
+        * only ``persistent``-class containers consume the per-workspace
+          ceiling -- ``resource`` and ``ephemeral`` containers are excluded
+          (classified via the shared ``lifecycle_class_from_labels`` helper).
+        Unknown/new statuses count (fail-safe: default to occupying a slot).
+
+        The terminal-state filter is delegated to the shared
+        ``consumes_workspace_slot`` predicate (single SSOT shared with the
+        registry and the admission gate); the persistent-only filter stays
+        local because the shared predicate treats ``resource`` as consuming.
+        """
+        entry = entry or {}
+        cls = lifecycle_class_from_labels(
+            entry.get("labels"),
+            name=entry.get("name"),
+            image_tags=entry.get("image"),
+            vault_root=getattr(self, "vault_root", None),
+        )
+        if cls != LIFECYCLE_PERSISTENT:
+            return False
+        return consumes_workspace_slot(
+            lifecycle_class=cls,
+            status=entry.get("status"),
+            exists=True,
+        )
+
+    def _active_containers(self, entries):
+        """Filter container entries down to those that occupy a limit slot."""
+        return [e for e in (entries or []) if self._counts_toward_limit(e)]
+
+    @staticmethod
+    def _resolve_vault_root(vault_root=None):
+        """Resolve the vault root directory (bulletin board + config storage).
+
+        Precedence: explicit ``vault_root`` kwarg -> ``THOUGHTMACHINE_VAULT_ROOT``
+        env var -> ``~/.thoughtmachine``. Returns an absolute path string.
+        """
+        if vault_root:
+            return os.path.abspath(os.path.expanduser(str(vault_root)))
+        env = os.environ.get("THOUGHTMACHINE_VAULT_ROOT")
+        if env:
+            return os.path.abspath(os.path.expanduser(env))
+        return str(Path.home() / ".thoughtmachine")
+
+    # ── Sticky-note bulletin board (per-workspace JSON file) ───────────
+    def _notes_path(self):
+        """Path of the per-workspace container_notes.json bulletin board."""
+        vault_root = getattr(self, "vault_root", None) or str(Path.home() / ".thoughtmachine")
+        return Path(vault_root) / "workspaces" / str(self.workspace_id) / "container_notes.json"
+
+    def _load_container_notes(self):
+        """Load the sticky-note bulletin board; returns a dict, NEVER raises.
+
+        Reads ``<vault_root>/workspaces/<workspace_id>/container_notes.json``
+        (name -> {"note": str}). Missing file -> {}; corrupt file -> WARNING log
+        + {}; non-dict values are normalized to {"note": str(value or "")}.
+        """
+        notes_path = self._notes_path()
+        try:
+            if not notes_path.exists():
+                return {}
+            with open(notes_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                log("WARNING", "docker.container_manager",
+                    f"Container notes {notes_path} is not a JSON object; ignoring")
+                return {}
+            normalized = {}
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    normalized[key] = {"note": str(value.get("note") or "")}
+                else:
+                    normalized[key] = {"note": str(value or "")}
+            return normalized
+        except (ValueError, OSError) as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to read container notes {notes_path}: {e}")
+            return {}
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"Unexpected error loading container notes {notes_path}: {e}")
+            return {}
+
+    def _warn_note_once(self, key, message):
+        """Log *message* at WARNING at most once per *key* (module-scoped).
+
+        Because a fresh ``ContainerManager`` is built for every tool call, the
+        "already warned" memo lives at MODULE scope (``_NOTES_WARNED``) so the
+        dedup actually holds across calls.
+        """
+        with _NOTES_MEMO_LOCK:
+            if key in _NOTES_WARNED:
+                return
+            _NOTES_WARNED.add(key)
+        log("WARNING", "docker.container_manager", message)
+
+    def _record_id_from_labels(self, labels):
+        """Return the record id carried by *labels*, or None.
+
+        The record id is the value of the ``RECORD_LABEL_KEY``
+        (``thoughtmachine.container_id``) label; an absent or empty value yields
+        None. Never raises.
+        """
+        try:
+            value = (labels or {}).get(RECORD_LABEL_KEY)
+        except Exception:
+            return None
+        if not value:
+            return None
+        return str(value)
+
+    def _record_id_for(self, container):
+        """Return the record id for a docker *container* object, or None.
+
+        Reads the container's labels (``container.labels`` when available, else
+        ``container.attrs["Config"]["Labels"]``). Never raises: any lookup
+        failure yields None.
+        """
+        if container is None:
+            return None
+        labels = getattr(container, "labels", None)
+        if not labels:
+            try:
+                attrs = getattr(container, "attrs", None) or {}
+                labels = (attrs.get("Config") or {}).get("Labels")
+            # R18: deliberately NOT narrowed. `_record_id_for` is a best-effort
+            # identity probe whose contract is "never raises; any lookup failure
+            # yields None" (see docstring + tests/test_container_start_drift.py (g)).
+            except Exception:
+                labels = None
+        return self._record_id_from_labels(labels)
+
+    def _emit_oom_event(self, container, *, exit_code=_EXEC_OOM_EXIT_CODE,
+                        require_oom_killed=False):
+        """Best-effort record event when a command exits 137 (OOM signature).
+
+        Uses a DISTINCT event type (``_EXEC_OOM_EVENT``) so an OOM kill is
+        never mistaken for the drift signals; the payload carries the exit
+        code, the container's lifecycle class, the DECLARED ``mem_limit``
+        budget, and ``OOMKilled`` when readable from the daemon. Never raises
+        and never affects the exec result.
+
+        ``exit_code`` defaults to the exit-137 OOM signature; the whole-
+        container death path passes the daemon-reported ``State.ExitCode``
+        when obtainable. When ``require_oom_killed`` is set the event is
+        emitted ONLY if the daemon confirms ``State.OOMKilled`` is True (a
+        whole-container death is an OOM only when the flag is set). A failure
+        to write the record event is logged at WARNING and swallowed; it must
+        never mask the original error.
+        """
+        try:
+            record_id = self._record_id_for(container)
+            if not record_id or not getattr(self, "workspace_id", None):
+                return
+            oom_killed = self._container_oom_killed(container)
+            if require_oom_killed and oom_killed is not True:
+                return
+            payload = {
+                "exit_code": exit_code,
+                "lifecycle_class": self.class_of(container),
+                "mem_limit": getattr(self, "mem_limit", None),
+            }
+            if oom_killed is not None:
+                payload["oom_killed"] = oom_killed
+            from thoughtmachine.container_record import append_event
+
+            append_event(
+                self.workspace_id, str(record_id),
+                _EXEC_OOM_EVENT, _EXEC_OOM_ACTOR, **payload,
+            )
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to record OOM event for container "
+                f"{getattr(container, 'id', '?')!r}: {type(e).__name__}: {e}")
+
+    @staticmethod
+    def _container_oom_killed(container):
+        """Best-effort OOMKilled flag from a container's live attrs, or None.
+
+        Reloads the container so a fresh ``State`` snapshot is read, then
+        returns ``State.OOMKilled`` when it is a bool. A structurally absent
+        key, a non-dict State, or an unreadable/reloading container yields
+        ``None`` (the caller then simply omits the field). Never raises.
+        """
+        try:
+            reload = getattr(container, "reload", None)
+            if callable(reload):
+                reload()
+            attrs = getattr(container, "attrs", None)
+            if not isinstance(attrs, dict):
+                return None
+            state = attrs.get("State")
+            if not isinstance(state, dict) or "OOMKilled" not in state:
+                return None
+            value = state.get("OOMKilled")
+            return bool(value) if isinstance(value, bool) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _container_exit_code(container):
+        """Best-effort ``State.ExitCode`` from a container's live attrs, or None.
+
+        Reads the container's current ``State.ExitCode`` when it is an int
+        (used by the whole-container death path to report the exit code where
+        obtainable). A structurally absent key, a non-dict State, or an
+        unreadable container yields ``None`` (the caller then falls back to the
+        137 OOM signature). Never raises.
+        """
+        try:
+            reload = getattr(container, "reload", None)
+            if callable(reload):
+                reload()
+            attrs = getattr(container, "attrs", None)
+            if not isinstance(attrs, dict):
+                return None
+            state = attrs.get("State")
+            if not isinstance(state, dict):
+                return None
+            value = state.get("ExitCode")
+            return value if isinstance(value, int) else None
+        except Exception:
+            return None
+
+    def _record_id_for_name(self, name):
+        """Resolve a record id for a container *name* via the docker client.
+
+        Returns None when the name is falsy, the lookup fails, or the container
+        carries no record label. Never raises.
+        """
+        if not name:
+            return None
+        try:
+            container = self.client.containers.get(name)
+        # A missing name is the docker SDK's NotFound; anything else must surface.
+        except NotFound:
+            return None
+        return self._record_id_for(container)
+
+    def _read_note(self, container_or_name):
+        """Return the sticky note for a container; returns '' and NEVER raises.
+
+        A docker container OBJECT is preferred (no extra daemon round-trip):
+        the note is read from the container RECORD, located via the
+        ``thoughtmachine.container_id`` label. When no record id can be
+        resolved, a READ-ONLY look at the legacy ``container_notes.json``
+        sidecar is used as a fallback (a WARNING is logged once).
+        """
+        if isinstance(container_or_name, str):
+            name = container_or_name
+            record_id = self._record_id_for_name(name)
+        else:
+            container = container_or_name
+            name = getattr(container, "name", None)
+            record_id = self._record_id_for(container)
+        if record_id:
+            try:
+                # Records live in the DEFAULT vault (SSOT); never thread a
+                # manager vault_root into the record store.
+                record = load_record(self.workspace_id, record_id)
+            except Exception:
+                return ""
+            if record is None:
+                return ""
+            return str(getattr(record, "notes", "") or "")
+        # No record: read-only legacy sidecar fallback (never written).
+        if name:
+            try:
+                entry = (self._load_container_notes() or {}).get(name) or {}
+                note = str(entry.get("note") or "")
+            except Exception:
+                note = ""
+            if note:
+                self._warn_note_once(
+                    ("notes.legacy_sidecar_read", self.workspace_id, name),
+                    f"Container note for {name!r} served from the legacy "
+                    f"container_notes.json sidecar (no container record); "
+                    f"recreate the container to adopt the note onto its record.")
+                return note
+        return ""
+
+    def _write_note(self, record_id, note):
+        """Persist *note* as the container RECORD's ``notes`` field; NEVER raises.
+
+        The note is record-owned, so it survives container recreation. FAIL
+        CLOSED: with no record id the write is REFUSED (a WARNING is logged) and
+        NOTHING is persisted -- the legacy sidecar is never written. A real
+        error from the record store is logged, not raised (a ``RuntimeError``
+        such as a safety barrier is NOT swallowed).
+        """
+        if not record_id:
+            self._warn_note_once(
+                ("notes.no_record_write_refused", self.workspace_id),
+                f"Refusing to persist a container note for workspace "
+                f"{self.workspace_id!r}: no container record id (the container "
+                f"carries no {RECORD_LABEL_KEY} label).")
+            return
+        try:
+            # Records live in the DEFAULT vault (SSOT); never thread a
+            # manager vault_root into the record store.
+            update_record(self.workspace_id, record_id, notes=note)
+        except (ContainerRecordError, RecordLocked, RecordNotFound,
+                OSError, ValueError) as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to write note for record {record_id} "
+                f"(workspace {self.workspace_id}): {e}")
+
+    def _migrate_legacy_notes_once(self):
+        """Adopt legacy ``container_notes.json`` notes onto records (once).
+
+        For every sidecar entry whose container resolves to a record with an
+        EMPTY ``notes`` field, copy the sidecar note onto the record; a record
+        that already has a note WINS (never overwritten). Adopted/rederived
+        names are dropped from the sidecar, which is rewritten atomically (or
+        removed once empty). Idempotent: a second run is a fixed point, and a
+        workspace with no sidecar returns immediately.
+        """
+        if self.workspace_id in _NOTES_MIGRATED:
+            return
+        with _NOTES_MEMO_LOCK:
+            if self.workspace_id in _NOTES_MIGRATED:
+                return
+            _NOTES_MIGRATED.add(self.workspace_id)
+        try:
+            legacy = self._load_container_notes()
+        except Exception:
+            legacy = {}
+        if not legacy:
+            return
+        remaining = dict(legacy)
+        changed = False
+        for name, entry in legacy.items():
+            note = str((entry or {}).get("note") or "")
+            record_id = self._record_id_for_name(name)
+            if not record_id:
+                continue
+            try:
+                # Records live in the DEFAULT vault (SSOT); never thread a
+                # manager vault_root into the record store.
+                record = load_record(self.workspace_id, record_id)
+            except Exception:
+                continue
+            if record is None:
+                continue
+            existing = str(getattr(record, "notes", "") or "")
+            if existing == "" and note != "":
+                try:
+                    # Records live in the DEFAULT vault (SSOT); never thread a
+                    # manager vault_root into the record store.
+                    update_record(self.workspace_id, record_id, notes=note)
+                except Exception as e:
+                    log("WARNING", "docker.container_manager",
+                        f"Failed to adopt legacy note for record {record_id}: {e}")
+                    continue
+            # The record now owns the note (adopted, or already present).
+            remaining.pop(name, None)
+            changed = True
+        if changed:
+            self._rewrite_legacy_notes(remaining)
+
+    def _rewrite_legacy_notes(self, remaining):
+        """Rewrite (or remove) the legacy sidecar after migration; NEVER raises."""
+        notes_path = self._notes_path()
+        try:
+            if remaining:
+                notes_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = notes_path.with_suffix(".json.tmp")
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(remaining, f, indent=2)
+                os.replace(tmp_path, notes_path)
+            else:
+                try:
+                    os.unlink(notes_path)
+                except FileNotFoundError:
+                    pass
+        except OSError as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to rewrite legacy container notes {notes_path}: {e}")
+
+    # ── Container-name index (record-first identity, schema v3) ─────────
+    def _ensure_name_index(self):
+        """Build the workspace-scoped ``(name) -> record id`` index ONCE.
+
+        Mirrors the notes memo discipline (module-scoped so dedup holds across
+        the fresh ``ContainerManager`` built per tool call).  Building from
+        ``list_records`` keeps it off the boot path (first start/set_note in a
+        workspace triggers it).  Never raises.
+        """
+        if self.workspace_id in _NAME_INDEX_BUILT:
+            return
+        with _NAME_INDEX_LOCK:
+            if self.workspace_id in _NAME_INDEX_BUILT:
+                return
+            _NAME_INDEX_BUILT.add(self.workspace_id)
+        try:
+            records = list_records(self.workspace_id)
+        except Exception:
+            records = []
+        for record in records or []:
+            self._name_index_add(record)
+
+    def _name_index_add(self, record):
+        """Record *record*'s name in the (workspace, name) index.
+
+        The record-first create paths hold a record id (not a record object),
+        so they call :meth:`_name_index_register` directly; this thin adapter
+        keeps the ``list_records``/migration callers unchanged.
+        """
+        self._name_index_register(
+            getattr(record, "name", ""), getattr(record, "id", None))
+
+    def _name_index_register(self, name, record_id):
+        """Index ``(workspace, name) -> record_id`` (in-memory).
+
+        A second record id claiming the same (workspace, name) marks the key as
+        COLLIDED (ambiguous identity) rather than silently overwriting.  A
+        falsy name or record id is ignored (an unbound identity is never
+        indexed).
+        """
+        name = str(name or "")
+        if not name or not record_id:
+            return
+        key = (self.workspace_id, name)
+        with _NAME_INDEX_LOCK:
+            existing = _NAME_INDEX.get(key)
+            if existing is None:
+                _NAME_INDEX[key] = record_id
+            elif existing != record_id:
+                _NAME_INDEX_COLLISIONS.add(key)
+
+    def _name_index_forget(self, record_id):
+        """Drop every index entry pointing at *record_id* (module helper)."""
+        _name_index_forget(record_id)
+
+    def _record_for_name(self, name):
+        """Return the record id indexed for *name* in this workspace, or None.
+
+        Returns None when the name is falsy, unindexed, or AMBIGUOUS (a
+        collision recorded for the same (workspace, name)).
+        """
+        if not name:
+            return None
+        key = (self.workspace_id, name)
+        with _NAME_INDEX_LOCK:
+            if key in _NAME_INDEX_COLLISIONS:
+                return None
+            return _NAME_INDEX.get(key)
+
+    def _name_collision(self, name):
+        """Return True when *name* is ambiguous (>=2 records) in this ws."""
+        if not name:
+            return False
+        with _NAME_INDEX_LOCK:
+            return (self.workspace_id, name) in _NAME_INDEX_COLLISIONS
+
+    def _migrate_records_v3_once(self):
+        """Backfill the ``name`` identity field onto v1/v2 records (once).
+
+        Sources each record's name from the LIVE container's
+        ``thoughtmachine.container_name`` label (record WINS: a record that
+        already carries a name is never overwritten). A record whose container
+        cannot be located / carries no name label is LEFT UNSET (no synthesis,
+        per the migration constraint). One-shot per workspace; idempotent.
+        """
+        if self.workspace_id in _NAME_MIGRATED:
+            return
+        with _NAME_INDEX_LOCK:
+            if self.workspace_id in _NAME_MIGRATED:
+                return
+            _NAME_MIGRATED.add(self.workspace_id)
+        try:
+            records = list_records(self.workspace_id)
+        except Exception:
+            records = []
+        labels_by_docker_id = {}
+        try:
+            for entry in self.list_containers():
+                cid = str(entry.get("container_id") or "")
+                cname = (entry.get("labels") or {}).get(CONTAINER_NAME_LABEL)
+                if cid and cname:
+                    labels_by_docker_id[cid] = str(cname)
+        except Exception:
+            labels_by_docker_id = {}
+        for record in records or []:
+            if str(getattr(record, "name", "") or ""):
+                self._name_index_add(record)  # record wins; just (re)index it
+                continue
+            cname = labels_by_docker_id.get(
+                str(getattr(record, "docker_id", "") or ""))
+            if not cname:
+                continue  # leave UNSET (no synthesis)
+            try:
+                updated = update_record(self.workspace_id, record.id, name=cname)
+            except Exception:
+                continue
+            self._name_index_add(updated)
+
+    # ── Public API ─────────────────────────────────────────────────────────
+    def start(self, image=None, name=None, note=None, worker_name=None, *,
+              lifecycle_class: str = LIFECYCLE_PERSISTENT,
+              allow_fresh: bool = False,
+              heal_missing: bool = False,
+              created_by: str | None = None,
+              network_mode: str | None = None,
+              workspace_mode: str | None = None):
+        """Ensure a running container exists and return {"id", "name", "status", "note"}.
+
+        Reuse order: in-memory registry -> label lookup -> fresh create.
+
+        ``lifecycle_class`` records the lifecycle of a FRESH-created container's
+        record; the default (``persistent``) is non-destructive, so only callers
+        that KNOW the container is ephemeral pass ``ephemeral`` explicitly.
+
+        ``worker_name`` (optional) stamps the container with the
+        ``thoughtmachine.worker`` ownership label - but only on a FRESH
+        create: reuse paths return before the label dict is built, so an
+        existing container keeps whatever labels it was created with. Workers
+        use this label to reclaim their containers at teardown (see
+        tools/workspace/worker.py).
+
+        ``note`` is an optional sticky note: it is persisted as the ``notes``
+        field of the container's RECORD (located via the
+        ``thoughtmachine.container_id`` Docker label) - never to Docker labels -
+        and returned in the response. On reuse, a new note overwrites the
+        record's note.
+
+        Desired isolation (network_mode, workspace_mode) is computed ONCE from
+        the session permissions BEFORE any reuse path.  A drifted container is
+        NEVER mutated here: when its live isolation differs from the resolved
+        policy but is not MORE permissive it is REUSED with a ``drift`` detail
+        attached to the response; when it is MORE permissive than the resolved
+        policy the container is REFUSED (``{"error": ..., "drift": ...}``) so
+        the caller can act, instead of being silently reused or removed.
+
+        ``allow_fresh`` (operator-only) recreates a record's container when the
+        record names one that no longer exists.  ``heal_missing`` (agent-only,
+        default False) is its auto-heal counterpart: when a record names a
+        ``docker_id`` with no live container AND the record's lifecycle class
+        does not own its own container lifecycle, ONE snapshot-sourced rebuild
+        is attempted, the attempt is memoised (so a persistently failing heal
+        refuses thereafter), and on success a ``container_record_auto_recreated``
+        event is emitted.  A failed heal never raises and falls through to the
+        ordinary refusal.
+
+        ``created_by`` (optional) is the creator attribution stamped on the
+        container as the ``thoughtmachine.created_by`` Docker label.  Defaults
+        to ``agent:session:<self.session_id>`` (or ``system:container_manager``
+        when this manager has no session -- e.g. the web UI's operator-driven
+        recreate, which therefore passes a value explicitly).
+
+        RECREATE CONTRACT: a caller that destroys and rebuilds an existing
+        container must pass the container's ORIGINAL creator -- read off the
+        live container's ``thoughtmachine.created_by`` label BEFORE the
+        destroy -- not the actor performing the rebuild.  The record stores no
+        creator field, so that label is the only surviving source of origin;
+        omitting it silently relabels an agent-created container as owned by
+        whoever resized it.
+
+        ``network_mode`` / ``workspace_mode`` (both optional) RESTORE a recorded
+        isolation envelope on the operator recreate path (``allow_fresh``).  The
+        record's persisted ``intent_snapshot`` is the rebuild source there, so
+        the caller passes the recorded envelope explicitly instead of letting the
+        CURRENT policy decide: the web-UI manager carries no session
+        (``session_permissions=None``), so a policy-computed envelope resolves to
+        the most restrictive pair and would silently downgrade a rebuilt
+        container.  Only the two ``allow_fresh`` fresh-create sites consume these
+        (an ordinary create ignores them entirely): they do NOT replace
+        ``_compute_config`` and are never consulted for reuse, naming, or the
+        drift comparison.  Empty/``None`` means "no recorded envelope => use the
+        resolved policy", so a create with no override is byte-for-byte
+        unchanged and stays fail-closed.
+        """
+        # Root-host refusal: the container user MUST match the host user so
+        # bind-mounted workspace files are owned correctly. A host running as
+        # root (uid 0) cannot be matched to a non-root in-container user, so we
+        # refuse up front rather than silently falling back to a fixed user.
+        # Route through the single host-id source of truth: on Windows
+        # _host_ids() returns None (no uid concept), so there is no root host
+        # to refuse.
+        ids = _host_ids()
+        if ids is not None and ids[0] == 0:
+            return {
+                "error": "Refusing to start a container from the host root "
+                         "user (uid 0); the container user must match a "
+                         "non-root host user.",
+                "code": "root_host_unsupported",
+            }
+
+        # Adopt any legacy container_notes.json entries onto records before we
+        # read/write notes below (idempotent; a no-op once per workspace).
+        self._migrate_legacy_notes_once()
+
+        # Capture the caller-supplied image BEFORE defaulting, so image-reuse
+        # honesty can tell an explicit request from the manager default.
+        explicit_image = image
+        image = image or self.image
+
+        # Hidden resource containers (tm-res-*) are never addressable through
+        # the generic container manager. Reject a CALLER-supplied resource name
+        # BEFORE any workspace_path/config access so the refusal is cheap and
+        # side-effect free (the builder below never emits a tm-res- name).
+        if name is not None and str(name).startswith(RESOURCE_NAME_PREFIX):
+            return {"error": "Resource container access denied"}
+
+        # Desired isolation (all paths). Computed BEFORE the name so the
+        # resolved envelope can be folded into the container name below.
+        computed = self._compute_config(
+            self.workspace_path,
+            self.workspace_id,
+            self.session_permissions,
+            lifecycle_class,
+        )
+        want_network, want_workspace = computed
+        want_effective = getattr(computed, "effective", None)
+
+        # Envelope RESTORE for the operator recreate path (``allow_fresh``).
+        # ``_compute_config`` above stays the single policy source for the
+        # container NAME (env_hash), the cached permissions and the drift
+        # comparison; the recorded envelope below only overrides the isolation
+        # the rebuilt container is actually created with, and only when the
+        # caller supplied one (an empty/absent value keeps the computed pair).
+        _restore_network = network_mode or None
+        _restore_workspace = workspace_mode or None
+        _restored_envelope = bool(_restore_network or _restore_workspace)
+        _recreate_network = _restore_network or want_network
+        _recreate_workspace = _restore_workspace or want_workspace
+
+        # Name is keyed by lifecycle class and (for ephemeral) session; the envelope (network_mode, workspace_mode) is part of the name via env_hash, not consulted separately at reuse time.
+        if name is None:
+            dex = _load_docker_executor()
+            name = dex.build_container_name(
+                self.workspace_path,
+                lifecycle_class,
+                session_id=self.session_id,
+                network_mode=want_network,
+                workspace_mode=want_workspace,
+            )
+
+        # Hidden resource containers (tm-res-*) are never addressable through
+        # the generic container manager — they are owned by the resource
+        # container manager and must stay invisible here.
+        if str(name).startswith(RESOURCE_NAME_PREFIX):
+            return {"error": "Resource container access denied"}
+
+        # Phase 3: workspace-scoped reuse + container-limit enforcement BEFORE
+        # any create. An existing container with the same name is reused as-is
+        # (never counted against the limit); otherwise the active (non-terminal)
+        # container count for THIS workspace decides whether a new one may be
+        # created.
+
+        # ── Record-first identity ladder (schema v3) ─────────────────────────
+        # The container RECORD is the source of truth for identity: a name
+        # resolves to a record via the workspace-scoped index, and the record's
+        # ``docker_id`` names the live container.  The in-memory
+        # ``self._containers`` dict is a read-through CACHE only.  The old
+        # ``_find_by_labels`` lookup stays available but is deliberately NOT on
+        # the identity path here.
+        self._ensure_name_index()
+        self._migrate_records_v3_once()
+
+        # (d) Ambiguous name: >=2 records share (workspace, name) -> REFUSE.
+        if self._name_collision(name):
+            self._warn_note_once(
+                ("name.collision", self.workspace_id, name),
+                f"Refusing start({name!r}) in workspace {self.workspace_id!r}: "
+                f"multiple container records share this name (ambiguous "
+                f"identity).")
+            _audit("CONTAINER_NAME_COLLISION",
+                   f"name={name} workspace_id={self.workspace_id}")
+            return {"error": (f"Container name {name!r} is ambiguous in this "
+                              f"workspace: multiple records share it."),
+                    "code": "container_name_collision"}
+
+        record_id = self._record_for_name(name)
+        if record_id:
+            record = None
+            try:
+                record = load_record(self.workspace_id, record_id)
+            except Exception:
+                record = None
+            docker_id = str(getattr(record, "docker_id", "") or "") if record else ""
+            # C3: 'container_record_not_healable' is a CLASS-only refusal; this
+            # defaults False and is set True only for a KNOWN class that owns its
+            # own lifecycle (resource/service).  Initialised here so the step-(a)
+            # heal refusal stays safe even if the live container vanished between
+            # the two _reuse_container lookups.
+            _heal_class_owns = False
+            # Reuse-sourcing for the recreate path: an OPERATOR-persisted
+            # resource intent (``mem_limit`` / ``cpu_quota`` on the record's
+            # ``intent_snapshot``) is honoured when the fresh container is
+            # rebuilt for this record.  An absent / evidence-less snapshot or a
+            # missing key falls back to the instance defaults (pass ``None``),
+            # so ordinary fresh creates are byte-for-byte unchanged.
+            _reuse_intent = getattr(record, "intent_snapshot", None) if record else None
+            if not snapshot_has_evidence(_reuse_intent):
+                _reuse_intent = None
+            _reuse_mem_limit = (_reuse_intent or {}).get("mem_limit") or None
+            _reuse_cpu_quota = (_reuse_intent or {}).get("cpu_quota") or None
+            if docker_id and self._reuse_container(docker_id)[0] is None:
+                # C3: a KNOWN class that OWNS its lifecycle (resource/service) is
+                # the ONLY class-based heal refusal; an unknown class is treated
+                # as owning (fail-closed) but is NEVER reported as 'not healable'.
+                try:
+                    _owns = policy_for(record.lifecycle_class).own_lifecycle is True
+                    _heal_class_owns = _owns
+                except UnknownLifecycleClass:
+                    _owns = True   # fail-closed: unknown class -> do NOT write to the record
+                    _heal_class_owns = False
+                if heal_missing and self._heal_eligible(record, docker_id):
+                    pass  # branch (a) below runs the Edge-4 heal path
+                elif not _owns:
+                    self._reconcile_record_unbound(
+                        name, record_id, docker_id, reason="container_absent"
+                    )
+                    docker_id = ""
+            if not docker_id:
+                # allow_fresh is operator-only (recreate path). Do not set in
+                # worker/agent code paths - the refusal is the fail-closed
+                # default.
+                if allow_fresh:
+                    return self._fresh_start(
+                        created_by=created_by,
+                        image=image, name=name, note=note, worker_name=None,
+                        lifecycle_class=lifecycle_class,
+                        network_mode=_recreate_network,
+                        workspace_mode=_recreate_workspace,
+                        reuse_record_id=record_id,
+                        permissions=want_effective,
+                        restored_envelope=_restored_envelope,
+                        mem_limit=_reuse_mem_limit,
+                        cpu_quota=_reuse_cpu_quota)
+                # (b) Record exists but names no container yet -> REFUSE.
+                self._warn_note_once(
+                    ("name.record_without_container", self.workspace_id, name),
+                    f"Refusing start({name!r}): its record {record_id} carries no "
+                    f"docker_id (no bound container).")
+                _audit("CONTAINER_START_NO_CONTAINER_RECORD",
+                       f"name={name} record_id={record_id} "
+                       f"workspace_id={self.workspace_id}")
+                return {"error": ("Container record is unbound — the underlying "
+                                  "container no longer exists. Recovery: an "
+                                  "agent cannot heal it with `heal=True` once "
+                                  "the record is unbound; an operator can "
+                                  "recreate it via the record's recreate "
+                                  "action."),
+                        "code": HEAL_OUTCOME_UNBOUND}
+            # (a) Record + docker_id: reuse via the record's docker id.
+            container, _reuse_running = self._reuse_container(docker_id)
+            if container is None:
+                if allow_fresh:
+                    return self._fresh_start(
+                        created_by=created_by,
+                        image=image, name=name, note=note, worker_name=None,
+                        lifecycle_class=lifecycle_class,
+                        network_mode=_recreate_network,
+                        workspace_mode=_recreate_workspace,
+                        reuse_record_id=record_id,
+                        permissions=want_effective,
+                        restored_envelope=_restored_envelope,
+                        mem_limit=_reuse_mem_limit,
+                        cpu_quota=_reuse_cpu_quota)
+                # Guardrail 5: auto-heal is reachable ONLY from this
+                # container_missing path (never on drift).  It is the agent
+                # counterpart to the operator-only allow_fresh recreate above
+                # (which, when set, wins).  On success _heal_missing returns the
+                # created-container payload; on any refusal/failure it returns
+                # None and we fall through to the byte-identical refusal below.
+                if heal_missing and self._heal_eligible(record, docker_id):
+                    healed = self._heal_missing(
+                        name=name, record_id=record_id, stale_docker_id=docker_id,
+                        image=image, note=note, lifecycle_class=lifecycle_class,
+                        record=record)
+                    if healed is not None:
+                        return healed
+                self._emit_stale_docker_id_drift_once(
+                    name, record_id, docker_id, "record")
+                # C3 INVARIANT (class-only, heal-requested-only): when a heal was
+                # explicitly requested and the ONLY reason it was refused is the
+                # record's class owning its own lifecycle (resource/service), we
+                # surface the distinct 'container_record_not_healable' code.  An
+                # unknown class, a memoised attempt, or heal_missing=False keep
+                # the ordinary 'container_record_container_missing' code below.
+                if heal_missing and _heal_class_owns:
+                    return {"error": (f"Container {name!r} record {record_id} "
+                                      f"names docker_id {docker_id!r} but no "
+                                      f"such container exists; this record is "
+                                      f"not healable (its lifecycle class owns "
+                                      f"its own container lifecycle). Recovery: "
+                                      f"an agent cannot heal it with "
+                                      f"`heal=True`; an operator can recreate "
+                                      f"it via the record's recreate action."),
+                            "code": HEAL_OUTCOME_NOT_HEALABLE}
+                return {"error": (f"Container {name!r} record {record_id} names "
+                                  f"docker_id {docker_id!r} but no such container "
+                                  f"exists. Recovery: an agent can heal it with "
+                                  f"`heal=True`; an operator can recreate it via "
+                                  f"the record's recreate action."),
+                        "code": HEAL_OUTCOME_CONTAINER_MISSING}
+            if _reuse_running:
+                self._containers[name] = container.id  # warm the read-through cache
+            if (explicit_image is not None
+                    and not self._image_matches(container, explicit_image)):
+                actual = self._image_ref(container)
+                msg = (f"Container `{name}` exists with image {actual}; cannot reuse "
+                       f"with image {explicit_image}. Remove it first or use a different name.")
+                log("WARNING", "docker.container_manager", msg)
+                _audit("CONTAINER_REUSE_IMAGE_MISMATCH",
+                       f"name={name} id={container.id} actual={actual} "
+                       f"requested={explicit_image} source=record")
+                return {"error": msg}
+            _action, _payload = self._start_drift_decision(
+                container, want_network, want_workspace, "record",
+                lifecycle_class=lifecycle_class,
+            )
+            if _action == "deny":
+                return _payload
+            if _action == "recreate":
+                # Recreate trigger = a HARDENING weakness (see
+                # _start_drift_decision): the live container is too weak and must
+                # be destroyed+recreated.  The destroy is an explicit reap intent
+                # routed through the lifecycle funnel, which emits ONE
+                # CONTAINER_LIFECYCLE decision and returns action="reap".  A
+                # (defensive) non-destroy decision is HONOURED: the weak
+                # container is left in place and start() falls through to reuse.
+                _recreate_decision = ContainerLifecycle.reconcile(
+                    container, self.session_permissions,
+                    ContainerIntent(
+                        kind="reap",
+                        explicit=True,
+                        reason="start_recreate",
+                        force=True,
+                        workspace_id=self.workspace_id,
+                        session_id=self.session_id,
+                    ),
+                )
+                if _recreate_decision.destroys:
+                    _removed_id = getattr(container, "id", None)
+                    emit_destroy_audit(
+                        _audit, "container_manager.start_recreate", container,
+                        reason="start_recreate")
+                    try:
+                        container.remove(force=True)
+                    except Exception as exc:
+                        log("WARNING", "docker.container_manager",
+                            f"Recreate: failed to remove weak container "
+                            f"{_removed_id!r} for {name!r}: {exc}")
+                    _audit("CONTAINER_CREATE",
+                           f"source=recreate+remove name={name} "
+                           f"removed_id={_removed_id} session={self.session_id} "
+                           f"workspace_id={self.workspace_id}")
+                    return self._fresh_start(
+                        created_by=created_by,
+                        image=image, name=name, note=note, worker_name=worker_name,
+                        lifecycle_class=lifecycle_class,
+                        network_mode=want_network, workspace_mode=want_workspace,
+                        reuse_record_id=record_id,
+                        permissions=want_effective,
+                        mem_limit=_reuse_mem_limit,
+                        cpu_quota=_reuse_cpu_quota,
+                    )
+                log("WARNING", "docker.container_manager",
+                    f"start: lifecycle funnel refused recreate of {name!r} "
+                    f"(action={_recreate_decision.action!r} "
+                    f"reason={_recreate_decision.reason!r}); "
+                    f"reusing the existing container")
+            if note is not None:
+                self._write_note(self._record_id_for(container), note)
+            note_value = (note if note is not None else self._read_note(container))
+            _audit("CONTAINER_REUSE_OK",
+                   f"source=record name={name} id={container.id} session={self.session_id}")
+            self._emit_container_reused_once(record_id, container.id)
+            log_container_event("started", container_id=container.id,
+                                session_id=self.session_id or "",
+                                data={"image": self._image_ref(container),
+                                      "name": name, "status": "reused"})
+            _reuse_resp = {"id": container.id, "name": name, "status": "reused",
+                           "note": note_value}
+            if _payload is not None:
+                _reuse_resp["drift"] = _payload
+            if not _reuse_running:
+                # VERIFIED state: only claim a plain reuse when the container was
+                # observed running; otherwise surface the unverified state.
+                _reuse_resp["running"] = False
+            return _reuse_resp
+
+        # (c) Cached name with NO record -> drift: REFUSE (no-container-record).
+        if name in self._containers:
+            container_id = self._containers.get(name)
+            self._warn_note_once(
+                ("name.cache_without_record", self.workspace_id, name),
+                f"Refusing start({name!r}): cached container {container_id!r} has "
+                f"no container record (drift: cache/record divergence).")
+            _audit("CONTAINER_START_NO_CONTAINER_RECORD",
+                   f"name={name} container_id={container_id} "
+                   f"workspace_id={self.workspace_id} source=cache")
+            return {"error": (f"Container {name!r} has no container record; "
+                              f"refusing to start (drift)."),
+                    "code": "container_no_record",
+                    "drift": {"reason": "cached container without a record"}}
+
+        # No record for *name*: fall through to the legacy reuse/create paths
+        # below (a fresh create records the name via record_creation).
+        containers = self.list_containers()
+        for entry in containers:
+            if entry["name"] == name:
+                note_value = note if note is not None else entry.get("note", "")
+                container = None
+                try:
+                    container = self.client.containers.get(entry["container_id"])
+                except Exception:
+                    container = None
+                # Image honesty: an explicitly-requested image that differs from
+                # the existing container's image cannot be honoured by reuse (the
+                # image is fixed at create). Surface it instead of silently
+                # returning a container running the wrong image. Do NOT remove
+                # the container on mismatch.
+                if (container is not None and explicit_image is not None
+                        and not self._image_matches(container, explicit_image)):
+                    actual = self._image_ref(container)
+                    msg = (f"Container `{name}` exists with image {actual}; cannot reuse "
+                           f"with image {explicit_image}. Remove it first or use a different name.")
+                    log("WARNING", "docker.container_manager", msg)
+                    _audit("CONTAINER_REUSE_IMAGE_MISMATCH",
+                           f"name={name} id={container.id} actual={actual} "
+                           f"requested={explicit_image} source=workspace-label")
+                    return {"error": msg}
+                # A drifted container (network or /workspace mount no longer
+                # matches the session permissions) is never silently reused and
+                # never mutated here: a not-more-permissive mismatch is reused
+                # with a drift detail attached; a more-permissive one is refused
+                # (see _start_drift_decision; mirrors the registry/label checks
+                # below).
+                _start_drift = None
+                _reuse_running = False
+                if container is not None:
+                    _action, _payload = self._start_drift_decision(
+                        container, want_network, want_workspace, "workspace-label",
+                        lifecycle_class=lifecycle_class,
+                    )
+                    if _action == "deny":
+                        return _payload
+                    if _action == "recreate":
+                        # HARDENING weakness -> destroy+recreate.  The destroy is
+                        # an explicit reap intent routed through the lifecycle
+                        # funnel (ONE CONTAINER_LIFECYCLE event).  A non-destroy
+                        # decision is HONOURED: fall through to reuse.
+                        _recreate_decision = ContainerLifecycle.reconcile(
+                            container, self.session_permissions,
+                            ContainerIntent(
+                                kind="reap",
+                                explicit=True,
+                                reason="start_recreate",
+                                force=True,
+                                workspace_id=self.workspace_id,
+                                session_id=self.session_id,
+                            ),
+                        )
+                        if _recreate_decision.destroys:
+                            _removed_id = getattr(container, "id", None)
+                            emit_destroy_audit(
+                                _audit, "container_manager.start_recreate",
+                                container, reason="start_recreate")
+                            try:
+                                container.remove(force=True)
+                            except Exception as exc:
+                                log("WARNING", "docker.container_manager",
+                                    f"Recreate: failed to remove weak container "
+                                    f"{_removed_id!r} for {name!r}: {exc}")
+                            _audit("CONTAINER_CREATE",
+                                   f"source=recreate+remove name={name} "
+                                   f"removed_id={_removed_id} "
+                                   f"session={self.session_id} "
+                                   f"workspace_id={self.workspace_id}")
+                            return self._fresh_start(
+                                created_by=created_by,
+                                image=image, name=name, note=note,
+                                worker_name=worker_name,
+                                lifecycle_class=lifecycle_class,
+                                network_mode=want_network,
+                                workspace_mode=want_workspace,
+                                reuse_record_id=None,
+                                permissions=want_effective,
+                            )
+                        log("WARNING", "docker.container_manager",
+                            f"start: lifecycle funnel refused recreate of "
+                            f"{name!r} "
+                            f"(action={_recreate_decision.action!r} "
+                            f"reason={_recreate_decision.reason!r}); "
+                            f"reusing the existing container")
+                    if _action == "reuse":
+                        _start_drift = _payload
+                    try:
+                        _reuse_running = self._ensure_running(container)
+                    except Exception:
+                        _reuse_running = False
+                if note is not None:
+                    _rid = (self._record_id_for(container)
+                            if container is not None
+                            else self._record_id_for_name(name))
+                    self._write_note(_rid, note)
+                _audit("CONTAINER_REUSE_OK",
+                       f"source=workspace-label name={name} id={entry['container_id']} "
+                       f"session={self.session_id}")
+                # Resolve the record id from data already in hand (the
+                # container object) and only fall back to the NAME-based
+                # daemon lookup when a docker client is actually present.
+                # A hand-built manager that bypasses __init__ (no ``.client``)
+                # must never crash here: the emission is best-effort and the
+                # record id is left unresolved (nothing emitted).
+                _reused_rid = None
+                if container is not None:
+                    _reused_rid = self._record_id_for(container)
+                elif getattr(self, "client", None) is not None:
+                    _reused_rid = self._record_id_for_name(name)
+                self._emit_container_reused_once(_reused_rid, entry["container_id"])
+                log_container_event("started", container_id=entry["container_id"],
+                                    session_id=self.session_id or "",
+                                    data={"image": self._image_ref(container),
+                                          "name": name, "status": "reused"})
+                _reuse_resp = {**entry, "status": "reused", "id": entry["container_id"],
+                               "note": note_value}
+                if _start_drift is not None:
+                    _reuse_resp["drift"] = _start_drift
+                if not _reuse_running:
+                    # VERIFIED state: only claim a plain reuse when the container
+                    # was observed running; otherwise surface the unverified state.
+                    _reuse_resp["running"] = False
+                return _reuse_resp
+        limit = self._get_max_containers()
+        active_containers = self._active_containers(containers)
+        if len(active_containers) >= limit:
+            log("WARNING", "docker.container_manager",
+                f"Workspace container limit reached: active={len(active_containers)} "
+                f"exited={len(containers) - len(active_containers)} limit={limit} "
+                f"workspace_id={self.workspace_id}")
+            return {"error": f"Workspace container limit reached "
+                             f"({len(active_containers)}/{limit} consuming "
+                             f"container(s)); remove an existing container with "
+                             f"ContainerRemoveTool to free a slot"}
+
+        # ── Desired isolation from session permissions (all paths) ─────────
+        computed = self._compute_config(
+            self.workspace_path,
+            self.workspace_id,
+            self.session_permissions,
+            lifecycle_class,
+        )
+        network_mode, workspace_mode = computed
+        effective = getattr(computed, "effective", None)
+        _audit("CONTAINER_CONFIG",
+               f"name={name} network={network_mode} workspace={workspace_mode} "
+               f"session=[REDACTED {_redact_permission_shape(self.session_permissions)}] "
+               f"workspace_id={self.workspace_id}")
+        # Explicit-grant guard: never silently fail-closed on a session that
+        # explicitly granted write access — surface it loudly instead.
+        sp = self.session_permissions or {}
+        if sp.get("network") in ("write", "outbound") and network_mode != "bridge":
+            log("WARNING", "docker.container_manager",
+                f"Session grants network={sp.get('network')} but gate returned "
+                f"network_mode={network_mode} (workspace_id={self.workspace_id}) "
+                f"— fail-closed; workspace capabilities restrict this session "
+                f"or the security gate errored (see docker.security_gate).")
+        if sp.get("filesystem") in ("write", "full") and workspace_mode != "rw":
+            log("WARNING", "docker.container_manager",
+                f"Session grants filesystem={sp.get('filesystem')} but gate "
+                f"returned workspace_mode={workspace_mode} "
+                f"(workspace_id={self.workspace_id}) "
+                f"— fail-closed; workspace capabilities restrict this session "
+                f"or the security gate errored (see docker.security_gate).")
+
+        # 2) Label lookup (survives manager restarts)
+        container = self._find_by_labels(name)
+        if container is not None:
+            # Image honesty (see workspace-label path).
+            if (explicit_image is not None
+                    and not self._image_matches(container, explicit_image)):
+                actual = self._image_ref(container)
+                msg = (f"Container `{name}` exists with image {actual}; cannot reuse "
+                       f"with image {explicit_image}. Remove it first or use a different name.")
+                log("WARNING", "docker.container_manager", msg)
+                _audit("CONTAINER_REUSE_IMAGE_MISMATCH",
+                       f"name={name} id={container.id} actual={actual} "
+                       f"requested={explicit_image} source=label")
+                return {"error": msg}
+            _action, _payload = self._start_drift_decision(
+                container, network_mode, workspace_mode, "label",
+                lifecycle_class=lifecycle_class,
+            )
+            if _action == "deny":
+                return _payload
+            if _action == "recreate":
+                # Recreate trigger = a HARDENING weakness (see
+                # _start_drift_decision).  The destroy is an explicit reap intent
+                # routed through the lifecycle funnel (ONE CONTAINER_LIFECYCLE
+                # event).  A non-destroy decision is HONOURED: fall through to
+                # reuse the existing container.
+                _recreate_decision = ContainerLifecycle.reconcile(
+                    container, self.session_permissions,
+                    ContainerIntent(
+                        kind="reap",
+                        explicit=True,
+                        reason="start_recreate",
+                        force=True,
+                        workspace_id=self.workspace_id,
+                        session_id=self.session_id,
+                    ),
+                )
+                if _recreate_decision.destroys:
+                    _removed_id = getattr(container, "id", None)
+                    emit_destroy_audit(
+                        _audit, "container_manager.start_recreate", container,
+                        reason="start_recreate")
+                    try:
+                        container.remove(force=True)
+                    except Exception as exc:
+                        log("WARNING", "docker.container_manager",
+                            f"Recreate: failed to remove weak container "
+                            f"{_removed_id!r} for {name!r}: {exc}")
+                    _audit("CONTAINER_CREATE",
+                           f"source=recreate+remove name={name} "
+                           f"removed_id={_removed_id} session={self.session_id} "
+                           f"workspace_id={self.workspace_id}")
+                    return self._fresh_start(
+                        created_by=created_by,
+                        image=image, name=name, note=note, worker_name=worker_name,
+                        lifecycle_class=lifecycle_class,
+                        network_mode=network_mode, workspace_mode=workspace_mode,
+                        reuse_record_id=None,
+                        permissions=effective,
+                    )
+                log("WARNING", "docker.container_manager",
+                    f"start: lifecycle funnel refused recreate of {name!r} "
+                    f"(action={_recreate_decision.action!r} "
+                    f"reason={_recreate_decision.reason!r}); "
+                    f"reusing the existing container")
+            _reuse_running = self._ensure_running(container)
+            if _reuse_running:
+                self._containers[name] = container.id
+            if note is not None:
+                self._write_note(self._record_id_for(container), note)
+            note_value = (note if note is not None
+                          else self._read_note(container))
+            _audit("CONTAINER_REUSE_OK",
+                   f"source=label name={name} id={container.id} session={self.session_id}")
+            self._emit_container_reused_once(self._record_id_for(container),
+                                             container.id)
+            log_container_event("started", container_id=container.id,
+                                session_id=self.session_id or "",
+                                data={"image": self._image_ref(container),
+                                      "name": name, "status": "reused"})
+            _reuse_resp = {"id": container.id, "name": name, "status": "reused",
+                           "note": note_value}
+            if _payload is not None:
+                _reuse_resp["drift"] = _payload
+            if not _reuse_running:
+                # VERIFIED state: only claim a plain reuse when the container was
+                # observed running; otherwise surface the unverified state.
+                _reuse_resp["running"] = False
+            return _reuse_resp
+
+        # 3) Fresh create: one shared creation path.
+        return self._fresh_start(
+            created_by=created_by,
+            image=image, name=name, note=note, worker_name=worker_name,
+            lifecycle_class=lifecycle_class,
+            network_mode=network_mode, workspace_mode=workspace_mode,
+            permissions=effective,
+        )
+
+    def _run_container(self, *, image, name, labels, mounts, tmpfs,
+                       network_mode, lifecycle_class,
+                       mem_limit=None, cpu_quota=None):
+        """Create one container via the daemon (the single ``run`` call site).
+
+        ``labels`` must already carry any record-owned label; the caller binds
+        the record to the returned container.  Returns the created container.
+        """
+        # The hardening values come from the canonical recipe in
+        # ``infra.container_create``; ``user`` is re-resolved from THIS module's
+        # ``host_user`` seam (the legacy, monkeypatchable seam the ownership
+        # tests pin) so the Windows ``"0:0"`` fallback and the POSIX
+        # pass-through are preserved unchanged.
+        _recipe = _expected_hardening_recipe()
+        hardening = _HardeningRecipe(
+            cap_drop=_recipe.cap_drop,
+            security_opt=_recipe.security_opt,
+            read_only=_recipe.read_only,
+            user=(host_user() or "0:0"),
+        )
+        spec = ContainerCreateSpec(
+            image=image,
+            command=["tail", "-f", "/dev/null"],
+            name=name,
+            container_type="user",
+            lifecycle_class=lifecycle_class,
+            hardening=hardening,
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+            labels=labels,
+            environment={"PYTHONUSERBASE": "/home/agent/.local"},
+            mounts=_mount_specs_from_docker_mounts(mounts),
+            tmpfs=tmpfs,
+            network_mode=network_mode,
+            mem_limit=mem_limit if mem_limit is not None else self.mem_limit,
+            cpu_quota=cpu_quota if cpu_quota is not None else self.cpu_quota,
+            oom_score_adj=1000,  # user containers are the first OOM-kill victims
+        )
+        return create_hardened_container(
+            self.client, spec, admission=None, record=False
+        ).container
+
+    def _cache_container(self, name, container):
+        """Reload a freshly created container and warm the read-through cache."""
+        try:
+            container.reload()
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_cache_container: container.reload() failed for {name!r} "
+                f"(id={getattr(container, 'id', '?')}): {type(e).__name__}: {e}")
+        self._containers[name] = container.id
+        return container
+
+    def _image_absent_message(self, image):
+        """One precise paragraph explaining a local-first image refusal.
+
+        Names the resolved image ref, states that NO pull was attempted,
+        points at the Dockerfile the image must be built from (rendered
+        relative, never as an absolute host path), and gives
+        the exact remedy -- including the trap that a TAG-omitted build
+        produces the workspace-hashed ``agent-executor-<hash>`` tag, which is
+        NOT the default start image ``agent-executor``.
+        """
+        # Same resolution as ``build_image`` (vault-managed Dockerfile first,
+        # legacy workspace-path Dockerfile second) -- mirrored, not shared, so
+        # ``build_image``'s behaviour is untouched.
+        vault_dockerfile = (
+            Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "Dockerfile"
+        )
+        # The path is RENDERED RELATIVE to the anchor it was resolved against,
+        # so the message never echoes an absolute host path.
+        display_dockerfile = f"workspaces/{self.workspace_id}/Dockerfile"
+        if not vault_dockerfile.exists():
+            legacy = Path(self.workspace_path) / "Dockerfile"
+            if legacy.exists():
+                vault_dockerfile = legacy
+                display_dockerfile = f"{Path(self.workspace_path).name}/Dockerfile"
+        # The tag a TAG-omitted ContainerBuildTool() actually produces, from
+        # the single tag convention (docker_executor._compute_image_tag).
+        hashed_tag = "agent-executor-" + hashlib.sha256(
+            self.workspace_path.encode()).hexdigest()[:16]
+        return (
+            f"Image {image!r} is not present locally, and NO pull was "
+            "attempted: container start is local-first, so an absent image is "
+            "refused instead of being fetched implicitly by docker-py's "
+            "containers.run. Build it from the Dockerfile at "
+            f"{display_dockerfile} and tag it explicitly with "
+            f"ContainerBuildTool(tag={image!r}). Warning: "
+            "ContainerBuildTool() with no tag builds "
+            f"{hashed_tag!r} instead (the "
+            "agent-executor-<sha256(workspace_path)[:16]> convention), which "
+            "is NOT the start image -- always pass the tag explicitly."
+        )
+
+    def _fresh_start(self, *, image, name, note, worker_name, lifecycle_class,
+                     network_mode, workspace_mode, reuse_record_id=None,
+                     permissions=None, mem_limit=None, cpu_quota=None,
+                     created_by: str | None = None,
+                     restored_envelope: bool = False):
+        """Create exactly one container (the single fresh-create path).
+
+        With ``reuse_record_id`` unset a NEW record is minted alongside the
+        container (the legacy fresh create).  With ``reuse_record_id`` set the
+        container is created for, and bound to, that EXISTING record instead -
+        the operator-only recreate path: no new record is minted, the record's
+        docker_id/state are rebound, and the name index keeps pointing at the
+        same record id.
+
+        ``restored_envelope`` marks ``network_mode``/``workspace_mode`` as a
+        RECORDED creation intent being restored (not a value resolved by the
+        current policy).  It only affects the admission step below: a policy
+        narrowing (``Transform``) of the network mode is NOT applied, because
+        re-creating a container with the envelope it was admitted with is not a
+        new envelope request.  A ``Deny`` still refuses, and the default
+        (``False``) path is byte-for-byte unchanged.
+        """
+        # Creator attribution for THIS container instance.  Derived
+        # here (the ONE fresh-create path) rather than in the
+        # caller, so an explicit ``created_by`` from ``start`` and
+        # the session default can never disagree.
+        _created_by = created_by or agent_created_by(
+            self.session_id, caller="container_manager")
+
+        # Route through the single host-id source of truth: on Windows
+        # _host_ids() returns None (no uid concept), so there is no root host
+        # to refuse.
+        ids = _host_ids()
+        if ids is not None and ids[0] == 0:
+            raise RuntimeError(
+                "root_host_unsupported: refusing to create a container for the "
+                "host root user (uid 0)"
+            )
+        home_tmpfs = "rw,exec,size=256M"
+        if ids is not None:
+            home_tmpfs += f",uid={ids[0]},gid={ids[1]}"
+        tmpfs = {
+            "/tmp": EXEC_TMPFS_OPTIONS,
+            "/home/agent": home_tmpfs,
+        }
+        shadow = git_shadow_for_workspace(
+            self.workspace_path,
+            git_shadow_mask_path(self.workspace_id) if self.workspace_id else None,
+        )
+        tmpfs.update(shadow.tmpfs)
+
+        mounts = [
+            Mount(
+                target="/workspace", source=self.workspace_path, type="bind",
+                read_only=(workspace_mode != "rw"),
+            ),
+            # Per-workspace package cache volume (mirrors docker_executor).
+            Mount(
+                target="/home/agent/.local",
+                source=f"tm-packages-{self.workspace_id}",
+                type="volume",
+            ),
+        ]
+        for _shadow_mount in shadow.mounts:
+            mounts.append(
+                Mount(
+                    target=_shadow_mount.target,
+                    source=_shadow_mount.source,
+                    type=_shadow_mount.type,
+                    read_only=_shadow_mount.read_only,
+                )
+            )
+
+        labels = {
+            CONTAINER_NAME_LABEL: name,
+            "thoughtmachine.workspace_id": self.workspace_id,
+            CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
+            # Creator attribution for THIS instance.  On a healthy create this
+            # is the creating session's identity; on a RECREATE it must be the
+            # container's ORIGIN, which the recreating caller passes explicitly
+            # after reading the live container's label BEFORE destroying it (the
+            # record holds no creator field, so that label is the only surviving
+            # source -- stamping whoever performed the rebuild instead would
+            # silently rewrite the container's origin).
+            CREATED_BY_LABEL: _created_by,
+        }
+        if worker_name:
+            # Ownership label: lets a worker reclaim the containers it created
+            # at teardown. The value is the worker's owner identity
+            # ("<session_id or 'unknown'>:<worker_name>") stamped VERBATIM;
+            # teardown compares the label value EXACTLY (mismatched/stale
+            # values are ignored).
+            #
+            # Class-gated: the worker label is a TEARDOWN-OWNERSHIP marker
+            # only. Non-ephemeral creates (persistent/service/resource) are
+            # long-lived and must NOT be reaped by worker teardown, so they
+            # never carry it. Ephemeral creates are byte-for-byte unchanged.
+            if lifecycle_class == LIFECYCLE_EPHEMERAL:
+                labels["thoughtmachine.worker"] = worker_name
+            # Self-heal: a crashed/hung worker session may have left stale
+            # containers behind (same owner identity, created/exited/dead).
+            # Remove them BEFORE the fresh create so a name collision can
+            # never block a worker respawn. Best-effort: a failure here must
+            # not block the spawn.
+            try:
+                cleanup_stale_worker_containers(self.client, worker_name)
+            except Exception as exc:
+                log("WARNING", "docker.container_manager",
+                    f"Stale worker container cleanup failed for {worker_name}: {exc}")
+        _audit("CONTAINER_CREATE",
+               f"image={image} network={network_mode} name={name} session={self.session_id}")
+
+        # Admission control (phase 2): the create is a terminal
+        # container-create site, so gate it through the pure admission gate
+        # before touching the daemon.  Fail closed: a ``Deny`` returns an
+        # error dict; a ``Transform`` may only narrow the network mode.
+        _admission_spec = ContainerSpec(
+            container_type="user",
+            lifecycle_class=lifecycle_class,
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+            # The image is operator-configured (``self.image``, defaulting to
+            # ``DEFAULT_IMAGE``), so gating it against the user-image allowlist is
+            # a tautology; image enforcement lives upstream.
+            image=None,
+            name=name,
+            mem_limit=self.mem_limit,
+            cpu_quota=self.cpu_quota,
+            oom_score_adj=1000,
+            network_mode=network_mode,
+            read_only=True,
+        )
+        _admission_request = AdmissionRequest(
+            spec=_admission_spec,
+            permissions=self.session_permissions or {},
+            capabilities=_load_capabilities(self.workspace_id),
+            session_config=getattr(self, "_session_config", None),
+        )
+        _decision = admit(_admission_request, probes=ClientProbes(self.client))
+        if isinstance(_decision, Deny):
+            return {"error": _decision.message, "code": _decision.code}
+        if isinstance(_decision, Transform):
+            if restored_envelope:
+                # The create RESTORES a recorded envelope: the policy-derived
+                # narrowing would downgrade a container that was admitted with
+                # that exact envelope when the record was first created, so it is
+                # reported and NOT applied.  A Deny above still refuses, and a
+                # create with no restored envelope keeps the narrowing verbatim.
+                _audit("CONTAINER_CREATE_ENVELOPE_RESTORED",
+                       f"name={name} workspace_id={self.workspace_id} "
+                       f"network={network_mode} workspace={workspace_mode} "
+                       f"policy_narrowed_to={_decision.spec.network_mode}")
+            else:
+                network_mode = _decision.spec.network_mode
+
+        if reuse_record_id is not None:
+            # Operator-only recreate: bind the fresh container to the EXISTING
+            # record (no new record, no delete; the name index is untouched).
+            labels.update(record_label(reuse_record_id))
+            # Local-first image guard: place the refusal BEFORE the create site
+            # so a recreate never reaches ``containers.run`` (which would pull).
+            if _local_image_present(self.client, image) is False:
+                return {"error": self._image_absent_message(image),
+                        "code": "image_not_present_locally"}
+            container = self._run_container(
+                image=image, name=name, labels=labels, mounts=mounts,
+                tmpfs=tmpfs, network_mode=network_mode,
+                lifecycle_class=lifecycle_class,
+                mem_limit=mem_limit, cpu_quota=cpu_quota)
+            # Guardrail 7: fill the record's intent snapshot from the fresh
+            # container in the SAME attach call — but ONLY when the record
+            # carries no intent snapshot yet (FILL-ONCE), and only when the live
+            # inspect payload carries real evidence.  The evidence gate is the
+            # shared, public ``snapshot_has_evidence`` helper (imported from the
+            # container_record package) — it is the single definition of the
+            # evidence rule.  attach_container writes the snapshot whenever the
+            # kwarg is not None, so an all-empty snapshot would clobber the
+            # record's good snapshot with ``{}``; omit the kwarg otherwise,
+            # leaving the record's existing (good) snapshot untouched.
+            #
+            # INTENTIONAL DIVERGENCE from hook.record_creation().attach(): that
+            # path applies its "a natively-authored snapshot wins" (fill-once)
+            # rule from the in-memory record handle; here we re-read the record
+            # via ``load_record`` and apply the SAME fill-once rule verbatim — an
+            # OPERATOR write to the record's ``intent_snapshot`` (e.g. the
+            # resources PATCH endpoint) MUST survive the recreate and be
+            # honoured at rebuild, so a record that ALREADY carries a snapshot
+            # WINS and is never overwritten from the freshly created container.
+            _has_existing_snapshot = False
+            try:
+                _existing_record = load_record(self.workspace_id, reuse_record_id)
+                _has_existing_snapshot = bool(
+                    getattr(_existing_record, "intent_snapshot", None))
+            except Exception:
+                _has_existing_snapshot = False
+            _snapshot = None
+            if not _has_existing_snapshot:
+                try:
+                    _candidate = snapshot_from_attrs(
+                        getattr(container, "attrs", None))
+                    if snapshot_has_evidence(_candidate):
+                        _snapshot = _candidate
+                except Exception:
+                    _snapshot = None
+            if _snapshot is not None:
+                _live_user_attr = None
+                try:
+                    _live_user_attr = (
+                        (getattr(container, "attrs", None) or {})
+                        .get("Config", {})
+                        .get("User")
+                    )
+                except Exception:
+                    _live_user_attr = None
+                # INVARIANT: the snapshot's user is ONLY ever the live container's
+                # OBSERVED user (its inspect Config.User). A policy value must
+                # never be fabricated into the snapshot — an unobserved key stays
+                # "" (mirroring snapshot_from_attrs, which leaves unobserved keys
+                # ""). Never reintroduce an ``or host_user()`` fallback here.
+                _snapshot["user"] = _live_user_attr or ""
+            _attach_kwargs = {"state": "running"}
+            if _snapshot is not None:
+                _attach_kwargs["intent_snapshot"] = _snapshot
+            attach_container(self.workspace_id, reuse_record_id, container.id,
+                             **_attach_kwargs)
+            container = self._cache_container(name, container)
+            # The record keeps the authored snapshot (fill-once); reconcile the
+            # observable keys against the container that was just created so a
+            # re-created record never describes a container that cannot exist.
+            _reobserve_effective_intent(
+                self.workspace_id, reuse_record_id, container)
+            if note is not None:
+                self._write_note(reuse_record_id, note)
+            _audit("CONTAINER_CREATE",
+                   f"source=recreate image={image} name={name} "
+                   f"record_id={reuse_record_id} session={self.session_id} "
+                   f"workspace_id={self.workspace_id}")
+            ContainerLifecycle.record_create(
+                container,
+                reason="container_created",
+                contributing_source="container_manager.create",
+                workspace_id=self.workspace_id,
+                session_id=self.session_id,
+            )
+            log_container_event("started", container_id=container.id,
+                                session_id=self.session_id or "",
+                                data={"image": image, "name": name,
+                                      "status": "created",
+                                      "mem_limit": self.mem_limit,
+                                      "oom_score_adj": 1000,
+                                      "lifecycle_class": lifecycle_class})
+            return {"id": container.id, "name": name, "status": "created",
+                    "note": note or ""}
+
+        # Local-first image guard: probed BEFORE the record is minted, so an
+        # absent image refuses the create without leaving an orphan record.
+        if _local_image_present(self.client, image) is False:
+            return {"error": self._image_absent_message(image),
+                    "code": "image_not_present_locally"}
+        with record_creation(
+            workspace_id=self.workspace_id,
+            lifecycle_class=lifecycle_class,
+            labels=labels,
+            name=name,
+            permissions=permissions,
+            created_by=_created_by,
+        ) as record:
+            container = self._run_container(
+                image=image, name=name, labels=labels, mounts=mounts,
+                tmpfs=tmpfs, network_mode=network_mode,
+                lifecycle_class=lifecycle_class,
+                mem_limit=mem_limit, cpu_quota=cpu_quota)
+            record.attach(container, state=STATE_RUNNING)
+            # Best-effort: reconcile the live-observable intent keys with the
+            # snapshot the attach just derived (a no-op when they agree, which
+            # is the normal case — the record is never the source of a change).
+            _reobserve_effective_intent(
+                self.workspace_id, getattr(record, "id", ""), container)
+            # Record-first identity: index the freshly minted record so a
+            # subsequent start(name=...) reuses it instead of re-creating.
+            self._name_index_register(name, getattr(record, "id", ""))
+        container = self._cache_container(name, container)
+        if note is not None:
+            self._write_note(self._record_id_for(container), note)
+        ContainerLifecycle.record_create(
+            container,
+            reason="container_created",
+            contributing_source="container_manager.create",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        log_container_event("started", container_id=container.id,
+                            session_id=self.session_id or "",
+                            data={"image": image, "name": name, "status": "created",
+                                  "mem_limit": self.mem_limit,
+                                  "oom_score_adj": 1000,
+                                  "lifecycle_class": lifecycle_class})
+        return {"id": container.id, "name": name, "status": "created",
+                "note": note or ""}
+
+    def exec(self, container_id, command, timeout=30, workdir="/workspace", environment=None):
+        """Run ``command`` in the container; returns {"stdout","stderr","exit_code"}."""
+        container = self.client.containers.get(container_id)
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            raise PermissionError(_denial)
+
+        # ── Exec-path drift admission (fail-closed) ─────────────────────────────────
+        # Deny when the LIVE container is more permissive than a RESOLVED session
+        # policy; warn (and continue) when it differs but is not more
+        # permissive.  Anything that leaves the policy UNPROVABLE FAILS CLOSED
+        # (refused): an unresolvable policy, an unreadable container isolation,
+        # and any unexpected classifier error.  We do not run what we cannot
+        # prove is allowed.
+        _drift_action, _drift_payload = self._check_exec_drift(container, container_id)
+        if _drift_action == "deny":
+            return _drift_payload
+        _exec_drift = _drift_payload if _drift_action == "warn" else None
+
+        # Phase 2: disk quota guard for the persistent package cache.
+        quota_mb = (getattr(self, "workspace_config", None) or {}).get("disk_quota_mb", 4096)
+        if quota_mb and quota_mb > 0 and self._exceeds_disk_quota(container, quota_mb):
+            return {
+                "stdout": "",
+                "stderr": f"Package volume exceeds disk quota ({quota_mb} MB). Please clean up unused packages.",
+                "exit_code": 1,
+            }
+
+        # Ensure the requested working directory exists (writable by agent)
+        if workdir != "/workspace":
+            # Route through the single host-id source of truth: on Windows
+            # _host_ids() returns None (no uid concept); omit the chown there.
+            ids = _host_ids()
+            if ids is not None:
+                _mkdir = f"mkdir -p {workdir} && chown {ids[0]}:{ids[1]} {workdir}"
+            else:
+                _mkdir = f"mkdir -p {workdir}"
+            container.exec_run(
+                ["sh", "-c", _mkdir],
+                workdir="/workspace",
+            )
+
+        exec_kwargs = {
+            "cmd": ["/bin/sh", "-c", command],
+            "demux": True,
+            "workdir": workdir,
+        }
+        merged_env = merge_container_identity_env(
+            environment,
+            session_id=self.session_id,
+            workspace_id=self.workspace_id,
+            git_identity=workspace_git_identity(self.workspace_id),
+        )
+        if merged_env:
+            exec_kwargs["environment"] = merged_env
+
+        result_queue = queue.Queue()
+
+        def _run():
+            try:
+                exit_code, output = container.exec_run(**exec_kwargs)
+                result_queue.put((exit_code, output, None))
+            except Exception as e:
+                result_queue.put((None, None, e))
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        # ── Interruptible wait ──────────────────────────────────────────────
+        # The exec itself runs on the daemon thread above; what used to block
+        # here was a SINGLE full-timeout ``join``, so a Stop pressed mid-command
+        # could not be honoured until the timeout expired.  Wait in short slices
+        # instead and poll the CURRENT TURN's cancellation token between them
+        # (0.5 s: quick enough that a Stop feels immediate, coarse enough that we
+        # are not spinning a core through a 300 s command).
+        #
+        # Interrupting the WAIT is all that happens here.  The in-container
+        # process was never launched as a killable handle (``exec_run`` hands us
+        # no handle to signal), so this does NOT kill the container, does NOT
+        # drop it and does NOT claim the command was cancelled: it reports that
+        # we stopped waiting on a process that may still be running.  Real
+        # cleanup would need the exec id captured from ``exec_inspect`` (or the
+        # in-container pid) and signalled explicitly -- future work, not this
+        # layer's business.
+        _WAIT_SLICE_SECONDS = 0.5
+        try:  # per-thread turn token; a no-op when nothing is bound
+            from tools.cancellation import cancel_reason as _cancel_reason
+            from tools.cancellation import is_interrupted as _is_interrupted
+        except Exception:  # pragma: no cover - tools package is a hard dep
+            def _is_interrupted():
+                return False
+
+            def _cancel_reason():
+                return None
+
+        def _interrupt_reason():
+            """Why this turn was cancelled: thread-local reason first, then the event's."""
+            reason = _cancel_reason()
+            if reason:
+                return reason
+            try:
+                from tools.cancellation import _active_event
+                return getattr(_active_event(), "reason", None) or "turn_cancelled"
+            except Exception:  # pragma: no cover - defensive
+                return "turn_cancelled"
+
+        _wait_started = time.monotonic()
+        _deadline = _wait_started + timeout
+        while thread.is_alive():
+            thread.join(max(0.0, min(_WAIT_SLICE_SECONDS, _deadline - time.monotonic())))
+            if not thread.is_alive():
+                break
+            if _is_interrupted():
+                return {
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "reason": _interrupt_reason(),
+                    "exec": "container_exec",
+                    "container_id": container_id,
+                    "command": command,
+                    "elapsed": round(time.monotonic() - _wait_started, 3),
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "",
+                    "note": (
+                        "Stopped WAITING because the turn was cancelled. The "
+                        "process inside the container was NOT killed and may "
+                        "still be running: interrupting the wait cannot kill a "
+                        "process that was never launched as a killable handle."
+                    ),
+                }
+            if time.monotonic() >= _deadline:
+                break
+
+        if thread.is_alive():
+            try:
+                container.kill()
+            except Exception:
+                pass
+            self._drop_container(container_id)
+            raise TimeoutError(f"Command timed out after {timeout} seconds")
+
+        try:
+            exit_code, output, error = result_queue.get_nowait()
+        except queue.Empty:
+            raise RuntimeError("Execution thread finished but no result")
+        if error is not None:
+            if isinstance(error, APIError):
+                # Whole-container death: the daemon raises APIError (e.g. the
+                # container was OOM-killed and is no longer running). Emit the
+                # SAME distinct OOM event as the exit-137 path, but ONLY when
+                # the daemon confirms the container was OOM-killed, then
+                # re-raise so the exec contract is unaffected.
+                _state_exit = self._container_exit_code(container)
+                self._emit_oom_event(
+                    container,
+                    exit_code=(_state_exit if _state_exit is not None
+                               else _EXEC_OOM_EXIT_CODE),
+                    require_oom_killed=True,
+                )
+            raise error
+
+        stdout = output[0].decode(errors="replace") if output and output[0] else ""
+        stderr = output[1].decode(errors="replace") if output and output[1] else ""
+        # Phase 6: persistent usage log (best-effort; never affects the result).
+        self._append_usage_log(container_id, command)
+        # A2 observability: a command exiting 137 (128 + SIGKILL) is the OOM
+        # signature. Emit a DISTINCT record event (never folded into
+        # drift.container_absent) carrying the exit code, the container's
+        # lifecycle class and the DECLARED memory budget, plus OOMKilled when
+        # the daemon reports it. Best-effort: this must never affect the result.
+        if exit_code == _EXEC_OOM_EXIT_CODE:
+            self._emit_oom_event(container)
+        result = {
+            "stdout": _truncate_output(stdout),
+            "stderr": _truncate_output(stderr),
+            "exit_code": exit_code,
+        }
+        if _exec_drift is not None:
+            result["drift"] = _exec_drift
+        return result
+
+    def _check_exec_drift(self, container, container_id):
+        """Classify the live container's isolation vs the session policy.
+
+        Returns one of:
+          ("run", None)           — no observable drift; run as today.
+          ("warn", drift_dict)    — drift seen; run, attaching drift_dict.
+          ("deny", response_dict) — live is MORE permissive; return the dict
+                                    WITHOUT running the command.
+
+        The session policy is resolved with ``strict=True``: when the policy
+        SSOT is unavailable, an unresolvable policy PROVES NOTHING about the
+        live container, so we cannot certify the exec is within policy and
+        FAIL CLOSED --- the command is REFUSED (exit 126, deny payload with no
+        ``drift`` key) with a WARNING, an audit record and a record event.
+
+        The live container's isolation is read with ``strict=True`` too, for the
+        same reason: an attrs read that RAISES means we cannot tell what the
+        container is isolated to, so the command is REFUSED the same way
+        (``reason="attrs_unresolved"``).  Isolation fields that are
+        STRUCTURALLY ABSENT (legible attrs, missing keys) stay a deliberate,
+        non-jurisdiction RUN case — that is NOT a refusal.
+
+        Finally, any OTHER exception raised by the classifier is ALSO
+        fail-closed (``reason="classifier_unresolved"``): the ruling is that we
+        do not run what we cannot prove is allowed, so a classifier error must
+        not be dressed up as an availability trade-off that runs the command.
+        """
+        try:
+            # User axis (fail-closed): a live container whose user differs from
+            # the host policy user runs as an unintended user -> DENY.
+            _user_axis = _user_drift_axis(container, host_user())
+            if _user_axis is not None:
+                _udec, _ureason, _udetail = _user_axis
+                if _udec == "deny":
+                    message = (
+                        "Container user is MORE PERMISSIVE than the host "
+                        f"policy ({_ureason}: expected {_udetail['expected']} "
+                        f"got {_udetail['actual']}); refusing to run the "
+                        "command."
+                    )
+                    return "deny", {
+                        "stdout": "",
+                        "stderr": f"{message}\nreason={_ureason}",
+                        "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                        "drift": {
+                            "drifted": True,
+                            "decision": _udec,
+                            "reason": _ureason,
+                            "user": _udetail,
+                        },
+                    }
+            # Hardening-recipe drift admission (fail-closed): a container whose
+            # docker HARDENING axes (cap_drop / security_opt / read_only rootfs /
+            # user) are weaker than the frozen recipe is strictly MORE PERMISSIVE
+            # than a fresh create would be, so REFUSE the command.  The
+            # network/workspace isolation can MATCH while hardening has drifted,
+            # so this gate runs BEFORE the ``_config_matches`` early-return below.
+            hardening_failures = _hardening_conformance(
+                container, _expected_hardening_recipe()
+            )
+            # ``_hardening_conformance`` reports UNREADABLE attrs as the distinct
+            # sentinel ``["attrs_unreadable"]``.  That condition is already refused
+            # by the pre-existing ``attrs_unresolved`` branch below, so strip the
+            # sentinel here to REUSE that branch -- never duplicate it.  Only REAL
+            # failing axes are acted on by this gate.
+            real_hardening_failures = [
+                f for f in hardening_failures if f != "attrs_unreadable"
+            ]
+            if real_hardening_failures:
+                failed_axes = ", ".join(real_hardening_failures)
+                hmessage = (
+                    "Container hardening is MORE PERMISSIVE than the host "
+                    f"recipe (failing axes: {failed_axes}); refusing to run the "
+                    "command."
+                )
+                try:
+                    log("WARNING", "docker.container_manager",
+                        "container hardening drifted "
+                        f"({failed_axes}); refusing to run (fail-closed)")
+                except Exception:
+                    pass
+
+                try:
+                    _audit(_EXEC_DRIFT_AUDIT,
+                           "container hardening drifted; refusing exec")
+                except Exception:
+                    pass
+
+                try:
+                    labels = getattr(container, "labels", None) or {}
+                    record_id = labels.get(RECORD_LABEL_KEY)
+                    if record_id is not None and getattr(self, "workspace_id", None):
+                        from thoughtmachine.container_record import append_event
+                        append_event(
+                            self.workspace_id,
+                            str(record_id),
+                            _EXEC_DRIFT_EVENT,
+                            _EXEC_DRIFT_ACTOR,
+                            decision="deny",
+                            reason="hardening_drift",
+                            detail=("failing hardening axes: "
+                                    + failed_axes),
+                            detected_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                except Exception:
+                    pass
+
+                return "deny", {
+                    "stdout": "",
+                    "stderr": f"{hmessage}\nreason=hardening_drift",
+                    "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                    "drift": {
+                        "drifted": True,
+                        "decision": "deny",
+                        "reason": "hardening_drift",
+                        "hardening": {"failed": list(real_hardening_failures)},
+                    },
+                }
+
+            try:
+                want_net, want_ws = self._compute_config(
+                    getattr(self, "workspace_path", None),
+                    getattr(self, "workspace_id", None),
+                    getattr(self, "session_permissions", None),
+                    LIFECYCLE_PERSISTENT,
+                    strict=True,
+                )
+            except Exception as exc:
+                # The policy SSOT could NOT be resolved at all.  This proves
+                # nothing about the live container, so we CANNOT certify the
+                # exec is within policy -> FAIL CLOSED and refuse the command.
+                try:
+                    log("WARNING", "docker.container_manager",
+                        "session policy could not be resolved "
+                        f"({exc!r}); refusing to run (fail-closed)")
+                except Exception:
+                    pass
+
+                try:
+                    _audit(_EXEC_DRIFT_AUDIT,
+                           "session policy could not be resolved; refusing exec")
+                except Exception:
+                    pass
+
+                try:
+                    labels = getattr(container, "labels", None) or {}
+                    record_id = labels.get(RECORD_LABEL_KEY)
+                    if record_id is not None and getattr(self, "workspace_id", None):
+                        from thoughtmachine.container_record import append_event
+                        append_event(
+                            self.workspace_id,
+                            str(record_id),
+                            _EXEC_DRIFT_EVENT,
+                            _EXEC_DRIFT_ACTOR,
+                            decision="deny",
+                            reason="policy_unresolved",
+                            detail=(f"session policy could not be resolved "
+                                    f"({exc!r})"),
+                            detected_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                except Exception:
+                    pass
+
+                return "deny", {
+                    "stdout": "",
+                    "stderr": (
+                        "refusing to run: session policy could not be resolved "
+                        f"({exc!r})"
+                    ),
+                    "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                }
+
+            if self._config_matches(container, want_net, want_ws):
+                return "run", None
+
+            try:
+                live_net, live_ws = _exec_live_isolation(container, strict=True)
+            except Exception as exc:
+                # The container's live isolation could not be READ at all.  That
+                # proves nothing about the container, so we cannot certify the
+                # exec is within policy -> FAIL CLOSED and refuse.  (An attrs
+                # that is LEGIBLE but missing isolation keys is a DIFFERENT case:
+                # it just yields ``None`` and RUNs below.)
+                try:
+                    log("WARNING", "docker.container_manager",
+                        "container isolation could not be read "
+                        f"({exc!r}); refusing to run (fail-closed)")
+                except Exception:
+                    pass
+
+                try:
+                    _audit(_EXEC_DRIFT_AUDIT,
+                           "container isolation could not be read; refusing exec")
+                except Exception:
+                    pass
+
+                try:
+                    labels = getattr(container, "labels", None) or {}
+                    record_id = labels.get(RECORD_LABEL_KEY)
+                    if record_id is not None and getattr(self, "workspace_id", None):
+                        from thoughtmachine.container_record import append_event
+                        append_event(
+                            self.workspace_id,
+                            str(record_id),
+                            _EXEC_DRIFT_EVENT,
+                            _EXEC_DRIFT_ACTOR,
+                            decision="deny",
+                            reason="attrs_unresolved",
+                            detail=(f"container isolation could not be read "
+                                    f"({exc!r})"),
+                            detected_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                except Exception:
+                    pass
+
+                return "deny", {
+                    "stdout": "",
+                    "stderr": (
+                        "refusing to run: container isolation could not be "
+                        f"read ({exc!r})"
+                    ),
+                    "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                }
+
+            decision, reason = _exec_drift_decision(
+                live_net, live_ws, want_net, want_ws
+            )
+            if decision == "run":
+                return "run", None
+
+            drift = {
+                "drifted": True,
+                "decision": decision,
+                "reason": reason,
+                "network_mode": live_net,
+                "workspace_mode": live_ws,
+            }
+            signature = hashlib.sha256(
+                f"{want_net}|{want_ws}|{live_net}|{live_ws}|{decision}".encode()
+            ).hexdigest()
+            self._emit_exec_drift_once(
+                container_id, container, signature, decision, reason,
+                want_net, want_ws, live_net, live_ws,
+            )
+
+            if decision == "deny":
+                message = (
+                    "Container isolation is MORE PERMISSIVE than the session "
+                    f"policy ({reason}); refusing to run the command. "
+                    f"expected network={want_net} workspace={want_ws}; "
+                    f"live network={live_net} workspace={live_ws}. "
+                    "Recreate the container to restore the desired isolation."
+                )
+                return "deny", {
+                    "stdout": "",
+                    "stderr": f"{message}\nreason={reason}",
+                    "exit_code": _EXEC_DRIFT_EXIT_CODE,
+                    "drift": drift,
+                }
+            return "warn", drift
+        except Exception as exc:
+            # The drift classifier itself failed before reaching a decision, so
+            # we cannot certify the exec is within policy.  FAIL CLOSED (ruling:
+            # we do not run what we cannot prove is allowed).  Mirrors the
+            # policy-unresolved refusal above.
+            try:
+                log("WARNING", "docker.container_manager",
+                    "exec drift check failed "
+                    f"({exc!r}); refusing to run (fail-closed)")
+            except Exception:
+                pass
+
+            try:
+                _audit(_EXEC_DRIFT_AUDIT,
+                       "exec drift check failed; refusing exec")
+            except Exception:
+                pass
+
+            try:
+                labels = getattr(container, "labels", None) or {}
+                record_id = labels.get(RECORD_LABEL_KEY)
+                if record_id is not None and getattr(self, "workspace_id", None):
+                    from thoughtmachine.container_record import append_event
+                    append_event(
+                        self.workspace_id,
+                        str(record_id),
+                        _EXEC_DRIFT_EVENT,
+                        _EXEC_DRIFT_ACTOR,
+                        decision="deny",
+                        reason="classifier_unresolved",
+                        detail=(f"exec drift check failed ({exc!r})"),
+                        detected_at=datetime.now(timezone.utc).isoformat(),
+                    )
+            except Exception:
+                pass
+
+            return "deny", {
+                "stdout": "",
+                "stderr": (
+                    "refusing to run: exec drift check failed "
+                    f"({exc!r})"
+                ),
+                "exit_code": _EXEC_DRIFT_EXIT_CODE,
+            }
+
+    def _emit_exec_drift_once(self, container_id, container, signature, decision,
+                              reason, want_net, want_ws, live_net, live_ws):
+        """Emit drift EVENT + WARNING + audit ONCE per (container_id, signature).
+
+        Best-effort: every sub-step is individually guarded so a logging/record
+        failure never affects the exec decision.  Repeat calls with the same
+        signature skip emission entirely (the decision is still applied by the
+        caller).
+        """
+        key = (container_id, signature)
+        with _EXEC_DRIFT_LOCK:
+            if key in _EXEC_DRIFT_SEEN:
+                return
+            _EXEC_DRIFT_SEEN[key] = True
+            while len(_EXEC_DRIFT_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _EXEC_DRIFT_SEEN.popitem(last=False)
+
+        summary = (
+            f"container_id={container_id} decision={decision} reason={reason} "
+            f"expected(network={want_net},workspace={want_ws}) "
+            f"actual(network={live_net},workspace={live_ws})"
+        )
+        try:
+            log("WARNING", "docker.container_manager",
+                f"exec on drifted container: {summary}")
+        except Exception:
+            pass
+
+        try:
+            _audit(_EXEC_DRIFT_AUDIT, summary)
+        except Exception:
+            pass
+
+        try:
+            labels = getattr(container, "labels", None) or {}
+            record_id = labels.get(RECORD_LABEL_KEY)
+            if record_id is not None and getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id,
+                    str(record_id),
+                    _EXEC_DRIFT_EVENT,
+                    _EXEC_DRIFT_ACTOR,
+                    decision=decision,
+                    reason=reason,
+                    expected={"network_mode": want_net, "workspace_mode": want_ws},
+                    actual={"network_mode": live_net, "workspace_mode": live_ws},
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
+
+    def _expected_restart_policy(self, container, lifecycle_class):
+        """Resolve the restart policy a container SHOULD carry.
+
+        Prefers the persisted record's ``restart_policy`` (authoritative for a
+        container that already has a record), falling back to the lifecycle
+        class policy.  ``None`` when neither is determinable (e.g. an unknown
+        class) --- which reads as "no opinion" on this axis.
+        """
+        record_policy = None
+        try:
+            labels = getattr(container, "labels", None) or {}
+            record_id = labels.get(RECORD_LABEL_KEY)
+            if record_id:
+                record = find_by_docker_label(record_id)
+                record_policy = getattr(record, "restart_policy", None)
+        except Exception:
+            record_policy = None
+        if record_policy:
+            return normalise_restart_policy(record_policy)
+        try:
+            return policy_for(lifecycle_class).restart_policy
+        except UnknownLifecycleClass:
+            return None
+
+    def _restart_drift_axis(self, container, lifecycle_class):
+        """Classify restart-policy drift for a reused container.
+
+        Returns ``None`` (no drift / not determinable) or a tuple
+        ``(decision, reason, detail)`` where decision is ``"deny"`` (live is
+        MORE permissive) or ``"warn"`` (differs, not more permissive).
+        """
+        expected = self._expected_restart_policy(container, lifecycle_class)
+        actual = _live_restart_policy(container)
+        if expected is None or actual is None:
+            return None
+        if actual == expected:
+            return None
+        detail = {"expected": expected, "actual": actual}
+        if _restart_policy_rank(actual) > _restart_policy_rank(expected):
+            return "deny", "restart_policy_more_permissive", detail
+        return "warn", "restart_policy_differs_not_more_permissive", detail
+
+    def _emit_restart_drift_once(self, container_id, container, source, detail,
+                                 decision):
+        """Emit restart-policy drift EVENT + WARNING + audit ONCE per signature.
+
+        Same module-scope memo/lock discipline as :meth:`_emit_start_drift_once`
+        (separate signature namespace via the "restart" tag).  Best-effort:
+        every sub-step is individually guarded.
+        """
+        expected = detail.get("expected")
+        actual = detail.get("actual")
+        signature = hashlib.sha256(
+            f"{source}|restart|{expected}|{actual}".encode()
+        ).hexdigest()
+        key = (container_id, signature)
+        with _START_DRIFT_LOCK:
+            if key in _START_DRIFT_SEEN:
+                return
+            _START_DRIFT_SEEN[key] = True
+            while len(_START_DRIFT_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _START_DRIFT_SEEN.popitem(last=False)
+
+        summary = (
+            f"container_id={container_id} source={source} decision={decision} "
+            f"expected_restart_policy={expected} actual_restart_policy={actual}"
+        )
+        try:
+            log("WARNING", "docker.container_manager",
+                f"start on restart-policy-drifted container: {summary}")
+        except Exception:
+            pass
+
+        try:
+            _audit(_START_DRIFT_RESTART_AUDIT, summary)
+        except Exception:
+            pass
+
+        try:
+            labels = getattr(container, "labels", None) or {}
+            record_id = labels.get(RECORD_LABEL_KEY)
+            if record_id is not None and getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id,
+                    str(record_id),
+                    _START_DRIFT_RESTART_EVENT,
+                    _START_DRIFT_RESTART_ACTOR,
+                    source=source,
+                    decision=decision,
+                    expected={"restart_policy": expected},
+                    actual={"restart_policy": actual},
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
+
+    def _emit_container_reused_once(self, record_id, docker_id):
+        """Append ONE ``container_reused`` record event per identity pair.
+
+        The affirmative counterpart to the drift events: a REUSE that actually
+        proceeded is recorded on the container's record.  Deduped on
+        ``(record_id, docker_id)`` via a MODULE-scope memo (like
+        ``_START_DRIFT_SEEN``) so it holds across the fresh ``ContainerManager``
+        built per tool call.  Best-effort: never raises, and a reuse whose
+        record id cannot be resolved emits nothing.
+        """
+        if not record_id or not docker_id:
+            return
+        if not getattr(self, "workspace_id", None):
+            return
+        key = (str(record_id), str(docker_id))
+        with _CONTAINER_REUSED_LOCK:
+            if key in _CONTAINER_REUSED_SEEN:
+                return
+            _CONTAINER_REUSED_SEEN[key] = True
+            while len(_CONTAINER_REUSED_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _CONTAINER_REUSED_SEEN.popitem(last=False)
+        try:
+            from thoughtmachine.container_record import append_event
+            append_event(
+                self.workspace_id,
+                str(record_id),
+                _CONTAINER_REUSED_EVENT,
+                _CONTAINER_REUSED_ACTOR,
+                docker_id=str(docker_id),
+                detected_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception:
+            pass
+
+    def _heal_eligible(self, record, stale_docker_id):
+        """Return True when ``start()`` may auto-heal this missing container.
+
+        Pure: consults the attempt memo and the class policy, mutating nothing.
+        Fail-closed — an unknown lifecycle class, or a class that OWNS its
+        container lifecycle (``own_lifecycle is True``; the orphan sweeps apply
+        the same rule), is never auto-healed.
+        """
+        # Already guaranteed on the calling path (the heal hook sits inside the
+        # record+docker_id branch ~:1146), but kept as an honest guard.
+        if record is None or not stale_docker_id:
+            return False
+        key = (str(getattr(record, "id", "") or ""), str(stale_docker_id))
+        with _HEAL_LOCK:
+            if key in _HEAL_ATTEMPTED:
+                return False
+        try:
+            policy = policy_for(record.lifecycle_class)
+        except UnknownLifecycleClass:
+            # Fail closed, mirroring the orphan sweeps (:3373-3384).
+            return False
+        if getattr(policy, "own_lifecycle", False) is True:
+            return False
+        return True
+
+    def _heal_missing(self, *, name, record_id, stale_docker_id, image, note,
+                      lifecycle_class, record):
+        """Attempt ONE snapshot-sourced rebuild of a record whose container is gone.
+
+        Agent-facing counterpart to the operator-only ``allow_fresh`` recreate:
+        the record names a ``docker_id`` that has no live container, so the
+        container is rebuilt for the EXISTING record (``reuse_record_id``).
+
+        The rebuild source is the record's STORED ``intent_snapshot`` (design
+        §1.1: the frozen creation intent), NEVER the current policy: only the
+        snapshot records the network/workspace isolation the container was
+        created with, so a rebuild restores exactly that intent.  When the
+        record carries no evidence-bearing snapshot the heal invents nothing —
+        it emits an ``intent_snapshot_missing`` drift finding and refuses (no
+        fresh container), falling through to the ordinary refusal.
+
+        Memo semantics (load-bearing): the ``(record_id, stale_docker_id)``
+        signature is recorded as ATTEMPTED here — at the moment of the attempt,
+        NOT on success — so a failed heal is terminal and later calls fall
+        through to the ordinary refusal.  Best-effort and total: never raises;
+        returns the created-container payload on success, else ``None``.
+        """
+        key = (str(record_id), str(stale_docker_id))
+        with _HEAL_LOCK:
+            _HEAL_ATTEMPTED[key] = True
+            while len(_HEAL_ATTEMPTED) > _HEAL_MEMO_MAX:
+                _HEAL_ATTEMPTED.popitem(last=False)
+
+        # Rebuild source = the record's STORED intent snapshot (never policy).
+        # The ONE evidence rule lives in the shared ``snapshot_has_evidence``
+        # helper; ``rebuild_config_from_snapshot`` is a total projection of the
+        # snapshot and is only read once the gate below has passed.
+        snapshot = getattr(record, "intent_snapshot", None)
+        if not snapshot_has_evidence(snapshot):
+            # No evidence-bearing snapshot -> invent nothing: report the absent
+            # intent as DRIFT, then refuse via the heal signal (start() then
+            # produces the byte-identical ordinary refusal payload).
+            try:
+                if getattr(self, "workspace_id", None):
+                    from thoughtmachine.container_record import append_event
+                    _expected = {"intent_snapshot": "evidence-bearing"}
+                    _actual = snapshot
+                    append_event(
+                        self.workspace_id, str(record_id),
+                        drift.EVENT_INTENT_SNAPSHOT_MISSING,
+                        drift.ACTOR,
+                        **{
+                            "class": drift.CLASS_INTENT,
+                            "expected": _expected,
+                            "actual": _actual,
+                            "signature": drift.signature_for(
+                                drift.EVENT_INTENT_SNAPSHOT_MISSING,
+                                _expected, _actual),
+                            "detected_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+            except Exception:
+                pass
+            try:
+                _audit(_HEAL_AUDIT_REFUSED,
+                       f"name={name} record_id={record_id} "
+                       f"stale_docker_id={stale_docker_id} "
+                       f"detail=snapshot_missing workspace_id={self.workspace_id}")
+            except Exception:
+                pass
+            try:
+                if getattr(self, "workspace_id", None):
+                    from thoughtmachine.container_record import append_event
+                    append_event(
+                        self.workspace_id, str(record_id),
+                        EVENT_CONTAINER_RECORD_AUTO_RECREATED_REFUSED,
+                        _HEAL_ACTOR,
+                        reason=_HEAL_REASON,
+                        old_docker_id=stale_docker_id,
+                        detail="snapshot_missing",
+                        detected_at=datetime.now(timezone.utc).isoformat(),
+                    )
+            except Exception:
+                pass
+            return None
+
+        rebuild = rebuild_config_from_snapshot(snapshot)
+        try:
+            result = self._fresh_start(
+                image=image, name=name, note=note, worker_name=None,
+                lifecycle_class=lifecycle_class,
+                network_mode=rebuild["network_mode"],
+                workspace_mode=rebuild["workspace_mode"],
+                reuse_record_id=record_id,
+                mem_limit=rebuild["mem_limit"],
+                cpu_quota=rebuild["cpu_quota"])
+        except Exception:
+            return None
+
+        if not (isinstance(result, dict) and result.get("id")
+                and "error" not in result):
+            # _fresh_start refused (e.g. admission Deny): treat as a failure and
+            # fall through to the byte-identical ordinary refusal.
+            return None
+
+        try:
+            _audit(_HEAL_AUDIT_HEALED,
+                   f"name={name} record_id={record_id} "
+                   f"old_docker_id={stale_docker_id} "
+                   f"new_docker_id={result.get('id')} "
+                   f"reason={_HEAL_REASON} workspace_id={self.workspace_id}")
+        except Exception:
+            pass
+        try:
+            if getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id, str(record_id),
+                    EVENT_CONTAINER_RECORD_AUTO_RECREATED,
+                    _HEAL_ACTOR,
+                    reason=_HEAL_REASON,
+                    old_docker_id=stale_docker_id,
+                    new_docker_id=result.get("id"),
+                    caller=_HEAL_ACTOR,
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
+        return result
+
+    def _emit_stale_docker_id_drift_once(self, name, record_id, stale_docker_id,
+                                         source):
+        """Emit stale-docker-id drift EVENT + WARNING + audit ONCE per signature.
+
+        Fired on the start path when a record names a ``docker_id`` that has no
+        live container.  Same module-scope memo/lock discipline as
+        :meth:`_emit_restart_drift_once` (separate signature namespace via the
+        ``stale-docker-id`` tag).  Best-effort: every sub-step is individually
+        guarded.  The record's ``docker_id`` is NEVER rewritten here.
+        """
+        docker_id = ""  # the container the record names is ABSENT
+        signature = hashlib.sha256(
+            f"{source}|{stale_docker_id}|{record_id}|{docker_id}".encode()
+        ).hexdigest()
+        key = (stale_docker_id, signature)
+        with _START_DRIFT_LOCK:
+            if key in _START_DRIFT_SEEN:
+                return
+            _START_DRIFT_SEEN[key] = True
+            while len(_START_DRIFT_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _START_DRIFT_SEEN.popitem(last=False)
+
+        summary = (
+            f"name={name} record_id={record_id} source={source} "
+            f"expected_docker_id={stale_docker_id} actual_docker_id=None"
+        )
+        try:
+            log("WARNING", "docker.container_manager",
+                f"start on stale-docker-id record: {summary}")
+        except Exception:
+            pass
+
+        try:
+            _audit("CONTAINER_START_STALE_DOCKER_ID", summary)
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id,
+                    str(record_id),
+                    drift.EVENT_CONTAINER_ABSENT,
+                    _START_DRIFT_ACTOR,
+                    source=source,
+                    expected={"docker_id": stale_docker_id},
+                    actual={"docker_id": None},
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
+
+    def _start_drift_decision(self, container, want_net, want_ws, source,
+                              lifecycle_class=None):
+        """Classify a reused container's isolation vs the resolved start policy.
+
+        Start-path twin of :meth:`_check_exec_drift`, but for the REUSE decision
+        (there is no command to run).  Two axes are evaluated: container
+        isolation (network + /workspace mount) and --- when ``lifecycle_class``
+        is supplied --- the Docker restart policy.  Returns one of:
+
+          ("ok", None)             — no observable drift; reuse as today.
+          ("reuse", drift_dict)    — drift seen but NOT more permissive; reuse
+                                     the container, attaching drift_dict.
+          ("deny", response_dict)  — live is MORE permissive on either axis;
+                                     REFUSE (return an error response carrying
+                                     the drift) WITHOUT running, mutating or
+                                     handing back the container.
+
+        The container is NEVER removed or recreated here: start() no longer
+        MUTATES on drift.  A caller that must replace a more-permissive drifted
+        container (e.g. the ephemeral runner) acts on the refusal itself.
+
+        A container whose HARDENING attrs cannot be READ is UNVERIFIABLE, not
+        weak: ``_hardening_conformance`` reports that case as the distinct
+        sentinel ``["attrs_unreadable"]``, which this method maps EXPLICITLY to
+        the zero-failure/reuse outcome (fail-soft: never recreate a container
+        merely because we could not read it).  Only REAL failing hardening axes
+        trigger the recreate branch.
+        """
+        config_ok = self._config_matches(container, want_net, want_ws)
+        restart_axis = None
+        if lifecycle_class is not None:
+            restart_axis = self._restart_drift_axis(container, lifecycle_class)
+        user_axis = _user_drift_axis(container, host_user())
+        hardening_failures = _hardening_conformance(
+            container, _expected_hardening_recipe()
+        )
+        # ``_hardening_conformance`` returns the DISTINCT sentinel
+        # ``["attrs_unreadable"]`` when the container's attrs cannot be read at
+        # all.  That verdict means "cannot tell", NOT "too weak": the fail-soft
+        # contract is to REUSE an unverifiable container (no remove/recreate),
+        # exactly as before, so the sentinel is stripped out here before every
+        # downstream gate.  Only REAL failing axes (cap_drop / security_opt /
+        # read_only / user) may drive a recreate.  The sentinel and a real axis
+        # are mutually exclusive, so this filter can never mask genuine drift.
+        real_hardening_failures = [
+            f for f in hardening_failures if f != "attrs_unreadable"
+        ]
+        if (config_ok and restart_axis is None and user_axis is None
+                and not real_hardening_failures):
+            return "ok", None
+
+        live_net, live_ws = _exec_live_isolation(container)
+        isolation_decision = None
+        reason = None
+        if not config_ok:
+            _decision, _reason = _exec_drift_decision(
+                live_net, live_ws, want_net, want_ws
+            )
+            if _decision != "run":
+                isolation_decision, reason = _decision, _reason
+
+        restart_decision = None
+        restart_reason = None
+        restart_detail = None
+        if restart_axis is not None:
+            restart_decision, restart_reason, restart_detail = restart_axis
+
+        user_decision = None
+        user_reason = None
+        user_detail = None
+        if user_axis is not None:
+            user_decision, user_reason, user_detail = user_axis
+
+        if (isolation_decision is None and restart_decision is None
+                and user_decision is None and not real_hardening_failures):
+            return "ok", None
+
+        decision = (
+            "deny" if "deny" in (isolation_decision, restart_decision,
+                                 user_decision) else "warn"
+        )
+        if reason is None:
+            reason = restart_reason
+        if reason is None:
+            reason = user_reason
+
+        drift = {
+            "drifted": True,
+            "decision": decision,
+            "reason": reason,
+            "network_mode": live_net,
+            "workspace_mode": live_ws,
+            "source": source,
+        }
+        if restart_detail is not None:
+            drift["restart_policy"] = restart_detail
+        if user_detail is not None:
+            drift["user"] = user_detail
+        if real_hardening_failures:
+            drift["hardening"] = {"failed": list(real_hardening_failures)}
+        container_id = getattr(container, "id", None)
+        if isolation_decision is not None:
+            signature = hashlib.sha256(
+                f"{source}|{want_net}|{want_ws}|{live_net}|{live_ws}|"
+                f"{isolation_decision}".encode()
+            ).hexdigest()
+            self._emit_start_drift_once(
+                container_id, container, signature, isolation_decision, reason,
+                want_net, want_ws, live_net, live_ws, source,
+            )
+        if restart_detail is not None:
+            self._emit_restart_drift_once(
+                container_id, container, source, restart_detail,
+                restart_decision,
+            )
+
+        if decision == "deny":
+            # Mirror the exec deny payload EXACTLY: the drifted container id
+            # rides INSIDE ``drift`` (never a top-level ``container_id``, which a
+            # lifecycle consumer would mistake for a successfully-tracked
+            # container).
+            drift["container_id"] = container_id
+            if restart_decision == "deny" and isolation_decision == "deny":
+                message = (
+                    "Container isolation and restart policy are MORE PERMISSIVE "
+                    f"than policy (isolation={reason}; "
+                    f"restart={restart_reason}: expected "
+                    f"{restart_detail['expected']} got "
+                    f"{restart_detail['actual']}); refusing to reuse the "
+                    "container."
+                )
+            elif restart_decision == "deny":
+                message = (
+                    "Container restart policy is MORE PERMISSIVE than the "
+                    f"lifecycle policy ({restart_reason}: expected "
+                    f"{restart_detail['expected']} got "
+                    f"{restart_detail['actual']}); refusing to reuse the "
+                    "container. Recreate the container to restore the desired "
+                    "restart policy."
+                )
+            elif user_decision == "deny":
+                message = (
+                    "Container user is MORE PERMISSIVE than the host policy "
+                    f"({user_reason}: expected {user_detail['expected']} got "
+                    f"{user_detail['actual']}); refusing to reuse the "
+                    "container. Recreate the container to restore the desired "
+                    "user."
+                )
+            else:
+                message = (
+                    "Container isolation is MORE PERMISSIVE than the session "
+                    f"policy ({reason}); refusing to reuse the container. "
+                    f"expected network={want_net} workspace={want_ws}; "
+                    f"live network={live_net} workspace={live_ws}. "
+                    "Recreate the container to restore the desired isolation."
+                )
+            return "deny", {"error": message, "drift": drift}
+        if real_hardening_failures:
+            # FOURTH axis: docker HARDENING (cap_drop / security_opt / read-only
+            # rootfs / user) is weaker than a fresh create would be.  A deny
+            # still wins above; otherwise the caller must REMOVE this container
+            # and recreate it rather than hand back the weak one.  The
+            # "attrs_unreadable" sentinel is NOT in ``real_hardening_failures``
+            # (stripped above), so an unverifiable container falls through to
+            # REUSE below instead of being recreated.
+            return "recreate", drift
+        return "reuse", drift
+
+    def _emit_start_drift_once(self, container_id, container, signature, decision,
+                               reason, want_net, want_ws, live_net, live_ws, source):
+        """Emit drift EVENT + WARNING + audit ONCE per (container_id, signature).
+
+        Start-path twin of :meth:`_emit_exec_drift_once` (its own module-scope
+        memo + lock, same dedup/discipline).  Best-effort: every sub-step is
+        individually guarded so a logging/record failure never affects the
+        start decision.
+        """
+        key = (container_id, signature)
+        with _START_DRIFT_LOCK:
+            if key in _START_DRIFT_SEEN:
+                return
+            _START_DRIFT_SEEN[key] = True
+            while len(_START_DRIFT_SEEN) > _EXEC_DRIFT_MEMO_MAX:
+                _START_DRIFT_SEEN.popitem(last=False)
+
+        summary = (
+            f"container_id={container_id} source={source} decision={decision} "
+            f"reason={reason} "
+            f"expected(network={want_net},workspace={want_ws}) "
+            f"actual(network={live_net},workspace={live_ws})"
+        )
+        try:
+            log("WARNING", "docker.container_manager",
+                f"start on drifted container: {summary}")
+        except Exception:
+            pass
+
+        try:
+            _audit(_START_DRIFT_AUDIT, summary)
+        except Exception:
+            pass
+
+        try:
+            labels = getattr(container, "labels", None) or {}
+            record_id = labels.get(RECORD_LABEL_KEY)
+            if record_id is not None and getattr(self, "workspace_id", None):
+                from thoughtmachine.container_record import append_event
+                append_event(
+                    self.workspace_id,
+                    str(record_id),
+                    _START_DRIFT_EVENT,
+                    _START_DRIFT_ACTOR,
+                    source=source,
+                    decision=decision,
+                    reason=reason,
+                    expected={"network_mode": want_net, "workspace_mode": want_ws},
+                    actual={"network_mode": live_net, "workspace_mode": live_ws},
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception:
+            pass
+
+    def _exceeds_disk_quota(self, container, quota_mb):
+        """True if /home/agent/.local usage (KB) exceeds quota_mb MB.
+
+        Best-effort: any error (missing dir, non-running container, exec
+        failure) returns False so the user command is never blocked.
+        """
+        try:
+            container.reload()
+            if container.status != "running":
+                return False
+            exit_code, output = container.exec_run(
+                cmd=["/bin/sh", "-c", "du -s /home/agent/.local 2>/dev/null || echo 0"]
+            )
+            if exit_code != 0:
+                return False
+            text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+            kb = int(float(text.strip().split()[0]))
+            return kb > quota_mb * 1024
+        except Exception:
+            return False
+
+    def stop(self, container_id):
+        """Stop the container. Idempotent; NEVER raises.
+
+        The stop decision routes through :meth:`ContainerLifecycle.reconcile`
+        with an explicit ``reap`` intent: an explicit stop always wins, so
+        reconcile returns ``action="reap"`` (ONE ``CONTAINER_LIFECYCLE``
+        decision event is emitted) and the stop proceeds unchanged.  The
+        destroy is guarded on ``decision.destroys``; on a non-destroy decision
+        (which cannot arise for an explicit intent) a WARNING is logged and the
+        container is left running.
+        """
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            return {"status": "missing", "container_id": container_id,
+                    "error": "container not found"}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            return {"status": "error", "container_id": container_id,
+                    "error": _denial}
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason="explicit_stop",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        decision = ContainerLifecycle.reconcile(
+            container, self.session_permissions, intent
+        )
+        if not decision.destroys:
+            log("WARNING", "docker.container_manager",
+                f"stop: lifecycle funnel refused stop of {container_id!r} "
+                f"(action={decision.action!r} reason={decision.reason!r}); "
+                f"container left running")
+            return {"status": "refused", "container_id": container_id,
+                    "reason": decision.reason}
+        return self._stop_container(container, container_id)
+
+    def _stop_container(self, container, container_id,
+                        grace=_STOP_GRACE_SECONDS):
+        """Stop+kill ``container``; the reconcile-FREE core (NEVER raises).
+
+        Shared by :meth:`stop` (which reconciles first, then calls this) and
+        :meth:`remove` (which reconciles the *removal* decision once, so its
+        internal stop must NOT emit a SECOND ``CONTAINER_LIFECYCLE`` event).
+        Idempotent.
+
+        ``grace`` is the seconds Docker waits for a graceful exit before
+        escalating to SIGKILL.  It defaults to the full ceiling; :meth:`remove`
+        passes :data:`_REMOVE_GRACE_SECONDS` because it force-removes the
+        container on the very next line.
+        """
+        try:
+            container.reload()
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"stop: container.reload() failed for {container_id!r}: "
+                f"{type(e).__name__}: {e}")
+        try:
+            if container.status == "running":
+                _audit("CONTAINER_STOP",
+                       f"container={container_id} session={self.session_id}")
+                container.stop(timeout=grace)
+                container.reload()
+                if container.status == "running":
+                    container.kill()
+            self._drop_container(container_id)
+            log_container_event("stopped", container_id=container_id,
+                                session_id=self.session_id or "")
+            return {"status": "stopped", "container_id": container_id, "name": container.name}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e),
+                    "name": getattr(container, "name", "")}
+
+    def restart(self, container_id):
+        """Stop then start ``container_id`` in place. NEVER raises.
+
+        Restart is a lifecycle action in its own right: it emits exactly ONE
+        ``CONTAINER_LIFECYCLE`` event with ``action="restart"`` -- NOT the
+        shape-identical ``action="reap"/reason="explicit_stop"`` a bare stop
+        would log.  The stop half still routes through the same reconcile gate
+        (the container is only recycled when the funnel permits its
+        destruction), but that gate is evaluated silently so only the restart
+        event is emitted.
+
+        Returns ``{"status": "restarted"|"refused"|"missing"|"error", ...}``.
+        """
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            return {"status": "missing", "container_id": container_id,
+                    "error": "container not found"}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+        name = getattr(container, "name", None) or container_id
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            return {"status": "error", "container_id": container_id, "error": _denial}
+        intent = ContainerIntent(
+            kind="restart",
+            explicit=True,
+            reason="explicit_restart",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        # Evaluate the destruction gate WITHOUT emitting (the restart emits its
+        # own, distinct action below).
+        decision = ContainerLifecycle.reconcile(
+            container, self.session_permissions, intent, emit=False
+        )
+        ContainerLifecycle.record_restart(
+            container,
+            reason="explicit_restart",
+            contributing_source="container_manager.restart",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        if not decision.destroys:
+            return {"status": "refused", "container_id": container_id,
+                    "name": name, "reason": decision.reason}
+        stopped = self._stop_container(container, container_id)
+        if stopped.get("status") not in ("stopped", "missing"):
+            return stopped
+        result = self.start(name=name)
+        if isinstance(result, dict) and result.get("error"):
+            return {"status": "error", "container_id": container_id,
+                    "name": name, "error": result.get("error")}
+        new_name = (result.get("name") if isinstance(result, dict) else None) or name
+        new_id = (result.get("id") if isinstance(result, dict) else None) or container_id
+        return {"status": "restarted", "container_id": new_id, "name": new_name}
+
+    def remove(self, container_id, *, keep_record=False,
+               audit_reason="explicit_remove",
+               audit_source="container_manager.remove"):
+        """Remove the container. Idempotent; NEVER raises.
+
+        The removal decision routes through :meth:`ContainerLifecycle.reconcile`
+        with an explicit ``reap`` intent: an explicit removal always wins, so
+        reconcile returns ``action="reap"`` (ONE ``CONTAINER_LIFECYCLE``
+        decision event is emitted) and the destroy proceeds unchanged.  The
+        guard is on ``decision.destroys``; on a non-destroy decision (which
+        cannot arise for an explicit intent) a WARNING is logged and the
+        container is left in place.  The internal stop runs through the
+        reconcile-FREE :meth:`_stop_container` core, so a single removal emits
+        exactly ONE lifecycle decision.
+
+        Stops the container first (best-effort) then removes it with
+        ``force=True``. Returns one of:
+            {"status": "removed", "container_id": ...}
+            {"status": "error", "container_id": ..., "error": ...}
+
+        ``keep_record`` (keyword-only, default False) PRESERVES the durable
+        container record bound to the removed container instead of reaping it,
+        and tags the ``container_removed`` audit event ``reason="recreate"``.
+        The record-user-action *recreate* ladder passes ``keep_record=True``:
+        it removes the old container then (re)starts + rebinds the SAME record,
+        so the record must survive the removal.  Every other caller keeps the
+        default terminal semantics (the record is reaped, ``reason="removed"``).
+
+        ``audit_reason``/``audit_source`` (keyword-only) relabel the
+        ``CONTAINER_DESTROY`` events this removal emits, so a destroy performed
+        as part of a larger operation (e.g. the resource-edit recreate) is not
+        indistinguishable from a user pressing "remove".  Defaults preserve the
+        historical ``reason=explicit_remove source=container_manager.remove``.
+        These affect AUDIT LABELS ONLY; the ``CONTAINER_LIFECYCLE`` decision
+        event keeps its funnel vocabulary (``explicit_remove``).
+        """
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            # Already gone: the destroy still happened, just not here.
+            emit_destroy_audit(
+                _audit, audit_source, None,
+                reason=audit_reason, container_id=container_id)
+            return {"status": "removed", "container_id": container_id}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            return {"status": "error", "container_id": container_id,
+                    "error": _denial}
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason="explicit_remove",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        decision = ContainerLifecycle.reconcile(
+            container, self.session_permissions, intent
+        )
+        if not decision.destroys:
+            log("WARNING", "docker.container_manager",
+                f"remove: lifecycle funnel refused removal of {container_id!r} "
+                f"(action={decision.action!r} reason={decision.reason!r}); "
+                f"container left in place")
+            # The refusal is audited too: a destroy that was asked for and
+            # denied must leave a trail, otherwise the history reads as if
+            # nobody ever tried.
+            emit_destroy_audit(
+                _audit, audit_source, container,
+                reason="refused",
+                detail=f"action={getattr(decision, 'action', 'unknown')} "
+                       f"decision_reason={getattr(decision, 'reason', 'unknown')}")
+            return {"status": "refused", "container_id": container_id,
+                    "reason": decision.reason}
+        # Destroy proceeds: audit BEFORE the stop so the pre-stop state is real.
+        emit_destroy_audit(
+            _audit, audit_source, container, reason=audit_reason)
+        # Short grace: the force-remove below destroys the container anyway, so
+        # waiting the full SIGTERM ceiling only delays the caller.
+        stopped = self._stop_container(container, container_id,
+                                       grace=_REMOVE_GRACE_SECONDS)
+        if stopped.get("status") not in ("stopped", "missing"):
+            return stopped
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            # Vanished between the stop and the re-get; the destroy stands.
+            emit_destroy_audit(
+                _audit, audit_source, None,
+                reason=audit_reason, container_id=container_id)
+            return {"status": "removed", "container_id": container_id}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+        try:
+            container.remove(force=True)
+            self._drop_container(container_id)
+            if not keep_record:
+                self._reap_record(container)
+            log_container_event("removed", container_id=container_id,
+                                session_id=self.session_id or "")
+            self._emit_removal_event(
+                container_id, container,
+                reason="recreate" if keep_record else "removed")
+            return {"status": "removed", "container_id": container_id}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+
+    def _emit_removal_event(self, container_id, container, reason="removed"):
+        """Publish ONE ``container_removed`` event (thin wrapper).
+
+        Delegates to the module-level :func:`_emit_container_removed` so removal
+        sites WITHOUT a manager instance share the SAME emission.  ``container_id``
+        is retained for signature stability; the emitted id is ``container.id``.
+        Never raises.
+        """
+        _emit_container_removed(self.workspace_id, self.session_id, container, reason)
+
+    def _reap_record(self, container):
+        """Delete the durable record bound to a REMOVED container (thin wrapper).
+
+        Delegates to the module-level :func:`_reap_bound_record` so removal sites
+        WITHOUT a manager instance share the SAME reap + class gate; never raises.
+        """
+        _reap_bound_record(self.workspace_id, container)
+
+    def status(self, container_id):
+        """Report container status; NEVER raises."""
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            return {"status": "missing", "container_id": container_id,
+                    "error": "container not found"}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            return {"status": "error", "container_id": container_id,
+                    "error": _denial}
+        try:
+            container.reload()
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"status: container.reload() failed for {container_id!r}: "
+                f"{type(e).__name__}: {e}")
+
+        uptime_seconds = None
+        started_at = (container.attrs.get("State") or {}).get("StartedAt")
+        if started_at:
+            try:
+                ts = datetime.fromisoformat(started_at.replace("Z", "+00:00")).timestamp()
+                uptime_seconds = max(0, int(time.time() - ts))
+            except Exception:
+                uptime_seconds = None
+
+        memory_usage_bytes = None
+        try:
+            stats = self.client.stats(container_id, stream=False)
+            memory_usage_bytes = (stats.get("memory_stats") or {}).get("usage")
+        except Exception:
+            memory_usage_bytes = None
+
+        result = {
+            "container_id": container_id,
+            "name": container.name,
+            "status": container.status,
+            "uptime_seconds": uptime_seconds,
+            "memory_usage_bytes": memory_usage_bytes,
+            "note": self._read_note(container),
+            # Read from the SAME attrs["State"] dict already inspected above --
+            # no extra Docker call. Surfaces OOM-killed containers (which may
+            # already be "running" again) to the container-view state mapper.
+            "oom_killed": bool((container.attrs.get("State") or {}).get("OOMKilled")),
+        }
+
+        # Phase 6: live introspection only for running containers. Every probe
+        # is best-effort via _exec_checked(); failures never raise and are
+        # reported in introspection_errors (only present when non-empty).
+        if container.status == "running":
+            introspection_errors = []
+
+            exit_code, stdout = (
+                self._exec_checked(container, "pip list --format=json") or (None, "")
+            )
+            if exit_code == 0:
+                try:
+                    packages = json.loads(stdout)
+                    if isinstance(packages, list):
+                        result["installed_packages"] = [
+                            {"name": p.get("name"), "version": p.get("version")}
+                            for p in packages if isinstance(p, dict)
+                        ]
+                    else:
+                        introspection_errors.append("pip list returned non-list JSON")
+                except (ValueError, TypeError):
+                    introspection_errors.append("pip list JSON unparseable")
+            else:
+                introspection_errors.append("pip list failed")
+
+            # Process enumeration is a PASSIVE daemon read: ``container.top()``
+            # issues ``GET /containers/{id}/top`` and never execs a shell
+            # inside the target. The old /proc shell probe was an execution
+            # path on a read tool (and was not recorded in ``recent_commands``).
+            try:
+                result["running_processes"] = self._parse_top(container.top())
+            except Exception:
+                introspection_errors.append("process scan failed")
+
+            exit_code, stdout = (
+                self._exec_checked(
+                    container, "du -sh /workspace /home/agent/.local 2>/dev/null"
+                )
+                or (None, "")
+            )
+            if exit_code == 0:
+                disk = self._parse_disk_usage(stdout)
+                result["disk_usage"] = disk if disk else stdout.strip()
+            else:
+                introspection_errors.append("du failed")
+
+            result["recent_commands"] = self.container_history(container_id, tail=20)
+
+            if introspection_errors:
+                result["introspection_errors"] = introspection_errors
+
+        return result
+
+    def _exec_checked(self, container, command, timeout=10):
+        """Run ``command`` in ``container``; return (exit_code, stdout_str) or None.
+
+        Best-effort introspection helper: NEVER raises and NEVER kills the
+        container. Any failure (daemon error, timeout, missing output) yields
+        None so callers can degrade gracefully.
+        """
+        result_queue = queue.Queue()
+
+        def _run():
+            try:
+                exit_code, output = container.exec_run(
+                    cmd=["/bin/sh", "-c", command], demux=True
+                )
+                result_queue.put((exit_code, output, None))
+            except Exception as e:
+                result_queue.put((None, None, e))
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            return None
+        try:
+            exit_code, output, error = result_queue.get_nowait()
+        except queue.Empty:
+            return None
+        if error is not None:
+            return None
+        stdout = output[0].decode(errors="replace") if output and output[0] else ""
+        return exit_code, stdout
+
+    def _append_usage_log(self, container_id, command):
+        """Append one line to the container's persistent usage log; NEVER raises.
+
+        Line format: ``<utc iso ts> | <session id or anon> | <normalised command>``
+        appended to ``/home/agent/.local/usage.log`` (the persistent package
+        volume, so it survives container recreation). Best-effort: any failure
+        only logs a WARNING and never affects the caller's result. No rotation.
+        """
+        try:
+            container = self.client.containers.get(container_id)
+            ts = datetime.now(timezone.utc).isoformat()
+            session = str(self.session_id) if self.session_id is not None else "anon"
+            line = f"{ts} | {session} | {' '.join(command.split())}"
+            escaped = line.replace("'", "'\\''")
+            self._exec_checked(
+                container,
+                f"printf '%s\\n' '{escaped}' >> /home/agent/.local/usage.log",
+            )
+        except Exception as e:
+            log("WARNING", "docker.container_manager", f"usage log append failed: {e}")
+
+    def container_history(self, container_id, tail=50):
+        """Return the last ``tail`` usage-log lines for a container; NEVER raises.
+
+        Reads ``/home/agent/.local/usage.log`` via a best-effort exec. Missing,
+        non-running containers and any exec failure yield [].
+        """
+        try:
+            container = self.client.containers.get(container_id)
+            container.reload()
+            if container.status != "running":
+                return []
+            result = self._exec_checked(
+                container,
+                f"tail -n {int(tail)} /home/agent/.local/usage.log 2>/dev/null",
+            )
+            if result is None:
+                return []
+            exit_code, stdout = result
+            if exit_code != 0:
+                return []
+            return stdout.splitlines()
+        except Exception:
+            return []
+
+    def container_summary(self, container_id):
+        """Compact introspection for list-style responses; {} unless running.
+
+        Runs only two best-effort execs (pip list + du) so callers can decorate
+        container entries cheaply. NEVER raises.
+        """
+        try:
+            container = self.client.containers.get(container_id)
+            container.reload()
+            if container.status != "running":
+                return {}
+            summary = {}
+            exit_code, stdout = self._exec_checked(container, "pip list --format=json")
+            if exit_code == 0:
+                try:
+                    packages = json.loads(stdout)
+                    if isinstance(packages, list):
+                        summary["packages_count"] = len(packages)
+                except (ValueError, TypeError):
+                    pass
+            exit_code, stdout = self._exec_checked(
+                container, "du -sh /workspace /home/agent/.local 2>/dev/null"
+            )
+            if exit_code == 0:
+                disk = self._parse_disk_usage(stdout)
+                if disk:
+                    summary["disk_usage"] = disk
+            return summary
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _parse_top(top):
+        """Parse ``container.top()`` into ``[{"pid", "command"}, ...]``.
+
+        ``container.top()`` returns the daemon's ``GET /containers/{id}/top``
+        payload: ``{"Titles": [...], "Processes": [[pid, cmd, ...], ...]}``.
+        The PID/CMD columns are resolved from ``Titles`` (case-insensitive,
+        accepting ``CMD`` or ``COMMAND``); when ``Titles`` is absent the first
+        two columns are assumed. Passive -- never execs inside the container
+        and never raises (malformed input yields ``[]``).
+        """
+        if not isinstance(top, dict):
+            return []
+        titles = [str(t).upper() for t in (top.get("Titles") or [])]
+        rows = top.get("Processes") or []
+        pid_i = titles.index("PID") if "PID" in titles else 0
+        cmd_i = None
+        for name in ("CMD", "COMMAND"):
+            if name in titles:
+                cmd_i = titles.index(name)
+                break
+        if cmd_i is None:
+            cmd_i = 1
+        idx = max(pid_i, cmd_i)
+        processes = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) <= idx:
+                continue
+            raw_pid = str(row[pid_i]).strip()
+            if not raw_pid.isdigit():
+                continue
+            processes.append({"pid": int(raw_pid), "command": str(row[cmd_i])})
+        return processes
+
+    @staticmethod
+    def _parse_disk_usage(text):
+        """Parse ``du -sh`` output into {"workspace": size, "packages": size}."""
+        try:
+            usage = {}
+            for line in text.splitlines():
+                parts = line.split("\t")
+                if len(parts) == 2:
+                    size, path = parts
+                    if path == "/workspace":
+                        usage["workspace"] = size
+                    elif path == "/home/agent/.local":
+                        usage["packages"] = size
+            return usage
+        except Exception:
+            return {}
+
+    def list_containers(self):
+        """List containers carrying this workspace's label; NEVER raises.
+
+        Queries the daemon for all containers (running or not) whose
+        ``thoughtmachine.workspace_id`` label matches this manager's workspace
+        id (the exact label source ``start()`` applies), so containers from
+        other workspaces — or unlabeled ones — never appear. ``note`` is the
+        container's RECORD sticky note (a legacy container_notes.json sidecar is
+        consulted read-only as a fallback when the container has no record).
+        Returns a list of dicts with the 8 base keys ``container_id``,
+        ``name``, ``image``, ``status``, ``uptime_seconds``, ``workspace_id``,
+        ``note``, ``labels`` — PLUS an OPTIONAL 9th key
+        ``unavailable_reason``, present ONLY when the row's isolation is MORE
+        permissive than the CALLING session's grant (the key is ABSENT when the
+        row is within bounds).
+
+        SESSION SCOPING: ephemeral rows (``class_of`` == ``LIFECYCLE_EPHEMERAL``)
+        are visible ONLY to the session that owns the container NAME
+        (``agent-exec-ephemeral-{ws}-{session_tag}-{env}``); the NAME is the sole
+        ownership vector (the worker label is never consulted). A manager whose
+        ``session_id`` is ``None`` (UI/dashboard) applies NO session filter, so
+        the workspace-wide listing is preserved.
+        """
+        try:
+            containers = self.client.containers.list(
+                all=True,
+                filters={"label": f"thoughtmachine.workspace_id={self.workspace_id}"},
+            )
+        except Exception:
+            return []
+
+        result = []
+        # Read the session id ONCE, defensively: hand-built managers that bypass
+        # __init__ (e.g. object.__new__(ContainerManager)) carry no ``session_id``
+        # attribute, and this method must NEVER raise. ``None`` => a session-less
+        # manager => no ephemeral filtering (workspace-wide listing).
+        session_id = getattr(self, "session_id", None)
+        # Ownership pattern for THIS session's ephemeral containers (NAME only;
+        # the worker label is deliberately NOT consulted).
+        owned_ephemeral_re = None
+        if session_id is not None:
+            owned_ephemeral_re = re.compile(
+                r"^agent-exec-ephemeral-[0-9a-f]{12}-"
+                + re.escape(_safe_session_tag(session_id))
+                + r"-[0-9a-f]{8}$"
+            )
+        for container in containers:
+            # Skip hidden resource containers (e.g. the git sandbox from
+            # infra/resource_container_manager.py, label thoughtmachine.resource):
+            # they carry the workspace_id label so cleanup_workspace sweeps them,
+            # but must stay invisible to agent-facing listings.
+            lifecycle_class = self.class_of(container)
+            if self._agent_access_denial(lifecycle_class) is not None:
+                continue
+            # Ephemeral rows are session-scoped: a manager WITH a session sees
+            # only the ephemeral containers it owns (matched by NAME).
+            if (
+                lifecycle_class == LIFECYCLE_EPHEMERAL
+                and owned_ephemeral_re is not None
+                and owned_ephemeral_re.match(container.name) is None
+            ):
+                continue
+            # uptime: now - StartedAt (mirrors status()); None when missing/unparseable
+            uptime_seconds = None
+            started_at = (container.attrs.get("State") or {}).get("StartedAt")
+            if started_at:
+                try:
+                    ts = datetime.fromisoformat(started_at.replace("Z", "+00:00")).timestamp()
+                    uptime_seconds = max(0, int(time.time() - ts))
+                except Exception:
+                    uptime_seconds = None
+
+            # image: first tag when available; None when image/tags missing
+            image = None
+            try:
+                image_obj = getattr(container, "image", None)
+                tags = getattr(image_obj, "tags", None) or []
+                image = tags[0] if tags else None
+            except Exception:
+                image = None
+
+            row = {
+                "container_id": container.id,
+                "name": container.name,
+                "image": image,
+                "status": container.status,
+                "uptime_seconds": uptime_seconds,
+                "workspace_id": (container.labels.get("thoughtmachine.workspace_id")
+                                 or self.workspace_id),
+                "labels": dict(container.labels or {}),
+                "note": self._read_note(container),
+            }
+            # Envelope tag: PERSISTENT rows only, and only when this manager has
+            # a session (otherwise there is no session grant to compare against).
+            if session_id is not None and lifecycle_class == LIFECYCLE_PERSISTENT:
+                try:
+                    reason = self._session_envelope_unavailable_reason(container)
+                except Exception:
+                    reason = None
+                if reason is not None:
+                    row["unavailable_reason"] = reason
+            result.append(row)
+        return result
+
+    def _session_envelope_unavailable_reasons(self, container):
+        """Reason string when ``container`` is MORE permissive than this session.
+
+        Reuses the exec-drift envelope comparison (NEVER raises):
+
+        * live isolation via the module-level ``_exec_live_isolation`` (default
+          non-strict; returns ``(None, None)`` when unreadable);
+        * this session's wanted ``(network_mode, workspace_mode)`` via
+          ``_compute_config(..., LIFECYCLE_PERSISTENT)`` -- the SAME call shape
+          the enforcement path uses (``_check_exec_drift`` ~:2157 and the build
+          gate ~:3517), in its NON-strict form.  A resolution failure yields the
+          plain ``("none", "ro")`` sentinel (not a
+          ``_ComputedContainerConfig``), which proves NO grant -> return None;
+        * ``_exec_drift_decision`` rules; ONLY ``decision == "deny"`` (the live
+          container is MORE permissive than the session may have) yields a
+          string.  ``run``/``warn`` yield ``None``.  Only the network + workspace
+          axes are compared (never mem_limit/cpu_quota/oom_score_adj).
+
+        Returns ``None`` on any failure or when the row is within bounds.
+        """
+        try:
+            live_net, live_ws = _exec_live_isolation(container)
+            cfg = self._compute_config(
+                getattr(self, "workspace_path", None),
+                getattr(self, "workspace_id", None),
+                getattr(self, "session_permissions", None),
+                LIFECYCLE_PERSISTENT,
+            )
+            if not isinstance(cfg, _ComputedContainerConfig):
+                return None
+            want_net, want_ws = cfg[0], cfg[1]
+            # Isolate each axis by neutralising the other, so an unmet
+            # requirement on one axis never MASKS an unmet one on the other;
+            # this enumerates ALL unmet requirements, not just the first.
+            net_decision, net_reason = _exec_drift_decision(
+                live_net, want_ws, want_net, want_ws
+            )
+            ws_decision, ws_reason = _exec_drift_decision(
+                want_net, live_ws, want_net, want_ws
+            )
+        except Exception:
+            return []
+        reasons = []
+        if net_decision == "deny" and net_reason == "network_more_permissive":
+            reasons.append("needs network:write; session has network:none")
+        if ws_decision == "deny" and ws_reason == "workspace_more_permissive":
+            reasons.append("needs filesystem:write; session has filesystem:read")
+        return reasons
+
+    def _session_envelope_unavailable_reason(self, container):
+        """Single reason string (``"; "``-joined) or ``None`` when within bounds.
+
+        Thin wrapper over :meth:`_session_envelope_unavailable_reasons`; kept so
+        list rows retain the historical shape (the key stays ABSENT when there
+        is no unmet requirement).
+        """
+        reasons = self._session_envelope_unavailable_reasons(container)
+        if not reasons:
+            return None
+        return "; ".join(reasons)
+
+    def unavailable_reason(self, container):
+        """Public: unmet-session-requirement reason for ``container`` (or None).
+
+        RECOMPUTED on every call from the LIVE envelope and this session's
+        grant -- never cached, never stale.  Returns ``None`` when the row is
+        within bounds.  NEVER raises.
+        """
+        try:
+            return self._session_envelope_unavailable_reason(container)
+        except Exception:
+            return None
+
+    def build_image(self, tag=None, nocache=False):
+        """Build a Docker image from ONLY the vault-managed Dockerfile.
+
+        Vault-gated: always builds from the vault-managed ``<workspace>/Dockerfile``
+        (resolved from ``<vault_root>/workspaces/<workspace_id>/Dockerfile``,
+        falling back to ``<workspace_path>/Dockerfile`` — no ``dockerfile_path``
+        override). The build context contains the Dockerfile plus
+        ``requirements.txt`` when one is present (vault workspace dir first,
+        then workspace root): both are copied into a temporary build directory,
+        so the rest of the workspace tree is NOT part of the build context and
+        ``COPY .`` cannot read workspace files. The build runs synchronously
+        and its output is returned (not just a bool).
+
+        Args:
+            tag: Image tag; auto-generated from the workspace path (the same
+                ``agent-executor-<hash>`` convention ``docker_executor`` uses)
+                when omitted.
+            nocache: If True, force a rebuild bypassing the Docker layer cache
+                (forwarded to ``_run_image_build`` -> ``client.api.build``) AND
+                bypassing the build-hash reuse gate below, so an unchanged
+                build hash cannot short-circuit an explicitly forced build.
+
+        Returns:
+            Dict with EXACTLY ``image_tag`` and ``build_log`` (the build log,
+            truncated to 100KB with a truncation notice).
+
+        Raises:
+            RuntimeError: If the vault Dockerfile is missing or the build fails.
+        """
+        if not DOCKER_AVAILABLE or self.client is None:
+            raise RuntimeError("Docker Python SDK not available")
+
+        ws = self.workspace_path
+        # Vault-gated resolution: prefer the vault-managed Dockerfile
+        # (<vault_root>/workspaces/<workspace_id>/Dockerfile), falling back to
+        # the workspace-path Dockerfile for legacy workspaces.
+        vault_dockerfile = (
+            Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "Dockerfile"
+        )
+        if not vault_dockerfile.exists():
+            legacy = Path(ws) / "Dockerfile"
+            if legacy.exists():
+                vault_dockerfile = legacy
+            else:
+                raise RuntimeError(
+                    f"Vault Dockerfile not found at {vault_dockerfile}. "
+                    "The vault-managed <workspace>/Dockerfile must exist before building."
+                )
+
+        dex = _load_docker_executor()
+        if not tag:
+            tag = dex._compute_image_tag(ws)
+
+        # Build-drift gate: reuse an existing image whose
+        # thoughtmachine.build_hash label still matches the current build
+        # sources — the vault-managed workspace Dockerfile (build context) plus
+        # the executor build sources resolved via docker_executor; otherwise
+        # rebuild with the fresh hash recorded as the label.
+        req_vault = (
+            Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "requirements.txt"
+        )
+        try:
+            # The hash MUST cover what is actually built: the executor sources
+            # plus the vault-supplied Dockerfile and requirements.txt that are
+            # copied into the build context below. Hashing only the repo sources
+            # leaves the label matching after a workspace Dockerfile edit, which
+            # silently skips the rebuild.
+            build_hash = dex.compute_executor_build_hash(
+                extra_paths=[str(vault_dockerfile), str(req_vault)]
+            )
+        except OSError as e:
+            raise RuntimeError(
+                f"Cannot read executor build sources ({e}); the vault-managed "
+                "workspace Dockerfile and the executor build sources "
+                "(requirements.txt + default Dockerfile, via docker_executor) "
+                "must exist."
+            ) from e
+        # An explicit force (nocache=True) must never be short-circuited by the
+        # build-hash reuse gate: the caller asked for a real rebuild.
+        force = bool(nocache)
+        try:
+            existing = self.client.images.get(tag)
+        except ImageNotFound:
+            existing = None
+        if not force and existing is not None and (
+            (getattr(existing, "labels", None) or {}).get(dex.EXECUTOR_BUILD_HASH_LABEL)
+            == build_hash
+        ):
+            log("INFO", "docker.container_manager",
+                f"Image {tag} already matches build sources \u2014 skipping build")
+            return {"image_tag": tag, "build_log": ""}
+        if existing is not None and not force:
+            log("INFO", "docker.container_manager",
+                f"Image {tag} build sources drifted (label mismatch) \u2014 rebuilding")
+
+        try:
+            # SECURITY: the build context contains ONLY the vault Dockerfile
+            # (plus requirements.txt when present — needed by the image defs
+            # that `COPY requirements.txt` before pip install). It is copied
+            # into a temporary build directory so the workspace tree is never
+            # part of the build context (no COPY . exfiltration).
+            with tempfile.TemporaryDirectory(prefix="tm_build_") as tmpdir:
+                shutil.copy2(str(vault_dockerfile), os.path.join(tmpdir, "Dockerfile"))
+                if not req_vault.exists():
+                    raise RuntimeError(
+                        f"Vault requirements not found at {req_vault}. "
+                        "Run the vault bootstrap to seed per-workspace requirements."
+                    )
+                # Session container-grant gate: a build is agent-reachable, so
+                # refuse it when the session has no container access
+                # (fail-closed).
+                try:
+                    _computed = self._compute_config(
+                        self.workspace_path,
+                        getattr(self, "workspace_id", None),
+                        getattr(self, "session_permissions", None),
+                        LIFECYCLE_PERSISTENT,
+                        strict=True,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "refusing to build: session policy could not be resolved "
+                        f"({exc!r}); fix the session permission config and retry"
+                    ) from exc
+                if not (
+                    dict(getattr(_computed, "effective", None) or {})
+                ).get("container"):
+                    raise RuntimeError(
+                        "refusing to build: session container grant denied "
+                        "(read it in the session permission config: "
+                        "session_permissions['container'])"
+                    )
+                shutil.copy2(str(req_vault), os.path.join(tmpdir, "requirements.txt"))
+                staged = set(os.listdir(tmpdir))
+                if not staged <= {"Dockerfile", "requirements.txt"}:
+                    raise RuntimeError(
+                        f"Unexpected files staged in build context: {sorted(staged)}"
+                    )
+                _net_mode, _ = dex._resolve_container_config_via_gate(
+                    self.workspace_id,
+                    getattr(self, "session_permissions", None),
+                    getattr(self, "session_id", None),
+                )
+                _, log_lines = dex._run_image_build(
+                    self.client, tmpdir, "Dockerfile", tag,
+                    nocache=nocache,
+                    labels={dex.EXECUTOR_BUILD_HASH_LABEL: build_hash},
+                    networkmode=("none" if _net_mode == "none" else None),
+                )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Docker build failed: {e}") from e
+
+        build_log = "\n".join(log_lines)
+        if len(build_log) > EXEC_OUTPUT_LIMIT_BYTES:
+            build_log = build_log[:EXEC_OUTPUT_LIMIT_BYTES] + _TRUNCATION_NOTICE
+        return {"image_tag": tag, "build_log": build_log}
+
+    def get_logs(self, container_id, tail=100, since=None):
+        """Fetch the stdout/stderr logs of a container.
+
+        Args:
+            container_id: Container ID or name.
+            tail: Number of log lines to fetch from the end (default 100).
+            since: Optional timestamp/duration (e.g. ``'10m'``, RFC3339, or a
+                Unix timestamp) passed through to Docker unmodified — only log
+                entries emitted after this time are returned.
+
+        Returns:
+            Dict with EXACTLY ``stdout`` and ``stderr`` — each a utf-8 string,
+            individually truncated to 100KB with a truncation notice.
+
+        Raises:
+            RuntimeError: If the container does not exist, the daemon cannot be
+                reached, or log retrieval fails.
+        """
+        if not DOCKER_AVAILABLE or self.client is None:
+            raise RuntimeError("Docker Python SDK not available")
+
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            raise RuntimeError(f"Container {container_id} not found") from None
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to access container {container_id}: {e}"
+            ) from e
+
+        _denial = self._agent_access_denial(self.class_of(container))
+        if _denial is not None:
+            raise RuntimeError(_denial)
+
+        try:
+            raw = container.logs(
+                stdout=True, stderr=True, tail=tail, since=since
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to fetch logs for container {container_id}: {e}"
+            ) from e
+
+        if not isinstance(raw, bytes):
+            raw = str(raw).encode("utf-8", errors="replace")
+
+        stdout_bytes, stderr_bytes = _split_docker_log_streams(raw)
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+        if len(stdout) > EXEC_OUTPUT_LIMIT_BYTES:
+            stdout = stdout[:EXEC_OUTPUT_LIMIT_BYTES] + _TRUNCATION_NOTICE
+        if len(stderr) > EXEC_OUTPUT_LIMIT_BYTES:
+            stderr = stderr[:EXEC_OUTPUT_LIMIT_BYTES] + _TRUNCATION_NOTICE
+
+        log(
+            "DEBUG",
+            "docker.container_manager",
+            f"get_logs container={container_id} tail={tail} since={since} "
+            f"stdout={len(stdout_bytes)}B stderr={len(stderr_bytes)}B",
+        )
+        return {"stdout": stdout, "stderr": stderr}
+
+    # ── Lifecycle class (single resource/record classifier) ───────────────
+
+    def class_of(self, container) -> str:
+        """Lifecycle class of a live ``container`` object.
+
+        Resource containers are recognised by the shared live probe; every
+        other container is resolved through its container-record (keyed by the
+        ``RECORD_LABEL_KEY`` label) and falls back to ``LIFECYCLE_PERSISTENT``
+        when no record is attached or resolvable.
+
+        The record lookup calls :func:`find_by_docker_label` with the DEFAULT
+        vault resolution (``vault_root=None``), mirroring the writer
+        (``thoughtmachine.container_record.hook.record_creation``), which also
+        writes with the default vault.  Do NOT thread a manager/session
+        ``vault_root`` in here without changing the writer too: a divergent
+        vault makes the lookup silently miss, so the class degrades to
+        ``LIFECYCLE_PERSISTENT`` and the fail-closed denial for the
+        ``service``/unknown classes is LOST.
+        """
+        return _container_lifecycle_class(container)
+
+    def class_of_handle(self, handle) -> str:
+        """Lifecycle class of a registry ``handle`` dict.
+
+        The registry records ``container_type`` for every tracked container, so
+        a ``"resource"`` handle is classified without touching the daemon.  Any
+        other handle is bridged to :meth:`class_of` via the live container (the
+        handle's ``id``/``name``), and finally by the ``tm-res-`` name prefix.  An
+        unclassifiable handle RAISES :class:`UnknownLifecycleClass` rather than
+        defaulting to ``LIFECYCLE_PERSISTENT`` (fail-closed).
+        """
+        if not isinstance(handle, dict):
+            raise UnknownLifecycleClass(
+                f"cannot classify lifecycle of non-dict handle: {type(handle).__name__}"
+            )
+        if handle.get("container_type") == CONTAINER_TYPE_RESOURCE:
+            return LIFECYCLE_RESOURCE
+        container = None
+        container_id = handle.get("id") or handle.get("name")
+        if container_id:
+            try:
+                container = self.client.containers.get(container_id)
+            except Exception:
+                container = None
+        if container is not None:
+            return self.class_of(container)
+        name = handle.get("name") or handle.get("id") or ""
+        if isinstance(name, str) and name.lstrip("/").startswith(RESOURCE_NAME_PREFIX):
+            return LIFECYCLE_RESOURCE
+        raise UnknownLifecycleClass(f"cannot classify lifecycle of handle name={name!r}")
+
+    def policy_of(self, container):
+        """Lifecycle policy for a live ``container`` object."""
+        return policy_for(self.class_of(container))
+
+    def policy_of_handle(self, handle):
+        """Lifecycle policy for a registry ``handle`` dict."""
+        return policy_for(self.class_of_handle(handle))
+
+    @staticmethod
+    def _agent_access_denial(lifecycle_class):
+        """Denial reason for an agent-facing ACCESS site, or None when allowed.
+
+        Fail-closed: an unknown lifecycle class (no policy) is denied with the
+        ``REASON_UNKNOWN_LIFECYCLE_CLASS`` code; a class whose policy is not
+        ``agent_reachable`` is denied with the standard resource message.
+        """
+        try:
+            policy = policy_for(lifecycle_class)
+        except UnknownLifecycleClass:
+            return REASON_UNKNOWN_LIFECYCLE_CLASS
+        if not policy.agent_reachable:
+            return "Resource container access denied"
+        return None
+
+    @staticmethod
+    def _is_resource_container(obj):
+        """True when ``obj`` is a hidden resource container (tm-res-*).
+
+        Thin delegation to the shared, pure probe
+        :func:`thoughtmachine.container_record.is_resource_like` — the single
+        source of truth for resource-container identity (``thoughtmachine.resource``
+        label, ``tm-res-`` name prefix, or ``tm-resource-git`` image).  Any probe
+        failure is treated as False (a non-resource container).
+        """
+        try:
+            labels = getattr(obj, "labels", None)
+            name = getattr(obj, "name", None)
+            image = getattr(obj, "image", None)
+            if image is None or isinstance(image, str):
+                image_tags = image
+            else:
+                image_tags = getattr(image, "tags", None)
+            return is_resource_like(labels, name=name, image_tags=image_tags)
+        except Exception:
+            return False
+
+    # ── Internals ──────────────────────────────────────────────────────────
+
+    def _reconcile_record_unbound(self, name, record_id, docker_id, *, reason):
+        """Mark a record UNBOUND when the container it names no longer exists.
+
+        Best-effort: any failure is WARNING-logged and never raises, so the
+        caller falls through to the ordinary refusal path. Emits the absent
+        drift + audit via the shared memoised helper (one implementation, not
+        two) so the reconcile path carries the same observability as the heal
+        path it guards.
+        """
+        try:
+            update_record(self.workspace_id, record_id, docker_id=None)
+            self._emit_stale_docker_id_drift_once(
+                name, record_id, docker_id, source="record",
+            )
+        except Exception as exc:
+            log("WARNING", "docker.container_manager",
+                f"_reconcile_record_unbound: failed for record {record_id!r} "
+                f"(reason={reason}): {type(exc).__name__}: {exc}")
+
+    def _reuse_container(self, container_id):
+        """Return ``(container, running)`` for ``container_id``.
+
+        ``(None, False)`` when ``container_id`` is falsy or the container cannot
+        be fetched; ``running`` is the VERIFIED result of ``_ensure_running`` --
+        callers must never claim a running reuse they did not observe.
+        """
+        if not container_id:
+            return None, False
+        try:
+            container = self.client.containers.get(container_id)
+            running = self._ensure_running(container)
+            return container, running
+        except Exception:
+            return None, False
+
+    def _find_by_labels(self, name):
+        """Find a container by its thoughtmachine labels (or None)."""
+        try:
+            containers = self.client.containers.list(
+                all=True,
+                filters={
+                    "label": [
+                        f"thoughtmachine.container_name={name}",
+                        f"thoughtmachine.workspace_id={self.workspace_id}",
+                    ]
+                },
+            )
+            if not containers:
+                return None
+            first = containers[0]
+            if self._agent_access_denial(self.class_of(first)) is not None:
+                return None
+            return first
+        except Exception:
+            return None
+
+    def _ensure_running(self, container):
+        try:
+            container.reload()
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: initial container.reload() failed for "
+                f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
+        try:
+            if container.status != "running":
+                container.start()
+                container.reload()
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: container.start()/reload() failed for "
+                f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
+        # VERIFY the outcome instead of assuming it: a best-effort start that
+        # silently failed -- or a container that came back non-running -- must
+        # never be reported as a running reuse.  The status read is defensive so
+        # this helper NEVER raises out to its caller.
+        try:
+            observed = container.status
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: status read failed for "
+                f"{getattr(container, 'id', '?')}: {type(e).__name__}: {e}")
+            observed = None
+        running = observed == "running"
+        if not running:
+            log("WARNING", "docker.container_manager",
+                f"_ensure_running: container {getattr(container, 'id', '?')} "
+                f"still not running after start attempt (status={observed!r})")
+        return running
+
+    def set_note(self, container_id, note):
+        """Set the container's sticky note on its RECORD; NEVER raises.
+
+        Persists the note as the ``notes`` field of the container's RECORD
+        (located via the ``thoughtmachine.container_id`` Docker label), so it
+        survives manager/session restarts and container recreation and is
+        visible to every manager of the workspace. Fail-closed: a container
+        with no record id is REFUSED and nothing is written. Docker labels are
+        never touched (they are immutable after create on stock daemons).
+
+        Returns {"success": True, "note": note} on success; on failure an error
+        dict following the existing convention:
+        {"success": False, "container_id": ..., "error": "container not found"}
+        or {"success": False, "container_id": ..., "error": "no container record"}
+        or {"success": False, "container_id": ..., "error": str(e)}.
+        """
+        # Adopt any legacy container_notes.json entries onto records first
+        # (idempotent; a no-op once per workspace).
+        self._migrate_legacy_notes_once()
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            return {"success": False, "container_id": container_id,
+                    "error": "container not found"}
+        except Exception as e:
+            return {"success": False, "container_id": container_id, "error": str(e)}
+        try:
+            container.reload()
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"set_note: container.reload() failed for {container_id!r}: "
+                f"{type(e).__name__}: {e}")
+        record_id = self._record_id_for(container)
+        if not record_id:
+            self._warn_note_once(
+                ("notes.set_note_no_record", self.workspace_id),
+                f"Refusing set_note for container {container_id!r}: the container "
+                f"carries no {RECORD_LABEL_KEY} label (no container record).")
+            return {"success": False, "container_id": container_id,
+                    "error": "no container record"}
+        self._write_note(record_id, note)
+        return {"success": True, "note": note}
+
+    def _drop_container(self, container_id):
+        """Remove all registry entries pointing at ``container_id``."""
+        for key in [k for k, v in self._containers.items() if v == container_id]:
+            self._containers.pop(key, None)
+
+    @staticmethod
+    def _normalize_mount_mode(mode):
+        """Map a Docker mount Mode string to canonical 'rw'/'ro'.
+
+        The daemon may report 'rw', 'ro', 'r', '' (rw default) or — on
+        SELinux hosts — 'z'/'Z'/'rw,z'/'ro,z' depending on driver and
+        labelling. Only the read-only bit matters for isolation comparison.
+        """
+        parts = [p for p in (mode or "").split(",") if p]
+        if "ro" in parts or "r" in parts or any(p.endswith("ro") for p in parts):
+            return "ro"
+        return "rw"
+
+    @staticmethod
+    def _normalize_network_mode(network_mode):
+        """Map a Docker HostConfig.NetworkMode to a canonical value.
+
+        containerd-integrated Docker reports the default bridge network as
+        'default' instead of 'bridge'; both are the same isolation level.
+        """
+        if network_mode == "default":
+            return "bridge"
+        return network_mode
+
+    def _image_ref(self, container):
+        """Best-effort human-readable image reference for ``container``.
+
+        Prefers the first tag (``container.image.tags[0]``), then the image
+        reference recorded in ``attrs['Config']['Image']``, then the image's
+        short id, else ``"<unknown>"``. Returns ``""`` on ANY exception (and
+        for ``container is None``) so callers can treat "unknown" distinctly.
+        """
+        try:
+            if container is None:
+                return ""
+            img = getattr(container, "image", None)
+            tags = getattr(img, "tags", None) or []
+            if tags:
+                return tags[0]
+            cfg_image = (
+                (getattr(container, "attrs", None) or {}).get("Config", {}) or {}
+            ).get("Image", "")
+            if cfg_image:
+                return cfg_image
+            short_id = getattr(img, "short_id", None)
+            if short_id:
+                return short_id
+            return "<unknown>"
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _normalize_image_ref(ref):
+        """Normalize an image reference for comparison.
+
+        Strips whitespace and appends ``':latest'`` when the repository part
+        carries no explicit tag (so ``nginx`` == ``nginx:latest``). A ':' inside
+        the registry host:port segment is NOT a tag.
+        """
+        if not ref:
+            return ""
+        ref = str(ref).strip()
+        last_slash = ref.rfind("/")
+        if ":" not in ref[last_slash + 1:]:
+            ref = f"{ref}:latest"
+        return ref
+
+    def _image_matches(self, container, image):
+        """True if ``container`` runs an image matching the requested ``image``.
+
+        Conservative: returns True when the container's image cannot be
+        determined (no tags/Config.Image), so an unknown image never blocks a
+        legitimate reuse. Any exception is treated as a match (fail-open on
+        comparison, fail-closed on the safety guard only when we KNOW the
+        images differ).
+        """
+        try:
+            wanted = self._normalize_image_ref(image)
+            if not wanted:
+                return True
+            candidates = []
+            ref = self._image_ref(container)
+            if ref and ref != "<unknown>":
+                candidates.append(ref)
+            try:
+                cfg_image = (
+                    (getattr(container, "attrs", None) or {}).get("Config", {}) or {}
+                ).get("Image")
+                if cfg_image:
+                    candidates.append(cfg_image)
+            except Exception:
+                pass
+            if not candidates:
+                return True
+            return any(
+                self._normalize_image_ref(c) == wanted for c in candidates
+            )
+        except Exception:
+            return True
+
+    def _config_matches(self, container, network_mode, workspace_mode):
+        """True if the container's actual network + /workspace mount match
+        the desired isolation (mirrors docker_executor's integrity check).
+
+        The /workspace mount is compared via the authoritative RW boolean:
+        docker reports Mode strings like 'z' for named volume mounts on
+        some hosts, so Mode cannot distinguish ro from rw. NetworkMode is
+        normalized ('default' -> 'bridge' for containerd integration).
+        """
+        try:
+            attrs = container.attrs
+        except Exception:
+            # Cannot READ attrs -> cannot prove a match, so report "no match".
+            # The exec gate does not lean on this swallow: it re-reads isolation
+            # with ``_exec_live_isolation(strict=True)`` and REFUSES (fail
+            # closed) when that read RAISES.  ``False`` here only routes the
+            # caller to that strict read.
+            return False
+        actual_network = (attrs.get("HostConfig") or {}).get("NetworkMode")
+        workspace_rw = None
+        for m in attrs.get("Mounts") or []:
+            if m.get("Destination") == "/workspace":
+                workspace_rw = m.get("RW")
+                break
+        if workspace_rw is None:
+            # /workspace mount missing -> genuine drift; force recreation.
+            return False
+        expected_rw = workspace_mode == "rw"
+        return (
+            self._normalize_network_mode(actual_network) == network_mode
+            and bool(workspace_rw) == expected_rw
+        )
+
+    def _compute_config(
+        self,
+        workspace_path,
+        workspace_id,
+        session_permissions,
+        lifecycle_class=None,
+        *,
+        strict=False,
+    ):
+        """Desired (network_mode, workspace_mode) from the security-gate SSOT.
+
+        Routes through ``security.security_gate.resolve_container_config`` -
+        the canonical, pure container-config resolver - merging the session
+        permissions with the workspace's (fail-closed) capabilities. Fail-closed
+        to ``("none", "ro")`` only if the SSOT is unavailable, raises, or
+        reports a ``ContainerConfigError``.
+
+        ``lifecycle_class`` is REQUIRED (no default): an ABSENT class raises
+        :class:`UnknownLifecycleClass` rather than being coerced to a permissive
+        default.  An unrecognised (non-empty) string still fails closed through
+        the SSOT's ``ContainerConfigError`` as before.
+
+        ``strict`` (keyword-only, default ``False``): when ``True`` the method
+        does NOT fail-closed to the ``("none", "ro")`` sentinel; instead it
+        PROPAGATES the resolution failure (re-raises / raises ``RuntimeError``)
+        so the caller can tell "the policy genuinely resolved to none/ro" apart
+        from "the policy could not be resolved at all".  Only the exec-path
+        drift admission and the ``build_image`` session container-grant gate
+        pass ``strict=True``; every other caller keeps the historical
+        fail-closed behaviour byte-for-byte.
+        """
+        if lifecycle_class is None:
+            raise UnknownLifecycleClass(
+                "_compute_config requires an explicit lifecycle_class; an absent "
+                "class is not coerced to a default"
+            )
+        try:
+            from security.security_gate import (
+                ContainerConfig,
+                get_workspace_capabilities,
+                resolve_container_config,
+            )
+
+            capabilities = get_workspace_capabilities(workspace_id)
+            # Thread the manager's own ids AND opt into the disk read so the
+            # vault permission store is the source of truth whenever BOTH ids
+            # are present.  When either id is absent the resolver stays pure
+            # and the legacy in-memory mirror is used byte-for-byte; on a store
+            # read failure (e.g. a uuid.UUID id the store path cannot express)
+            # the resolver falls back to the caller's mirror instead of failing
+            # closed.
+            _session_id = getattr(self, "session_id", None)
+            cfg = resolve_container_config(
+                session_permissions or {}, capabilities, lifecycle_class,
+                session_id=_session_id, workspace_id=workspace_id,
+                use_disk=True,
+            )
+        except Exception:
+            if strict:
+                raise
+            return "none", "ro"
+        if not isinstance(cfg, ContainerConfig):
+            if strict:
+                raise RuntimeError(
+                    "resolve_container_config did not return a ContainerConfig "
+                    f"(got {type(cfg).__name__}); cannot resolve session policy"
+                )
+            return "none", "ro"
+        return _ComputedContainerConfig(
+            cfg.network_mode, cfg.workspace_mode, dict(cfg.effective)
+        )
+
+    def _remove_container(self, container):
+        """Stop and remove a container via the lifecycle funnel; NEVER raises.
+
+        The removal decision routes through
+        :meth:`ContainerLifecycle.reconcile` with an explicit ``reap`` intent:
+        an explicit removal always wins, so reconcile returns
+        ``action="reap"`` (one ``CONTAINER_LIFECYCLE`` decision event is
+        emitted) and the destroy proceeds.  ``remove()`` is called ONLY when
+        the decision destroys; on any non-destroy decision the container is
+        left untouched.
+
+        On a successful removal the bound record is reaped and ONE
+        ``container_removed`` event (``reason="removed"``) is emitted.
+        """
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason="removed",
+            workspace_id=self.workspace_id,
+            session_id=self.session_id,
+        )
+        decision = ContainerLifecycle.reconcile(
+            container, self.session_permissions, intent
+        )
+        if not decision.destroys:
+            return
+        try:
+            container.stop(timeout=5)
+        except Exception:
+            pass
+        try:
+            container.remove()
+        except Exception:
+            return
+        _reap_bound_record(self.workspace_id, container)
+        _emit_container_removed(
+            self.workspace_id, self.session_id, container, reason="removed")
+
+
+# ── Module-level workspace helpers ──────────────────────────────────────────
+# The single implementation lives in :mod:`infra.container_destroy_audit`;
+# this alias keeps the historical module-level private name importable.
+_record_id_from_container = record_id_from_container
+
+
+# ── Destroy-audit telemetry ────────────────────────────────────────────────
+# Every site that actually DESTROYS a docker container emits ONE
+# `CONTAINER_DESTROY` audit event so the destroy trail is reconstructible
+# independently of the `CONTAINER_LIFECYCLE` decision event (which records the
+# DECISION, not the destruction). `source` names the destroy site and `reason`
+# the lifecycle intent that justified it, so decision and destruction can be
+# reconciled one-for-one.
+# The formatter itself is shared (:func:`infra.container_destroy_audit.
+# emit_destroy_audit`); this module keeps the event name for backwards
+# compatibility with callers that import it.
+_DESTROY_AUDIT = CONTAINER_DESTROY
+
+
+def _reap_bound_record(workspace_id, container):
+    """Delete the durable record bound to a REMOVED *container* (best-effort).
+
+    Module-level twin of :meth:`ContainerManager._reap_record`: resolves the
+    record via the container's ``RECORD_LABEL_KEY`` label, applies the ownership
+    guard (the record's ``docker_id`` must match the container) and the SAME
+    class gate as the orphan sweeper (:func:`sweep_orphan_container_records`),
+    then deletes the record.  Never raises -- record cleanup must never fail a
+    removal.
+    """
+    record_id = _record_id_from_container(container)
+    if not record_id:
+        return
+    try:
+        record = load_record(workspace_id, record_id)
+    except Exception:
+        record = None
+    if record is None:
+        return
+    docker_id = str(getattr(record, "docker_id", "") or "")
+    container_id = str(getattr(container, "id", "") or "")
+    if docker_id and container_id and docker_id != container_id:
+        return
+    try:
+        policy = policy_for(record.lifecycle_class)
+    except UnknownLifecycleClass:
+        return
+    if policy.own_lifecycle and record.lifecycle_class != LIFECYCLE_RESOURCE:
+        return
+    try:
+        delete_record(workspace_id, record.id)
+        _name_index_forget(record.id)
+    except Exception:
+        return
+
+
+def _emit_container_removed(workspace_id, session_id, container, reason="removed"):
+    """Publish ONE ``container_removed`` event to the tenant event bus.
+
+    Module-level twin of :meth:`ContainerManager._emit_removal_event`, for
+    removal sites without a manager instance.  Best-effort and success-only;
+    reaches ``<vault_root>/logs/event_log.jsonl`` through the ``EventLogger`` bus
+    subscriber.  Never raises -- event emission must never fail a removal.
+    """
+    try:
+        from agent.events import create_event, global_event_bus, EventType
+        if global_event_bus is None:
+            return
+        data = {
+            "container_id": getattr(container, "id", None),
+            "name": getattr(container, "name", None),
+            "workspace_id": workspace_id,
+            "session_id": session_id,
+            "reason": reason,
+        }
+        event = create_event(
+            EventType.CONTAINER_REMOVED,
+            data,
+            source="infra.container_manager.remove",
+            session_id=session_id,
+        )
+        global_event_bus.publish(event)
+    except Exception:
+        pass
+
+
+def cleanup_workspace(workspace_id, docker_client):
+    """Stop + remove every container labelled with ``workspace_id``.
+
+    Every container is removed (``force=True``); each removed container's bound
+    record is reaped and ONE ``container_removed`` event
+    (``reason="workspace_cleanup"``) is emitted.  A container force-removed while
+    still RUNNING is reported at WARNING, naming it.  Returns ``{"removed": n}``.
+    Never raises.
+    """
+    wid = str(workspace_id) if workspace_id is not None else "default"
+    removed = 0
+    try:
+        containers = docker_client.containers.list(
+            all=True, filters={"label": f"thoughtmachine.workspace_id={wid}"}
+        )
+    except Exception:
+        containers = []
+    for container in containers:
+        was_running = False
+        try:
+            state = (getattr(container, "attrs", None) or {}).get("State") or {}
+            was_running = bool(state.get("Running")) or state.get("Status") == "running"
+        except Exception:
+            was_running = False
+        if not was_running:
+            try:
+                was_running = getattr(container, "status", None) == "running"
+            except Exception:
+                was_running = False
+        # Route the destroy decision through the funnel: a workspace teardown
+        # is an explicit removal intent, so reconcile returns action="reap"
+        # (and emits a CONTAINER_LIFECYCLE decision event).  A refuse is
+        # HONOURED -- the container is left ALIVE rather than destroyed.
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason="workspace_cleanup",
+            workspace_id=wid,
+        )
+        decision = ContainerLifecycle.reconcile(container, None, intent)
+        if not decision.destroys:
+            log("WARNING", "docker.container_manager",
+                f"cleanup_workspace refused to destroy container "
+                f"{getattr(container, 'name', None)!r} "
+                f"(action={decision.action!r} reason={decision.reason!r}) "
+                f"for workspace {wid!r}")
+            continue
+        try:
+            container.stop(timeout=5)
+        except Exception:
+            pass
+        try:
+            # force=True: a stuck/still-running container must not leave
+            # the counter at 0 (plain remove() raises on running containers).
+            container.remove(force=True)
+        except Exception:
+            continue
+        removed += 1
+        if was_running:
+            log("WARNING", "docker.container_manager",
+                f"cleanup_workspace force-removed RUNNING container "
+                f"{getattr(container, 'name', None)!r} "
+                f"(id={getattr(container, 'id', None)!r}) for workspace {wid!r}")
+        _reap_bound_record(wid, container)
+        _emit_container_removed(wid, None, container, reason="workspace_cleanup")
+    _audit("CONTAINER_CLEANUP", f"workspace={wid} count={removed}")
+    return {"removed": removed}
+
+
+# ── Stale worker-container cleanup (crashed/hung worker sessions) ────────────
+_WORKER_LABEL = "thoughtmachine.worker"
+_REMOVABLE_WORKER_STATES = {"created", "exited", "dead"}
+
+# ── Detached-worker registry (phase 2.1a: STOP = DETACH) ──────────────────────
+# Owner identities of workers that are currently DETACHED: parked and awaiting a
+# possible ``resume()``, but still alive and still owning their ephemeral
+# containers.  Since ``stop()`` no longer tears containers down, a detached
+# worker's leftovers are indistinguishable from a crashed worker's leftovers by
+# label/state alone -- so the stale sweep has to ask this registry first.
+#
+# It lives HERE (not in the worker layer) because ``infra`` must never import
+# ``tools.workspace.worker_thread`` (import cycle); the worker imports these
+# helpers lazily and swallows failures (see
+# ``WorkerThread._set_detached_registration``).
+#
+# ``None`` means "registry unavailable": the sweep then treats detach state as
+# UNKNOWN and refuses to reap (see ``_detached_state``).
+_DETACHED_WORKER_IDENTITIES = set()
+
+
+def register_detached_worker(identity) -> None:
+    """Mark ``identity`` as detached so its containers survive a stale sweep."""
+    global _DETACHED_WORKER_IDENTITIES
+    if not identity:
+        return
+    if _DETACHED_WORKER_IDENTITIES is None:
+        _DETACHED_WORKER_IDENTITIES = set()
+    _DETACHED_WORKER_IDENTITIES.add(str(identity))
+
+
+def unregister_detached_worker(identity) -> None:
+    """Drop ``identity`` from the detached set (killed / resumed / torn down)."""
+    global _DETACHED_WORKER_IDENTITIES
+    if not identity or _DETACHED_WORKER_IDENTITIES is None:
+        return
+    _DETACHED_WORKER_IDENTITIES.discard(str(identity))
+
+
+def is_worker_detached(identity) -> bool:
+    """True iff ``identity`` is registered as detached. Never raises."""
+    return _detached_state(identity) is True
+
+
+def _detached_state(identity):
+    """Tri-state detach lookup: ``True`` / ``False`` / ``None`` (unknown).
+
+    ``None`` means "cannot tell" (registry unavailable, or no identity to look
+    up) -- callers must treat it as "do not reap", never as "not detached".
+    """
+    registry = _DETACHED_WORKER_IDENTITIES
+    if registry is None or not identity:
+        return None
+    try:
+        return str(identity) in registry
+    except Exception:  # pragma: no cover - defensive (non-container registry)
+        return None
+
+
+def cleanup_stale_worker_containers(docker_client, owner_identity,
+                                   worker_status=None):
+    """Remove containers a crashed/hung worker session left behind.
+
+    Worker containers carry ``thoughtmachine.worker=<owner identity>`` (see
+    ``ContainerManager.start(worker_name=...)``). When a worker dies without
+    teardown, its container lingers in ``created``/``exited``/``dead`` state
+    and can block a later respawn of the same worker (docker name/label
+    collisions).
+
+    Only containers whose label value EXACTLY matches ``owner_identity`` and
+    whose state is one of ``{'created', 'exited', 'dead'}`` are removed:
+    running workers, paused/restarting containers and resource containers
+    (``thoughtmachine.resource`` label) are never touched. The label filter
+    runs server-side; the per-container checks are defensive for fake/missing
+    attributes (all access via ``getattr``).
+
+    DETACHED workers are exempt (phase 2.1a: ``stop()`` detaches instead of
+    tearing down, so a parked worker's containers look exactly like a crashed
+    worker's leftovers). ``worker_status='detached'`` skips the sweep outright;
+    when ``worker_status`` is ``None`` the module-level detached registry
+    (``is_worker_detached``) is consulted instead. If that state cannot be
+    determined the sweep SKIPS ("unknown" never falls to "reap"): removing a
+    live parked worker's containers is unrecoverable, while leaving a crashed
+    worker's containers behind only defers the reclaim to a sweep that CAN
+    tell.
+
+    Returns the list of removed container ids. Never raises: failures are
+    logged and skipped.
+    """
+    removed = []
+    # Detach gate -- evaluated BEFORE listing so a parked worker's containers
+    # are never even considered for removal.
+    if worker_status == "detached":
+        detached = True
+    elif worker_status is not None:
+        detached = False
+    else:
+        _state = _detached_state(owner_identity)
+        if _state is None:
+            # Unknown => do not reap (see docstring). Deliberately NOT "fixed"
+            # by refreshing container timestamps: age says nothing about
+            # whether the owner is parked, and a guessed reap is destructive.
+            log("INFO", "docker.container_manager",
+                f"Skipped stale worker container sweep for {owner_identity}: "
+                f"detach state unknown (no worker_status supplied and the "
+                f"detached registry is unavailable) -- refusing to reap on a "
+                f"guess")
+            return removed
+        detached = _state
+    if detached:
+        log("INFO", "docker.container_manager",
+            f"Skipped stale worker container sweep for {owner_identity}: "
+            f"worker is detached (parked workers keep their containers until "
+            f"resume or TTL kill)")
+        return removed
+    try:
+        matches = docker_client.containers.list(
+            all=True,
+            filters={"label": {_WORKER_LABEL: owner_identity}},
+        )
+    except Exception as exc:
+        log("WARNING", "docker.container_manager",
+            f"Failed to list stale worker containers for {owner_identity}: {exc}")
+        return removed
+    for container in matches or []:
+        try:
+            labels = getattr(container, "labels", None) or {}
+            if labels.get(_WORKER_LABEL) != owner_identity:
+                # Not ours (defensive: the label filter runs server-side, but
+                # fake/mislabeled containers must never be touched).
+                continue
+            if _gc_should_skip(container):
+                # Resource / lifecycle-owning containers (e.g. the git sandbox from
+                # infra/resource_container_manager) are owned elsewhere — never here.
+                continue
+            status = getattr(container, "status", None)
+            if status is None:
+                attrs = getattr(container, "attrs", None) or {}
+                status = (attrs.get("State") or {}).get("Status")
+            if status not in _REMOVABLE_WORKER_STATES:
+                continue
+            container_id = getattr(container, "id", None)
+            # Route the destroy decision through the lifecycle funnel: a stale
+            # worker cleanup is an explicit reap intent, so reconcile returns
+            # action="reap" and emits ONE CONTAINER_LIFECYCLE decision event.  A
+            # non-destroy decision is HONOURED -- the container is left alone.
+            _decision = ContainerLifecycle.reconcile(
+                container, None,
+                ContainerIntent(
+                    kind="reap",
+                    explicit=True,
+                    reason="stale_worker_cleanup",
+                    force=True,
+                ),
+            )
+            if not _decision.destroys:
+                log("WARNING", "docker.container_manager",
+                    f"cleanup_stale_worker_containers refused to remove "
+                    f"container {str(container_id)[:12]} "
+                    f"(action={_decision.action!r} "
+                    f"reason={_decision.reason!r})")
+                continue
+            emit_destroy_audit(
+                _audit, "container_manager.cleanup_stale_worker_containers",
+                container, reason="stale_worker_cleanup")
+            container.remove(force=True)
+            removed.append(container_id)
+            short = str(container_id)[:12]
+            log("INFO", "docker.container_manager",
+                f"Removed stale worker container {short} ({status}) for {owner_identity}")
+        except Exception as exc:
+            log("WARNING", "docker.container_manager",
+                f"Failed to remove stale worker container "
+                f"{getattr(container, 'id', getattr(container, 'name', '?'))}: {exc}")
+    return removed
+
+
+# ── Idle/TTL + orphan sweep for EXITED workspace containers ─────────────────
+_WORKSPACE_LABEL = "thoughtmachine.workspace_id"
+_RESOURCE_LABEL = RESOURCE_LABEL
+_SWEEP_SKIP_DETAIL_CAP = 8  # keep startup log lines bounded
+
+# Record states the orphan-RECORD sweeper never reaps, whatever the age:
+# ``creating`` (still being built) and ``error`` (a failed create/resize whose
+# container may be mid-rebuild by the recovery path).
+_SWEEP_PROTECTED_STATES = ("creating", "error")
+
+
+def _container_lifecycle_class(container) -> str:
+    """Best-effort lifecycle class of a live ``container`` object.
+
+    Module-level twin of :meth:`ContainerManager.class_of`, for the sweeps that
+    run without a manager instance: resource containers are recognised by the
+    shared live probe; every other container is resolved through its
+    container-record (``RECORD_LABEL_KEY`` label) and falls back to
+    ``LIFECYCLE_PERSISTENT`` when no record is attached or resolvable.
+
+    The record lookup uses the DEFAULT vault resolution
+    (``find_by_docker_label(record_id)`` with ``vault_root=None``), matching the
+    writer ``record_creation``; a divergent vault makes the lookup silently miss
+    and the class degrade to ``LIFECYCLE_PERSISTENT`` (losing the fail-closed
+    denial for the ``service``/unknown classes).  See :meth:`class_of`.
+    """
+    try:
+        labels = getattr(container, "labels", None)
+        name = getattr(container, "name", None)
+        image = getattr(container, "image", None)
+        if image is None or isinstance(image, str):
+            image_tags = image
+        else:
+            image_tags = getattr(image, "tags", None)
+    except Exception:
+        labels = name = image_tags = None
+    return lifecycle_class_from_labels(
+        labels, name=name, image_tags=image_tags, lookup=find_by_docker_label,
+    )
+
+
+def _gc_should_skip(container) -> bool:
+    """True when a destructive workspace GC must NOT touch ``container``.
+
+    Containers whose lifecycle class owns its own lifecycle (resource/service)
+    are skipped, as is any container with an unknown/absent class
+    (fail-closed).
+    """
+    try:
+        policy = policy_for(_container_lifecycle_class(container))
+    except UnknownLifecycleClass:
+        return True
+    return policy.own_lifecycle
+
+
+def _container_name(container):
+    """Best-effort human-readable name for a container object."""
+    for attr in ("name", "id"):
+        try:
+            value = getattr(container, attr, None)
+        except Exception:
+            value = None
+        if value:
+            return value
+    return repr(container)
+
+
+def sweep_exited_workspace_containers(registered_workspace_ids=None,
+                                      max_age_s=86400, dry_run=False,
+                                      max_age_s_by_class=None):
+    """Sweep EXITED ``thoughtmachine.workspace_id``-labelled containers that
+    have been idle past the TTL for their lifecycle class.
+
+    ``max_age_s_by_class`` maps a lifecycle class (``LIFECYCLE_EPHEMERAL`` /
+    ``LIFECYCLE_PERSISTENT`` / ``LIFECYCLE_RESOURCE`` / ``LIFECYCLE_SERVICE``)
+    to its idle TTL in seconds.  When it is ``None`` the per-class defaults are
+    used: ephemeral containers are reclaimed quickly (15 min) because they are
+    cheap and expected to be re-created on demand, while every owning class
+    keeps the historical 24 h retention.  Any class missing from the map falls
+    back to the flat ``max_age_s`` (default 24 h).
+
+    ``max_age_s`` remains the flat fallback TTL.  Callers that need to force
+    ONE TTL on EVERY class (e.g. the ``THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S``
+    debug knob in ``web_ui/backend/server.py``) must pass a ``max_age_s_by_class``
+    that names every class -- a bare ``max_age_s`` cannot override the defaults.
+
+    Two branches share the same predicate (``status == 'exited'`` AND idle
+    age ``>= ttl-for-class``):
+    - registered workspaces -> idle/TTL branch (``removed_registered``)
+    - unregistered workspaces -> orphan branch (``removed_orphan``)
+    Resource containers (``thoughtmachine.resource`` label) are ALWAYS
+    skipped, as are running/created containers and any container whose
+    ``State.FinishedAt`` is missing, unparseable or in the future (clock
+    skew safety).
+
+    ``registered_workspace_ids=None`` -> TTL-only sweep: every workspace
+    container is treated as registered (orphan classification disabled).
+    ``registered_workspace_ids=[]``  -> conservative NO-OP: with an empty
+    registry every container would look like an orphan, so nothing is
+    removed ("safe when the registry is empty").
+
+    ``dry_run=True`` counts would-be removals but never calls ``remove()``.
+    Never raises — a missing/broken docker daemon soft-fails into a result.
+    Returns::
+
+        {"removed": int, "skipped": int, "detail": str, "dry_run": bool,
+         "removed_registered": int, "removed_orphan": int,
+         "removed_containers": [container name or id, ...]}
+    """
+    result = {
+        "removed": 0,
+        "skipped": 0,
+        "detail": "",
+        "dry_run": bool(dry_run),
+        "removed_registered": 0,
+        "removed_orphan": 0,
+        "removed_containers": [],
+    }
+
+    if max_age_s_by_class is None:
+        # Per-class default idle TTLs (seconds). Ephemeral containers are cheap
+        # and expected to be re-created on demand, so they are reclaimed
+        # quickly; every owning class keeps the historical 24 h retention.
+        max_age_s_by_class = {
+            LIFECYCLE_EPHEMERAL: 900,
+            LIFECYCLE_PERSISTENT: 86400,
+            LIFECYCLE_RESOURCE: 86400,
+            LIFECYCLE_SERVICE: 86400,
+        }
+
+    if registered_workspace_ids is not None and len(registered_workspace_ids) == 0:
+        # Empty registry -> nothing can be classified as "registered"; wiping
+        # every exited container on startup would be a data-loss surprise.
+        result["detail"] = "registry empty; sweep skipped"
+        return result
+
+    if not DOCKER_AVAILABLE:
+        result["detail"] = "docker SDK not installed"
+        return result
+
+    try:
+        client = docker.from_env()
+        containers = client.containers.list(all=True, filters={"label": _WORKSPACE_LABEL})
+    except Exception as exc:
+        result["detail"] = f"docker unavailable: {exc}"
+        return result
+
+    registered = (
+        None
+        if registered_workspace_ids is None
+        else {str(ws) for ws in registered_workspace_ids}
+    )
+
+    skip_counts = {}
+    now = time.time()
+
+    def _note_skip(category):
+        skip_counts[category] = skip_counts.get(category, 0) + 1
+        result["skipped"] += 1
+
+    for container in containers:
+        name = _container_name(container)
+
+        try:
+            labels = container.labels or {}
+        except Exception:
+            labels = {}
+        if _gc_should_skip(container):
+            # Resource / lifecycle-owning containers (hidden git images etc.) are
+            # owned by infra/resource_container_manager — never touched here.
+            _note_skip("resource")
+            continue
+
+        wid = labels.get(_WORKSPACE_LABEL)
+        if not wid:
+            _note_skip("no_workspace_label")
+            continue
+
+        try:
+            status = container.status
+        except Exception:
+            status = None
+        if status != "exited":
+            _note_skip(f"status={status!r}")
+            continue
+
+        try:
+            finished_at = ((container.attrs or {}).get("State") or {}).get("FinishedAt") or ""
+            ts = datetime.fromisoformat(finished_at.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            _note_skip("FinishedAt unparseable")
+            continue
+        if ts > now:
+            _note_skip("FinishedAt in future")
+            continue
+        cls = _container_lifecycle_class(container)
+        ttl = max_age_s_by_class.get(cls, max_age_s)
+        if now - ts < ttl:
+            _note_skip("too young")
+            continue
+
+        is_registered = registered is None or wid in registered
+        ttl_reason = "ttl_expired" if is_registered else "orphaned"
+
+        if dry_run:
+            result["removed"] += 1
+            if is_registered:
+                result["removed_registered"] += 1
+            else:
+                result["removed_orphan"] += 1
+            result["removed_containers"].append(name)
+            continue
+
+        # Route the TTL/orphan removal through the funnel: an explicit reap
+        # intent returns action="reap" and emits a CONTAINER_LIFECYCLE decision
+        # event.  The TTL semantics above are UNCHANGED -- only the decision
+        # point moves.  A non-destroy decision is honoured (nothing removed).
+        intent = ContainerIntent(
+            kind="reap",
+            explicit=True,
+            reason=ttl_reason,
+            force=True,
+            workspace_id=wid,
+        )
+        decision = ContainerLifecycle.reconcile(container, None, intent)
+        if not decision.destroys:
+            _note_skip(f"lifecycle {decision.action}")
+            continue
+        emit_destroy_audit(_audit, "container_manager.ttl_sweep", container,
+                           reason=ttl_reason)
+        try:
+            container.remove(force=True)
+        except Exception as exc:
+            _note_skip(f"remove failed: {exc}")
+            continue
+        result["removed"] += 1
+        if is_registered:
+            result["removed_registered"] += 1
+        else:
+            result["removed_orphan"] += 1
+        result["removed_containers"].append(name)
+
+    if skip_counts:
+        parts = ", ".join(f"{cat}: {cnt}" for cat, cnt in sorted(skip_counts.items()))
+        if len(parts) > _SWEEP_SKIP_DETAIL_CAP * 40:
+            parts = parts[:_SWEEP_SKIP_DETAIL_CAP * 40] + "…"
+        result["detail"] = f"skipped ({parts})"
+
+    _audit("CONTAINER_SWEEP",
+           f"removed={result['removed']} skipped={result['skipped']} "
+           f"dry_run={dry_run}")
+    return result
+
+
+# ``default_max_age_s`` is a FALLBACK — every lifecycle class that reaches this age gate normally carries an explicit ``workspace_gc_max_age_s``, and ``own_lifecycle=True`` classes skip the gate entirely, so per-class policy is authoritative (see the precedence docstring in ``thoughtmachine/container_record/lifecycle_policy.py``).  Exception: resource-class RECORDS are no longer skipped by the record sweeper (they own their container lifecycle, not their record), and their policy carries no ``workspace_gc_max_age_s``, so an orphaned resource record falls back to ``default_max_age_s`` here.
+def sweep_orphan_container_records(*, registered_workspace_ids=None,
+                                   default_max_age_s=86400, dry_run=False,
+                                   docker_client=None) -> dict:
+    """Sweep orphaned container RECORDS whose bound container is gone.
+
+    A record is reaped when ALL of the following hold:
+    - its lifecycle class policy does NOT own its lifecycle, or it is a
+      resource-class record (``LIFECYCLE_RESOURCE``): resource containers
+      manage their own CONTAINER lifecycle, but an orphaned resource RECORD
+      is still reaped; service records remain exempt;
+    - its state is not in ``_SWEEP_PROTECTED_STATES`` -- a record still being
+      created is never an orphan, and a record in ``error`` may be mid-rebuild
+      on the recovery path, so neither is ever reaped;
+    - its ``docker_id`` is empty or names no LIVE container;
+    - its age (from ``created_at`` else ``updated_at``) is past its retention
+      window (``retention_days`` when set, else ``default_max_age_s``).
+
+    The age clock is the IMMUTABLE birth stamp ``created_at`` (written once at
+    create; see ``api._IMMUTABLE_FIELDS``), not ``updated_at``, so neither the
+    drift scan nor any event write can reset it and defeat the age gate.
+
+    The record's workspace registration is NOT a reap condition: a record
+    whose bound container is gone is reaped whether or not its workspace is
+    registered.
+
+    ``registered_workspace_ids=None`` or ``[]`` -> conservative NO-OP: an
+    absent registry is treated as an unconfigured caller, so nothing is removed.
+
+    ``dry_run=True`` counts would-be removals but never calls ``delete_record``.
+    Never raises: a missing/broken docker daemon soft-fails into a result.
+    Returns::
+
+        {"removed": int, "skipped": int, "detail": str, "dry_run": bool,
+         "removed_records": [record id, ...], "removed_orphan": int}
+    """
+    result = {
+        "removed": 0,
+        "skipped": 0,
+        "detail": "",
+        "dry_run": bool(dry_run),
+        "removed_records": [],
+        "removed_orphan": 0,
+    }
+
+    def _emit_summary():
+        """Emit the once-per-invocation sweep summary (WARNING + audit).
+
+        WARNING is used deliberately: an INFO line would be dropped by the
+        console gate (``msg_priority >= WARNING`` when ``TM_LOG_TAGS`` is
+        empty), so it would not be printed to stderr.  WARNING reaches stderr,
+        which ``start_thoughtmachine.sh`` tees into
+        ``logs/backend_startup.log``.  (``server.py`` now calls ``set_logger``,
+        so an INFO line would also reach the agent sink -- but the console gate
+        still suppresses INFO on stderr, so WARNING stays the level visible on
+        boot.)  Each emit is independently best-effort and never raises.
+        """
+        try:
+            log("WARNING", "docker.container_manager",
+                f"orphan record sweep: reaped={result['removed']} "
+                f"skipped={result['skipped']} "
+                f"reason={result['detail'] or 'clean'}")
+        except Exception:
+            pass
+        try:
+            _audit("RECORD_SWEEP",
+                   f"reaped={result['removed']} skipped={result['skipped']} "
+                   f"dry_run={dry_run} reason={result['detail']!r}")
+        except Exception:
+            pass
+
+    if registered_workspace_ids is None or len(registered_workspace_ids) == 0:
+        # Empty/absent registry -> every workspace would classify as orphan;
+        # wiping every record on a bad registry read is a data-loss surprise.
+        result["detail"] = "registry empty; record GC skipped"
+        _emit_summary()
+        return result
+
+    if docker_client is None:
+        if not DOCKER_AVAILABLE:
+            result["detail"] = "docker SDK not installed"
+            _emit_summary()
+            return result
+        try:
+            docker_client = docker.from_env()
+        except Exception as exc:
+            result["detail"] = f"docker unavailable: {exc}"
+            _emit_summary()
+            return result
+
+    try:
+        live_ids = set()
+        for container in docker_client.containers.list(all=True):
+            cid = getattr(container, "id", None)
+            if cid:
+                live_ids.add(str(cid))
+    except Exception as exc:
+        result["detail"] = f"docker unavailable: {exc}"
+        _emit_summary()
+        return result
+
+    skip_counts = {}
+    now = time.time()
+
+    def _note_skip(category):
+        skip_counts[category] = skip_counts.get(category, 0) + 1
+        result["skipped"] += 1
+
+    try:
+        workspace_ids = storage.iter_workspace_ids()
+    except Exception:
+        workspace_ids = []
+
+    for ws in workspace_ids:
+        try:
+            records = list_records(ws)
+        except Exception:
+            records = []
+        for record in records or []:
+            try:
+                policy = policy_for(record.lifecycle_class)
+            except UnknownLifecycleClass:
+                _note_skip("unknown_class")
+                continue
+            # Resource-class records own their CONTAINER's lifecycle, but a
+            # resource RECORD whose bound container is gone is still an orphan
+            # and must be reaped (bug/resource-record-reaper).  Every other
+            # own-lifecycle class (service) stays exempt.  The carve-out is
+            # scoped to this record sweeper only; ``own_lifecycle`` remains the
+            # gate for container stop / workspace GC / auto-heal.
+            if policy.own_lifecycle and record.lifecycle_class != LIFECYCLE_RESOURCE:
+                _note_skip("lifecycle_own")
+                continue
+
+            docker_id = str(getattr(record, "docker_id", "") or "")
+            if docker_id and docker_id in live_ids:
+                _note_skip("container_live")
+                continue
+
+            # A record mid-creation is never an orphan.
+            if str(getattr(record, "state", "") or "") == "creating":
+                _note_skip("state_creating")
+                continue
+
+            # A record in an ``error`` state (failed create / failed resize) is
+            # not an orphan: the recovery path rebinds it to a rebuilt
+            # container, so reaping it here would race the rebuild.
+            state = str(getattr(record, "state", "") or "")
+            if state in _SWEEP_PROTECTED_STATES:
+                _note_skip(f"state_{state}")
+                continue
+
+            # Age from the record's IMMUTABLE birth stamp.  ``updated_at`` must
+            # NOT be the clock here: ``api.append_event`` rewrites it, so any
+            # event-receiving record would look perpetually young and never be
+            # reaped (an unbounded retention leak).
+            timestamp_text = (
+                getattr(record, "created_at", "") or getattr(record, "updated_at", "") or ""
+            )
+            try:
+                ts = datetime.fromisoformat(
+                    str(timestamp_text).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                ts = None
+            if ts is None:
+                _note_skip("no_timestamp")
+                continue
+            if ts > now:
+                _note_skip("timestamp_in_future")
+                continue
+
+            retention = getattr(record, "retention_days", None)
+            if isinstance(retention, int) and not isinstance(retention, bool) \
+                    and retention > 0:
+                max_age_s = retention * 86400
+            elif policy.workspace_gc_max_age_s is not None:
+                max_age_s = policy.workspace_gc_max_age_s
+            else:
+                max_age_s = default_max_age_s
+            if now - ts < max_age_s:
+                _note_skip("too young")
+                continue
+
+            if dry_run:
+                result["removed"] += 1
+                result["removed_orphan"] += 1
+                result["removed_records"].append(record.id)
+                continue
+
+            # Route the orphan-record reap through the funnel: the bound
+            # container is already GONE (that is what makes the record an
+            # orphan), so reconcile is handed ``None`` with an explicit reap
+            # intent; it returns action="reap" and emits a CONTAINER_LIFECYCLE
+            # decision event.  A non-destroy decision is honoured.
+            intent = ContainerIntent(
+                kind="reap",
+                explicit=True,
+                reason="orphaned",
+                force=True,
+                workspace_id=ws,
+            )
+            decision = ContainerLifecycle.reconcile(None, None, intent)
+            if not decision.destroys:
+                _note_skip(f"lifecycle {decision.action}")
+                continue
+
+            try:
+                delete_record(ws, record.id)
+            except Exception as exc:
+                _note_skip(f"delete failed: {exc}")
+                continue
+            _name_index_forget(record.id)
+            result["removed"] += 1
+            result["removed_orphan"] += 1
+            result["removed_records"].append(record.id)
+            try:
+                log("WARNING", "docker.container_manager",
+                    f"reaped orphan container record: workspace_id={ws} "
+                    f"record_id={record.id} docker_id={docker_id!r} "
+                    f"name={getattr(record, 'name', None)!r} "
+                    f"state={getattr(record, 'state', None)!r}")
+            except Exception:
+                pass
+            try:
+                _audit("RECORD_REAP",
+                       f"workspace_id={ws} record_id={record.id} "
+                       f"docker_id={docker_id!r} dry_run={dry_run} "
+                       f"name={getattr(record, 'name', None)!r} "
+                       f"state={getattr(record, 'state', None)!r} "
+                       f"created_at={getattr(record, 'created_at', None)!r} "
+                       f"updated_at={getattr(record, 'updated_at', None)!r} "
+                       f"intent_snapshot={(getattr(record, 'intent_snapshot', None) or {})!r}")
+            except Exception:
+                pass
+
+    if skip_counts:
+        parts = ", ".join(f"{cat}: {cnt}" for cat, cnt in sorted(skip_counts.items()))
+        if len(parts) > _SWEEP_SKIP_DETAIL_CAP * 40:
+            parts = parts[:_SWEEP_SKIP_DETAIL_CAP * 40] + "\u2026"
+        result["detail"] = f"skipped ({parts})"
+
+    _emit_summary()
+    return result
+
+
+def reap_container_record(workspace_id, record_id, *, apply=False,
+                          docker_client=None, actor=None, reason=None) -> dict:
+    """Force-reap ONE orphan container record, bypassing the AGE gate ONLY.
+
+    Primitive behind ``scripts/reap_container_record.py``.  It reaps a single
+    record identified by ``record_id`` in ``workspace_id`` without waiting for
+    its retention window to elapse -- the operator's explicit escape hatch for
+    a record whose bound container is long gone but which the age-gated sweeper
+    (:func:`sweep_orphan_container_records`) still considers "too young".
+
+    Every OTHER safety gate the sweeper enforces stays in force, fail-closed:
+
+    - **own-lifecycle** -- ``resource`` / ``service`` classes manage their own
+      lifecycle and are never reaped here (``reason="lifecycle_own"``); an
+      unknown class is refused (``reason="unknown_class"``).
+    - **liveness** -- a record whose ``docker_id`` still names a LIVE container
+      is NEVER reaped, even with ``apply=True`` (``reason="container_live"``).
+      This is the whole point of "orphan".
+    - **docker** -- a missing/unreachable docker daemon soft-fails
+      (``reason="docker_unavailable"``) and never deletes.
+
+    Only the age/retention gate is bypassed.
+
+    ``apply=False`` (default) is a dry run: it reports ``reaped=True`` but
+    writes nothing and emits no audit.  ``apply=True`` deletes the record,
+    forgets its ``(workspace, name)`` index entry, logs a WARNING and emits
+    ``RECORD_REAP`` + ``RECORD_FORCE_REAP`` audit events.
+
+    ``actor`` / ``reason`` are free-form attribution recorded on the
+    ``RECORD_FORCE_REAP`` audit line (e.g. the CLI's ``--actor`` / ``--reason``).
+
+    Never raises: every failure soft-fails into ``result["reason"]``.
+    Returns::
+
+        {"workspace_id": str, "record_id": str, "docker_id": str,
+         "found": bool, "reaped": bool, "applied": bool,
+         "detail": str, "reason": str}
+    """
+    workspace_id = str(workspace_id) if workspace_id is not None else ""
+    record_id = str(record_id) if record_id is not None else ""
+    result = {
+        "workspace_id": workspace_id,
+        "record_id": record_id,
+        "docker_id": "",
+        "found": False,
+        "reaped": False,
+        "applied": False,
+        "detail": "",
+        "reason": "",
+    }
+
+    try:
+        record = load_record(workspace_id, record_id)
+    except Exception:
+        record = None
+    if record is None:
+        result["reason"] = "record_not_found"
+        result["detail"] = (
+            f"no record {record_id!r} in workspace {workspace_id!r}")
+        return result
+
+    result["found"] = True
+    docker_id = str(getattr(record, "docker_id", "") or "")
+    result["docker_id"] = docker_id
+
+    # Own-lifecycle gate (fail closed): resource/service containers manage
+    # their own lifecycle; an unknown class is never reaped.  ``apply`` does NOT
+    # bypass this -- it bypasses the AGE gate only.
+    try:
+        policy = policy_for(record.lifecycle_class)
+    except UnknownLifecycleClass:
+        result["reason"] = "unknown_class"
+        result["detail"] = (
+            f"unknown lifecycle class {record.lifecycle_class!r}; refusing")
+        return result
+    if policy.own_lifecycle:
+        result["reason"] = "lifecycle_own"
+        result["detail"] = (
+            f"lifecycle class {record.lifecycle_class!r} owns its lifecycle; "
+            f"refusing to reap")
+        return result
+
+    # Docker liveness (NEVER bypassed).  Mirror the sweeper's soft-fail.
+    if docker_client is None:
+        if not DOCKER_AVAILABLE:
+            result["reason"] = "docker_unavailable"
+            result["detail"] = "docker SDK not installed"
+            return result
+        try:
+            docker_client = docker.from_env()
+        except Exception as exc:
+            result["reason"] = "docker_unavailable"
+            result["detail"] = f"docker unavailable: {exc}"
+            return result
+
+    try:
+        live_ids = set()
+        for container in docker_client.containers.list(all=True):
+            cid = getattr(container, "id", None)
+            if cid:
+                live_ids.add(str(cid))
+    except Exception as exc:
+        result["reason"] = "docker_unavailable"
+        result["detail"] = f"docker unavailable: {exc}"
+        return result
+
+    if docker_id and docker_id in live_ids:
+        result["reason"] = "container_live"
+        result["detail"] = (
+            f"container {docker_id!r} still exists; refusing to force-reap "
+            f"(liveness gate never bypassed)")
+        return result
+
+    # AGE GATE BYPASSED: reap regardless of age / retention below this point.
+
+    if not apply:
+        result["reaped"] = True
+        result["applied"] = False
+        result["reason"] = "dry_run"
+        result["detail"] = (
+            f"would force-reap record {record.id!r} (docker_id={docker_id!r}); "
+            f"dry run, nothing written")
+        return result
+
+    try:
+        delete_record(workspace_id, record.id)
+    except Exception as exc:
+        result["reason"] = "delete_failed"
+        result["detail"] = f"delete failed: {exc}"
+        return result
+
+    _name_index_forget(record.id)
+    result["reaped"] = True
+    result["applied"] = True
+    result["reason"] = "ok"
+    result["detail"] = (
+        f"force-reaped record {record.id!r} (docker_id={docker_id!r})")
+
+    try:
+        log("WARNING", "docker.container_manager",
+            f"force-reaped orphan container record: "
+            f"workspace_id={workspace_id} record_id={record.id} "
+            f"docker_id={docker_id!r}")
+    except Exception:
+        pass
+    try:
+        _audit("RECORD_REAP",
+               f"workspace_id={workspace_id} record_id={record.id} "
+               f"docker_id={docker_id!r} dry_run=False")
+    except Exception:
+        pass
+    try:
+        _audit("RECORD_FORCE_REAP",
+               f"workspace_id={workspace_id} record_id={record.id} "
+               f"docker_id={docker_id!r} actor={actor!r} reason={reason!r} "
+               f"created_at={str(getattr(record, 'created_at', '') or '')}")
+    except Exception:
+        pass
+
+    return result

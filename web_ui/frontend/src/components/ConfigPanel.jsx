@@ -1,186 +1,143 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
-import WorkspacePanel from './WorkspacePanel';
+import SessionWorkspaceTab from './SessionWorkspaceTab';
+import PromptLibrary from './PromptLibrary';
+import useStore from '../store/useStore';
+import { apiUrl } from '../apiBase';
 
-// ── Directory Browser sub-component ──────────────────────────────────────
-function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect, setLoading, setEntries, setError }) {
-  const fetchDir = useCallback(async (dirPath) => {
-    setLoading(true);
-    setError('');
-    try {
-      const url = `http://${window.location.hostname}:8000/api/browse?path=${encodeURIComponent(dirPath || '')}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      if (data.success) {
-        setEntries(data.entries || []);
-      } else {
-        setError(data.error || 'Failed to list directory');
-        setEntries([]);
-      }
-    } catch (err) {
-      setError('Network error: ' + err.message);
-      setEntries([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [setLoading, setEntries, setError]);
+// Canonical-only option lists, permissive-first; no rank map needed — some
+// canonical levels share a rank (write_on_feature_branch is a write-tier grant).
+// Container is a boolean toggle, so it has no option list here.
+const SESSION_PERMISSION_OPTION_ORDER = {
+  git: ['write', 'write_on_feature_branch', 'read', 'ask', 'banned'],
+  filesystem: ['write', 'read', 'banned'],
+  network: ['write', 'outbound', 'ask', 'banned'],
+  mcp: ['full', 'connect', 'banned'],
+  host_bash: ['allow', 'ask', 'banned'],
+}
+// Only these keys may be PUT to /api/session/{id}/permissions (mirrors the
+// backend session-permission store schema).
+const CANONICAL_SESSION_PERMISSION_KEYS = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash']
 
-  const [newFolderName, setNewFolderName] = useState('');
-  const [hoveredFolder, setHoveredFolder] = useState(null);
-  const [creating, setCreating] = useState(false);
+// Canonical-key subset of a raw permission map. BOTH sides of the permissions
+// dirty compare go through this: a GET can carry legacy `system`/`execution` or
+// gate grains (which is exactly why the PUT below may send canonical keys only),
+// and comparing the FULL raw map against a canonical-only applied baseline would
+// pin the panel dirty forever -- Apply stays blue and 'Unsaved permission
+// changes' never clears. Identity for canonical-only data. Null-safe.
+const canonicalPermKeySubset = (raw) =>
+  !raw || typeof raw !== 'object'
+    ? {}
+    : Object.fromEntries(
+        CANONICAL_SESSION_PERMISSION_KEYS.filter((k) => k in raw).map((k) => [k, raw[k]])
+      );
+const permissionOptionStyle = { background: '#1e1e2e', color: '#cdd6f4' }
+const permissionOptionLabel = (value) => value === 'write_on_feature_branch'
+  ? 'Write on feature branches'
+  : String(value).charAt(0).toUpperCase() + String(value).slice(1)
 
-  const createFolder = useCallback(async () => {
-    const name = newFolderName.trim();
-    if (!name) return;
-    setCreating(true);
-    try {
-      const url = `http://${window.location.hostname}:8000/api/browse/create`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ parent_path: path, name }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        setNewFolderName('');
-        fetchDir(path);
-      } else {
-        setError(data.error || 'Failed to create directory');
-      }
-    } catch (err) {
-      setError('Network error: ' + err.message);
-    } finally {
-      setCreating(false);
-    }
-  }, [newFolderName, path, fetchDir, setError]);
+// Flat-map deep equality for the permissions raw maps (string/bool values).
+const isEqualRaw = (a, b) => {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  return keysA.every((k) => a[k] === b[k]);
+}
 
-  useEffect(() => {
-    fetchDir(path);
-  }, [path, fetchDir]);
+// Backend-canonical key → human label for the "Not global defaults" notice.
+// translate_frontend_config renames provider→provider_type and tools→enabled_tools
+// BEFORE the allowlist split, so dropped_keys carries the BACKEND names.
+const DEFAULT_KEY_LABELS = {
+  provider: 'Provider',
+  provider_type: 'Provider',
+  tools: 'Tools',
+  enabled_tools: 'Tools',
+  mode: 'Mode',
+  workspace_path: 'Workspace path',
+  token_monitor_warning_threshold: 'Token warning threshold',
+  token_monitor_critical_threshold: 'Token critical threshold',
+  tool_output_token_limit: 'Tool output limit',
+};
 
-  const goUp = () => {
-    const parts = path.replace(/\\/g, '/').replace(/\/$/, '').split('/');
-    parts.pop();
-    const parent = parts.join('/') || '/';
-    onNavigate(parent);
-  };
+function humanizeDefaultKey(key) {
+  if (DEFAULT_KEY_LABELS[key]) return DEFAULT_KEY_LABELS[key];
+  return String(key)
+    .split('_')
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(' ');
+}
 
-  const listStyle = {
-    listStyle: 'none',
-    margin: 0,
-    padding: 0,
-    overflowY: 'auto',
-    flex: 1,
-    minHeight: 0,
-  };
-
-  const itemStyle = (isDir, isHovered) => ({
-    padding: '0.3rem 0.5rem',
-    cursor: isDir ? 'pointer' : 'default',
-    borderRadius: '4px',
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.4rem',
-    fontSize: '0.85rem',
-    color: isDir ? '#89b4fa' : '#cdd6f4',
-    background: isHovered ? '#45475a' : 'transparent',
-    transition: 'background 0.15s',
-  });
-
-  if (loading) {
-    return <div style={{ ...listStyle, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#a6adc8' }}>Loading...</div>;
+// Keys in dropped_keys ARE saved (as session-level config) — just not as global
+// defaults — so the copy must never say "not saved".
+function buildDefaultSaveNotice(savedKeys, droppedKeys) {
+  const saved = savedKeys ?? [];
+  const dropped = droppedKeys ?? [];
+  let text =
+    saved.length === 0
+      ? 'No settings saved as global defaults.'
+      : `Saved ${saved.length} settings as global defaults.`;
+  if (dropped.length > 0) {
+    text += ` Not global defaults: ${dropped.map(humanizeDefaultKey).join(', ')}.`;
   }
+  return text;
+}
 
-  if (error) {
-    return (
-      <div style={{ ...listStyle, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
-        <span style={{ color: '#f38ba8', fontSize: '0.85rem' }}>{error}</span>
-        <button onClick={() => fetchDir(path)} style={{
-          background: '#45475a', color: '#cdd6f4', border: '1px solid #585b70',
-          borderRadius: '4px', padding: '0.3rem 0.8rem', cursor: 'pointer', fontSize: '0.8rem'
-        }}>Retry</button>
-      </div>
-    );
-  }
+const DEFAULT_SAVE_TIMEOUT_MS = 5000;
 
+// ── Read-only field-tier badge ────────────────────────────────────────────
+// Whether an AgentConfig field can be hot-swapped onto a RUNNING session or
+// needs a restart is decided by the backend authority
+// (agent.core.agent.config_field_tiers) and published at
+// GET /api/workspace/{ws_id}/config_tiers. This component only ever renders
+// that verdict: no field list lives here, nothing is guessed locally, and a
+// field the map has no entry for gets no badge at all.
+function ConfigTierBadge({ field, tiers }) {
+  const tier = tiers?.[field];
+  if (tier !== 'hot_swap' && tier !== 'requires_respawn') return null;
+  const hot = tier === 'hot_swap';
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-      <div style={{ marginTop: '0.1rem', marginBottom: '0.4rem', display: 'flex', gap: '0.3rem', flexWrap: 'wrap' }}>
-        {path && path !== '/' && (
-          <button onClick={goUp} style={{
-            background: '#45475a', color: '#cdd6f4', border: '1px solid #585b70',
-            borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontSize: '0.75rem'
-          }}>↑ Parent</button>
-        )}
-        <div style={{ display: 'flex', gap: '0.3rem', alignItems: 'center' }}>
-          <input
-            type="text"
-            value={newFolderName}
-            onChange={(e) => setNewFolderName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') createFolder(); }}
-            placeholder="new folder"
-            style={{
-              background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #585b70',
-              borderRadius: '4px', padding: '0.2rem 0.4rem', fontSize: '0.75rem',
-              width: '90px', outline: 'none',
-            }}
-          />
-          <button onClick={createFolder} disabled={creating || !newFolderName.trim()} style={{
-            background: creating ? '#585b70' : '#45475a',
-            color: creating || !newFolderName.trim() ? '#6c7086' : '#a6e3a1',
-            border: '1px solid #585b70',
-            borderRadius: '4px', padding: '0.2rem 0.4rem',
-            cursor: creating || !newFolderName.trim() ? 'not-allowed' : 'pointer',
-            fontSize: '0.75rem', whiteSpace: 'nowrap',
-          }}>{creating ? '…' : '+ Folder'}</button>
-        </div>
-        <button onClick={() => onSelect(path)} style={{
-          background: '#89b4fa', color: '#1e1e2e', border: 'none',
-          borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontWeight: 600, fontSize: '0.75rem',
-          marginLeft: 'auto',
-        }}>Select This Folder</button>
-      </div>
-      <ul style={listStyle}>
-        {entries.filter(e => e.is_dir).length === 0 && (
-          <li style={{ padding: '0.5rem', color: '#6c7086', fontSize: '0.8rem', textAlign: 'center' }}>
-            (no subdirectories)
-          </li>
-        )}
-        {entries.filter(e => e.is_dir).map((entry) => (
-          <li
-            key={entry.name}
-            onClick={() => {
-              const newPath = path.replace(/\\/g, '/').replace(/\/$/, '') + '/' + entry.name;
-              onNavigate(newPath);
-            }}
-            onMouseEnter={() => setHoveredFolder(entry.name)}
-            onMouseLeave={() => setHoveredFolder(null)}
-            style={itemStyle(true, hoveredFolder === entry.name)}
-          >
-            <span>📁</span>
-            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.name}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
+    <span
+      data-testid={`config-tier-${field}`}
+      style={{
+        marginLeft: '0.4rem',
+        padding: '0.05rem 0.3rem',
+        borderRadius: '3px',
+        fontSize: '0.65rem',
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+        background: hot ? '#a6e3a1' : '#fab387',
+        color: '#1e1e2e',
+      }}
+      title={
+        hot
+          ? 'Applies to the next query — no restart needed'
+          : 'Requires restarting the session to take effect'
+      }
+    >
+      {hot ? 'Applies to next query' : 'Requires restart'}
+    </span>
   );
 }
 
-
-function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult }) {
-  const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
+function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, configQueued = false, applyFailed = null }) {
+  const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error' | 'timeout'
+  const [notice, setNotice] = useState(null);  // null | { kind: 'status' | 'alert', text }
+  const [confirmReset, setConfirmReset] = useState(false);
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
+  const [allTools, setAllTools] = useState([]);
+  // {} until (and unless) GET /config_tiers answers — no badges is a valid render.
+  const [configTiers, setConfigTiers] = useState({});
+  // Permission safe defaults mirror the backend SINGLE OWNER through the store's
+  // `permissionDefaults` slice (hydrated from GET /api/permission-defaults);
+  // {} until the fetch resolves (fail-closed).  No hand-copied literal here.
+  const CANONICAL_PERMISSION_DEFAULTS = useStore((s) => s.permissionDefaults) || {};
   const normalizeSessionPermissions = (permissions) => {
     const normalized = {
-      filesystem: 'read',
-      network: 'banned',
-      container: false,
-      security: 'read',
-      git: 'write',
-      execution: 'banned',
-      system: true,
+      ...CANONICAL_PERMISSION_DEFAULTS,
       ...(permissions ?? {}),
     };
 
@@ -193,6 +150,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
   };
 
   const getSafeDraft = (cfg) => ({
+    mode: cfg?.mode ?? null,
     temperature: cfg?.temperature ?? 0.7,
     max_turns: cfg?.max_turns ?? 10,
     provider: cfg?.provider,
@@ -200,16 +158,30 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     model: cfg?.model,
     system_prompt: cfg?.system_prompt ?? '',
     tools: cfg?.tools ?? [],
-    session_permissions: normalizeSessionPermissions(cfg?.session_permissions),
+    // NOTE: session_permissions deliberately NOT included — permissions now live
+    // in the disk-pure session endpoint (/api/session/{id}/permissions) and the
+    // draft / apply_config payload must never carry them again.
 
-    token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 35000,
-    token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 50000,
+    token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 65000,
+    token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 80000,
     workspace_path: cfg?.workspace_path ?? '',
     tool_output_token_limit: cfg?.tool_output_token_limit ?? 10000,
   });
 
-  const [activeTab, setActiveTab] = useState('general');
-  const [draft, setDraft] = useState(getSafeDraft(config));
+  const [activeTab, setActiveTab] = useState('live_view');
+  // Draft persistence: the draft lives in the Zustand store (sessionDrafts)
+  // while sessionId is known, so unsaved edits survive tab switches that
+  // unmount this panel. localDraft is a fallback for the brief window where
+  // sessionId is still null (fresh tab, pre-load) but config already exists.
+  const storeDraft = useStore((s) => (sessionId ? s.sessionDrafts[sessionId] : undefined))
+  const setSessionDraft = useStore((s) => s.setSessionDraft)
+  const clearSessionDraft = useStore((s) => s.clearSessionDraft)
+  const [localDraft, setLocalDraft] = useState(null)
+  const draft = storeDraft ?? localDraft ?? getSafeDraft(config)
+  const updateDraft = (next) => {
+    if (sessionId) setSessionDraft(sessionId, next)
+    else setLocalDraft(next)
+  }
 
   // ── Directory browser state ────────────────────────────────────────
   // ── Dirty tracking & apply feedback ────────────────────────────────
@@ -217,48 +189,76 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
   const [isApplying, setIsApplying] = useState(false);
   const [applyError, setApplyError] = useState(null);
 
-  const [browserOpen, setBrowserOpen] = useState(false);
-  const [browserPath, setBrowserPath] = useState('');
-  const [browserEntries, setBrowserEntries] = useState([]);
-  const [browserLoading, setBrowserLoading] = useState(false);
-  const [browserError, setBrowserError] = useState('');
-  const handleBrowseNavigate = useCallback((newPath) => {
-    setBrowserPath(newPath);
-    setBrowserError('');
-  }, []);
-
   // ── Sync defaultConfigSaveStatus from backend into local UI state ────
+  // Accepts the new object payload { status, saved_keys, dropped_keys, session_id,
+  // message } OR the legacy bare string ('ok' | 'error') for backward compat.
   useEffect(() => {
-    if (defaultConfigSaveStatus === 'ok') {
+    const incoming = defaultConfigSaveStatus;
+    if (!incoming) return;
+    const isObject = typeof incoming === 'object';
+    const status = isObject ? incoming.status : incoming;
+
+    if (status === 'ok') {
       setDefaultSaved(true);
+      // Only the structured payload can describe which keys were global vs local.
+      if (isObject) {
+        setNotice({ kind: 'status', text: buildDefaultSaveNotice(incoming.saved_keys, incoming.dropped_keys) });
+      }
       const t = setTimeout(() => {
         setDefaultSaved(false);
+        setNotice(null);
         onClearDefaultSaveStatus?.();
-      }, 2500);
+      }, DEFAULT_SAVE_TIMEOUT_MS);
       return () => clearTimeout(t);
-    } else if (defaultConfigSaveStatus === 'error') {
+    } else if (status === 'error') {
       setDefaultSaved('error');
+      if (isObject && incoming.message) {
+        setNotice({ kind: 'alert', text: incoming.message });
+      }
       const t = setTimeout(() => {
         setDefaultSaved(false);
+        setNotice(null);
         onClearDefaultSaveStatus?.();
       }, 4000);
       return () => clearTimeout(t);
     }
   }, [defaultConfigSaveStatus, onClearDefaultSaveStatus]);
 
+  // ── Stuck-pending guard: if the backend never confirms (e.g. the session went
+  // stale and SessionTab dropped the message), surface an honest timeout instead
+  // of leaving the button on 'Saving…' forever. Cleanup is keyed on defaultSaved,
+  // so a pending → ok/error transition clears the timer.
   useEffect(() => {
-    setDraft(getSafeDraft(config));
-    setLastAppliedConfig(getSafeDraft(config));
-    // Clear applying state when config arrives (apply succeeded)
+    if (defaultSaved !== 'pending') return;
+    const t = setTimeout(() => {
+      setDefaultSaved('timeout');
+      setNotice({ kind: 'alert', text: 'Not saved — session may be stale. Try Start New Session.' });
+    }, DEFAULT_SAVE_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [defaultSaved]);
+
+  useEffect(() => {
+    const seeded = getSafeDraft(config)
+    setLastAppliedConfig(seeded)
+    // When an apply is in flight, the incoming config is the applied truth:
+    // drop any pending draft so the panel re-seeds from it. Otherwise a
+    // store-backed draft is the user's unsaved work and must NOT be clobbered
+    // by this config update — it only falls back to getSafeDraft(config) when
+    // no draft is pending.
     if (isApplying) {
-      setIsApplying(false);
+      if (sessionId) clearSessionDraft(sessionId)
+      setLocalDraft(null)
+      setIsApplying(false)
     }
+    setApplyError(null);
   }, [config]);
 
-  // Apply error timeout: if no config change after 6s, show error
+  // Apply error timeout: if no config change after 6s, show error.
+  // Disarmed while the apply is QUEUED (controller busy — the config_changed
+  // arrives later via the deferred apply, so no false 'timed out' error).
   const applyTimeoutRef = React.useRef(null);
   useEffect(() => {
-    if (isApplying) {
+    if (isApplying && !configQueued) {
       applyTimeoutRef.current = setTimeout(() => {
         setIsApplying(false);
         setApplyError('Apply timed out — check server connection');
@@ -270,7 +270,16 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
         applyTimeoutRef.current = null;
       }
     };
-  }, [isApplying]);
+  }, [isApplying, configQueued]);
+
+  // Server-reported apply failure (config_apply_failed) — surface the real
+  // error immediately instead of waiting for the 6s timeout.
+  useEffect(() => {
+    if (applyFailed) {
+      setIsApplying(false);
+      setApplyError(applyFailed);
+    }
+  }, [applyFailed]);
 
   // Auto-clear error after 5 seconds
   useEffect(() => {
@@ -280,9 +289,140 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     }
   }, [applyError]);
 
+  // Fetch the complete list of all available tools from the backend
+  useEffect(() => {
+    fetch(apiUrl('/api/tools'))
+      .then(res => res.json())
+      .then(data => {
+        if (data.tools) setAllTools(data.tools);
+      })
+      .catch(() => {
+        // Ignore — tools tab will just show whatever the session config provides
+      });
+  }, []);
+
+  // Fetch the field tiers for the badges below. Read-only and best-effort: a
+  // failure leaves configTiers empty, so the panel renders exactly as it did
+  // before (no badges) rather than inventing a verdict the backend would
+  // disagree with. Nothing here touches the draft, the save or the apply path.
+  useEffect(() => {
+    if (!workspaceId) return undefined;
+    let cancelled = false;
+    fetch(apiUrl(`/api/workspace/${workspaceId}/config_tiers`))
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled && data?.tiers && typeof data.tiers === 'object') {
+          setConfigTiers(data.tiers);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
+
+  // ── Permissions tab: disk-pure REST state ──────────────────────────
+  // Tab-LOCAL: raw (editable grant map), effective (read-only enforced
+  // profile) and resolved_at come from GET/PUT /api/session/{id}/permissions.
+  // Permission edits NEVER enter the draft.
+  const [sessionPerms, setSessionPerms] = useState(null);    // { raw, effective, resolved_at } | null
+  const [lastAppliedRaw, setLastAppliedRaw] = useState(null); // raw from the last GET/PUT response
+  const [permsLoadError, setPermsLoadError] = useState(null); // muted tab note when GET fails
+
+  // The STORED (persisted) raw map as of the last GET/PUT echo. A ref, so the
+  // tab-switch reset below can rewind the tab without a network round-trip and
+  // without depending on the identity of any other state value.
+  const persistedRawRef = useRef(null)
+
+  // Single GET path for the tab's stored sidecar.
+  const loadSessionPermissions = useCallback((sid, isCancelled = () => false) => {
+    setPermsLoadError(null);
+    if (!sid) {
+      persistedRawRef.current = null;
+      setSessionPerms(null);
+      setLastAppliedRaw(null);
+      return;
+    }
+    fetch(apiUrl(`/api/session/${encodeURIComponent(sid)}/permissions`))
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (isCancelled()) return;
+        const raw = data && typeof data.raw === 'object' && data.raw !== null ? data.raw : {};
+        persistedRawRef.current = { ...raw };
+        setSessionPerms({
+          raw,
+          effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : null,
+          resolved_at: data?.resolved_at ?? null,
+        });
+        // Baseline is the canonical projection, never the full raw map: see
+        // canonicalPermKeySubset.
+        setLastAppliedRaw(canonicalPermKeySubset(raw));
+      })
+      .catch(() => {
+        if (isCancelled()) return;
+        // No permission source for this session (or server unreachable): the
+        // tab falls back to display-only values; Apply skips the PUT.
+        persistedRawRef.current = null;
+        setSessionPerms(null);
+        setLastAppliedRaw(null);
+        setPermsLoadError('Session permissions unavailable — showing stored values');
+      });
+  }, []);
+
+  // Load the session's permission profile whenever the session changes.
+  useEffect(() => {
+    let cancelled = false;
+    loadSessionPermissions(sessionId, () => cancelled);
+    return () => { cancelled = true; };
+  }, [sessionId, loadSessionPermissions]);
+
+  // ── Tab-switch reset (permissions are DISK-PURE, not a draft) ──────
+  // The session deck keeps every pane mounted (App.jsx
+  // `.session-tab-pane-hidden`) so the window stays alive across tab switches,
+  // which means this panel is NOT remounted when the operator leaves the
+  // session. Permission edits are different from config drafts: the raw map is
+  // a STORED sidecar (GET/PUT /api/session/{id}/permissions), never part of the
+  // draft, so an un-applied edit must not outlive the view. Leaving the tab
+  // rewinds the raw map to the last persisted value; returning re-reads disk.
+  // Panes are keyed by session id, so this only ever fires for one session.
+  // `isActive` undefined means no deck is driving us (unit tests) — no-op.
+  const wasActiveRef = useRef(Boolean(isActive))
+  useEffect(() => {
+    if (typeof isActive !== 'boolean') return;
+    const wasActive = wasActiveRef.current;
+    wasActiveRef.current = isActive;
+    if (!sessionId || wasActive === isActive) return;
+    if (!isActive) {
+      if (persistedRawRef.current) {
+        const stored = persistedRawRef.current;
+        setSessionPerms((prev) => (prev ? { ...prev, raw: { ...stored } } : prev));
+        setLastAppliedRaw(canonicalPermKeySubset(stored));
+      }
+    } else {
+      loadSessionPermissions(sessionId);
+    }
+  }, [isActive, sessionId, loadSessionPermissions]);
+
+  // Display map for the Permissions tab: REST raw once loaded, otherwise a
+  // normalized seed from config.session_permissions (DISPLAY ONLY).
+  const permsRaw = sessionPerms?.raw ?? normalizeSessionPermissions(config?.session_permissions);
+
   // ── Derived: selected provider object ──────────────────────────────
   // Backend sends 'provider' in config_changed; fall back if 'provider_id' not set.
-  const activeProviderId = draft.provider_id || draft.provider || '';
+  // Try matching by UUID id first, then by legacy provider_type string.
+  const activeProviderId = (() => {
+    if (draft.provider_id) {
+      const match = providers.find(p => p.id === draft.provider_id);
+      if (match) return draft.provider_id;
+    }
+    if (draft.provider) {
+      const match = providers.find(p => p.provider_type === draft.provider);
+      if (match) return match.id;
+    }
+    return '';
+  })();
   const selectedProvider = providers.find((p) => p.id === activeProviderId);
   const availableModels = useMemo(() => {
     if (!selectedProvider) return []
@@ -298,11 +438,20 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     return JSON.stringify(draft) !== JSON.stringify(lastAppliedConfig);
   }, [draft, lastAppliedConfig]);
 
+  // Permissions-tab dirty: JSON-diff of the tab raw edits vs the raw returned
+  // by the last GET/PUT response. Only meaningful while a REST source is loaded.
+  const permsDirty = useMemo(() => {
+    if (!sessionPerms || !lastAppliedRaw) return false;
+    // Compare canonical projections on both sides (a legacy key in the GET raw
+    // must never pin the panel dirty).
+    return !isEqualRaw(canonicalPermKeySubset(permsRaw), lastAppliedRaw);
+  }, [sessionPerms, lastAppliedRaw, permsRaw]);
+
   const handleProviderChange = (e) => {
     const providerId = e.target.value
     const provider = providers.find((p) => p.id === providerId)
     // Reset model when provider changes; prefer default_model
-    setDraft({
+    updateDraft({
       ...draft,
       provider_id: providerId,
       model: provider?.default_model || (provider?.models?.[0]) || '',
@@ -310,8 +459,256 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
   }
 
   const handleModelChange = (e) => {
-    setDraft({ ...draft, model: e.target.value })
+    updateDraft({ ...draft, model: e.target.value })
   }
+
+  // ── Permissions tab: raw-map edits (tab-local state only) ──────────
+  const handlePermissionChange = (key, value) => {
+    if (!sessionPerms) return; // display-only fallback (no session REST source)
+    setSessionPerms({ ...sessionPerms, raw: { ...(sessionPerms.raw ?? {}), [key]: value } });
+  }
+
+  // ── Shared session-permissions save (single fetch path) ──
+  // PUTs the given raw map (the endpoint is a FULL REPLACE), then adopts the
+  // echoed effective/resolved_at without overwriting the tab's raw edits — the
+  // user may have edited the tab again while the PUT was in flight, and those
+  // newer edits must survive (stay dirty until the next save) instead of being
+  // silently swallowed by echo adoption. Used by Apply AND the host_bash quick
+  // action, so the fetch/error-decoding lives here only.
+  const putSessionPermissions = async (rawMap) => {
+    // PUT only canonical session-permission keys — the backend schema rejects
+    // any other key (legacy system/execution or gate grains).
+    const payload = canonicalPermKeySubset(rawMap)
+    const res = await fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/permissions`), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`
+      try {
+        const errData = await res.json()
+        if (errData?.detail?.errors?.length) message = errData.detail.errors.join('; ')
+        else if (typeof errData?.detail === 'string') message = errData.detail
+        else if (errData?.detail) message = JSON.stringify(errData.detail)
+      } catch { /* non-JSON error body */ }
+      throw new Error(message)
+    }
+    const data = await res.json()
+    // Applied baseline = exactly what we PUT (canonical values the backend
+    // persists unchanged).
+    setSessionPerms((prev) => ({
+      ...prev,
+      effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : (prev?.effective ?? null),
+      resolved_at: data?.resolved_at ?? null,
+    }))
+    setLastAppliedRaw(payload)
+    // The sidecar is now exactly what we PUT (full replace): keep the
+    // tab-switch reset baseline in sync so returning to the tab shows this.
+    persistedRawRef.current = { ...(persistedRawRef.current ?? {}), ...payload }
+    return data
+  }
+
+  // ── Quick action: grant host_bash 'allow' to THIS session ──
+  // Session-sidecar write through the shared helper above, MERGED into the
+  // session's current grants so no other capability is ever dropped.
+  const [grantHostBashError, setGrantHostBashError] = useState(null)
+  const handleGrantHostBash = async () => {
+    if (!sessionId || !sessionPerms) return
+    setGrantHostBashError(null)
+    try {
+      await putSessionPermissions({ ...(sessionPerms.raw ?? {}), host_bash: 'allow' })
+      // Adopt the grant into the tab's raw map too: the PUT is a full replace,
+      // so the merged map IS now the stored sidecar — the select and the dirty
+      // baseline must agree with it.
+      setSessionPerms((prev) => ({
+        ...prev,
+        raw: { ...(prev?.raw ?? {}), host_bash: 'allow' },
+      }))
+    } catch (err) {
+      setGrantHostBashError(`Failed to save permissions: ${err.message}`)
+    }
+  }
+
+  // ── Addendum (W1.5) ────────────────────────────────────────────────
+  // The operator's addendum is session state reached over its own REST
+  // surface (GET/POST/DELETE /api/session/{id}/addendum), never through the
+  // config draft or apply_config: the write boundary owns the budget verdict
+  // (refuse, never truncate), so the panel only mirrors what the server
+  // returns. The rendered list IS the server's answer — every mutation adopts
+  // the `entries` it came back with, so the panel cannot drift.
+  const [addendumState, setAddendumState] = useState({ entries: [], total_chars: 0, budget_chars: null, max_entries: null })
+  const [addendumText, setAddendumText] = useState('')
+  const [addendumBusy, setAddendumBusy] = useState(false)
+  const [addendumRefusal, setAddendumRefusal] = useState(null)  // { reason, message } | null — the 409 channel
+  const [addendumError, setAddendumError] = useState(null)      // every other non-2xx
+  const [confirmClearAddendum, setConfirmClearAddendum] = useState(false)
+
+  // Adopt a server payload without inventing numbers: fields the response does
+  // not carry keep their previous value (DELETE and POST both return them, but
+  // a future reader should not silently zero the budget).
+  const adoptAddendum = (data) => {
+    setAddendumState((prev) => ({
+      entries: Array.isArray(data?.entries) ? data.entries : prev.entries,
+      total_chars: typeof data?.total_chars === 'number' ? data.total_chars : prev.total_chars,
+      budget_chars: typeof data?.budget_chars === 'number' ? data.budget_chars : prev.budget_chars,
+      max_entries: typeof data?.max_entries === 'number' ? data.max_entries : prev.max_entries,
+    }))
+  }
+
+  const addendumUrl = () => apiUrl(`/api/session/${encodeURIComponent(sessionId)}/addendum`)
+
+  // Load the entry list on mount and whenever the session changes.
+  useEffect(() => {
+    let cancelled = false
+    setAddendumError(null)
+    setAddendumRefusal(null)
+    setConfirmClearAddendum(false)
+    if (!sessionId) {
+      setAddendumState({ entries: [], total_chars: 0, budget_chars: null, max_entries: null })
+      return () => { cancelled = true }
+    }
+    fetch(addendumUrl())
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data = await res.json()
+        if (cancelled) return
+        adoptAddendum(data)
+      })
+      .catch((err) => {
+        if (cancelled) return
+        setAddendumError(`Failed to load addendum: ${err?.message || err}`)
+      })
+    return () => { cancelled = true }
+  }, [sessionId])
+
+  // Append one entry. `text` is sent exactly as typed — the boundary measures
+  // it, so trimming here would misreport the budget.
+  const handleAddendumSubmit = async (e) => {
+    e?.preventDefault?.()
+    if (!sessionId || addendumBusy) return
+    const text = addendumText
+    setAddendumBusy(true)
+    setAddendumRefusal(null)
+    setAddendumError(null)
+    try {
+      const res = await fetch(addendumUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      })
+      const data = await res.json().catch(() => null)
+      if (res.status === 409) {
+        // Refusal channel: the write boundary dropped the entry and persisted
+        // nothing, so the stored set is unchanged. Keep the typed text so it can
+        // be edited down; render the boundary's own sentence verbatim.
+        setAddendumRefusal({
+          reason: data?.reason ?? 'refused',
+          message: data?.message ?? 'addendum write refused',
+        })
+        if (Array.isArray(data?.entries)) adoptAddendum(data)
+        return
+      }
+      if (!res.ok || data?.status !== 'accepted') {
+        setAddendumError(`Failed to add entry: HTTP ${res.status}`)
+        return
+      }
+      adoptAddendum(data)
+      // Persisted, not pushed: the REST write lands in the session STORE
+      // (FileSystemSessionStore.load_session() returns a fresh deserialised
+      // Session), so a running Agent's in-memory Session keeps its old addendum
+      // and this entry reaches a turn only once that agent loaded/updated its
+      // session from disk. Hence the store echo here is UI coherence, not
+      // delivery to the model.
+      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries })
+      setAddendumText('')
+    } catch (err) {
+      setAddendumError(`Failed to add entry: ${err?.message || err}`)
+    } finally {
+      setAddendumBusy(false)
+    }
+  }
+
+  // Clear every entry (two-step: this is the CONFIRMED half).
+  const handleAddendumClear = async () => {
+    if (!sessionId || addendumBusy) return
+    setConfirmClearAddendum(false)
+    setAddendumBusy(true)
+    setAddendumRefusal(null)
+    setAddendumError(null)
+    try {
+      const res = await fetch(addendumUrl(), { method: 'DELETE' })
+      const data = await res.json().catch(() => null)
+      if (!res.ok || data?.status !== 'cleared') {
+        setAddendumError(`Failed to clear addendum: HTTP ${res.status}`)
+        return
+      }
+      adoptAddendum(data)
+      // Same echo as the write. NOTE: receiveAddendumUpdated merges by entry id
+      // and never deletes, so the store cannot represent a clear — the list
+      // above is authoritative and the store slice only gains entries.
+      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries ?? [] })
+    } catch (err) {
+      setAddendumError(`Failed to clear addendum: ${err?.message || err}`)
+    } finally {
+      setAddendumBusy(false)
+    }
+  }
+
+  // ── Apply: PUT permissions first (when a session REST source is loaded),
+  // then apply_config for the rest of the draft (never carrying permissions).
+  const handleApply = async () => {
+    setIsApplying(true);
+    setApplyError(null);
+    setProviderVersion(0);
+
+    // Permission edits are persisted by the REST PUT below — immediate and
+    // independent of the WebSocket apply_config pipeline (which may be queued
+    // while the controller is busy).  When the ONLY pending change is the
+    // permissions tab, finish right after the PUT and skip apply_config so the
+    // save is never deferred behind the busy-queue ('Queued — applying…').
+    const permissionsOnlyApply = Boolean(sessionPerms) && permsDirty && !isDirty && providerVersion === 0;
+
+    if (sessionId && sessionPerms) {
+      try {
+        await putSessionPermissions(sessionPerms.raw ?? {})
+      } catch (err) {
+        // PUT failed: surface the error, re-enable Apply, DO NOT touch apply_config.
+        setIsApplying(false);
+        setApplyError(`Failed to save permissions: ${err.message}`);
+        return;
+      }
+    }
+
+    if (permissionsOnlyApply) {
+      // The PUT already applied the permission edits and refreshed
+      // lastAppliedRaw (clearing permsDirty).  Nothing config-level changed, so
+      // there is nothing to queue behind the controller — re-enable Apply now.
+      setIsApplying(false);
+      return;
+    }
+
+    // Strip session_permissions defensively (stale store drafts may still hold
+    // the legacy key); the apply_config payload must never carry permissions.
+    const { session_permissions, ...configPayload } = draft;
+    sendCommand('apply_config', { config: configPayload });
+  }
+
+  // ── Load prompt from library and switch to system_prompt tab ──
+  const handleLoadPromptFromLibrary = useCallback(async (promptName) => {
+    if (!promptName) return;
+    try {
+      const res = await fetch(apiUrl(`/api/prompts/${promptName}`));
+      if (!res.ok) return;
+      const text = await res.text();
+      const base = useStore.getState().sessionDrafts[sessionId] ?? getSafeDraft(config);
+      if (sessionId) setSessionDraft(sessionId, { ...base, system_prompt: text });
+      else setLocalDraft({ ...base, system_prompt: text });
+      setActiveTab('system_prompt');
+    } catch (e) {
+      // silent
+    }
+  }, [sessionId, config]);
 
   if (!config) {
     return (
@@ -350,24 +747,121 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     color: '#a6adc8',
   };
 
-  const TAB_KEYS = ['general', 'model', 'tools', 'permissions', 'container', 'workspace', 'system_prompt', 'advanced'];  // container tab placeholder
-  const TAB_LABELS = { workspace: 'Workspace', general: 'General', model: 'Model', tools: 'Tools', permissions: 'Permissions', container: 'Container', system_prompt: 'Prompt', advanced: 'Advanced' };
+  // Fallback: use config?.mode when the mode prop is null (e.g. on session load)
+  const effectiveMode = mode || config?.mode || null;
+  const isModeLocked = effectiveMode && effectiveMode !== 'custom'
+
+  const TAB_KEYS = ['live_view', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced'];
+  const TAB_LABELS = { live_view: 'Live View', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced' };
+
+  const modeBadge = effectiveMode === 'agent' ? 'Agent' : effectiveMode === 'engineer' ? 'Engineer' : effectiveMode === 'custom' ? 'Custom' : null
+  const modeBadgeColor = effectiveMode === 'agent' ? '#89b4fa' : effectiveMode === 'engineer' ? '#a6e3a1' : effectiveMode === 'custom' ? '#f9e2af' : '#6c7086'
 
   return (
     <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%' }}>
+      {/* Mode badge */}
+      {modeBadge && (
+        <div style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '0.3rem',
+          marginBottom: '0.5rem',
+          padding: '0.2rem 0.5rem',
+          borderRadius: '4px',
+          background: modeBadgeColor + '22',
+          border: `1px solid ${modeBadgeColor}`,
+          color: modeBadgeColor,
+          fontSize: '0.78rem',
+          fontWeight: 600,
+        }}>
+          {modeBadge}
+          {isModeLocked && <span style={{ marginLeft: '0.15rem', opacity: 0.7, fontSize: '0.7rem' }}>(locked)</span>}
+        </div>
+      )}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
-        <h3 style={{ margin: 0 }}>Config</h3>
-        <button
-          className="btn btn-accent"
-          style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
-          onClick={() => {
-            sendCommand('set_default_config', { config: draft });
-            setDefaultSaved('pending');
-          }}
-        >
-          {defaultSaved === 'pending' ? 'Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : 'Save as Default'}
-        </button>
+        <h3 style={{ margin: 0 }}>Session Panel</h3>
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button
+            className="btn btn-accent"
+            style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+            onClick={() => {
+              // Save-as-Default never carries session_permissions (disk-pure split).
+              const { session_permissions, ...defaultsPayload } = draft;
+              sendCommand('set_default_config', { config: defaultsPayload });
+              setDefaultSaved('pending');
+            }}
+          >
+            {defaultSaved === 'pending' ? 'Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : 'Save as Default'}
+          </button>
+          <button
+            className="btn"
+            style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem', color: '#f38ba8', borderColor: '#f38ba8' }}
+            onClick={() => setConfirmReset(true)}
+          >
+            Reset
+          </button>
+        </div>
       </div>
+      {notice && (
+        <p
+          role={notice.kind === 'alert' ? 'alert' : 'status'}
+          style={{ margin: '0.5rem 0 0 0', fontSize: '0.85rem', color: notice.kind === 'alert' ? '#f38ba8' : '#a6e3a1' }}
+        >
+          {notice.text}
+        </p>
+      )}
+      {confirmReset && (
+        <div
+          role="alertdialog"
+          aria-label="Confirm config reset"
+          style={{ margin: '0.5rem 0 0 0', padding: '0.6rem 0.75rem', border: '1px solid #f38ba8', borderRadius: '4px', background: '#f38ba811' }}
+        >
+          <p style={{ margin: '0 0 0.5rem 0', fontSize: '0.85rem', color: '#f38ba8' }}>
+            Reset config to factory defaults? This deletes your custom system prompt and global config, and cannot be undone.
+          </p>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <button
+              className="btn"
+              style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem', color: '#f38ba8', borderColor: '#f38ba8' }}
+              onClick={async () => {
+                // Destructive: POST once. The reset is global, but carry the
+                // scope it is applied in (workspace_id + session_id) whenever we
+                // know it, so the backend does not have to guess the session's
+                // workspace from the session id alone. Absent keys are omitted,
+                // which keeps the historical body shape exactly.
+                setConfirmReset(false);
+                const body = {
+                  ...(workspaceId ? { workspace_id: workspaceId } : {}),
+                  ...(sessionId ? { session_id: sessionId } : {}),
+                };
+                try {
+                  const res = await fetch(apiUrl('/api/config/reset'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                  });
+                  if (!res.ok) {
+                    setNotice({ kind: 'alert', text: `Reset failed: HTTP ${res.status}` });
+                    return;
+                  }
+                  setNotice({ kind: 'status', text: 'Config reset to factory defaults' });
+                } catch (err) {
+                  setNotice({ kind: 'alert', text: `Reset failed: ${err?.message || err}` });
+                }
+              }}
+            >
+              Confirm reset
+            </button>
+            <button
+              className="btn"
+              style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+              onClick={() => setConfirmReset(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Tab bar */}
       <div style={{ display: 'flex', gap: '0.25rem', marginBottom: '1rem', borderBottom: '1px solid #45475a', paddingBottom: '0.5rem' }}>
@@ -378,75 +872,170 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
         ))}
       </div>
 
-      {/* ── Workspace Tab ──────────────────────────────────────────── */}
-      {activeTab === 'workspace' && (
-        <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} />
+      {/* ── Live View Tab ── */}
+      {activeTab === 'live_view' && (
+        <div>
+          {/* ── Workspace Path (read-only) ── */}
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}>
+              <strong>Workspace Path</strong>
+              <ConfigTierBadge field="workspace_path" tiers={configTiers} />
+            </label>
+            <div style={{
+              marginTop: '0.3rem',
+              padding: '0.4rem 0.6rem',
+              background: '#1e1e2e',
+              borderRadius: '4px',
+              color: '#cdd6f4',
+              fontSize: '0.85rem',
+              fontFamily: 'monospace',
+              wordBreak: 'break-all',
+            }}>
+              {draft.workspace_path
+                ? draft.workspace_path
+                : <span style={{ color: '#f38ba8', fontWeight: 'bold' }}>⚠️ No workspace — session is unbound. Set a workspace.</span>}
+            </div>
+          </div>
+
+          <SessionWorkspaceTab workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} isActive={isActive} effectivePermissions={sessionPerms?.effective ?? null} />
+
+          {/* ── Addendum (W1.5) ── */}
+          <div style={{ marginTop: '1rem', borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
+            <label style={labelStyle}><strong>Addendum</strong></label>
+            <div
+              data-testid="addendum-totals"
+              style={{ margin: '0.25rem 0 0.5rem 0', fontSize: '0.75rem', color: '#a6adc8' }}
+            >
+              {`${addendumState.total_chars} / ${addendumState.budget_chars ?? '—'} chars · ${addendumState.entries.length} / ${addendumState.max_entries ?? '—'} entries`}
+            </div>
+
+            {addendumRefusal && (
+              <div
+                role="alert"
+                data-testid="addendum-refusal"
+                style={{ margin: '0 0 0.5rem 0', padding: '0.4rem 0.6rem', border: '1px solid #f38ba8', borderRadius: '4px', background: '#f38ba811', color: '#f38ba8', fontSize: '0.78rem' }}
+              >
+                <div>{addendumRefusal.message}</div>
+                <div style={{ opacity: 0.75, fontSize: '0.72rem' }}>{addendumRefusal.reason}</div>
+              </div>
+            )}
+            {addendumError && (
+              <div data-testid="addendum-error" style={{ color: '#f38ba8', fontSize: '0.75rem', marginBottom: '0.5rem' }}>
+                {addendumError}
+              </div>
+            )}
+
+            {addendumState.entries.length === 0 ? (
+              <p style={{ color: '#6c7086', fontSize: '0.8rem', fontStyle: 'italic', margin: '0 0 0.5rem 0' }}>
+                No addendum entries.
+              </p>
+            ) : (
+              <ul data-testid="addendum-list" style={{ listStyle: 'none', margin: '0 0 0.5rem 0', padding: 0 }}>
+                {addendumState.entries.map((entry) => (
+                  <li
+                    key={entry.id}
+                    data-testid={`addendum-entry-${entry.id}`}
+                    style={{ marginBottom: '0.4rem', padding: '0.4rem 0.6rem', background: '#1e1e2e', border: '1px solid #45475a', borderRadius: '4px', fontSize: '0.78rem' }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', fontSize: '0.7rem', color: '#6c7086' }}>
+                      <span>{entry.id}</span>
+                      <span>{(entry.text || '').length} chars</span>
+                    </div>
+                    <div
+                      title={entry.text}
+                      style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
+                    >
+                      {entry.text}
+                    </div>
+                    <div style={{ marginTop: '0.2rem', fontSize: '0.7rem', color: '#6c7086' }}>
+                      {`${entry.ts} · ${entry.source}${entry.pinned ? ' · pinned' : ''}`}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <form onSubmit={handleAddendumSubmit}>
+              <textarea
+                aria-label="Addendum entry text"
+                value={addendumText}
+                onChange={(e) => setAddendumText(e.target.value)}
+                rows={3}
+                style={{ ...inputStyle, resize: 'vertical' }}
+              />
+              <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.4rem' }}>
+                <button
+                  type="submit"
+                  className="btn btn-accent"
+                  disabled={addendumBusy || !sessionId}
+                  style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+                >
+                  {addendumBusy ? 'Saving…' : 'Add entry'}
+                </button>
+                {confirmClearAddendum ? (
+                  <>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={addendumBusy}
+                      onClick={handleAddendumClear}
+                      style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem', color: '#f38ba8', borderColor: '#f38ba8' }}
+                    >
+                      Confirm clear
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => setConfirmClearAddendum(false)}
+                      style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={addendumBusy || addendumState.entries.length === 0}
+                    onClick={() => setConfirmClearAddendum(true)}
+                    style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+                  >
+                    Clear all
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
+        </div>
       )}
 
       {/* ── General Tab ──────────────────────────────────────────────── */}
       {activeTab === 'general' && (
         <div>
-          {/* ── Workspace (first) ── */}
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Workspace</strong></label>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.3rem' }}>
-              {draft.workspace_path ? (
-                <span style={{ color: '#cdd6f4', fontSize: '0.9rem' }}>
-                  📁 {draft.workspace_path.split('/').filter(Boolean).pop() || '/'}
-                </span>
-              ) : (
-                <span style={{ color: '#6c7086', fontSize: '0.85rem', fontStyle: 'italic' }}>
-                  No workspace selected
-                </span>
-              )}
-              <button
-                onClick={async () => {
-                  let initialPath = draft.workspace_path;
-                  if (!initialPath) {
-                    try {
-                      const res = await fetch(`http://${window.location.hostname}:8000/api/browse?path=`);
-                      const data = await res.json();
-                      if (data.success && data.current_path) {
-                        initialPath = data.current_path;
-                      }
-                    } catch (_) {}
-                  }
-                  setBrowserPath(initialPath || '/');
-                  setBrowserOpen(true);
-                  setBrowserError('');
-                }}
-                style={{
-                  background: '#45475a',
-                  color: '#cdd6f4',
-                  border: '1px solid #585b70',
-                  borderRadius: '4px',
-                  padding: '0.3rem 0.6rem',
-                  cursor: 'pointer',
-                  fontWeight: 600,
-                  fontSize: '0.8rem',
-                  whiteSpace: 'nowrap',
-                  marginLeft: 'auto',
-                }}
-              >Browse</button>
-            </div>
-          </div>
+
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Temperature:</strong> {draft.temperature}</label>
+            <label style={labelStyle}>
+              <strong>Temperature:</strong> {draft.temperature}
+              <ConfigTierBadge field="temperature" tiers={configTiers} />
+            </label>
             <input
               type="range" min="0" max="2" step="0.1"
               value={draft.temperature}
-              onChange={(e) => setDraft({ ...draft, temperature: parseFloat(e.target.value) })}
+              onChange={(e) => updateDraft({ ...draft, temperature: parseFloat(e.target.value) })}
               style={{ width: '100%' }}
             />
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Max Turns</strong></label>
+            <label style={labelStyle}>
+              <strong>Max Turns</strong>
+              <ConfigTierBadge field="max_turns" tiers={configTiers} />
+            </label>
             <input
-              type="number" min="1" max="100"
+              type="number" min="1" max="150"
               value={draft.max_turns}
-              onChange={(e) => setDraft({ ...draft, max_turns: parseInt(e.target.value, 10) || 1 })}
+              onChange={(e) => updateDraft({ ...draft, max_turns: parseInt(e.target.value, 10) || 1 })}
               style={inputStyle}
             />
           </div>
@@ -454,13 +1043,17 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
 
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Critical Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens, warning is 15k below)</span></label>
+            <label style={labelStyle}>
+              <strong>Critical Threshold</strong>{' '}
+              <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens, warning is 15k below)</span>
+              <ConfigTierBadge field="token_monitor_critical_threshold" tiers={configTiers} />
+            </label>
             <input
               type="number" min="0"
               value={draft.token_monitor_critical_threshold}
               onChange={(e) => {
                 const critical = parseInt(e.target.value, 10) || 0;
-                setDraft({
+                updateDraft({
                   ...draft,
                   token_monitor_critical_threshold: critical,
                   token_monitor_warning_threshold: Math.max(critical - 15000, 0),
@@ -476,7 +1069,10 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {activeTab === 'model' && (
         <div>
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Provider</strong></label>
+            <label style={labelStyle}>
+              <strong>Provider</strong>
+              <ConfigTierBadge field="provider_type" tiers={configTiers} />
+            </label>
             <select
               value={activeProviderId}
               onChange={handleProviderChange}
@@ -492,7 +1088,10 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Model</strong></label>
+            <label style={labelStyle}>
+              <strong>Model</strong>
+              <ConfigTierBadge field="model" tiers={configTiers} />
+            </label>
             <select
               value={draft.model || ''}
               onChange={handleModelChange}
@@ -544,25 +1143,42 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {/* ── Tools Tab ────────────────────────────────────────────────── */}
       {activeTab === 'tools' && (
         <div>
+          {isModeLocked && (
+            <div style={{
+              background: 'rgba(249,226,175,0.1)',
+              border: '1px solid rgba(249,226,175,0.3)',
+              borderRadius: '4px',
+              padding: '0.5rem 0.6rem',
+              marginBottom: '0.75rem',
+              color: '#f9e2af',
+              fontSize: '0.8rem',
+            }}>
+              Tools are locked in {effectiveMode === 'agent' ? 'Agent' : 'Engineer'} mode.
+              Switch to Custom mode to enable tool configuration.
+            </div>
+          )}
           {/* ── Tool Output Token Limit (above tool checkboxes) ───── */}
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle} htmlFor="tool_output_token_limit">
               <strong>Tool Output Token Limit</strong>
+              <ConfigTierBadge field="tool_output_token_limit" tiers={configTiers} />
             </label>
             <input
               id="tool_output_token_limit"
               type="number"
               min="0"
               step="100"
+              disabled={isModeLocked}
               style={{
                 ...inputStyle,
                 width: '100%',
                 marginTop: '0.3rem',
+                opacity: isModeLocked ? 0.5 : 1,
               }}
               value={draft.tool_output_token_limit ?? 10000}
               onChange={(e) => {
                 const val = e.target.value === '' ? null : parseInt(e.target.value, 10);
-                setDraft({ ...draft, tool_output_token_limit: val });
+                updateDraft({ ...draft, tool_output_token_limit: val });
               }}
               placeholder="Default: 10000"
             />
@@ -571,32 +1187,51 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
             </small>
           </div>
           <div style={{ borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
-            <label style={labelStyle}><strong>Tools</strong></label>
-            {availableTools.map((tool) => {
-              const toolName = tool.name || tool;
-              const toolConfig = draft.tools?.find(t => t.name === toolName);
-              const enabled = toolConfig ? toolConfig.enabled : false;
+            {(() => {
+              /* Locked modes show allTools (mode presets); custom shows availableTools */
+              const displayTools = isModeLocked ? allTools : availableTools;
               return (
-                <div key={toolName} style={{ marginBottom: '0.35rem' }}>
-                  <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
-                    <input
-                      type="checkbox"
-                      checked={enabled}
-                      onChange={(e) => {
-                        const updatedTools = draft.tools?.map(t =>
-                          t.name === toolName ? { ...t, enabled: e.target.checked } : t
-                        ) || [];
-                        if (!updatedTools.find(t => t.name === toolName)) {
-                          updatedTools.push({ name: toolName, enabled: e.target.checked });
-                        }
-                        setDraft({ ...draft, tools: updatedTools });
-                      }}
-                    />
-                    {toolName}
+                <>
+                  <label style={labelStyle}>
+                    <strong>Tools ({displayTools.length} total)</strong>
+                    <ConfigTierBadge field="enabled_tools" tiers={configTiers} />
                   </label>
-                </div>
+                  {displayTools.length > 0 ? (
+                    displayTools.map((tool) => {
+                      const toolName = typeof tool === 'string' ? tool : tool?.name;
+                      const toolConfig = draft.tools?.find(t => t.name === toolName);
+                      const enabled = toolConfig ? toolConfig.enabled : false;
+                return (
+                  <div key={toolName} style={{ marginBottom: '0.35rem' }}>
+                    <label style={{ cursor: isModeLocked ? 'default' : 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', opacity: isModeLocked ? 0.6 : 1 }}>
+                      <input
+                        type="checkbox"
+                        checked={enabled}
+                        disabled={isModeLocked}
+                        onChange={(e) => {
+                          const updatedTools = draft.tools?.map(t =>
+                            t.name === toolName ? { ...t, enabled: e.target.checked } : t
+                          ) || [];
+                          if (!updatedTools.find(t => t.name === toolName)) {
+                            updatedTools.push({ name: toolName, enabled: e.target.checked });
+                          }
+                          updateDraft({ ...draft, tools: updatedTools });
+                        }}
+                      />
+                      {toolName}
+                      {isModeLocked && <span style={{ color: '#6c7086', fontSize: '0.7rem', marginLeft: '0.25rem' }}>(read-only)</span>}
+                    </label>
+                  </div>
+                );
+              })
+            ) : (
+              <div style={{ color: '#6c7086', fontSize: '0.8rem', fontStyle: 'italic', padding: '0.5rem 0' }}>
+                Loading tool list...
+              </div>
+            )}
+                </>
               );
-            })}
+            })()}
           </div>
         </div>
       )}
@@ -604,43 +1239,60 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {/* ── Permissions Tab ───────────────────────────────────────────── */}
       {activeTab === 'permissions' && (
         <div>
+          {permsLoadError && (
+            <div style={{ color: '#f9e2af', fontSize: '0.75rem', fontStyle: 'italic', marginBottom: '0.5rem' }}>
+              ⚠ {permsLoadError}
+            </div>
+          )}
+          {sessionPerms?.effective && (
+            <div style={{ marginBottom: '0.75rem', padding: '0.4rem 0.6rem', background: '#1e1e2e', border: '1px solid #45475a', borderRadius: '4px', fontSize: '0.75rem', color: '#a6adc8' }}>
+              <strong>Effective profile (enforced):</strong>{' '}
+              {(() => {
+                const e = sessionPerms.effective;
+                const pairs = [
+                  ['git', e.git],
+                  ['filesystem', e.filesystem],
+                  ['container', e.container],
+                  ['network', e.network],
+                  ['mcp', e.mcp],
+                  ['host_bash', e.host_bash],
+                ];
+                return pairs
+                  .filter(([, v]) => v !== undefined && v !== null)
+                  .map(([k, v]) => `${k}: ${typeof v === 'boolean' ? (v ? 'Enabled' : 'Disabled') : permissionOptionLabel(String(v))}`)
+                  .join(' · ');
+              })()}
+            </div>
+          )}
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Filesystem</strong></label>
+            <label style={labelStyle}><strong>Git</strong></label>
             <select
-              value={draft.session_permissions?.filesystem ?? 'read'}
-              onChange={(e) => setDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, filesystem: e.target.value }
-              })}
+              value={permsRaw.git ?? CANONICAL_PERMISSION_DEFAULTS.git}
+              onChange={(e) => handlePermissionChange('git', e.target.value)}
               style={inputStyle}
             >
-              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              {SESSION_PERMISSION_OPTION_ORDER.git.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Read/write access to the workspace filesystem. "Ask" prompts for approval on each write.
+              Access level for Git operations. "Ask" prompts for approval on each write operation (commit, push, pull, etc.); "Write on feature branches" restricts writes to feature branches.
             </small>
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Network</strong></label>
+            <label style={labelStyle}><strong>Filesystem</strong></label>
             <select
-              value={draft.session_permissions?.network ?? 'banned'}
-              onChange={(e) => setDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, network: e.target.value }
-              })}
+              value={permsRaw.filesystem ?? CANONICAL_PERMISSION_DEFAULTS.filesystem}
+              onChange={(e) => handlePermissionChange('filesystem', e.target.value)}
               style={inputStyle}
             >
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              {SESSION_PERMISSION_OPTION_ORDER.filesystem.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Allow the agent to make network requests.
+              Read/write access to the workspace filesystem.
             </small>
           </div>
 
@@ -650,88 +1302,85 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               <label className="toggle-switch">
                 <input
                   type="checkbox"
-                  checked={draft.session_permissions?.container ?? false}
-                  onChange={(e) => setDraft({
-                    ...draft,
-                    session_permissions: { ...draft.session_permissions, container: e.target.checked }
-                  })}
+                  checked={permsRaw.container ?? CANONICAL_PERMISSION_DEFAULTS.container}
+                  onChange={(e) => handlePermissionChange('container', e.target.checked)}
                 />
                 <span className="toggle-slider"></span>
               </label>
-              <span style={{ fontSize: '0.85rem', color: draft.session_permissions?.container ? '#a6e3a1' : '#f38ba8' }}>
-                {draft.session_permissions?.container ? 'Enabled' : 'Disabled'}
+              <span style={{ fontSize: '0.85rem', color: permsRaw.container ? '#a6e3a1' : '#f38ba8' }}>
+                {permsRaw.container ? 'Enabled' : 'Disabled'}
               </span>
             </div>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Allow container execution of code.
+              Allow container operations.
             </small>
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Git</strong></label>
+            <label style={labelStyle}><strong>Network</strong></label>
             <select
-              value={draft.session_permissions?.git ?? 'read'}
-              onChange={(e) => setDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, git: e.target.value }
-              })}
+              value={permsRaw.network ?? CANONICAL_PERMISSION_DEFAULTS.network}
+              onChange={(e) => handlePermissionChange('network', e.target.value)}
               style={inputStyle}
             >
-              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
+              {SESSION_PERMISSION_OPTION_ORDER.network.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Access level for Git operations. "Ask" prompts for approval on each write operation (commit, push, pull, etc.).
+              Allow the agent to make network requests.
             </small>
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>System</strong></label>
+            <label style={labelStyle}><strong>MCP</strong></label>
             <select
-              value={draft.session_permissions?.system ?? 'read'}
-              onChange={(e) => setDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, system: e.target.value }
-              })}
+              value={permsRaw.mcp ?? CANONICAL_PERMISSION_DEFAULTS.mcp}
+              onChange={(e) => handlePermissionChange('mcp', e.target.value)}
               style={inputStyle}
             >
-              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              {SESSION_PERMISSION_OPTION_ORDER.mcp.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Controls access to system-level operations (environment inspection, process management). "Ask" prompts for approval on each write operation.
+              Allow the agent to connect to external MCP servers.
             </small>
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Execution</strong></label>
+            <label style={labelStyle}><strong>Host Bash</strong></label>
             <select
-              value={draft.session_permissions?.execution ?? 'banned'}
-              onChange={(e) => setDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, execution: e.target.value }
-              })}
+              value={permsRaw.host_bash ?? CANONICAL_PERMISSION_DEFAULTS.host_bash}
+              onChange={(e) => handlePermissionChange('host_bash', e.target.value)}
               style={inputStyle}
             >
-              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              {SESSION_PERMISSION_OPTION_ORDER.host_bash.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Allow the agent to spawn background/child processes (experimental).
+              Supervised host-shell access outside the sandbox. "Ask" prompts for approval before each command.
             </small>
+            {/* Quick action: writes host_bash:'allow' into the SESSION sidecar
+                (merged into the current grants), disabled once granted. */}
+            <button
+              type="button"
+              onClick={handleGrantHostBash}
+              disabled={(permsRaw.host_bash ?? CANONICAL_PERMISSION_DEFAULTS.host_bash) === 'allow'}
+              style={{ marginTop: '0.4rem', padding: '0.3rem 0.6rem', background: '#313244', color: '#cdd6f4', border: '1px solid #45475a', borderRadius: '4px', fontSize: '0.75rem', cursor: 'pointer' }}
+            >
+              Grant host_bash: allow to this session
+            </button>
+            {grantHostBashError && (
+              <div style={{ color: '#f38ba8', fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                {grantHostBashError}
+              </div>
+            )}
           </div>
 
           <p style={{ color: '#6c7086', fontSize: '0.8rem', fontStyle: 'italic', borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
-            Changes take effect on the next tool call. No restart required.
+            Changes take effect on the next tool call.
           </p>
         </div>
       )}
@@ -746,19 +1395,88 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
         />
       )}
 
-      {/* ── System Prompt Tab ──────────────────────────────────────────── */}
+      {/* ── System Prompt Tab (merged with library) ───────────────────────────────── */}
       {activeTab === 'system_prompt' && (
         <div>
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>System Prompt</strong></label>
-            <textarea
-              rows={6}
-              style={{ ...inputStyle, fontFamily: 'monospace', resize: 'vertical' }}
-              value={draft.system_prompt || ''}
-              onChange={(e) => setDraft({ ...draft, system_prompt: e.target.value })}
-              placeholder="Optional system-level instructions for the agent..."
-            />
-          </div>
+          {isModeLocked ? (
+            /* ── Locked modes: factory prompt preview (read-only) ── */
+            <>
+              {/* Factory prompt badge */}
+              <div style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.3rem',
+                marginBottom: '0.5rem',
+                padding: '0.2rem 0.5rem',
+                borderRadius: '4px',
+                background: effectiveMode === 'agent' ? 'rgba(137,180,250,0.15)' : 'rgba(166,227,161,0.15)',
+                border: `1px solid ${effectiveMode === 'agent' ? '#89b4fa' : '#a6e3a1'}`,
+                color: effectiveMode === 'agent' ? '#89b4fa' : '#a6e3a1',
+                fontSize: '0.75rem',
+                fontWeight: 600,
+              }}>
+                {effectiveMode === 'agent' ? 'Agent' : 'Engineer'} Factory Prompt
+                <span style={{ marginLeft: '0.15rem', opacity: 0.6, fontSize: '0.7rem' }}>(locked)</span>
+              </div>
+              {/* Read-only preview */}
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={labelStyle}>
+                  <strong>System Prompt</strong>{' '}
+                  <span style={{ color: '#6c7086', fontSize: '0.7rem' }}>(read-only — factory default for this mode)</span>
+                  <ConfigTierBadge field="system_prompt" tiers={configTiers} />
+                </label>
+                <div style={{
+                  ...inputStyle,
+                  fontFamily: 'monospace',
+                  fontSize: '0.8rem',
+                  lineHeight: '1.4',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  maxHeight: '300px',
+                  overflowY: 'auto',
+                  padding: '0.5rem',
+                  cursor: 'default',
+                  opacity: 0.75,
+                }}>
+                  {draft.system_prompt || <span style={{ color: '#6c7086', fontStyle: 'italic' }}>No factory prompt loaded</span>}
+                </div>
+              </div>
+              {/* Prompt Library — visible but marked read-only */}
+              <div style={{ borderTop: '1px solid #45475a', paddingTop: '0.75rem', marginTop: '0.75rem' }}>
+                <label style={labelStyle}><strong>Prompt Library</strong></label>
+                <p style={{ color: '#6c7086', fontSize: '0.75rem', fontStyle: 'italic', marginTop: '0.25rem', marginBottom: '0.5rem' }}>
+                  Browse prompts — switch to Custom mode to apply them.
+                </p>
+                <div style={{ marginTop: '0.35rem', opacity: 0.6, pointerEvents: 'none' }}>
+                  <PromptLibrary onSelectPrompt={handleLoadPromptFromLibrary} />
+                </div>
+              </div>
+            </>
+          ) : (
+            /* ── Custom mode: editable textarea + library ── */
+            <>
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={labelStyle}>
+                  <strong>System Prompt</strong>
+                  <ConfigTierBadge field="system_prompt" tiers={configTiers} />
+                </label>
+                <textarea
+                  rows={6}
+                  style={{ ...inputStyle, fontFamily: 'monospace', resize: 'vertical' }}
+                  value={draft.system_prompt || ''}
+                  onChange={(e) => updateDraft({ ...draft, system_prompt: e.target.value })}
+                  placeholder="Optional system-level instructions for the agent..."
+                />
+              </div>
+              {/* Prompt Library section — editable in Custom mode */}
+              <div style={{ borderTop: '1px solid #45475a', paddingTop: '0.75rem', marginTop: '0.75rem' }}>
+                <label style={labelStyle}><strong>Prompt Library</strong></label>
+                <div style={{ marginTop: '0.35rem' }}>
+                  <PromptLibrary onSelectPrompt={handleLoadPromptFromLibrary} />
+                </div>
+              </div>
+            </>
+          )}
         </div>
       )}
 
@@ -769,79 +1487,16 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
         </div>
       )}
 
-      {/* ── Directory Browser Overlay ────────────────────────────────── */}
-      {browserOpen && (
-        <div style={{
-          position: 'fixed',
-          top: 0, left: 0, right: 0, bottom: 0,
-          background: 'rgba(0,0,0,0.6)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          zIndex: 1000,
-        }} onClick={() => setBrowserOpen(false)}>
-          <div style={{
-            background: '#313244',
-            border: '1px solid #585b70',
-            borderRadius: '8px',
-            padding: '1rem',
-            width: '400px',
-            maxHeight: '60vh',
-            display: 'flex',
-            flexDirection: 'column',
-            boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
-          }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-              <strong style={{ fontSize: '0.9rem' }}>Select Directory</strong>
-              <button onClick={() => setBrowserOpen(false)} style={{
-                background: 'none', border: 'none', color: '#a6adc8', cursor: 'pointer', fontSize: '1.2rem'
-              }}>✕</button>
-            </div>
-            <div style={{
-              background: '#1e1e2e',
-              borderRadius: '4px',
-              padding: '0.65rem 0.7rem',
-              marginBottom: '0.75rem',
-              fontSize: '0.9rem',
-              color: '#cdd6f4',
-              fontFamily: 'monospace',
-              lineHeight: '1.5',
-              flexShrink: 0,
-              overflowX: 'auto',
-              whiteSpace: 'pre',
-              wordBreak: 'keep-all',
-            }}>{browserPath || '~'}</div>
-            <DirectoryBrowser
-              path={browserPath}
-              entries={browserEntries}
-              loading={browserLoading}
-              error={browserError}
-              onNavigate={handleBrowseNavigate}
-              onSelect={(selectedPath) => {
-                setDraft({ ...draft, workspace_path: selectedPath });
-                setBrowserOpen(false);
-              }}
-              setLoading={setBrowserLoading}
-              setEntries={setBrowserEntries}
-              setError={setBrowserError}
-            />
-          </div>
-        </div>
-      )}
-
       {/* ── Apply Button ─────────────────────────────────────────────── */}
       <div style={{ marginTop: '1rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
         <button
           onClick={() => {
-            setIsApplying(true);
-            setApplyError(null);
-            setProviderVersion(0);
-            sendCommand('apply_config', { config: draft });
+            handleApply();
           }}
           disabled={!wsConnected || isApplying}
           style={{
-            background: !wsConnected ? '#585b70' : isApplying ? '#585b70' : (isDirty || providerVersion > 0) ? '#89b4fa' : '#45475a',
-            color: !wsConnected || (!isDirty && !isApplying && providerVersion === 0) ? '#6c7086' : '#1e1e2e',
+            background: !wsConnected ? '#585b70' : isApplying ? '#585b70' : (isDirty || permsDirty || providerVersion > 0) ? '#89b4fa' : '#45475a',
+            color: !wsConnected || (!isDirty && !permsDirty && !isApplying && providerVersion === 0) ? '#6c7086' : '#1e1e2e',
             border: 'none',
             borderRadius: '4px',
             padding: '0.5rem 1.5rem',
@@ -855,16 +1510,16 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           }}
         >
           {isApplying && <span className="config-spinner" />}
-          {isApplying ? 'Applying…' : 'Apply'}
+          {isApplying ? (configQueued ? 'Queued — applying when idle…' : 'Applying…') : 'Apply'}
         </button>
         {!wsConnected && (
           <span style={{ color: '#f9e2af', fontSize: '0.8rem', fontWeight: 500 }}>
             ⚠ Reconnecting...
           </span>
         )}
-        {(isDirty || providerVersion > 0) && !isApplying && wsConnected && (
+        {(isDirty || permsDirty || providerVersion > 0) && !isApplying && wsConnected && (
           <span style={{ color: '#f9e2af', fontSize: '0.75rem', fontStyle: 'italic' }}>
-            {isDirty ? 'Unsaved changes' : 'Provider credentials updated'}
+            {isDirty ? 'Unsaved changes' : permsDirty ? 'Unsaved permission changes' : 'Provider credentials updated'}
           </span>
         )}
         {applyError && (

@@ -8,7 +8,11 @@ import libcst.metadata
 from typing import ClassVar, Dict, List, Optional, Set, Tuple, Any, Union, Literal
 from pydantic import Field
 from .base import ToolBase
-from agent.logging import log
+try:
+    from agent.logging import log
+except ImportError:
+    import logging
+    log = logging.getLogger(__name__)
 import os
 import sys
 import json
@@ -169,7 +173,6 @@ class PydanticModelVisitor(cst.CSTVisitor):
             trunc_limit = 200
             if trunc_limit > 0 and len(msg) > trunc_limit:
                 msg = msg[:trunc_limit] + '...'
-            log('DEBUG', 'tools.field_viewer', msg)
         if isinstance(node, cst.Annotation):
             node = node.annotation
             if self.debug:
@@ -177,7 +180,6 @@ class PydanticModelVisitor(cst.CSTVisitor):
                 trunc_limit = 200
                 if trunc_limit > 0 and len(msg) > trunc_limit:
                     msg = msg[:trunc_limit] + '...'
-                log('DEBUG', 'tools.field_viewer', msg)
         try:
             result = cst.Module([]).code_for_node(node).strip()
             if self.debug:
@@ -185,7 +187,6 @@ class PydanticModelVisitor(cst.CSTVisitor):
                 trunc_limit = 200
                 if trunc_limit > 0 and len(msg) > trunc_limit:
                     msg = msg[:trunc_limit] + '...'
-                log('DEBUG', 'tools.field_viewer', msg)
             return result
         except Exception as e:
             if self.debug:
@@ -193,7 +194,6 @@ class PydanticModelVisitor(cst.CSTVisitor):
                 trunc_limit = 200
                 if trunc_limit > 0 and len(msg) > trunc_limit:
                     msg = msg[:trunc_limit] + '...'
-                log('DEBUG', 'tools.field_viewer', msg)
             return None
 
     def _is_in_pydantic_model(self) -> bool:

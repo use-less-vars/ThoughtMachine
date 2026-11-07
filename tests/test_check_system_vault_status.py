@@ -1,0 +1,119 @@
+"""Tests for the CheckSystem 'vault_status' query (vault drift vs manifest)."""
+
+import json
+from unittest.mock import patch
+
+from tools.workspace.check_system import CheckSystem
+
+
+BASE_KWARGS = {
+    "session_permissions": {"filesystem": "read", "network": "write"},
+}
+
+ALLOWLIST_12 = [
+    "capabilities",
+    "container_status",
+    "dockerfile",
+    "effective_permissions",
+    "event_bus_status",
+    "event_log",
+    "mcp_servers",
+    "my_config",
+    "network_diagnostics",
+    "running_workers",
+    "workers",
+    "workspace_info",
+]
+
+ALLOWLIST_SHA256 = "697c326308135db2b508b16261e849bb79dd75b1d529748a5f8d88e799afa2d8"
+
+
+def _make_clean_vault(root):
+    """Create a vault whose files are all type-correct per the REAL manifest.
+
+    Every file written here must pass VaultDriftChecker without raising
+    (no type mismatches, no missing required fields).
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    files = {
+        "vault_version.json": {"vault_version": 1},
+        "system/providers.json": {"profiles": [], "active_profile_id": None},
+        "system/factory_defaults.json": {
+            "version": "1",
+            "description": "d",
+            "config": {
+                "max_turns": 50,
+                "temperature": 0.7,
+                "provider_id": "",
+                "model": "",
+                "system_prompt": "",
+            },
+        },
+        "system/checksystem_allowlist.json": {
+            "version": 1,
+            "allowlist": ALLOWLIST_12,
+            "sha256": ALLOWLIST_SHA256,
+        },
+        "state/session_registry.json": {},
+        "state/workspace_registry.json": {},
+        "user/defaults.json": {
+            "provider_id": "",
+            "model": "",
+            "base_url": "",
+            "temperature": 0.7,
+            "max_turns": 50,
+            "system_prompt": "",
+        },
+    }
+    for relpath, data in files.items():
+        path = root / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_check_system_vault_status_returns_report_without_secrets(tmp_path):
+    """vault_status returns the drift report; secrets never leak into JSON."""
+    tmp_vault = tmp_path / "vault"
+    _make_clean_vault(tmp_vault)
+    # agent_config.json is optional in the manifest: valid, secret-bearing entry.
+    (tmp_vault / "agent_config.json").write_text(
+        json.dumps({"api_key": "sk-SUPERSECRET", "model": "deepseek-v4-flash"}),
+        encoding="utf-8",
+    )
+    # Undeclared root file -> warning drift (status "warnings").
+    (tmp_vault / "stray.json").write_text("{}", encoding="utf-8")
+
+    with patch.object(
+        CheckSystem, "_load_allowlist_from_vault", return_value=["vault_status"]
+    ), patch("thoughtmachine.vault.vault_root", return_value=tmp_vault):
+        tool = CheckSystem(query="vault_status", **BASE_KWARGS)
+        out = json.loads(tool.execute())
+
+    assert "sk-SUPERSECRET" not in json.dumps(out)
+    assert "files" in out
+    assert out["status"] in ("ok", "warnings")
+    assert out["vault_root"] == str(tmp_vault)
+    # repairs_available is read-only (vault_repair.run_inspection, machine_apply
+    # only): this fixture has 5 backfillable missing-field/missing-file findings;
+    # the extra_file + seeded_drift findings are manual-review and never count.
+    assert out["repairs_available"] == 5
+    assert out["repair_hint"] == (
+        "use the Vault Health panel in the landing page to apply repairs"
+    )
+
+
+def test_check_system_vault_status_not_gated_by_session_permissions():
+    """vault_status is NOT gated by a permission category: CheckSystem declares
+    no required categories (the canonical effective dict has no 'system' key;
+    resources are filesystem/network/container/git/mcp/host_bash), so a legacy
+    'system:read' category would fail-closed deny every query. Access control
+    is the vault query allowlist."""
+    assert CheckSystem.required_categories == []
+
+    with patch.object(
+        CheckSystem, "_load_allowlist_from_vault", return_value=["my_config"]
+    ):
+        tool = CheckSystem(query="vault_status", **BASE_KWARGS)
+        out = json.loads(tool.execute())
+
+    assert out["status"] == "denied"

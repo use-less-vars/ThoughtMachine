@@ -19,6 +19,20 @@ except ImportError:
 import sys
 
 
+def _safe_stderr_print(message: str) -> None:
+    """Print *message* to stderr without crashing when stderr is None.
+
+    In headless daemon launches CPython may set ``sys.stderr`` to ``None``;
+    ``print(x, file=None)`` then raises
+    ``AttributeError: 'NoneType' object has no attribute 'write'``.
+    This helper makes debug logging best-effort in any environment.
+    """
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
+
+
 class ToolBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
     """
@@ -26,7 +40,7 @@ class ToolBase(BaseModel):
     They must define a 'tool' field with a Literal of their unique name.
     They must implement execute() returning a string.
     """
-    workspace_path: Optional[str] = Field(default=None, description="Root directory for file operations (None = unrestricted)")
+    workspace_path: Optional[str] = Field(default=None, description="[DEPRECATED] Root directory for file operations (None = unrestricted). Tools should call _resolve_registry_workspace() instead.")
     token_limit: Optional[int] = Field(default=None, description="Maximum token limit for tool output (None = no limit)")
     is_docker: bool = Field(default=False, description="Whether the tool is executing in a Docker container")
     container_workspace_path: Optional[str] = Field(default=None, description="Workspace path as seen from inside the container (e.g., /workspace)")
@@ -38,10 +52,26 @@ class ToolBase(BaseModel):
         description='Session permissions dict injected by ToolExecutor.',
     )
 
+    # Effective merged permissions injected by ToolExecutor for in-tool atomic re-checks.
+    # Computed as session_permissions × workspace_capabilities.
+    effective_permissions: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description='Effective merged permissions (session × workspace) for atomic checks.',
+    )
+
     # Agent config dict injected by ToolExecutor before execute().
     # Contains runtime-observable settings such as temperature, max_turns,
     # provider, model, tool_output_token_limit, and workspace_path.
     agent_config: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
+
+    # Session ID injected by ToolExecutor. Set only for tools that
+    # declare this field; inherited by all tools that extend ToolBase.
+    session_id: Optional[str] = Field(default=None, description="Session ID injected by ToolExecutor")
+
+    # Worker-context flag injected by ToolExecutor before execute(). True when
+    # the tool runs inside a worker sub-agent with no interactive user; tools
+    # that self-gate on the 'ask' grain must deny instead of prompting.
+    is_worker_context: bool = Field(default=False, description="Whether tool runs in worker context (no interactive user); injected by ToolExecutor.")
 
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = []
@@ -49,6 +79,23 @@ class ToolBase(BaseModel):
     # Permission categories required by this tool (e.g., ['container:true'])
     # Empty list means no special permissions needed.
     required_categories: ClassVar[List[str]] = []
+
+    # Name of the hidden resource (see agent/config/defaults.RESOURCE_REGISTRY)
+    # this tool must execute inside, or None for tools that need no resource
+    # container. When set, tool execution is denied unless the session holds
+    # the matching ``<resource>:read`` permission (see
+    # security_gate.check_requires_resource).
+    requires_resource: ClassVar[Optional[str]] = None
+
+    # Stable registry/display name for this tool: used in LLM schemas
+    # (model_to_openai_tool), preset lists, and the /api/tools endpoint.
+    # Defaults to the class name when unset (legacy behavior).
+    name: ClassVar[str] = ""
+
+    @classmethod
+    def tool_name(cls) -> str:
+        """Return the stable tool identifier (``name`` ClassVar or class name)."""
+        return cls.name or cls.__name__
 
     # If True, framework-level output truncation is skipped for this tool.
     # Use this for tools whose output must always be complete (e.g., Respond, SummarizeTool).
@@ -112,7 +159,7 @@ class ToolBase(BaseModel):
                 msg = f"DEBUG: {message}"
                 if trunc_limit > 0 and len(msg) > trunc_limit:
                     msg = msg[:trunc_limit] + "..."
-                print(msg, file=sys.stderr)
+                _safe_stderr_print(msg)
 
     def _log_tool_warning(self, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Log tool warning using structured logging or fallback."""
@@ -130,7 +177,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"WARNING: {message}", file=sys.stderr)
+                _safe_stderr_print(f"WARNING: {message}")
     
     def _log_tool_error(self, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Log tool error using structured logging or fallback."""
@@ -148,7 +195,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"ERROR: {message}", file=sys.stderr)
+                _safe_stderr_print(f"ERROR: {message}")
     
     def _log_tool_internal(self, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Log tool internal event using structured logging or fallback."""
@@ -166,7 +213,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"INTERNAL: {message}", file=sys.stderr)
+                _safe_stderr_print(f"INTERNAL: {message}")
     
     def _log_tool_performance(self, message: str, metrics: Dict[str, Any], tool_call_id: Optional[str] = None):
         """Log tool performance metrics using structured logging or fallback."""
@@ -184,7 +231,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"PERFORMANCE: {message} - {metrics}", file=sys.stderr)
+                _safe_stderr_print(f"PERFORMANCE: {message} - {metrics}")
     
     def _log_tool_event(self, event_type: Any, level: Any, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Generic tool event logging using structured logging or fallback."""
@@ -211,8 +258,43 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"TOOL [{level}]: {message}", file=sys.stderr)
+                _safe_stderr_print(f"TOOL [{level}]: {message}")
     
+    def _resolve_registry_workspace(self) -> Optional[str]:
+        """
+        Resolve workspace path from registries (primary path).
+
+        Queries SessionRegistry + WorkspaceRegistry first, falling back to
+        the deprecated ``AgentConfig.workspace_path`` field.  Returns None if
+        no workspace path can be resolved at all.
+
+        All tools should call this instead of reading ``self.workspace_path``
+        directly.
+        """
+        ws_path = None
+        session_id = getattr(self, 'session_id', None)
+        if session_id:
+            try:
+                from session.session_registry import SessionRegistry
+                from thoughtmachine.workspace_registry import WorkspaceRegistry
+                session_info = SessionRegistry.get_default().get(session_id)
+                ws_id = session_info.get("workspace_id") if session_info else None
+                if ws_id:
+                    entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
+                    ws_path = entry.root_path if entry else None
+            except Exception:
+                pass
+
+        if not ws_path:
+            ws_path = getattr(self, 'workspace_path', None)
+            if ws_path:
+                logging.getLogger(self.__class__.__name__).warning(
+                    "%s falling back to deprecated AgentConfig.workspace_path",
+                    self.__class__.__name__,
+                )
+
+        return ws_path
+
     def execute(self) -> str:
         raise NotImplementedError
 
@@ -266,12 +348,15 @@ class ToolBase(BaseModel):
         Returns absolute normalized path if valid.
         Raises ValueError if path is outside workspace.
         """
+        # Resolve workspace path from registries first
+        resolved_ws = self._resolve_registry_workspace()
+
         # Use centralized security validation if available
         if SECURITY_AVAILABLE:
             # Call security module's validate_path
             # It will log the access and raise appropriate exceptions
             try:
-                return security_validate_path(path, mode='read', workspace_path=self.workspace_path)
+                return security_validate_path(path, mode='read', workspace_path=resolved_ws)
             except Exception as e:
                 # Convert security exceptions to ValueError for backward compatibility
                 # Try to import security exception classes
@@ -285,13 +370,13 @@ class ToolBase(BaseModel):
                     pass
                 raise
         else:
-            # Fallback to original implementation
-            if not self.workspace_path:
+            # Fallback to original implementation using resolved workspace path
+            if not resolved_ws:
                 # No restrictions
                 return os.path.abspath(path)
 
             # Convert to absolute paths
-            workspace_abs = os.path.abspath(self.workspace_path)
+            workspace_abs = os.path.abspath(resolved_ws)
             # If workspace is provided, treat relative paths as relative to workspace
             if not os.path.isabs(path):
                 path = os.path.join(workspace_abs, path)
@@ -302,10 +387,10 @@ class ToolBase(BaseModel):
                 target_rel = os.path.relpath(target_abs, workspace_abs)
             except ValueError:
                 # Paths are on different drives (Windows)
-                raise ValueError(f"Path {path} is outside workspace {self.workspace_path}")
+                raise ValueError(f"Path {path} is outside workspace {resolved_ws}")
 
             # Check for directory traversal attempts
             if target_rel.startswith("..") or os.path.isabs(target_rel):
-                raise ValueError(f"Path {path} is outside workspace {self.workspace_path}")
+                raise ValueError(f"Path {path} is outside workspace {resolved_ws}")
 
             return target_abs

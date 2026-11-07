@@ -7,18 +7,29 @@ name = "thoughtmachine"
 dynamic = ["version"]
 description = "ThoughtMachine — AI agent framework"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "BSL-1.1" }
 authors = [
     { name = "ThoughtMachine Contributors" },
 ]
 requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+[project.scripts]
+tm-logs = "agent.cli.logs:main"
 
 [tool.setuptools]
-packages = { find = { include = ["thoughtmachine*", "agent*", "tools*", "security*", "web_ui*", "llm_providers*"] } }
+packages = { find = { include = ["thoughtmachine*", "agent*", "tools*", "security*", "web_ui*", "llm_providers*", "infra*"] } }
 
 [tool.setuptools.package-data]
 thoughtmachine = [
     "py.typed",
+    "git_askpass.sh",
 ]
 # Include the top-level resources directory as data files
 # accessible via importlib.resources when thoughtmachine is installed.
@@ -27,6 +38,7 @@ thoughtmachine = [
     "resources/.version",
     "resources/default_config.json",
     "resources/default_system_prompt.txt",
+    "resources/engineer_system_prompt.txt",
     "resources/default_providers.json",
     "resources/MANIFEST.json",
     "resources/global_kb/*",
@@ -35,6 +47,15 @@ thoughtmachine = [
 
 [tool.setuptools.dynamic]
 version = { file = "resources/.version" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "web_ui/backend/tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "docker: marks tests that require a real Docker daemon",
+    "e2e: marks Playwright end-to-end browser tests (run with '--run-e2e')",
+]
 
 [project.urls]
 Homepage = "https://github.com/your-org/thoughtmachine"

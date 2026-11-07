@@ -1,19 +1,11 @@
 # Development Guides
-
-Coding conventions, setup instructions, and development workflows.
-
-## Current Status
-- No guides recorded yet.
-
-## Setup
-(To be populated)
-
-## Conventions
-(To be populated)
-
-## Workflows
-(To be populated)
-
+Coding conventions and workflows. **Restructured 2026-08-16**: stale/superseded guides moved to `archive_arch_b.md`; active guides kept here.
+> **LOST (2026-08-16, S2 incident):** the `DURABLE MEMORY REQUIREMENT` section (operator mandate) was uncommitted in the working tree at restore time and is not recoverable from git/workspace. Essence survives in `personal/task_tracker.md` → OPERATOR HANDOFF (durable files DECISIONS.md / BACKLOG.md / ROADMAP.md in repo root, every item statused: done / in progress / decided / deferred / superseded / needs verification; KB kept in sync). Please re-supply the section from host-side if available.
+## Current Status (2026-08-16)
+- DURABLE MEMORY REQUIREMENT section: LOST (see note above); essence preserved in task_tracker.md OPERATOR HANDOFF.
+- Active guides kept: Logging API, DockerCodeRunner (status note added), FileEditor usage, permission toggles, test infrastructure, worker tool rules, event checklist, cross-session worker panel, 10 Sacred Rules, second-instance port, install & run scripts, serve-frontend flag.
+## Archived
+Stale guides → `archive_arch_b.md` (`## SOURCE: development_guides.md — archived (stale/superseded)`).
 ## Logging API Reference
 
 *(Migrated from docs/logging_manual.md — Last validated: 2026-05-22)*
@@ -138,7 +130,7 @@ Total directory size capped at `TM_LOG_DIR_MAX_MB` — oldest files deleted when
 - Use `show_log_config()` in diagnostic output or `/debug` endpoints.
 
 ## DockerCodeRunner Usage
-## DockerCodeRunner Usage
+> **STATUS NOTE (2026-08-16)**: DockerCodeRunner is LIVE in current code — tools/docker_code_runner.py; agent/core/tool_executor.py:267; infra/container_manager.py:97. Older guide kept for reference.
 
 *(Migrated from docs/docker_usage.md — Last validated: 2026-05-05)*
 
@@ -229,101 +221,6 @@ JSON-formatted string with: `success`, `exit_code`, `stdout`, `stderr`, `command
 | Package disappears between calls | Idle timeout exceeded, or policy mismatch |
 | Container name changes between calls | Workspace path not normalized (absolute, no trailing slash) |
 
-## 2026-05-07 — ## Phase 1 Complete: Branch Creation & Switching
-
-### New Me...
-
-## Phase 1 Complete: Branch Creation & Switching
-
-### New Methods Added (3 methods, ~220 lines)
-1. **`_create_agent_branch(repo_root)`** — Creates `agent_{base}_{suffix}` branch from base, validates suffix format, checks for duplicates
-2. **`_switch_branch(repo_root)`** — Switches to existing branch (agent branches + readonly branches allowed)
-3. **`_cleanup_agent_branch(repo_root)`** — Stashes changes, switches to merge target, safe-deletes branch
-
-### New Fields (3 Pydantic fields)
-- `branch_suffix: Optional[str]` — Suffix for new branch names
-- `base_branch: str = "dev"` — Source branch for branching
-- `branch_name: Optional[str]` — Target for switch/cleanup
-
-### New Literal Operations
-- `"create_agent_branch"`, `"switch_branch"`, `"cleanup_agent_branch"`
-
-### Config Used
-- `.thoughtmachine/git_config.json`: `agent_branch_prefix`, `readonly_branches`, `allowed_merge_targets`
-
-### Protection
-- All writes blocked on `dev`/`main`/`master` via `_assert_not_readonly_branch()`
-- `_switch_branch` only allows agent/readonly branches
-- `_cleanup_agent_branch` only operates on agent-prefixed branches
-- Safe delete (`-d` flag) — only if fully merged
-
-## 2026-05-07 — ## Phase 2 Complete: Commit on Agent Branches
-
-**New Pydanti...
-
-## Phase 2 Complete: Commit on Agent Branches
-
-**New Pydantic fields added:**
-- `commit_message: Optional[str]` — commit message (required, validates format)
-- `file_paths: Optional[List[str]]` — list of files to `git add`
-- `add_all: bool = False` — if True, runs `git add -A` instead
-
-**New operation:** `"commit_on_agent_branch"`
-
-**Method `_commit_on_agent_branch()` validates:**
-1. `commit_message` is non-empty
-2. Current branch is an agent branch (starts with `agent_` prefix from config)
-3. Message matches `<type>: <description>` format where type is one of `allowed_commit_types` (configurable, defaults: fix, feat, refactor, chore, docs, test, perf, ci)
-4. If `add_all=False`, `file_paths` must be provided
-5. If `add_all=True`, runs `git add -A` ignoring file_paths
-
-**Staging flow:**
-- `add_all=True` → single `git add -A`
-- `add_all=False` → iterative `git add <path>` for each path in file_paths
-
-**Commit:** `git commit -m "<message>"` via `_run_git_write`
-
-**Safety:** Blocked on non-agent branches, protected by `_assert_not_readonly_branch()`. All writes through `_run_git_write` with error_context.
-
-**Cleanup:** Moved `import re` from local scope in `_create_agent_branch` to module-level import.
-
-## 2026-05-07 — ## Phase 3 Complete: Sync and Merge
-
-**New Pydantic fields:*...
-
-## Phase 3 Complete: Sync and Merge
-
-**New Pydantic fields:**
-- `prose_message: Optional[str]` — merge commit message (200 char max, required for merge_agent_to_dev)
-
-**New operation Literal values:**
-- `"sync_agent_with_dev"`
-- `"merge_agent_to_dev"`
-
-**Readonly guard integration:**
-- Added `readonly_guarded_ops` set in `execute()` — calls `_assert_not_readonly_branch()` for Phase 1/2 ops but NOT for sync/merge (which legitimately write to dev)
-
-### `_sync_agent_with_dev(repo_root)`
-1. Validates on agent branch (not detached HEAD, starts with prefix)
-2. Checks no uncommitted changes (`git status --porcelain`)
-3. `git fetch origin dev`
-4. `git merge origin/dev --no-edit`
-5. On `GitWriteError`: `git merge --abort`, then `git diff --name-only --diff-filter=U` to list conflicted files
-6. Returns success or conflict report (never auto-resolves)
-
-### `_merge_agent_to_dev(repo_root)`
-1. Validates on agent branch
-2. Validates `prose_message` is non-empty and ≤200 chars
-3. Checks no uncommitted changes
-4. `git checkout dev`, `git pull origin dev`
-5. `git merge --no-ff <agent_branch> -m "<prose_message>"`
-6. On conflict: abort, list conflicted files
-7. Post-merge: checks `delete_agent_after_merge` config flag (default `False`), safe-deletes branch if True
-
-**Phase 1-3 complete.** Full write operations: create branch, switch, cleanup, commit, sync with dev, merge to dev.
-
-## 2026-05-09 — ## FileEditor `line_number` vs `line_numbers` — subtle disti...
-
 ## FileEditor `line_number` vs `line_numbers` — subtle distinction
 
 **Problem**: Agents get confused and use `line_numbers` (plural) expecting context lines around the result.
@@ -344,46 +241,6 @@ FileEditor(operation="read", filename="path/to/file.py",
 
 **For reading a full block/range**, use `line_numbers: "420-451"` (range string) to get all lines.
 
-## 2026-05-14 — ## Chat Display Overhaul (2025-01-17)
-
-Replaced `ChatPanel.j...
-
-## Chat Display Overhaul (2025-01-17)
-
-Replaced `ChatPanel.jsx` with a full-featured chat display supporting:
-- **Markdown rendering** via `react-markdown` + `remark-gfm` for assistant and reasoning content
-- **Tool calls** displayed as expandable `<details>` with 🛠️ icon and formatted JSON args
-- **Long tool results** truncated at 500 chars with "▼ Show more" toggle
-- **Reasoning blocks** as 💭 Thinking collapsible `<details>` with markdown rendering
-- All roles (user, assistant, tool_call, tool_result, system) get distinct bubbles
-- Prop renamed from `history` to `messages` to match SessionTab usage
-- Added ~200 lines of CSS in `styles.css` for markdown styling, reasoning blocks, tool call details, and truncation toggle
-
-**Files changed:**
-- `frontend/src/components/ChatPanel.jsx` — full rewrite (51→137 lines)
-- `frontend/src/styles.css` — appended ~200 lines of new CSS
-- `frontend/src/components/SessionTab.jsx` — already updated with `messages={state.history}`
-
-## 2026-05-14 — Bridge debug logging added
-
-## Bridge Debug Logging Added (2025-01-17)
-
-Added debug logging to `web_ui/backend/bridge.py`:
-
-1. **`_emit` method** — Logs structured `conversation_changed` events with:
-   - Message count and roles array
-   - Per-message `reasoning_content` presence flags
-   - A `sample_tool_msg` (first tool_call or tool_result message found) for diagnostic inspection
-
-2. **`_on_controller_event` method** — Logs raw controller events before translation for types: `turn`, `tool_call`, `tool_result`, `user_query`, `final`, `execution_state_change`, `token_update`, `reasoning`
-   - Includes full event dict and keys list
-
-3. **Truncation** — Both `log()` calls use default `truncate_hint=None`, which means `_truncate_data` passes data through unchanged, preserving full diagnostic data in JSONL file logs. Console output may still truncate the display line per `TM_DEBUG_TRUNCATE_LENGTH`.
-
-## 2026-05-30 — ## Feature: `--serve-frontend` CLI flag (2026-06-02)
-
-Added ...
-
 ## Feature: `--serve-frontend` CLI flag (2026-06-02)
 
 Added `--serve-frontend` flag to `web_ui/backend/server.py` main() so the backend can build and serve the React frontend directly, eliminating the need for a separate Vite dev server.
@@ -402,10 +259,6 @@ Added `--serve-frontend` flag to `web_ui/backend/server.py` main() so the backen
 - Missing `dist/` → triggers auto-build
 - API paths under catch-all → returns 404 (not SPA fallback)
 
-## 2026-05-30 — ## Install & Run Scripts (created 2026-05-30)
-
-Two scripts w...
-
 ## Install & Run Scripts (created 2026-05-30)
 
 Two scripts were added to the project root:
@@ -414,239 +267,6 @@ Two scripts were added to the project root:
 - **`start_thoughtmachine.sh`** — Activates `.venv` and starts server with `--serve-frontend` on `127.0.0.1:8000` (override via `HOST`/`PORT` env vars).
 
 Usage: `./install_thoughtmachine.sh && ./start_thoughtmachine.sh`
-
-## Pre-Release Fixes Applied
-
-## 2026-05-31 — **2026-06-02 — Three pre-release fixes applied:**
-
-1. **Fixe...
-
-**2026-06-02 — Three pre-release fixes applied:**
-
-1. **Fixed hardcoded workspace path** (`resources/default_config.json`): Changed `workspace_path` from `"/home/jojo/PycharmProjects/ThoughtMachine-dev"` to `""` — new users no longer get a broken path copied to their config.
-
-2. **Cleaned stale tool names** (`resources/default_config.json`): Removed `"Final"`, `"FinalReport"`, `"RequestUserInteraction"` from `enabled_tools` — these were consolidated into `"Respond"` and no longer exist as tools.
-
-3. **Install script polish** (`install_thoughtmachine.sh`):
-   - Added `chmod +x` for both `start_thoughtmachine.sh` and `install_thoughtmachine.sh` at end of install
-   - Improved completion message: numbered next-steps, mentions auto-config creation, shows URL
-
-4. **Handbook correction** (`resources/global_kb/handbook.md`): Updated "First Run" section to reflect that config is auto-created by the server bootstrap, not manually.
-
-**Files changed:** resources/default_config.json, install_thoughtmachine.sh, resources/global_kb/handbook.md
-
-## Build Scripts
-
-## 2026-05-31 — ## Build Scripts
-
-**2025-07-14**: Created two build scripts ...
-
-## Build Scripts
-
-**2025-07-14**: Created two build scripts for PyInstaller packaging:
-
-- **`build_thoughtmachine_exe.sh`** (Linux/macOS) — Bash script, 5 steps: (1) build React frontend, (2-4) check/install Python deps, (5) run PyInstaller in one-folder (default via `thoughtmachine.spec`) or one-file mode (`ONE_FILE=1`).
-- **`build_thoughtmachine_exe.bat`** (Windows) — Batch script equivalent with same 5 steps. Uses `set ONE_FILE=1` for one-file mode. Uses Windows path separators throughout. Helpers: `:info`, `:ok`, `:warn`, `:err` subroutines.
-
-## Requirements
-
-## 2026-05-31 — ## Requirements Split (2025-07-14)
-
-Split `requirements.txt`...
-
-## Requirements Split (2025-07-14)
-
-Split `requirements.txt` into core + optional RAG to reduce venv bloat:
-
-- **`requirements.txt`** — Core dependencies only (FastAPI, uvicorn, pydantic, openai, anthropic, tiktoken, docker, etc.). ~200 MB venv.
-- **`requirements-rag.txt`** — Optional RAG stack (CPU-only PyTorch via `--index-url`, sentence-transformers, chromadb, langchain). ~500 MB extra.
-- **`install_thoughtmachine.sh`** — Now accepts `--with-rag` flag to install RAG deps.
-
-Removed from core: `PyQt6` (legacy GUI, not needed for web UI), `sentence-transformers`, `chromadb`, `langchain`, `langchain-community`.
-
-
-## 2026-06-01 — ## 2026-06-03 — New User Onboarding System (Created)
-
-### Wh...
-
-## 2026-06-03 — New User Onboarding System (Created)
-
-### What was done
-1. **Created `user/onboarding_guide.md` in global KB** — A friendly, non-technical guide for new ThoughtMachine users. Explains concepts in plain language (workspace, session, KB). Gives suggested "first things to say." Doesn't assume prior knowledge. Warm, guided tone.
-
-2. **Added Rule 14 to system prompt** — Both `system_prompt.txt` (root, actually loaded) and `resources/default_system_prompt.txt` (template) now contain:
-   > *"When interacting with someone who seems new to ThoughtMachine, offer a guided, friendly experience. Do not assume prior knowledge — explain concepts like workspaces, sessions, and the knowledge base in plain language. Check the global KB's `user/onboarding_guide.md` for a ready-to-use friendly introduction. Suggest clear next steps. Invite questions."*
-
-### Still open / not implemented
-- **No first-time user detection mechanism** — The agent needs some way to know it's talking to a new user. Options: check for a marker in global KB (e.g., `user/user_profile.md`), or simply run onboarding when the user seems confused.
-- **The "View Artifact" tool** — Previously brainstormed idea. Could pair well with onboarding (agent generates a welcome page and presents it visually).
-
-
-## 2026-06-07 — # 🕵️ The Case of the Missing Panel — Full Investigation Repo...
-
-# 🕵️ The Case of the Missing Panel — Full Investigation Report
-
-**To**: GUI Engineer  
-**From**: ThoughtMachine AI  
-**Date**: 2026-06-07  
-**Subject**: Complete investigation log — ConfigPanel sidebar + Docker panel feature request
-
----
-
-## 1. How It Started
-
-The user (jojo) reported: *"my Config panel sidebar was once there but not currently."* Meaning: the gray sidebar on the left side of the session view (the one with config tabs like General, Model, Tools, Permissions, etc.) that they remember seeing before, is now absent from the screen.
-
-At this point, we had uncommitted changes in the workspace:
-- `agent/config/models.py` — modified
-- `agent/config/provider_profile.py` — modified
-(These are the "overwrite when non-empty" fix for provider profile resolution.)
-
-## 2. Investigation Phase 1 — Is ConfigPanel Rendering?
-
-We checked the code path:
-
-- **SessionTab.jsx:446** — ConfigPanel IS rendered unconditionally:
-  ```jsx
-  <ConfigPanel
-    config={state.config}
-    sendCommand={sendCommand}
-    providers={providers}
-    ...
-  />
-  ```
-  No `if` guard, no `isDeferred` check. If the tab is loaded, ConfigPanel renders.
-
-- **ConfigPanel.jsx:169** — The component signature:
-  ```jsx
-  function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, ... })
-  ```
-
-- **ConfigPanel.jsx:302-306** — The only conditional is the loading state:
-  ```jsx
-  if (!config) {
-    return <div style={{ padding: '1rem', ..., width: panelWidth || 280, ... }}>
-      Loading config...
-    </div>;
-  }
-  ```
-
-- **ConfigPanel.jsx:342-343** — The real render:
-  ```jsx
-  return (
-    <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244',
-                  color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500,
-                  flexShrink: 0, overflowY: 'auto', height: '100%' }}>
-  ```
-
-### Key findings:
-- ConfigPanel uses **inline styles entirely** — no CSS class like `.config-panel` on the outer div (the `.config-panel` class in `styles.css:100` is unused vestigial CSS)
-- The resize handle (`.resize-handle`) sits between ConfigPanel and the chat panel — uses `width: 5px` CSS class
-- ConfigPanel is resizable via drag, persisted per tab in `localStorage` key `config-panel-width:{tabId}`
-
-## 3. Investigation Phase 2 — Is ConfigPanel in the DOM?
-
-The user couldn't access browser DevTools (no Elements/Inspector tab available in their Firefox). We worked around this:
-
-- Confirmed via WS message count (907 messages received) that **the tab IS loaded and active**
-- The backend sends `config_changed` events after `load_session` (server.py:721-726) — so config should arrive
-- No React errors in browser console
-- The user eventually found CSS via browser inspection that **exactly matches** ConfigPanel's inline styles:
-  ```
-  padding: 1rem;
-  font-family: sans-serif;
-  background: rgb(49, 50, 68);  /* = #313244 */
-  color: rgb(205, 214, 244);    /* = #cdd6f4 */
-  width: 280px;                  /* = panelWidth || 280 */
-  min-width: 200px;
-  max-width: 500px;
-  flex-shrink: 0;
-  overflow-y: auto;
-  height: 100%;
-  ```
-  **Verdict: ConfigPanel IS in the DOM with correct styles.**
-
-## 4. Investigation Phase 3 — Why Is It Not Visible?
-
-This is where it gets tricky. ConfigPanel exists in HTML but the user says it's not visible on screen. Possible causes (not fully resolved):
-
-| Cause | Likelihood | Notes |
-|---|---|---|
-| **User is looking at deferred tab** | Medium | 4 of 5 tabs are deferred ("Click tab to load conversation") — possible user was on wrong tab |
-| **CSS layout clipping** | Low | Parent `.app-main` has `overflow: hidden` but ConfigPanel has `flex-shrink: 0` and fixed width |
-| **Browser zoom/scroll** | Low | Could be off-screen to the right |
-| **ConfigPanel is there but user didn't notice** | Low | Unlikely given user's certainty |
-
-## 5. Plot Twist — It's Not ConfigPanel!
-
-After the investigation, the user revealed: **"we are looking for the container panel, the docker thing"**
-
-So the entire investigation was a misunderstanding! The user was NOT looking for the Config sidebar. They were looking for a **Docker containers panel** — a UI component that:
-
-- **Does not exist** in the codebase
-- Was never built
-- Has no placeholder, no route, no component file
-- Only Docker-related code is the `DockerCodeRunner` tool listing and a "Container" permission toggle in ConfigPanel's Permissions tab (lines 633-653)
-
-## 6. Current State
-
-### Uncommitted changes (the provider profile fix):
-```
- M agent/config/models.py
- M agent/config/provider_profile.py
-```
-
-### Branch situation:
-- Currently on **detached HEAD** at `4b3dde3`
-- Branch `master` exists
-- User plans to create a new branch (likely named `docker-panel`), commit the changes, then build the Docker panel from scratch
-
-### The user's plan:
-1. ✅ Commit current changes to new branch
-2. ❓ Provide full instructions for building the Docker panel UI
-3. ❓ Build the Docker panel component
-
-## 7. Technical Notes for the GUI Engineer
-
-### Frontend architecture (relevant parts):
-- **Stack**: React (Vite), vanilla CSS (inline styles + some CSS classes in `styles.css`)
-- **State management**: Per-tab state via `useState`/`useCallback` in SessionTab — no Redux/Zustand
-- **Backend communication**: WebSocket (`sendCommand()` / event listeners)
-- **Tab system**: Up to 5 tabs, lazy-loaded (deferred pattern), state persisted per tab
-- **Config delivery**: Backend sends `config_changed` event after `load_session`
-- **Styling**: Catppuccin Mocha palette (`--bg-primary: #1e1e2e`, `--bg-surface: #313244`, etc.)
-
-### ConfigPanel inline style pattern (for reference when building new panels):
-```jsx
-<div style={{
-  padding: '1rem',
-  fontFamily: 'sans-serif',
-  background: '#313244',
-  color: '#cdd6f4',
-  width: panelWidth || 280,
-  minWidth: 200,
-  maxWidth: 500,
-  flexShrink: 0,
-  overflowY: 'auto',
-  height: '100%'
-}}>
-```
-
-### The `sendCommand` interface:
-```jsx
-sendCommand('command_name', { payload })
-```
-Available commands are handled in `bridge.py` and `server.py`.
-
----
-
-**End of report.** Ready for Docker panel feature design.
-
-## How to add a new permission toggle
-
-## 2026-06-10 — ## How to add a new permission toggle
-
-Every new trust domai...
 
 ## How to add a new permission toggle
 
@@ -689,18 +309,222 @@ Some resources — like network — are enforced at the container level. For ema
 Add a row to the merge table in the existing gate contract tests (`tests/docker/test_gate_contract.py`). The parametrized tests cover all combinations automatically.
 
 
-## 2026-06-10 — ## Windows packaging: "Terminate batch job (Y/N)?" fix (2026...
+## Second instance port configuration (2025-07-16)
 
-## Windows packaging: "Terminate batch job (Y/N)?" fix (2026-06-03)
+### How to start a second instance
+```bash
+# Terminal 1 — first instance (default ports)
+python -m web_ui.backend.server
+# In another terminal:
+cd web_ui/frontend && npm run dev
 
-**Problem:** `start_thoughtmachine.bat` used `powershell Start-Process` to launch Python, but `cmd.exe` (the batch file's parent console) still owned the console. When the user pressed Ctrl+C, `cmd.exe` intercepted it and prompted "Terminate batch job (Y/N)?" before the batch could continue.
+# Terminal 2 — second instance (custom ports)
+TM_PORT=8001 python -m web_ui.backend.server
+# In another terminal:
+cd web_ui/frontend && VITE_PORT=5174 VITE_BACKEND_PORT=8001 npm run dev
+```
 
-**Root cause:** `cmd.exe` runs batch files synchronously. When Ctrl+C is pressed in the console, `cmd.exe`'s default handler prompts before executing the next batch line — including `exit /b`.
+### Environment variables
+| Variable | Default | Scope | Description |
+|----------|---------|-------|-------------|
+| `PORT` / `TM_PORT` | 8000 | Backend | Backend server port (already supported) |
+| `VITE_PORT` | 5173 | Vite dev | Frontend dev server port |
+| `VITE_BACKEND_PORT` | 8000 | Frontend | Backend port for WS/API connections |
 
-**Fix:** Replaced `powershell -Command "Start-Process python ... -NoNewWindow -PassThru; $p.WaitForExit(); exit $p.ExitCode"` with `start "ThoughtMachine Backend" /wait python ...`. The `start` command launches Python in a new console window (its own process group), so Ctrl+C only reaches Python, not the parent `cmd.exe`. After Python exits, the new window closes, the batch continues to `exit /b`, and **no prompt appears**.
+### Files changed
+- `web_ui/frontend/vite.config.js` — env var for port + proxy target
+- `web_ui/frontend/src/App.jsx` — env var for WS_URL
+- `web_ui/frontend/src/components/SessionTab.jsx` — env var for WS_URL
+- `web_ui/frontend/src/components/ConfigPanel.jsx` — env var for API base URL
 
-**Key principles:**
-- `start "" /wait` creates a new process in its own console — Ctrl+C isolation
-- `start /b` (same-window) makes the app ignore Ctrl+C — NOT what we want
-- Vite was already launched in a separate window via `start "ThoughtMachine Vite" cmd /c "npm run dev"` — the backend now follows the same pattern
-- The `exit /b %ERRORLEVEL%` after `start /wait` propagates Python's exit code
+Backend (`server.py`) already supported `--port` and `PORT` env var from earlier work.
+
+## 2026-07-02 — Master Vault: Design Principles (10 Sacred Rules)
+
+These are the core design principles that guide all architecture decisions. They should not be violated without explicit deliberation.
+
+### Rule 1: Workers are Agents with Restricted Tools
+Workers reuse the agent's reasoning loop. They are not scripts or plugins — they are full agents that happen to have fewer tools and a narrower context. This ensures consistency, debugability, and future extensibility.
+
+### Rule 2: Separation of Agent and Host
+The agent should never need direct access to the host filesystem, Docker daemon, or network beyond what tools expose. The Host is the boundary. The agent operates inside tool-mediated constraints.
+
+### Rule 3: Events are the Universal Language
+All state changes should flow through events. No direct method calls between subsystems. The EventBus is the nervous system. This decouples components and enables real-time UI updates.
+
+### Rule 4: Persistence is Transparent
+Sessions, configs, and state should serialize and deserialize without custom migration scripts. If you need a migration, the persistence model is wrong.
+
+### Rule 5: The UI is a Client, Not the System
+The Web UI is one client among many (CLI, API, future clients). All logic lives in the backend. The frontend is a rendering layer, not a decision-maker.
+
+### Rule 6: Security Defaults to Deny
+Permissions should default to the most restrictive safe state. Users explicitly grant access. This prevents accidental exposure and follows least-privilege principles.
+
+### Rule 7: Config is Code
+Configuration files should be treated as code: version-controlled, validated, and structured. No magic strings, no undocumented keys. Config schemas should be explicit and typed.
+
+### Rule 8: One Source of Truth for State
+No duplicated state between frontend and backend. The backend owns state; the frontend reflects it. Avoid local state that mirrors server state.
+
+### Rule 9: Fail Closed, Not Open
+When in doubt about permissions, connectivity, or state validity, refuse the operation and report the issue. Silent failures are bugs. Defensive checks are welcome.
+
+### Rule 10: Test the Boundaries
+Unit test the internals, integration test the boundaries (tool interface, event bus, persistence, WebSocket bridge). E2E tests cover the happy path. Edge cases live in integration tests.
+
+### Deriving Sprints from Principles
+- Panel Unification (Sprint 1-3): Upholds Rule 8 (one source of truth) and Rule 5 (UI is client)
+- Worker Config Panel: Upholds Rule 1 (workers are agents) and Rule 6 (security defaults)
+- Container Persistence: Upholds Rule 4 (persistence is transparent)
+- Security Defaults: Upholds Rule 6 (default to deny) and Rule 9 (fail closed)
+
+## Cross-Session Worker Panel Access — Changes Implemented
+
+**Date:** 2026-07-09
+
+**Objective:** Make workers visible across all session tabs in the same workspace for VIEWING (list, panel, events) while keeping CONTROL (query, stop) session-scoped.
+
+### Files Changed:
+
+1. **`web_ui/frontend/src/components/WorkspacePanel.jsx` (line 199)**
+   - **Before:** `data.filter(w => !sessionId || w.session_id === sessionId)`
+   - **After:** `data` (no filter)
+   - **Effect:** WorkerAutoOpenWatcher now auto-opens for ANY worker in the workspace, not just the current session's workers.
+
+2. **`web_ui/frontend/src/components/WorkerOutputPanel.jsx` (line 141)**
+   - **Before:** `data.find((w) => w.name === workerName && (!sessionId || w.session_id === sessionId))`
+   - **After:** `data.find((w) => w.name === workerName)`
+   - **Effect:** fetchWorkerInfo() finds any worker by name regardless of session.
+
+3. **`web_ui/frontend/src/components/WorkerOutputPanel.jsx` (line 288-296)**
+   - Added session-scoped guard in `handleStop`:
+   - If `workerInfo.session_id !== sessionId`, shows error "Cannot stop worker from another session" and returns early.
+   - **Effect:** Control operations are blocked for cross-session workers; viewing still works.
+
+4. **`web_ui/frontend/src/components/WorkerOutputPanel.jsx` (lines 182-206)**
+   - Added worker-name filtering on incoming WS events merge:
+   - Filters `incomingEvents` by `e.worker_name` or `e.response?.worker_name` matching the current `workerName`.
+   - **Effect:** When all sessions' events are passed, only events for the displayed worker are merged in.
+
+5. **`web_ui/frontend/src/App.jsx` (line 671)**
+   - **Before:** `incomingEvents={workerEvents[activeSessionId] || []}`
+   - **After:** `incomingEvents={Object.values(workerEvents).flat()}`
+   - **Effect:** ALL session worker events are passed to the WorkerOutputPanel, which then filters by worker name internally.
+
+
+## Adding a New Event Type — Checklist
+
+Every new event type must be added to every layer of the pipeline. Missing any step causes silent failures.
+
+### 1. Backend — Event Definition
+- [ ] Add enum value to `EventType` in `agent/events.py`
+- [ ] Create typed Pydantic event class (with validator if payload required)
+- [ ] Add to `event_class_map` in `create_event()` factory
+- [ ] Add to `_map_legacy_event_type()` mapping (for backward compatibility)
+
+### 2. Backend — Event Emission
+- [ ] Add `_publish_event()` call at the appropriate lifecycle point
+- [ ] Ensure data dict includes `worker_name` and `session_id`
+
+### 3. Backend — WebSocket Forwarding
+- [ ] Subscribe to the new event type in `bridge.py` `_subscribe_to_worker_events()`
+- [ ] Add WebSocket message format to `server.py` docstring (Server→Client types)
+- [ ] Add unsubscribe handler in `_unsubscribe_worker_events()`
+
+### 4. Frontend — Event Reception
+- [ ] Add case to WS message handler in `SessionTab.jsx` (connectSessionWs switch)
+
+### 5. Frontend — Event Rendering
+- [ ] Add case to `adaptWorkerEvent.js` switch statement
+- [ ] Add handling in `WorkerOutputPanel.jsx` merge/incoming events logic (if needed)
+
+### 6. Schema & Tests
+- [ ] Add event type to `web_ui/shared/worker_event_schema.json`
+- [ ] Add test case to `adaptWorkerEvent.test.js`
+
+## Test Infrastructure Summary
+- **44 test files** total (43 Python + 1 JavaScript)
+- **~486 tests** total (~414 Python + ~72 JavaScript)
+- **Runner:** pytest (no config section in pyproject.toml) + vitest (frontend)
+- **conftest.py:** 3 files (docker_integration, security, web_ui/backend)
+- **Test commands:** `python -m pytest` | `cd web_ui/frontend && npm test`
+- **Top files by test count:** test_history_pruner.py (45), test_worker_agent_transplant.py (30), test_worker_loop_spike.py (29), test_permissions_roundtrip.py (25), test_security_coercion.py (20)
+- **Full report:** TEST_INFRASTRUCTURE_REPORT.md
+
+## Worker Tool Usage Rules (Critical)
+
+**NEVER use `spawn` with `context={"query": "..."}` for follow-up tasks.** Doing so **deletes the worker's `context.json`** and creates a **fresh agent with an empty conversation**, losing all prior context.
+
+### Correct pattern:
+1. **`spawn`**: Use ONCE to start the worker with `context={"query": "initial task"}`. This creates the worker thread + agent + conversation.
+2. **`query`**: Use for ALL follow-up tasks by passing `worker_query="follow-up message"`. This preserves the existing Agent, WorkerContext, and all conversation history.
+3. **`force=True`**: Only use when the worker is genuinely stuck/hanging (stale from another session). **Never use `force=True` for routine continuation** — it kills the existing worker and starts fresh.
+
+### Why:
+- `spawn` with context deletes old `context.json` → fresh `WorkerContext` → empty conversation
+- `query` reuses the existing Agent → conversation history preserved
+- The worker thread stays alive after completing a task, waiting on `_input_queue` for the next query
+
+### How to check worker state before acting:
+- `check` returns `current_context_tokens` and `status`
+- If `status="ready"` and `alive=True`, the worker is ready for a follow-up `query`
+- If `status="stopped"` or `alive=False`, need to `spawn` fresh
+
+## cmd.exe .bat block-paren scanner (caret/quote/echo(-aware)
+
+## 2026-09-08 — Reusable scanner methodology for finding cmd.exe crash hazar...
+
+Reusable scanner methodology for finding cmd.exe crash hazards in .bat files (perfected during the install_thoughtmachine.bat Windows saga). Write a python script that walks lines tracking paren depth with these rules:
+- '(' and ')' ONLY count when OUTSIDE double quotes.
+- '^(' and '^)' are caret-escaped = LITERAL parens, never block tokens.
+- A line matching ^\s*echo\s*\( is the echo( idiom — does NOT open a block.
+- Parens inside REM comments / quoted strings are ONLY risky when current depth > 0 (inside a real open multi-line block). On top-level lines they are safe (they can only OPEN a block at the next ( that ends a line, and REM/quoted ones don't).
+- A line ending with an unclosed '(' at depth>0 opens a multi-line block that continues until matching ')'.
+Desired end state: unclosed depth == 0 at EOF and zero lines where (content with parens) sits inside an open block. Then grep-flag candidates for manual eyeball (REM w/ parens + python -c "...(...)" one-liners + call :label "text (parens)"): verify whether each flagged line is inside an open block; if yes, apply the flat single-line if/goto fix pattern (see bugs_and_fixes 'Windows .bat cmd.exe parsing saga'). All 5 repo .bat files pass depth=0 at EOF; install_thoughtmachine.bat is the only confirmed hazard instance fixed (a9ee26e).
+
+## Wave 9a step 2/3 — PREMISE FALSIFIED by read-only recon (2026-10-15, at HEAD e58529e3)
+
+Do NOT re-run this recon; these facts are verified with file:line.
+
+1. `ContainerLifecycle` and `reconcile` **DO NOT EXIST in production** (0 matches across agent/, infra/, web_ui/, session/, tools/, thoughtmachine/, security/, llm_providers/, scripts/, mcp_examples/, resources/, presets/). Only match: `tests/docker/test_container_lifecycle.py:113 class TestContainerLifecycle` (test-only). So step 2 is NOT "re-point S1–S13 to an existing funnel" — it is "author the funnel class, then migrate". Lifetime classification today lives in `security/security_gate.py:1159` (frozen dataclass `ContainerConfig`, field `lifecycle_class` at :1169) + `thoughtmachine/container_record/lifecycle_policy.py`.
+
+2. `resolve_container_config` is defined at **`security/security_gate.py:1185`**; returns `ContainerConfig` (:1159) or the fail-closed `ContainerConfigError` value (:1172). **13 production call sites = S1–S13**, none in tests:
+   - direct (8): `security/admission_gate.py:459` (NEW — missed by the earlier pass), `infra/container_registry.py:1055`, `infra/container_manager.py:4224`, `infra/resource_container_manager.py:1667` and `:2202`, `tools/git_info_tool.py:1189`, `thoughtmachine/container_record/drift.py:440`, `docker_executor.py:280` (inside the adapter body).
+   - via adapter `_resolve_container_config_via_gate` (def `docker_executor.py:245`), 5 sites: `docker_executor.py:424` (verify_container_integrity), `:614` (DockerExecutor._compute_container_config), `:1232`, `:1361`, `infra/container_manager.py:3741`.
+
+3. `NETWORK_DECISION` is emitted from **TWO** sites, not one: `docker_executor.py:437-438` and `docker_executor.py:619-620` (both `audit_event(...)`).
+
+4. Step 3 item 1 is WRONG: `agent/presenter/session_lifecycle.py` is **NOT factory-dead**. It defines `SessionLifecycle` (:23) and is instantiated by `agent/presenter/agent_presenter.py:24` (import) / `:40` (instantiate), re-exported at `agent/presenter/__init__.py:12`, consumed by `agent/presenter/event_processor.py:18/24/28`, and referenced by `tests/test_session_grants_canonical_pins.py:656`. The narrower true statement is that the presenter chain has no importer outside `agent/presenter/` (importers of `agent_presenter`/`RefactoredAgentPresenter`: 0). Workers use a different class: `tools/workspace/worker_thread.py:1728 WorkerSessionLifecycle`.
+
+5. Step 3 item 2 is WRONG: `GET /api/container/integrity` is LIVE — `web_ui/backend/server.py:3294` `@app.get("/api/container/integrity")`, handler `:3295 def container_integrity(workspace: str = "", permissions: str = "")`, called by `web_ui/frontend/src/components/ContainerPanel.jsx:52`. Deleting it breaks the UI panel.
+
+⇒ Recommendation carried to the engineer report: step 2 is a build-and-migrate project (not a re-point) and step 3 must NOT be executed as written.
+
+## W5 (finding E) — the fix, and the reusable pattern
+
+`_ensure_running` (`infra/container_manager.py:3975-3989`) used to return nothing and swallow start failure; the three reuse sites (record :1585 / workspace-label :1694-1698 / label :1793-1797) therefore reported `status="reused"` for containers that were not running, and two of them warmed the read-through cache with the dead id (:1533, :1780).
+
+Fix pattern worth reusing: **make the best-effort helper return a VERIFIED bool, change the response additively-only, and never silently warm a cache with unverified state.** Additive-only means the new key (`"running": False`) appears ONLY on the unverified path, so every verified-path payload stays byte-identical and no existing consumer or test can change — that is what keeps a 4459-test suite green while fixing the lie. Evidence style that convinced the reviewer: parametrize all three sites, then add a DIFFERENTIAL test that monkeypatches the verification to the old constant-True behaviour and asserts the previously-passing assertions flip.
+
+## CORRECTION (2026-10-15, post-review) — two verdicts in the entry ABOVE were WRONG
+
+The engineer challenged the earlier conclusions; an independent decisive re-read (not grep counts) overturned both. Corrected facts:
+
+**CORRECTION 1 — `agent/presenter/session_lifecycle.py` IS dead in production (the engineer was right, my earlier "live" verdict was wrong).**
+`SessionLifecycle(...)` is instantiated in production exactly ONCE: `agent/presenter/agent_presenter.py:40`, inside `RefactoredAgentPresenter.__init__` (class def `:27`). And `RefactoredAgentPresenter` is **constructed nowhere** — 0 hits across agent/, infra/, tools/, thoughtmachine/, security/, web_ui/ (149 files), tests/, and root scripts; no `getattr`/`importlib`/`setattr` string construction. Production actually uses **`WebAgentBridge`** (`web_ui/backend/bridge.py:274`, built in `web_ui/backend/server.py` at :1165/:1401/:2116/:2507/:2685 and factory `create_bridge()` :2666) plus **`Agent`** (`agent/core/agent.py:96`, built at `bridge.py:1225`). Test-only users: `tests/test_session_grants_canonical_pins.py:656`, `:682` (`lc = SessionLifecycle(_FakeBridge(), None)`, class `TestPresenterMetadataStripsGrant`, test `test_build_session_drops_grant_keeps_config`).
+**LESSON (the actual mistake): "referenced/instantiated in production code" is NOT "reachable". Always ask whether the class that instantiates it is itself ever constructed.** I had the raw fact (the "no importer outside agent/presenter" caveat) but wrote the headline as "live" and recommended against deletion. Deleting `session_lifecycle.py` is blocked not by liveness but by the **chain**: it needs `agent_presenter.py` + `event_processor.py` decided together, plus a rewrite of the test at `test_session_grants_canonical_pins.py:656`.
+
+**CORRECTION 2 — `GET /api/container/integrity` is DESTRUCTIVE on a plain call (the engineer was right; my "it's live, so don't delete it" was a strawman against the actual plan, which was to DE-DESTRUCT it).**
+`web_ui/backend/server.py:3294` decorator, `:3295 def container_integrity(workspace="", permissions="")`, body `:3296-3339`. **No repair/heal/force/dry_run parameter exists** — so no caller opt-in gates the mutation. Chain: `:3321 from docker_executor import get_integrity_status` → `:3332 result = get_integrity_status(workspace, sp)` → `docker_executor.py:1437` → `:1463 verify_container_integrity(workspace_path, session_permissions)` (`:386`) → on network/workspace-mode mismatch, **`docker_executor.py:530-532 container.stop(timeout=5)` / `container.remove()`**, returning `action_taken="removed"` (`:1465-1471`). Response keys: `status/container_name/desired/actual/mismatch_reason` (`:1470-1476`; `server.py:3308-3314`).
+**Worse:** the only frontend consumer polls it **every 5 seconds** (`web_ui/frontend/src/components/ContainerPanel.jsx:66-69`) and reads `data.integrity` / `data.details` (`:52-56`) — keys this endpoint **never returns**, so the panel always falls back to "unknown". ⇒ A GET that can stop+remove a container is being polled at 5s by a panel that cannot even parse the response. De-destruct is therefore more urgent than originally scoped.
+
+**CORRECTION 3 — what the branch changes about victims (answer to "does it fix the turn-boundary kill?"): NO.**
+Admission **refuses, it does not evict**: `infra/container_manager.py:1709-1719` (`limit = self._get_max_containers()`; `active_containers = self._active_containers(containers)`; `if len(active_containers) >= limit: return {"error": ... "ContainerRemoveTool to free a slot"}`), helpers `_active_containers :810` / `_counts_toward_limit :779-808`; sibling implementation `infra/container_registry.py:544-553`. Victim selection exists **only** in the TTL sweeps: `sweep_exited_workspace_containers :4568` with predicate `:4668 if _gc_should_skip(container)` / `:4683 if status != "exited": continue` / `:4696-4700 ttl = max_age_s_by_class.get(cls, max_age_s)` / removal `:4714 container.remove(force=True)`, plus `sweep_orphan_container_records :4738` (records only). **`mem_limit` is NOT consulted anywhere in victim selection** (all occurrences are create/report/intent paths); the only "victim" wording is the OOM comment `:1858 oom_score_adj=1000  # user containers are the first OOM-kill victims`.
+⇒ W2′ + W3/W3-2/W3-4/W3-5/W4/W5 change capacity ACCOUNTING and OBSERVABILITY. **Naming a predicate is not changing it.** A running/busy container being killed mid-turn is NOT explained by this branch; the two live candidates are (a) the destructive integrity GET above, and (b) kernel OOM at `oom_score_adj=1000`. Hypothesis to verify, not a claim: the 5s UI poll of `/api/container/integrity` against a mismatch predicate derived from session permissions could stop+remove a container mid-turn — and `748def2a` (wave 9a-0b, #112) changed container-config resolution, which is a plausible changepoint for a mismatch-predicate regression.
+
+**Two disciplines the operator has now made standing rules (gen-47).**
+
+1) **Sandbox verdict ≠ CI verdict — name the tests, run them by name.** A split/sharded run reporting "4522 + 299 passed" still missed the seeding invariant that CI caught. For every PR: `grep -rlnE '<the symbols you touched>|<the functions you touched>' --include='*.py' tests/ web_ui/backend/tests/`, then run those files EXPLICITLY (batches of ~5 per worker turn), and treat any `FAILED`/`ERROR` in a `.pytest-*.log` as CI's answer arriving early. Do not present shard counts as a suite verdict. Verify numbers from the log files (`grep -cE '^(FAILED|ERROR)'`, `tail -n 3`), never from a worker's summary table; and always re-run a "N skipped" batch with `-rs` — two "green" e2e files in PR 2 were pure `pytest.importorskip("playwright.sync_api")` no-ops with zero coverage.
+
+2) **Immutability-admits-one-exception is one-design + one-audited-call-site, enforced at review.** `Session.workspace_id` is immutable via `__setattr__` except through `Session.rebind_workspace()` (PR 2, commit `5b13ff9a`). The moment a second caller appears, the exception becomes the pattern and deny-by-default is gone. Its caller list is therefore a REVIEW invariant, not a comment: grep `rebind_workspace` on every PR that touches `session/` or `web_ui/backend/`, and refuse any new call site that is not the owning apply_config switch. Same test applies to any future "single escape hatch" API.
