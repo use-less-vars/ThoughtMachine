@@ -1,6 +1,6 @@
 # ThoughtMachine -- Status
 
-Updated: 2026-10-28, Gen 54 mid-session.
+Updated: Gen 60 close — stabilization sprint COMPLETE. See "Current state — Gen 60 close" below; this banner supersedes the Gen 54 and Gen 56 wording.
 
 **Gen 48 close-out snapshot (historical):** **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
@@ -38,6 +38,64 @@ after W4 merges." Status line for this wave, verbatim: "Credential
 injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
 port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
+
+## Current state — Gen 60 close: stabilization sprint COMPLETE
+
+**Sprint status: CLOSED.** No new feature work is starting. For any question about current state, this section supersedes the Gen 56 close and every older `## Current state` block below; those are kept as history, not as current truth.
+
+`dev` HEAD at close: `27d19459` (merge of PR #304). If any number in this document disagrees with `git log dev`, believe `git log dev`.
+
+### The four stabilization defects — all fixed and merged
+
+| # | Defect | Fix | Landed as |
+|---|---|---|---|
+| 1 | Slow boot — the Vite build ran when it was not needed | build skipped when not required | fast-boot change |
+| 2 | Dirty worker spawns — a stale instance could survive and be reused | stale instance force-cleared before spawn | force-clear change |
+| 3 | Wrong workspace binding — the category gate resolved the enforced workspace from a deprecated config snapshot | precedence inverted (see below) | PR #304 / `9a4a606f` |
+| 4 | Slow session loading — session load fetched twice | duplicate fetch removed | PR #303 / `2e3e8d04` |
+
+### The "Gentle Wolf" root cause — the one that mattered
+
+The original report was: *a reused executor leaks a previous session's `workspace_path`, so the worker gets the wrong path and fails closed.*
+
+**That premise is false and was refuted by audit.** There is no executor reuse anywhere: one `ToolExecutor` per `Agent` (`agent/core/agent.py:497`), one `Agent` per bridge (`agent/presenter/bridge.py:1708`), a fresh `WebAgentBridge` per session load (`web_ui/backend/server.py:1442/1744/2597/3309/3555`), and one executor per worker spawn (`agent/worker/worker_thread.py:3704`). A test asserting cross-session leakage would have passed vacuously while the real defect survived.
+
+**The real defect was a precedence inversion** in the workspace gate inside `ToolExecutor._execute_single_tool`. The gate derived the workspace id it enforces from `self.config.workspace_path` *first*, and only fell back to the explicitly passed `workspace_id` or the persisted session record when no path was configured. But `AgentConfig.workspace_path` (`agent/config/models.py:179`) is deprecated, restart-required, construction-time only, defaults to `None`, and is omitted entirely by `agent/presenter/state_bridge.py:245`, `web_ui/backend/config_manager.py:508` and `agent/config/audit.py:176`. Worse, `Agent._hot_swap()` (`agent/core/agent.py:791-797`) replaces `self.config` wholesale — with a config carrying no `workspace_path` — without rebuilding the executor, so a live executor can end up with `workspace_path = None`.
+
+Consequence: the fail-closed branch denied **every** category-gated tool while a perfectly correct workspace id was already in hand. Not a leak — an ordering bug in which a deprecated snapshot outranked live state.
+
+New precedence, documented in the gate block because it decides *who* may run gated tools:
+
+1. the explicit `workspace_id` argument — the live session id, `agent/core/agent.py:1952`;
+2. the persisted session record — the `store.load_session_workspace_id` probe, then the legacy payload probe;
+3. `resolve_workspace_id(config.workspace_path)` — legacy fallback only.
+
+The fail-closed refusal is preserved, and its message now names all three sources so an "unresolvable workspace" denial stays distinguishable from a category denial. Separately, `_get_session_store()` caches one lazily-created session store on the executor, shared by the gate probe and `_resolve_workspace_id_from_session`, where previously each allocated a throwaway store per gated call.
+
+Test evidence: `TestWorkspaceIdResolutionPrecedence` covers session-record resolution with a pathless config, an explicit id beating a competing config path, the session record beating a competing config path, nothing-resolvable staying denied with the gate never consulted, and a hot-swap onto a `workspace_path`-less config. Assertions land on the id the gate actually receives, not on log text. Pre-fix RED was 5 failures; post-fix, 101 passed (`tests/test_tool_executor.py` plus `tests/test_worker_permission_hardening.py`), 556 passed and 28 skipped (`tests/security`), and 96 passed across six related permission and workspace suites. Those counts were reproduced by an independent clean-context verifier, not taken from the implementing worker's report.
+
+### Open follow-up tickets — audited, deliberately not fixed
+
+1. `agent/worker/worker_thread.py:5255-5266` — the comment says "injected path wins", the code is `registry_ws or parent_ws` (registry-first). Comment and behaviour disagree.
+2. The injected `agent_config` dict omits `workspace_path` even though `tools/base.py:62-65` documents that it carries it.
+3. The worker spawn chain re-derives workspace identity four times. It needs one source of truth.
+4. `ToolExecutor._resolve_workspace_id_from_session` still full-parses the session payload on a cache miss and caches forever; it should delegate entirely to `load_session_workspace_id`.
+5. `AgentConfig.workspace_path` deprecation is unenforced. PR #304 removed its last security-relevant reader; nothing stops the next one. Remove the field or make reads loud.
+6. `Agent._hot_swap()` mutates `config` without re-deriving dependent state.
+
+### Known tooling gaps — agent-side, reported, not yet fixed
+
+- No fetch verb in either git tool: `git_read` has none, and `git_write` offers commit/init/clone/push/branch_create/checkout/stage/unstage/worktree/stash. Remote history the agent did not create is invisible to it.
+- `git_write push` is advertised but blocked by session policy (`network:banned`: "Tool requires network:outbound"). Publishing is the operator's job; an agent must never report a push it did not verify.
+- `git` is not installed in the `DockerCodeRunner` image (exit 127), so workers cannot produce diffs; they report line numbers and the agent must reconstruct from `git_read diff`.
+- `Worker spawn` and `Worker query` require an explicit `worker_name` despite the documented default.
+- `WorkingDocument create` ignores a supplied `doc_id`; later appends must reuse the returned id or they write to a new document.
+- `DockerCodeRunner` containers are fresh per invocation, so `/tmp` does not survive between tool calls.
+- `FileSearchTool` under-reported headings in this very file (one match for thirteen headings) — do not use it to outline documents.
+
+### Rule extracted for future generations
+
+Verify object lifecycle — *is the object actually reused?* — before hypothesising state leakage. And when a gate takes its authority from a config snapshot, audit that snapshot's provenance: deprecated plus construction-time plus hot-swappable is a three-way guarantee that it will eventually be stale.
 
 ## Current state — 2026-10-28, Gen 54 mid-session
 **Gen 56 close — 2026-11-02.** (Section content replaced in place; the heading above still carries the Gen 54 date.)
