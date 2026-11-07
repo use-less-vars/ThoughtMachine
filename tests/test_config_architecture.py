@@ -38,6 +38,9 @@ Each test maps to one architecture requirement:
 12. ``test_no_silent_agentconfig_empty_fallback`` — a broken agent_config
     service (exception or junk data) must raise RuntimeError instead of
     silently constructing ``AgentConfig(api_key='')``.
+13. ``test_*_invent_no_workspace`` — an UNBOUND session has no workspace: the
+    in-code fallback and every bridge-less projection must emit
+    ``workspace_path=None`` instead of inventing the project root.
 """
 
 import json
@@ -510,3 +513,68 @@ def test_no_silent_agentconfig_empty_fallback(monkeypatch):
     bridge2 = bridge_module.WebAgentBridge(event_callback=lambda e: None)
     with pytest.raises(RuntimeError, match="Could not build global agent config"):
         bridge2._build_global_agent_config()
+
+
+# ---------------------------------------------------------------------------
+# 13. The in-code fallback never invents a workspace (unbound session)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _empty_config_layers(monkeypatch, tmp_path):
+    """Isolate the layer chain from this machine's ~/.thoughtmachine state."""
+    monkeypatch.setattr(
+        cm, "_get_factory_defaults_path",
+        lambda: str(tmp_path / "factory_defaults.json"))
+    monkeypatch.setattr(cm, "_load_global_defaults_layer", lambda: {})
+    monkeypatch.setattr(cm, "_load_agent_config_layer", lambda: {})
+    monkeypatch.setattr(
+        cm, "_resolve_provider_layer",
+        lambda merged, provider_id=None, fallback_any=True: merged)
+    monkeypatch.setattr(cm, "_canonical_session_permissions", lambda bridge: {})
+
+
+def test_fallback_frontend_config_invents_no_workspace():
+    """An unbound session has NO workspace: the in-code fallback is None.
+
+    ``_project_root`` used to be injected here, so an unbound session silently
+    claimed the repository checkout as its workspace.
+    """
+    assert cm.FALLBACK_FRONTEND_CONFIG["workspace_path"] is None, (
+        "the in-code fallback invents a workspace path, so an unbound session "
+        "renders a bogus binding instead of the explicit unbound state: "
+        f"{cm.FALLBACK_FRONTEND_CONFIG['workspace_path']!r}"
+    )
+
+
+def test_factory_defaults_layer_invents_no_workspace(_empty_config_layers):
+    """The factory layer starts from a COPY of the fallback with no path."""
+    merged = cm._load_factory_defaults()
+    assert "workspace_path" in merged
+    assert merged["workspace_path"] is None, merged["workspace_path"]
+
+
+def test_default_frontend_config_invents_no_workspace(_empty_config_layers):
+    """With every layer empty the projection carries workspace_path=None and
+    the shared fallback dict is never mutated by the projection."""
+    result = cm.default_frontend_config()
+    assert result["workspace_path"] is None, result["workspace_path"]
+    assert cm.FALLBACK_FRONTEND_CONFIG["workspace_path"] is None
+
+
+def test_bridgeless_projection_invents_no_workspace(_empty_config_layers):
+    """``frontend_config_from_bridge(None)`` (no bridge at all) invents no path."""
+    assert cm.frontend_config_from_bridge(None)["workspace_path"] is None
+
+
+def test_unbound_bridge_projection_invents_no_workspace(_empty_config_layers):
+    """A bridge with no config and no bound workspace projects None."""
+    class _Bridge:
+        _workspace_path = None
+        current_session_id = None
+
+        def get_config(self):
+            return None
+
+    result = cm.frontend_config_from_bridge(_Bridge())
+    assert result["workspace_path"] is None, result["workspace_path"]

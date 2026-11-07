@@ -528,3 +528,80 @@ describe('Permissions tab — grant host_bash quick action', () => {
   });
 });
 
+// ==========================================================================
+// Live workspace binding (unbound sessions must be rendered as unbound)
+// ==========================================================================
+
+describe('live workspace binding', () => {
+  const UNBOUND_TEXT = /No workspace — session is unbound/;
+
+  function seedLiveWorkspace(sessionId, workspacePath) {
+    useStore.setState({
+      sessionConfigs: {
+        [sessionId]: {
+          config: baseConfig,
+          permissions: null,
+          providers: [],
+          tools: [],
+          isLoaded: true,
+          workspace_path: workspacePath,
+        },
+      },
+    });
+  }
+
+  it('renders the LIVE binding reported by session_loaded, not the snapshot', () => {
+    seedLiveWorkspace('ws-live-sess', '/ws/live');
+    renderPanel({ sessionId: 'ws-live-sess' });
+    expect(screen.getByText('/ws/live')).toBeInTheDocument();
+    expect(screen.queryByText('/home/jojo/work')).not.toBeInTheDocument();
+  });
+
+  it('renders the unbound warning when the live binding is explicitly null', () => {
+    // The static config snapshot still carries a project root; an explicitly
+    // unbound session must NOT display it.
+    seedLiveWorkspace('ws-unbound-sess', null);
+    renderPanel({ sessionId: 'ws-unbound-sess' });
+    expect(screen.getByText(UNBOUND_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText('/home/jojo/work')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the config snapshot while the live binding is unknown', () => {
+    // No sessionConfigs entry at all -> workspace_path is undefined (unknown),
+    // which is NOT the same as unbound.
+    renderPanel({ sessionId: 'ws-unknown-sess' });
+    expect(screen.getByText('/home/jojo/work')).toBeInTheDocument();
+    expect(screen.queryByText(UNBOUND_TEXT)).not.toBeInTheDocument();
+  });
+
+  it('falls back to the config snapshot when session_loaded omits workspace_path', () => {
+    // The third state: the key is ABSENT (unknown), which must NOT be coerced
+    // to null (explicitly unbound).  The snapshot path stays visible.
+    act(() => {
+      useStore.getState().receiveSessionLoaded('ws-absent-sess', { config: baseConfig });
+    });
+    expect('workspace_path' in useStore.getState().sessionConfigs['ws-absent-sess']).toBe(true);
+    expect(useStore.getState().sessionConfigs['ws-absent-sess'].workspace_path).toBeUndefined();
+    renderPanel({ sessionId: 'ws-absent-sess' });
+    expect(screen.getByText('/home/jojo/work')).toBeInTheDocument();
+    expect(screen.queryByText(UNBOUND_TEXT)).not.toBeInTheDocument();
+  });
+
+  it('receiveSessionLoaded stores the top-level workspace_path', () => {
+    useStore.getState().receiveSessionLoaded('ws-store-sess', {
+      config: baseConfig,
+      workspace_path: '/ws/a',
+    });
+    expect(useStore.getState().sessionConfigs['ws-store-sess'].workspace_path).toBe('/ws/a');
+  });
+
+  it('receiveConfigChanged preserves the live binding when the payload omits it', () => {
+    seedLiveWorkspace('ws-keep-sess', '/ws/b');
+    useStore.getState().receiveConfigChanged('ws-keep-sess', {
+      config: baseConfig,
+      permissions: null,
+    });
+    expect(useStore.getState().sessionConfigs['ws-keep-sess'].workspace_path).toBe('/ws/b');
+  });
+});
+

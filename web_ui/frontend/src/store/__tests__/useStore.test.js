@@ -170,6 +170,7 @@ describe('registerSession', () => {
       permissions: null,
       providers: [],
       tools: [],
+      workspace_path: undefined,
       isLoaded: true,
     });
   });
@@ -225,6 +226,7 @@ describe('receiveSessionLoaded', () => {
       permissions: { network: 'banned' },
       providers: [{ id: 'p1' }],
       tools: ['read_file', 'glob'],
+      workspace_path: undefined,
       isLoaded: true,
     });
   });
@@ -236,6 +238,7 @@ describe('receiveSessionLoaded', () => {
       permissions: null,
       providers: [],
       tools: [],
+      workspace_path: undefined,
       isLoaded: true,
     });
   });
@@ -256,6 +259,7 @@ describe('receiveConfigChanged', () => {
       permissions: null,
       providers: [{ id: 'p1' }],
       tools: ['read_file'],
+      workspace_path: undefined,
       isLoaded: true,
     });
   });
@@ -272,6 +276,7 @@ describe('receiveConfigChanged', () => {
       permissions: null,
       providers: [{ id: 'p2' }],
       tools: ['glob'],
+      workspace_path: undefined,
       isLoaded: true,
     });
   });
@@ -511,6 +516,7 @@ describe('new slice cross-session isolation', () => {
       permissions: null,
       providers: [],
       tools: [],
+      workspace_path: undefined,
       isLoaded: true,
     });
     expect(st.sessionMessages.s2).toBeUndefined();

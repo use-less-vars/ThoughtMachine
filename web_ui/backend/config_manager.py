@@ -81,7 +81,9 @@ FALLBACK_FRONTEND_CONFIG: Dict[str, Any] = {
     "log_categories": ["SESSION", "LLM", "TOOLS"],
     "max_file_size_mb": 10,
     "max_backup_files": 5,
-    "workspace_path": _project_root,
+    # An unbound session has NO workspace.  The UI renders an explicit unbound
+    # state for None; this in-code fallback must never invent the project root.
+    "workspace_path": None,
     "rag_enabled": False,
     "rag_embedding_model": "BAAI/bge-small-en-v1.5",
     "rag_vector_store_path": None,
