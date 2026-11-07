@@ -149,6 +149,14 @@ class TestPausedHeartbeat(_RunSafetyPatches):
             with mock.patch("tools.workspace.worker.time.monotonic",
                             side_effect=[31.0]):
                 thread._heartbeat_tick()
-            hb_events = self.heartbeat_events()
+            # Select THIS test's own worker by name, as in
+            # test_heartbeat_payload_shape (lines 119-127): a heartbeat published
+            # into the (patched) global bus by a worker thread leaked from
+            # another test module in the same session can arrive first, and it
+            # is not the payload under test.
+            hb_events = [
+                e for e in self.heartbeat_events()
+                if e.data.get("worker_name") == "w-hb-p"
+            ]
             self.assertEqual(len(hb_events), 1)
             self.assertEqual(hb_events[0].data["status"], "paused")
