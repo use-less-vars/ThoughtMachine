@@ -2611,17 +2611,34 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             # open-by-id and the REST-create → WS-load contract,
                             # so the session's OWN workspace has to be resolved
                             # here, at the adapter, and pinned before the load.
+                            #
+                            # METADATA-ONLY: this needs ONE attribute of the
+                            # stored record, so it must not deserialise the
+                            # payload.  It used to call session_store.load_session
+                            # and read .workspace_id off the result, which built
+                            # a full Session — hundreds of Message objects from a
+                            # multi-MB history — and dropped it immediately, so a
+                            # single cold load parsed that history TWICE (here,
+                            # and again in bridge.load_session below).
+                            # load_session_workspace_id resolves the same
+                            # workspace from the sidecar/registry (the real load
+                            # below stays the one full parse), and the legacy
+                            # workspace_id backfill still runs there, on the real
+                            # load path.  The resolver yields None exactly where
+                            # the old probe did — unknown session, legacy record
+                            # with no workspace_id, or a lookup error.
                             try:
-                                _probe = session_store.load_session(session_id)
+                                _resolve_ws = getattr(
+                                    session_store, 'load_session_workspace_id', None)
+                                _probe_ws = (
+                                    _resolve_ws(session_id)
+                                    if callable(_resolve_ws) else None
+                                )
                             except Exception as exc:  # noqa: BLE001
                                 log('WARNING', 'server.ws',
                                     f'load_session: could not resolve the workspace '
                                     f'of session {session_id}: {exc}')
-                                _probe = None
-                            _probe_ws = (
-                                getattr(_probe, 'workspace_id', None)
-                                if _probe is not None else None
-                            )
+                                _probe_ws = None
                             if _probe_ws:
                                 _expected_ws = _probe_ws
                         if _expected_ws:
