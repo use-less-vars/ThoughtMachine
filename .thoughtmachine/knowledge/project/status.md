@@ -58,7 +58,7 @@ port migration filed as `design/host-port-git-authorization`."
 
 The original report was: *a reused executor leaks a previous session's `workspace_path`, so the worker gets the wrong path and fails closed.*
 
-**That premise is false and was refuted by audit.** There is no executor reuse anywhere: one `ToolExecutor` per `Agent` (`agent/core/agent.py:497`), one `Agent` per bridge (`agent/presenter/bridge.py:1708`), a fresh `WebAgentBridge` per session load (`web_ui/backend/server.py:1442/1744/2597/3309/3555`), and one executor per worker spawn (`agent/worker/worker_thread.py:3704`). A test asserting cross-session leakage would have passed vacuously while the real defect survived.
+**That premise is false and was refuted by audit.** There is no executor reuse anywhere: one `ToolExecutor` per `Agent` (`agent/core/agent.py:497`), one `Agent` per bridge (`web_ui/backend/bridge.py:1708`), a fresh `WebAgentBridge` per session load (`web_ui/backend/server.py:1442/1744/2597/3309/3555`), and one executor per worker spawn (`tools/workspace/worker_thread.py:3704`). A test asserting cross-session leakage would have passed vacuously while the real defect survived.
 
 **The real defect was a precedence inversion** in the workspace gate inside `ToolExecutor._execute_single_tool`. The gate derived the workspace id it enforces from `self.config.workspace_path` *first*, and only fell back to the explicitly passed `workspace_id` or the persisted session record when no path was configured. But `AgentConfig.workspace_path` (`agent/config/models.py:179`) is deprecated, restart-required, construction-time only, defaults to `None`, and is omitted entirely by `agent/presenter/state_bridge.py:245`, `web_ui/backend/config_manager.py:508` and `agent/config/audit.py:176`. Worse, `Agent._hot_swap()` (`agent/core/agent.py:791-797`) replaces `self.config` wholesale — with a config carrying no `workspace_path` — without rebuilding the executor, so a live executor can end up with `workspace_path = None`.
 
@@ -76,7 +76,7 @@ Test evidence: `TestWorkspaceIdResolutionPrecedence` covers session-record resol
 
 ### Open follow-up tickets — audited, deliberately not fixed
 
-1. `agent/worker/worker_thread.py:5255-5266` — the comment says "injected path wins", the code is `registry_ws or parent_ws` (registry-first). Comment and behaviour disagree.
+1. `tools/workspace/worker_thread.py:5255-5266` — the comment says "injected path wins", the code is `registry_ws or parent_ws` (registry-first). Comment and behaviour disagree.
 2. The injected `agent_config` dict omits `workspace_path` even though `tools/base.py:62-65` documents that it carries it.
 3. The worker spawn chain re-derives workspace identity four times. It needs one source of truth.
 4. `ToolExecutor._resolve_workspace_id_from_session` still full-parses the session payload on a cache miss and caches forever; it should delegate entirely to `load_session_workspace_id`.
