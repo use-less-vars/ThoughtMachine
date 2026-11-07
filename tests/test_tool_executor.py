@@ -565,3 +565,215 @@ class TestToolFailureSuccessFlag:
         assert executed[0]["result"] == "OK"
         assert "success" not in executed[0]
 
+
+# ---------------------------------------------------------------------------
+# Workspace-id resolution precedence for the permission gate
+#
+# The gate must enforce the LIVE workspace identity.  ``config.workspace_path``
+# is a DEPRECATED construction-time snapshot that a hot-swap nulls out
+# (agent.py:791-797 replaces ``self.config`` wholesale), so resolving from it
+# FIRST inverted the precedence: the snapshot beat the explicit
+# ``workspace_id`` argument and the persisted session record, and an
+# unresolvable snapshot DENIED a call whose live identity resolved fine.
+# ---------------------------------------------------------------------------
+
+class _GateSpy:
+    """Stand-in for ``get_effective_permissions`` that records the enforcement
+    inputs, so the assertions land on the RESOLVED workspace id itself rather
+    than on a log string.
+
+    The returned profiles mirror the gate: with a workspace id the on-disk
+    grant record backs a permissive profile; with NO workspace id there is no
+    on-disk authority, so the id-less fail-closed floor applies (deny-all).
+    """
+
+    _DENY_ALL = {
+        "filesystem": "banned",
+        "network": "banned",
+        "container": False,
+        "git": "banned",
+        "mcp": "banned",
+        "host_bash": "banned",
+    }
+    _ALLOW_ALL = {
+        "filesystem": "write",
+        "network": True,
+        "container": True,
+        "git": "write_on_feature_branch",
+        "mcp": "full",
+        "host_bash": "allow",
+    }
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, session_perms, caps, workspace_permissions=None, *,
+                 session_id=None, workspace_id=None):
+        self.calls.append({"session_id": session_id, "workspace_id": workspace_id})
+        return dict(self._ALLOW_ALL if workspace_id else self._DENY_ALL)
+
+    @property
+    def resolved_workspace_id(self):
+        assert len(self.calls) == 1, f"expected exactly one gate merge, got {self.calls}"
+        return self.calls[0]["workspace_id"]
+
+
+class _FakeSessionStore:
+    """Stand-in for ``FileSystemSessionStore`` that isolates the RESOLVER.
+
+    ``load_session_workspace_id`` answers (the store's purpose-built
+    read-only probe); ``_find_session_path`` answers None, i.e. the shape of a
+    session the store knows through its index / ``_meta_<sid>.json`` sidecar
+    but whose payload the legacy probe cannot locate.  A resolver that never
+    asks the store therefore resolves NOTHING here -- which is how a
+    regression in the resolution order becomes observable.
+    """
+
+    def __init__(self, records):
+        self.records = dict(records)
+        self.loader_calls = []
+
+    def load_session_workspace_id(self, session_id):
+        self.loader_calls.append(session_id)
+        return self.records.get(session_id)
+
+    def _find_session_path(self, session_id):
+        return None
+
+
+class TestWorkspaceIdResolutionPrecedence:
+    """Resolution order: explicit id -> session record -> config.workspace_path."""
+
+    def _executor(self, tool_classes, permissions=None):
+        return ToolExecutor(
+            tool_classes=tool_classes,
+            config=FakeConfig(permissions),
+            state=FakeState(),
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+
+    @staticmethod
+    def _run(executor, tool_cls, session_id="", workspace_id=""):
+        return executor._execute_single_tool(
+            tool_cls, {}, tool_cls.__name__, 0,
+            lambda: False, lambda: None, lambda: 0,
+            session_id=session_id,
+            workspace_id=workspace_id,
+        )
+
+    @staticmethod
+    def _patch_gate(monkeypatch, store=None, path_to_ws=None):
+        import agent.core.tool_executor as _te
+
+        spy = _GateSpy()
+        monkeypatch.setattr(_te, "get_effective_permissions", spy)
+        monkeypatch.setattr(_te, "get_workspace_capabilities", lambda ws_id: object())
+        if path_to_ws is not None:
+            monkeypatch.setattr(
+                _te, "resolve_workspace_id",
+                lambda path: path_to_ws.get(path) if path else None,
+            )
+        if store is not None:
+            import session.store as _session_store
+            monkeypatch.setattr(
+                _session_store, "FileSystemSessionStore",
+                lambda *a, **k: store,
+            )
+        return spy
+
+    def test_session_record_resolves_when_config_snapshot_is_none(self, monkeypatch):
+        """T1: ``config.workspace_path`` is None (the post-hot-swap shape) while
+        the session record names ws-A -> the category-gated call is ALLOWED and
+        every category check is made against ws-A."""
+        store = _FakeSessionStore({"sess-A": "ws-A"})
+        spy = self._patch_gate(monkeypatch, store=store)
+        executor = self._executor([ContainerTool], SessionPermissions(container=True))
+        assert executor.config.workspace_path is None
+
+        result = self._run(executor, ContainerTool, session_id="sess-A")
+
+        assert result["result"] == "Container OK", result["result"]
+        assert spy.resolved_workspace_id == "ws-A", spy.calls
+        assert store.loader_calls == ["sess-A"], store.loader_calls
+
+    def test_explicit_workspace_id_beats_config_workspace_path(self, monkeypatch):
+        """T2: ``config.workspace_path`` resolves to ws-B while the explicit
+        ``workspace_id`` names ws-A -> ws-A is what the gate enforces."""
+        spy = self._patch_gate(monkeypatch, path_to_ws={"/ws/B": "ws-B"})
+        executor = self._executor([ContainerTool], SessionPermissions(container=True))
+        executor.config.workspace_path = "/ws/B"
+
+        result = self._run(executor, ContainerTool, "sess-A", "ws-A")
+
+        assert result["result"] == "Container OK", result["result"]
+        assert spy.resolved_workspace_id == "ws-A", spy.calls
+
+    def test_session_record_beats_config_workspace_path(self, monkeypatch):
+        """T2 (second leg): with no explicit id, the session record (ws-A) must
+        still beat a resolvable ``config.workspace_path`` (ws-B)."""
+        store = _FakeSessionStore({"sess-A": "ws-A"})
+        spy = self._patch_gate(monkeypatch, store=store, path_to_ws={"/ws/B": "ws-B"})
+        executor = self._executor([ContainerTool], SessionPermissions(container=True))
+        executor.config.workspace_path = "/ws/B"
+
+        result = self._run(executor, ContainerTool, session_id="sess-A")
+
+        assert result["result"] == "Container OK", result["result"]
+        assert spy.resolved_workspace_id == "ws-A", spy.calls
+
+    def test_nothing_resolvable_stays_denied_fail_closed(self, monkeypatch):
+        """T3: an unresolvable config path plus no explicit id and no session
+        record still DENIES fail-closed -- and the refusal names the reason it
+        could not resolve, so it cannot be confused with a category denial."""
+        store = _FakeSessionStore({})
+        spy = self._patch_gate(monkeypatch, store=store, path_to_ws={})
+        executor = self._executor([ContainerTool], SessionPermissions(container=True))
+        executor.config.workspace_path = "/ws/unresolvable"
+
+        result = self._run(executor, ContainerTool, session_id="sess-unknown")
+
+        assert result["success"] is False, result
+        assert result["result"].startswith(
+            "DENIED: could not resolve workspace_id for workspace_path=/ws/unresolvable; "
+            "tool execution denied (fail-closed)."
+        ), result["result"]
+        assert "No workspace id resolved from the explicit workspace_id argument" in result["result"], result["result"]
+        assert spy.calls == [], f"gate must not merge with an unresolved id: {spy.calls}"
+
+    def test_hot_swap_to_config_without_workspace_path_keeps_gating(self, monkeypatch):
+        """T4 (hot-swap regression): agent.py:791-797 replaces ``self.config``
+        with an AgentConfig that carries NO workspace_path; a category-gated
+        call must still be enforced against the live session workspace."""
+        from agent.config.models import AgentConfig
+        from agent.core.state import AgentState
+
+        store = _FakeSessionStore({"sess-A": "ws-A"})
+        spy = self._patch_gate(
+            monkeypatch, store=store, path_to_ws={"/ws/A": "ws-A"},
+        )
+        cfg = AgentConfig(
+            session_permissions=SessionPermissions(container=True),
+            workspace_path="/ws/A",
+        )
+        executor = ToolExecutor(
+            tool_classes=[ContainerTool],
+            config=cfg,
+            state=AgentState(config=cfg),
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+
+        # The hot-swap: exactly what agent.py:791-797 does (new config assigned
+        # to the agent, its state AND the live executor).
+        new_config = AgentConfig(session_permissions=SessionPermissions(container=True))
+        assert new_config.workspace_path is None, new_config.workspace_path
+        executor.config = new_config
+
+        result = self._run(executor, ContainerTool, session_id="sess-A")
+
+        assert result["result"] == "Container OK", result["result"]
+        assert spy.resolved_workspace_id == "ws-A", spy.calls
+

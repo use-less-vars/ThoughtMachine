@@ -425,25 +425,66 @@ class ToolExecutor:
             effective: Optional[Dict[str, Any]] = None
 
             if GATE_AVAILABLE and session_perms_obj is not None:
-                # Resolve workspace ID to load workspace capabilities
+                # Resolve the workspace ID the gate is entitled to enforce.
+                #
+                # PRECEDENCE (security-relevant -- do not reorder):
+                #   1. the explicitly passed `workspace_id`, i.e. the id the
+                #      agent hands down from its LIVE session record on every
+                #      tool call (agent.py:1952);
+                #   2. the persisted session record, read through the store's
+                #      purpose-built probe (`load_session_workspace_id`: one
+                #      file-existence check / registry hit, no payload parse)
+                #      or, when the store does not expose it, the legacy
+                #      payload probe;
+                #   3. `self.config.workspace_path` -- LAST, and only as a
+                #      legacy fallback.
+                #
+                # `config.workspace_path` is a DEPRECATED, RESTART_REQUIRED
+                # construction-time snapshot: a hot-swap replaces
+                # `self.config` wholesale with an AgentConfig that carries no
+                # workspace_path at all (agent.py:791-797), so resolving from
+                # the snapshot FIRST silently loses the workspace the session
+                # is actually pinned to and the gate then enforces the wrong
+                # capability ceiling (or the fail-closed floor). The live
+                # identities are authoritative; the snapshot is not.
+                #
+                # Widening or narrowing this set changes WHO can execute
+                # category-gated tools: whichever id wins decides the
+                # capability ceiling and the on-disk grant record the gate
+                # reads, so a source that yields the wrong id both under- and
+                # over-privileges.
                 workspace_path = getattr(self.config, 'workspace_path', None)
-                ws_id = resolve_workspace_id(workspace_path) if (workspace_path and resolve_workspace_id) else None
                 required_categories = tool_class.get_required_categories(arguments)
-                # Fail-closed: when a workspace_path is configured but its
-                # workspace ID cannot be resolved, deny execution instead of
-                # silently falling back to (potentially permissive) default
-                # capabilities. Only tools that actually declare required
-                # capability categories are gated -- tools with no required
-                # categories have nothing to be permissive about and keep
-                # executing (e.g. introspection probes in tests).
+                ws_id = workspace_id or None
+                if not ws_id and session_id:
+                    try:
+                        _store = self._get_session_store()
+                        _load_ws_id = getattr(_store, 'load_session_workspace_id', None)
+                        if callable(_load_ws_id):
+                            ws_id = _load_ws_id(session_id) or None
+                    except Exception:  # noqa: BLE001 - best-effort probe
+                        pass
+                    if not ws_id:
+                        ws_id = self._resolve_workspace_id_from_session(session_id)
+                if not ws_id and workspace_path and resolve_workspace_id:
+                    ws_id = resolve_workspace_id(workspace_path)
+                # Fail-closed: when a workspace_path is configured but NO
+                # source above could resolve a workspace id, deny execution
+                # instead of silently falling back to (potentially
+                # permissive) default capabilities. The refusal NAMES why it
+                # is refusing, so an unresolvable-workspace denial stays
+                # distinguishable from a category denial. Only tools that
+                # actually declare required capability categories are gated
+                # -- tools with no required categories have nothing to be
+                # permissive about and keep executing (e.g. introspection
+                # probes in tests).
                 if workspace_path and not ws_id and required_categories:
-                    return {'result': f"DENIED: could not resolve workspace_id for workspace_path={workspace_path}; tool execution denied (fail-closed).", 'tool_type': 'normal', 'success': False}
-                # Fallback workspace-id resolution when no workspace_path is
-                # configured: prefer the explicitly passed workspace_id (agent
-                # session context), then a cached best-effort lookup of the
-                # persisted session record's top-level 'workspace_id'.
-                if not ws_id:
-                    ws_id = workspace_id or self._resolve_workspace_id_from_session(session_id)
+                    return {'result': (
+                        f"DENIED: could not resolve workspace_id for workspace_path={workspace_path}; "
+                        "tool execution denied (fail-closed). No workspace id resolved from the "
+                        "explicit workspace_id argument, the persisted session record, or the "
+                        "configured workspace_path."
+                    ), 'tool_type': 'normal', 'success': False}
                 caps = get_workspace_capabilities(ws_id) if ws_id else WorkspaceCapabilities()
                 # Disk-authoritative permissions mode: when BOTH a session id
                 # and a workspace id are available, ask the gate to read the
@@ -770,6 +811,33 @@ class ToolExecutor:
         except Exception:  # noqa: BLE001 - observability only, never blocking
             pass
 
+    def _get_session_store(self):
+        """Lazily create and cache the session store used for workspace-id probes.
+
+        Cached so the workspace gate above and the legacy resolver below share
+        ONE instance instead of allocating a throwaway store per gated tool
+        call.  A probe that cannot get a store simply falls through to the next
+        resolution source, so construction failures return None rather than
+        raising.
+
+        The import stays local to this method on purpose: tests (and the gate
+        probe) monkeypatch ``session.store.FileSystemSessionStore``, so the
+        lookup has to happen at call time, not at executor construction.
+        """
+        store = getattr(self, '_session_store', None)
+        if store is not None:
+            return store
+        try:
+            from session.store import FileSystemSessionStore
+        except Exception:  # noqa: BLE001 - optional dependency / partial import
+            return None
+        try:
+            store = FileSystemSessionStore()
+        except Exception:  # noqa: BLE001 - best-effort probe
+            return None
+        self._session_store = store
+        return store
+
     def _resolve_workspace_id_from_session(self, session_id: str) -> Optional[str]:
         """Best-effort resolve a session's workspace_id from its persisted
         session record (top-level 'workspace_id' field).  Never raises and
@@ -781,8 +849,9 @@ class ToolExecutor:
         if cached:
             return cached
         try:
-            from session.store import FileSystemSessionStore
-            store = FileSystemSessionStore()
+            store = self._get_session_store()
+            if store is None:
+                return None
             path = store._find_session_path(session_id)
             if path is None:
                 return None
