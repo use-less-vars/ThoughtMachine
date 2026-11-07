@@ -6188,6 +6188,40 @@ def _build_frontend() -> bool:
         return False
 
 
+def _dist_is_fresh(dist: Path, frontend_dir: Path) -> bool:
+    """True when the built dist is strictly newer than every frontend source.
+
+    The newest source mtime is the max of ``package.json``, every file directly
+    in the frontend root (vite config, tsconfig, lockfile, index.html, ``.env`` …)
+    and every file under ``src/`` (recursive walk), compared against
+    ``dist/index.html``.  A missing artefact, a missing ``src/`` tree or any
+    OS-level failure reports "not fresh", so the caller falls through to a
+    normal build.
+    """
+    index_html = dist / "index.html"
+    src_dir = frontend_dir / "src"
+    package_json = frontend_dir / "package.json"
+    try:
+        if not index_html.exists() or not src_dir.is_dir():
+            return False
+        newest_source = package_json.stat().st_mtime if package_json.exists() else 0.0
+        for path in src_dir.rglob("*"):
+            if path.is_file():
+                mtime = path.stat().st_mtime
+                if mtime > newest_source:
+                    newest_source = mtime
+        # Top-level frontend root files only (non-recursive): directories such
+        # as node_modules/, dist/ and public/ are skipped by the is_file() test.
+        for path in frontend_dir.iterdir():
+            if path.is_file():
+                mtime = path.stat().st_mtime
+                if mtime > newest_source:
+                    newest_source = mtime
+        return index_html.stat().st_mtime > newest_source
+    except OSError:
+        return False
+
+
 def _setup_frontend_serving() -> bool:
     """Build frontend (if needed) and mount static file serving.
 
@@ -6215,6 +6249,10 @@ def _setup_frontend_serving() -> bool:
         log('WARNING', 'server',
             f'Frontend dependencies not installed in {frontend_dir} — skipping '
             f'rebuild and serving existing dist at {dist}')
+    elif _dist_is_fresh(dist, frontend_dir):
+        # dist/index.html is strictly newer than package.json, the top-level
+        # frontend root files and everything under src/ — nothing to rebuild.
+        log('INFO', 'server', 'Skipping frontend build (dist is fresh)')
     elif not _build_frontend():
         log('WARNING', 'server',
             'Frontend build failed — will show build-error page on /')
