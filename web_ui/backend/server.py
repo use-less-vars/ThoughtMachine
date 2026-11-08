@@ -6370,10 +6370,12 @@ def main():
             file=sys.stderr,
         )
 
-    # Rebuild global session registry from disk
+    # Report the existing global session registry.  The automatic rebuild from
+    # disk is intentionally NOT performed (an empty scan must never overwrite a
+    # populated registry); this only logs the current size at startup.
     registry = SessionRegistry.get_default()
-    count = registry.rebuild_from_disk()
-    log('INFO', 'server', f'Rebuilt session registry from disk: {count} sessions found')
+    count = len(registry.get_all())
+    log('INFO', 'server', f'Session registry loaded: {count} sessions')
 
     if args.serve_frontend:
         _setup_frontend_serving()
