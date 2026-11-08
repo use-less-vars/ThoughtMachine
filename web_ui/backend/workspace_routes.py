@@ -2590,8 +2590,10 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
     except Exception:
         active_workers = []
 
-    # Open sessions for this workspace.
+    # Sessions for this workspace: ``active_sessions`` is the open-only view,
+    # ``total_sessions_count`` counts every registered session (open or closed).
     active_sessions: List[Dict[str, Any]] = []
+    total_sessions_count = 0
     try:
         from session.session_registry import SessionRegistry
 
@@ -2600,7 +2602,10 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
             for s in sessions.values():
                 if not isinstance(s, dict):
                     continue
-                if s.get("workspace_id") != ws_id or not s.get("is_open"):
+                if s.get("workspace_id") != ws_id:
+                    continue
+                total_sessions_count += 1
+                if not s.get("is_open"):
                     continue
                 active_sessions.append(
                     {
@@ -2614,6 +2619,7 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
             active_sessions.sort(key=lambda s: s["session_id"])
     except Exception:
         active_sessions = []
+        total_sessions_count = 0
 
     # Provisioned (agent-facing) containers for this workspace.  The agent
     # enumeration excludes resource containers (list_containers hides them).
@@ -2658,6 +2664,7 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
         "worker_templates": worker_templates,
         "active_workers": active_workers,
         "active_sessions": active_sessions,
+        "total_sessions_count": total_sessions_count,
         "containers_in_use": containers_in_use,
         "containers_listed": containers_listed,
         "tools": tools,

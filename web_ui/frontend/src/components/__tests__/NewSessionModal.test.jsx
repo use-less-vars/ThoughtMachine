@@ -184,6 +184,18 @@ describe('NewSessionModal — sessions list', () => {
     await waitFor(() => expect(screen.getByText('No sessions yet.')).toBeInTheDocument())
   })
 
+  it('shows an UNAVAILABLE state (not the empty state) when the list request fails', async () => {
+    stubBackend({ '/api/session/list?workspace_id=ws-1': jsonErr('registry unavailable') })
+    renderModal()
+    await waitFor(() =>
+      expect(screen.getByText(/Sessions could not be loaded/)).toBeInTheDocument()
+    )
+    // A failed request must never be presented as "this workspace is empty".
+    expect(screen.queryByText('No sessions yet.')).not.toBeInTheDocument()
+    expect(screen.getByText(/registry unavailable/)).toBeInTheDocument()
+    expect(useWorkspaceStore.getState().sessionsError).toBe('registry unavailable')
+  }, 20000)
+
   it('opens a session from the row Open button', async () => {
     stubBackend({
       '/api/session/list?workspace_id=ws-1': jsonOk([

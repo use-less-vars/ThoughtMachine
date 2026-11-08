@@ -886,7 +886,6 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}>
               <strong>Workspace Path</strong>
-              <ConfigTierBadge field="workspace_path" tiers={configTiers} />
             </label>
             <div style={{
               marginTop: '0.3rem',

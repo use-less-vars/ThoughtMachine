@@ -150,8 +150,8 @@ def test_summary_full_payload(tmp_path, monkeypatch):
     assert set(result.keys()) == {
         "workspace_id", "label", "root_path", "allow_host_resources",
         "permissions", "capabilities", "dockerfile", "worker_templates",
-        "active_workers", "active_sessions", "containers_in_use",
-        "containers_listed",
+        "active_workers", "active_sessions", "total_sessions_count",
+        "containers_in_use", "containers_listed",
         "tools", "resource_catalog",
     }, result.keys()
 
@@ -173,6 +173,8 @@ def test_summary_full_payload(tmp_path, monkeypatch):
         "session_id": "s1", "workspace_id": "ws-1", "name": "n1", "mode": "m1",
         "started_at": "2024-01-01T00:00:00Z",
     }]
+    # s1 (open) + s2 (closed) belong to ws-1; s3 belongs to another workspace.
+    assert result["total_sessions_count"] == 2
     assert result["containers_in_use"] == AGENT_CONTAINERS
     assert result["containers_listed"] == len(UI_CONTAINERS)
     assert result["tools"] == ["alpha", "file_read", "shell_exec"]
@@ -224,6 +226,7 @@ def test_summary_missing_assets_and_empty_sections(tmp_path, monkeypatch):
     assert result["worker_templates"] == []
     assert result["active_workers"] == []
     assert result["active_sessions"] == []
+    assert result["total_sessions_count"] == 0
     assert result["containers_in_use"] == []
     assert result["containers_listed"] == 0
     assert result["tools"] == ["shell_exec"]

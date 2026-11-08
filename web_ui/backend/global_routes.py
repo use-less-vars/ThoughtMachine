@@ -272,10 +272,18 @@ def _build_summary() -> Dict[str, Any]:
         open_in_workspace = [
             s for s in open_sessions if s.get("workspace_id") == eid
         ]
+        # Every registered session for this workspace, open or closed: the
+        # ``active_sessions_count`` above is an open-only view and must not be
+        # read as "the number of sessions this workspace has".
+        total_in_workspace = [
+            s for s in all_sessions.values()
+            if isinstance(s, dict) and s.get("workspace_id") == eid
+        ]
         workspaces_out.append({
             "id": eid,
             "label": entry.label or "",
             "active_sessions_count": len(open_in_workspace),
+            "total_sessions_count": len(total_in_workspace),
             "total_workers": sum(
                 _session_worker_count(worker_manager, str(s.get("session_id") or ""))
                 for s in open_in_workspace

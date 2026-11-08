@@ -27,6 +27,9 @@ export default function NewSessionModal({ workspace, onClose }) {
   const deleteSession = useWorkspaceStore((s) => s.deleteSession)
   const fetchSessions = useWorkspaceStore((s) => s.fetchSessions)
   const storeSessions = useWorkspaceStore((s) => s.sessions)
+  // '' = the list loaded fine; non-empty = the list request FAILED (the empty
+  // array in that case means "unknown", not "no sessions").
+  const sessionsError = useWorkspaceStore((s) => s.sessionsError)
   const sessions = storeSessions.length > 0 ? storeSessions : workspace.sessions || []
 
   const [name, setName] = useState('')
@@ -172,6 +175,13 @@ export default function NewSessionModal({ workspace, onClose }) {
           <h5 className="wp-session-title">Sessions in this workspace</h5>
           {loading ? (
             <p className="wp-empty">Loading sessions…</p>
+          ) : sessions.length === 0 && sessionsError ? (
+            // An unavailable list must NOT read as "this workspace is empty".
+            // Only shown when there is nothing to display; a stale list that
+            // failed to refresh is left on screen.
+            <p className="wp-empty wp-error-text">
+              Sessions could not be loaded ({sessionsError}).
+            </p>
           ) : sessions.length === 0 ? (
             <p className="wp-empty">No sessions yet.</p>
           ) : (
