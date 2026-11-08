@@ -103,11 +103,16 @@ class _RecordingManager:
 # ---------------------------------------------------------------------------
 
 
-def test_pins_are_exactly_the_historical_hardening_env():
-    # Moving the pins into one place must not change them.
+def test_pins_are_exactly_the_hardening_env():
+    # The historical two, plus the three env-injection pins (GIT_SSH_COMMAND is
+    # forced to the bare builtin transport; GIT_DIR / GIT_WORK_TREE are pinned
+    # to ABSENT via the ``None`` sentinel -- see GIT_ENV_PINS' docstring).
     assert GIT_ENV_PINS == {
         "GIT_PAGER": "cat",
         "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_SSH_COMMAND": "ssh",
+        "GIT_DIR": None,
+        "GIT_WORK_TREE": None,
     }
 
 
@@ -153,11 +158,18 @@ def test_merge_layers_the_seam_under_the_pins():
 def test_merge_never_lets_the_seam_override_a_pin(key, value):
     merged = merge_git_environment({key: "/tmp/hijacked"})
 
-    assert merged[key] == value
+    # ``get`` (not ``[]``) so the ABSENT pins are covered too: a ``None`` pin
+    # removes the key, so ``merged.get(key) is None`` is the pass condition.
+    assert merged.get(key) == value
+    assert "/tmp/hijacked" not in merged.values()
 
 
 def test_merge_returns_pins_even_without_a_seam():
-    assert merge_git_environment(None) == GIT_ENV_PINS
+    # The ABSENT pins (``None``) are rendered as *absent keys*, not as ``None``
+    # values, so compare against the string-valued subset of the pin table.
+    assert merge_git_environment(None) == {
+        key: value for key, value in GIT_ENV_PINS.items() if value is not None
+    }
 
 
 # ---------------------------------------------------------------------------

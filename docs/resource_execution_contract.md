@@ -80,9 +80,16 @@ sections are implemented and verified against the tree at `b23c26b`.
 - The agent **MAY edit the pytest-list file** (choosing which tests run) but **NOT**
   the preflight script (how they run).
 - **Current status:** no `pytest-list` / `test-list` mechanism exists (0 matches).
-  Today's pre-commit gating is the repo-owned `.githooks/pre-commit` (operator-wired,
-  runs via `core.hooksPath` host-side) — it is not
-  agent-configurable beyond the repo's own hook contents.
+  There is also **no repository hook** gating a commit: `.githooks/` does not exist
+  in the workspace (`ls -la .githooks/` → No such file or directory;
+  `find . -name 'pre-commit*' -not -path './.git/*'` → 0 matches), so the
+  repo-owned `.githooks/pre-commit` gate previously described here is not merely
+  unconfigurable — it does not exist. What constrains a git commit today is
+  argv-level hardening in `tools/git_info_tool.py`: the host path applies
+  `-c core.hooksPath=/dev/null` and `--no-verify` (L1051, L1066-1069) and **fails
+  closed** if a `.githooks/pre-commit` file ever appears (refusal, L1034-1044);
+  the container path pins `core.hooksPath` at the workspace `.githooks` dir
+  (L1155-1162) and never consults repo-local `.git/hooks`.
 
 ## 7. Resource execution modes
 

@@ -370,7 +370,7 @@ class CheckSystem(ToolBase):
                 "event_bus_status": lambda: self._query_event_bus_status(),
                 "event_log": lambda: self._query_event_log(),
                 "vault_status": lambda: self._query_vault_status(ws_id),
-                "vault_repair_status": lambda: self._query_vault_repair_status(),
+                "vault_repair_status": lambda: self._query_vault_repair_status(ws_id),
                 "runtime_state": lambda: self._query_runtime_state(ws_id, workspace_path),
             }
 
@@ -768,10 +768,18 @@ class CheckSystem(ToolBase):
         if not CAPABILITIES_AVAILABLE or not _workspace_dir:
             return {"workers": [], "count": 0}
         if not ws_id:
-            scanned = self._scan_workspace_dirs_for_workers()
+            workspace_path = getattr(self, "workspace_path", None)
+            scanned = self._scan_workspace_dirs_for_workers(ws_id, workspace_path)
             if scanned:
                 return {"workers": scanned, "count": len(scanned)}
-            return {"workers": [], "count": 0}
+            reason = (
+                "no workers.json found for the caller's own workspace"
+                if workspace_path
+                else "no workspace id resolved for this session; worker "
+                     "definitions are only readable from the caller's own "
+                     "workspace (sibling workspace directories are never scanned)"
+            )
+            return {"workers": [], "count": 0, "reason": reason}
         workers_path = _workspace_dir(ws_id) / "workers.json"
         if not workers_path.exists():
             return {"workers": [], "count": 0}
@@ -786,7 +794,9 @@ class CheckSystem(ToolBase):
         if not CAPABILITIES_AVAILABLE or not _workspace_dir:
             return {"error": "workspace not available"}
         if not ws_id:
-            scanned = self._scan_workspace_dirs_for_workers()
+            scanned = self._scan_workspace_dirs_for_workers(
+                ws_id, getattr(self, "workspace_path", None)
+            )
             for w in scanned:
                 if isinstance(w, dict) and w.get("name") == worker_name:
                     return w
@@ -965,33 +975,47 @@ class CheckSystem(ToolBase):
 
         return result
 
-    def _scan_workspace_dirs_for_workers(self) -> list:
+    def _scan_workspace_dirs_for_workers(
+        self,
+        ws_id: Optional[str] = None,
+        workspace_path: Optional[str] = None,
+    ) -> list:
         """
-        Scan ``~/.thoughtmachine/workspaces/<id>/workers.json`` for all workspace
-        directories and return the first valid workers list found.
+        Return the caller's OWN ``workers.json`` worker list (confined fallback).
 
-        This is a fallback when ``ws_id`` cannot be resolved.
+        Historically this enumerated ``~/.thoughtmachine/workspaces/*/workers.json``
+        and returned the FIRST valid list found, so a caller whose workspace id
+        could not be resolved was shown ANOTHER workspace's worker definitions.
+        The lookup is now strictly confined: it keys on the caller's own
+        workspace id (or the id resolved from the caller's workspace path) and
+        never enumerates sibling workspace directories. With no resolvable
+        workspace identity there is nothing the caller is entitled to read, so
+        ``[]`` is returned and the caller reports the missing context.
+
+        ``_workspace_dir`` resolves through ``vault_root()``, so
+        ``THOUGHTMACHINE_VAULT_ROOT`` is honoured (the old hard-coded
+        ``~/.thoughtmachine/workspaces`` path was not).
         """
-        import os
-
-        base = Path(os.path.expanduser("~/.thoughtmachine/workspaces"))
-        if not base.is_dir():
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not resolve_workspace_id:
             return []
 
-        for entry in sorted(base.iterdir()):
-            if not entry.is_dir():
-                continue
-            workers_path = entry / "workers.json"
-            if not workers_path.is_file():
-                continue
+        own_ws_id = ws_id or None
+        if not own_ws_id and workspace_path:
             try:
-                data = json.loads(workers_path.read_text(encoding="utf-8"))
-                if data and isinstance(data, list):
-                    return data
-            except (json.JSONDecodeError, OSError):
-                continue
+                own_ws_id = resolve_workspace_id(workspace_path) or None
+            except Exception:  # noqa: BLE001 - resolution is best-effort
+                own_ws_id = None
+        if not own_ws_id:
+            return []
 
-        return []
+        workers_path = _workspace_dir(own_ws_id) / "workers.json"
+        if not workers_path.is_file():
+            return []
+        try:
+            data = json.loads(workers_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        return data if isinstance(data, list) else []
 
     def _query_dockerfile(self, ws_id: Optional[str]) -> dict:
         """Return current Dockerfile content as a string."""
@@ -1265,10 +1289,12 @@ class CheckSystem(ToolBase):
         By default (no ``vault_status: global`` grant) only the caller's own
         ``workspaces/<caller>/`` entries are kept alongside vault-wide
         (non-``workspaces/``) files; every other workspace's entries are
-        dropped from ``files``, ``warnings`` and ``pending_repairs`` so foreign
-        session titles never leak.  A ``workspaces/*/...`` manifest-pattern
-        placeholder is vault-wide (not tenant data) and is kept.  With the
-        grant, the report is returned vault-wide (``scope: "global"``).
+        dropped from ``files``, ``warnings``, ``pending_repairs`` and -- for the
+        vault_repair ``run_inspection`` shape -- ``issues``, ``extra_files`` and
+        ``seeded_files``, so foreign paths never leak.  A
+        ``workspaces/*/...`` manifest-pattern placeholder is vault-wide (not
+        tenant data) and is kept.  With the grant, the report is returned
+        vault-wide (``scope: "global"``).
         """
         prefix = _VAULT_WORKSPACE_PREFIX
         if self._vault_status_global_allowed():
@@ -1308,6 +1334,22 @@ class CheckSystem(ToolBase):
                 p for p in pending
                 if not (isinstance(p, dict) and not _in_scope(p.get("file", "")))
             ]
+        # vault_repair.run_inspection() shape (absent from vault_status reports).
+        issues = report.get("issues")
+        if isinstance(issues, list):
+            scoped["issues"] = [
+                i for i in issues
+                if not (isinstance(i, dict) and not _in_scope(i.get("file", "")))
+            ]
+        extra_files = report.get("extra_files")
+        if isinstance(extra_files, list):
+            scoped["extra_files"] = [f for f in extra_files if _in_scope(f)]
+        seeded_files = report.get("seeded_files")
+        if isinstance(seeded_files, list):
+            scoped["seeded_files"] = [
+                s for s in seeded_files
+                if not (isinstance(s, dict) and not _in_scope(s.get("file", "")))
+            ]
         scoped["scope"] = "workspace"
         if caller_ws_id:
             scoped["scoped_to"] = caller_ws_id
@@ -1317,7 +1359,7 @@ class CheckSystem(ToolBase):
             )
         return scoped
 
-    def _query_vault_repair_status(self) -> dict:
+    def _query_vault_repair_status(self, caller_ws_id: Optional[str] = None) -> dict:
         """Full read-only vault repair dry run (vault_repair.run_inspection).
 
         Mirrors vault_status' root resolution (thoughtmachine.vault.vault_root(),
@@ -1337,11 +1379,17 @@ class CheckSystem(ToolBase):
                     "aborted": True}
         try:
             # Same resolution as _query_vault_status: vault_root() (env-aware).
-            return run_inspection(vault_root())
+            report = run_inspection(vault_root())
         except Exception as exc:
             return {"status": "error",
                     "error": f"vault repair inspection failed: {exc}",
                     "aborted": True}
+        # The inspection walks the WHOLE vault, so scope it exactly like
+        # vault_status: foreign ``workspaces/<other>/`` entries are dropped
+        # unless the caller holds the explicit ``vault_status: global`` grant.
+        if isinstance(report, dict):
+            report = self._scope_vault_status_report(report, caller_ws_id)
+        return report
 
     def _query_runtime_state(self, ws_id: Optional[str], workspace_path: Optional[str] = None) -> dict:
         """Return a REDACTED runtime snapshot: token limits, worker caps,

@@ -24,6 +24,17 @@ _FOR_EACH_REF_ALLOWED_TOKENS = frozenset({
 _REF_PATTERN_FORBIDDEN = frozenset({";", "|", "&", "$", "`", ">", "<", "\n", "\r"})
 _CAT_FILE_ALLOWED_TYPES = frozenset({"blob", "tree", "commit", "tag"})
 
+# ``show_file`` line-window limits.  ``line_start``/``line_end`` are applied to
+# the blob BEFORE the output budget truncates it, so the window has to be
+# bounded on its own terms: otherwise a caller could ask for the whole file
+# back through the range path and bypass the head-truncation notice entirely.
+#: Lines returned when only ``line_start`` is given (no ``line_end``).
+_SHOW_FILE_DEFAULT_SPAN = 200
+#: Conservative characters-per-line used to convert the token budget to a span.
+_SHOW_FILE_ASSUMED_LINE_CHARS = 80
+#: Span cap applied when the tool has no usable token budget configured.
+_SHOW_FILE_MAX_SPAN_FALLBACK = 2000
+
 
 class GitUnavailableError(FileNotFoundError):
     """The git executable could not be run (missing binary / unspawnable).
@@ -79,9 +90,39 @@ def _migrate_legacy_git_execution_mode(agent_config: Optional[dict]) -> None:
 #: ``git_environment`` entry is layered UNDER them by
 #: :func:`merge_git_environment`, so the seam can never disable e.g. the null
 #: system gitconfig.
+#:
+#: A value of ``None`` means "pin this variable to ABSENT": the key is removed
+#: from the merged mapping (see :func:`merge_git_environment`) rather than set
+#: to an empty/placeholder value.  Absence is the only value the seam cannot
+#: exploit -- neither git nor a probe can distinguish it from a variable the
+#: session never mentioned, and no empty-value edge case in git can resurrect
+#: it.
+#:
+#: Threat model for the three ``GIT_SSH_COMMAND`` / ``GIT_DIR`` /
+#: ``GIT_WORK_TREE`` pins -- all three are environment-only INJECTIONS that
+#: bypass every argv-level hardening pin:
+#:   * ``GIT_SSH_COMMAND`` is *arbitrary command execution*: git runs it as
+#:     ``$GIT_SSH_COMMAND <host> <command>`` the moment any remote-transport
+#:     verb runs (fetch/push/ls-remote/clone), with no shell-metacharacter
+#:     filter in between and no argv pin able to neutralise it.  Pinned to the
+#:     bare builtin transport (``"ssh"``); NOT to the empty string, because an
+#:     empty ``GIT_SSH_COMMAND`` is treated by git as a command with no argv[0]
+#:     (the exec fails, but relying on that failure mode is a needless
+#:     dependency on git's error handling for a security control).
+#:   * ``GIT_DIR`` re-points git at *another repository* -- ``GIT_DIR=/etc``
+#:     or ``GIT_DIR=/other/workspace/.git`` makes every read (including
+#:     ``show_file``) answer from a foreign gitdir while the tool still
+#:     believes it is confined to ``repo_root``.  Pinned to ABSENT so git
+#:     discovers the repository from the ``cwd`` the tool pins.
+#:   * ``GIT_WORK_TREE`` does the same for the working tree -- it can point
+#:     ``git show``/``ls-files``/``status`` at a directory the caller cannot
+#:     read, or make a write land outside the repository.  Pinned to ABSENT.
 GIT_ENV_PINS: dict = {
     "GIT_PAGER": "cat",
     "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_SSH_COMMAND": "ssh",
+    "GIT_DIR": None,
+    "GIT_WORK_TREE": None,
 }
 
 
@@ -129,11 +170,19 @@ def merge_git_environment(git_environment: Any) -> dict:
     """Return the child-env additions: the seam layered UNDER the pins.
 
     ``GIT_ENV_PINS`` are applied LAST, so a session-supplied entry for the same
-    key loses.  This is the single place the composition rule lives; both
-    ``_exec_host_raw`` and ``_exec_container_raw`` call it.
+    key loses: a string pin overwrites the seam's value, and a ``None`` pin
+    DELETES the key outright, so the seam's value never reaches the child
+    process at all (neither host nor container path).  This is the single place
+    the composition rule lives; both ``_exec_host_raw`` and
+    ``_exec_container_raw`` call it.
     """
     merged = normalize_git_environment(git_environment)
-    merged.update(GIT_ENV_PINS)
+    for key, value in GIT_ENV_PINS.items():
+        if value is None:
+            # Pinned to ABSENT (e.g. GIT_DIR / GIT_WORK_TREE).
+            merged.pop(key, None)
+        else:
+            merged[key] = value
     return merged
 
 
@@ -433,14 +482,22 @@ class GitReadTool(ToolBase):
         description="Format string for show operation (e.g., '%H %s')"
     )
     
-    # Blame parameters
+    # Blame / show_file parameters
     line_start: Optional[int] = Field(
         default=None,
-        description="Start line number for blame operation"
+        description=(
+            "Start line number for blame and show_file operations. For "
+            "show_file, line_start alone returns _SHOW_FILE_DEFAULT_SPAN (200) "
+            "lines from there."
+        )
     )
     line_end: Optional[int] = Field(
         default=None,
-        description="End line number for blame operation"
+        description=(
+            "End line number for blame and show_file operations. For "
+            "show_file it must be given together with line_start (a bare "
+            "line_end is refused)."
+        )
     )
     
     # Commit parameters
@@ -2069,6 +2126,13 @@ class GitReadTool(ToolBase):
         A non-zero exit is the explicit "path not tracked at ref" signal and is
         surfaced as the standard error form; exit 0 with empty stdout is a
         legitimately empty file and is returned as empty content, not an error.
+
+        ``line_start``/``line_end`` ARE honoured here (see
+        :meth:`_show_file_line_window`): the window is sliced out of the blob
+        BEFORE the output budget is applied.  This handler used to ignore the
+        range entirely and hand the whole blob to ``_truncate_output``, so a
+        caller asking for lines 900-910 of a large file silently received the
+        head of the file -- a wrong answer that reads like a right one.
         """
         if not self.ref:
             return self._truncate_output(
@@ -2093,6 +2157,9 @@ class GitReadTool(ToolBase):
         except ValueError as e:
             return self._truncate_output(f"Error: {e}")
         rel = rels[0]
+        # Resolve the requested window FIRST: an impossible range must fail
+        # before any git work happens.
+        line_window = self._show_file_line_window()
         exit_code, stdout, stderr = self._run_git_raw(
             repo_root,
             ["show", "--no-ext-diff", "--no-textconv", f"{ref}:{rel}"],
@@ -2103,7 +2170,76 @@ class GitReadTool(ToolBase):
                     f"Git command failed (exit code {exit_code}):\n{stderr}"
                 )
             )
-        return self._with_mode(self._truncate_output(stdout))
+        if line_window is None:
+            return self._with_mode(self._truncate_output(stdout))
+        start, end = line_window
+        lines = stdout.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        # ``end`` is inclusive and 1-based; Python's slice end is exclusive, and
+        # an out-of-range ``end`` simply clamps to the end of the file.
+        return self._with_mode(self._truncate_output("\n".join(lines[start - 1:end])))
+
+    def _show_file_max_span(self) -> int:
+        """Largest line span a single ``show_file`` call will return.
+
+        Derived from the tool's token budget with the same conservative
+        ~4-chars-per-token assumption ``ToolBase._truncate_output`` uses, at
+        ``_SHOW_FILE_ASSUMED_LINE_CHARS`` per line.  With no configured budget
+        the fixed fallback applies.
+        """
+        limit = self.token_limit
+        if not limit or limit <= 0:
+            return _SHOW_FILE_MAX_SPAN_FALLBACK
+        return max(1, (int(limit) * 4) // _SHOW_FILE_ASSUMED_LINE_CHARS)
+
+    def _show_file_line_window(self) -> Optional[tuple]:
+        """Resolve ``line_start``/``line_end`` into an exact inclusive window.
+
+        Returns ``None`` when no range was requested (whole file), otherwise a
+        ``(start, end)`` 1-based inclusive pair.
+
+        Contract:
+
+        * both given: honoured exactly (``end`` clamps to EOF);
+        * ``line_start`` alone: ``_SHOW_FILE_DEFAULT_SPAN`` lines from there;
+        * ``line_end`` alone: refused -- a bare end has no defined start, and
+          guessing one is exactly the silently-wrong-window failure this
+          method exists to prevent;
+        * a span wider than :meth:`_show_file_max_span` raises ``ValueError``
+          naming the range and the maximum, rather than returning the head of
+          the file (or a silently narrowed window).
+        """
+        if self.line_start is None and self.line_end is None:
+            return None
+        if self.line_start is None:
+            raise ValueError(
+                f"Requested line range end={self.line_end} has no line_start; "
+                "maximum is unbounded only with an explicit start. Pass "
+                "line_start, or omit both to read the whole file."
+            )
+        if self.line_start < 1:
+            raise ValueError(
+                f"Invalid line_start={self.line_start}; lines are 1-based."
+            )
+        start = self.line_start
+        end = (
+            self.line_end if self.line_end is not None
+            else start + _SHOW_FILE_DEFAULT_SPAN - 1
+        )
+        if end < start:
+            raise ValueError(
+                f"Invalid line range {start}-{end}; line_start must not exceed "
+                "line_end."
+            )
+        max_span = self._show_file_max_span()
+        span = end - start + 1
+        if span > max_span:
+            raise ValueError(
+                f"Requested line range {start}-{end} spans {span} lines; maximum "
+                f"is {max_span} per call. Request a smaller window."
+            )
+        return (start, end)
 
     def _git_cat_file(self, repo_root: Path) -> str:
         """Run git cat-file (-p by default, or a validated object type)."""
