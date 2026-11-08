@@ -174,6 +174,21 @@ async function tryGet(url) {
   }
 }
 
+// Companion to tryGet for callers that must tell "the request FAILED" apart
+// from "the request succeeded and returned nothing". tryGet collapses both into
+// null, which is fine for optional decoration (docker health etc.) but wrong for
+// data a panel renders as authoritative (the session list: a failed fetch must
+// never be shown as an empty workspace). Returns { ok, data } and never throws.
+async function tryGetResult(url) {
+  try {
+    const res = await fetch(url)
+    if (!res.ok) return { ok: false, data: null }
+    return { ok: true, data: await res.json() }
+  } catch {
+    return { ok: false, data: null }
+  }
+}
+
 function omit(obj, key) {
   const next = { ...obj }
   delete next[key]
@@ -222,6 +237,7 @@ const initialState = {
   dockerAvailable: null,  // tri-state: true=reachable, false=down, null=unverified
   error: '',
   sessions: [],
+  sessionsError: '',     // '' = loaded fine; non-empty = the session list is UNAVAILABLE
   containerStatus: {},   // container name → status string (optimistic overlay)
   busyContainers: {},    // container name → bool (action in flight)
 }
@@ -336,13 +352,16 @@ const useWorkspaceStore = create((set, get) => ({
       (activeSessionId ? `?session_id=${encodeURIComponent(activeSessionId)}` : '')
 
     try {
-      const [listData, permsData, healthData, workersData, containersData, sessionsData, sessionPermsData] = await Promise.all([
+      const [listData, permsData, healthData, workersData, containersData, sessionsResult, sessionPermsData] = await Promise.all([
         tryGet(`${API_BASE}/api/workspace/list`),
         tryGet(effectivePermissionsUrl),
         tryGet(`${API_BASE}/api/health/containers`),
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/workers`),
         tryGet(`${API_BASE}/api/workspace/${encodeURIComponent(id)}/containers`),
-        tryGet(`${API_BASE}/api/session/list?workspace_id=${encodeURIComponent(id)}`),
+        // NOT tryGet: the session list must keep its failure signal (see the
+        // sessionsError handling below) — a null here would be indistinguishable
+        // from an empty list.
+        tryGetResult(`${API_BASE}/api/session/list?workspace_id=${encodeURIComponent(id)}`),
         // The session's OWN uncapped grant map. The effective_permissions
         // envelope above carries no raw map, so it is read from the disk-pure
         // session endpoint GET /api/session/{id}/permissions, whose envelope
@@ -435,7 +454,12 @@ const useWorkspaceStore = create((set, get) => ({
       })
 
       // ── Sessions ──
-      const sessions = Array.isArray(sessionsData) ? sessionsData : []
+      // sessionsError ('' = the list really is authoritative) keeps a FAILED
+      // request distinct from "this workspace has no sessions": both used to
+      // collapse into [], so the panel rendered "No sessions yet." for an
+      // unreachable backend.
+      const sessions = sessionsResult && Array.isArray(sessionsResult.data) ? sessionsResult.data : []
+      const sessionsError = sessionsResult && sessionsResult.ok ? '' : 'Session list request failed'
 
       // ── Local-only parts (resources/tools/credentials/sessionDefaults) ──
       const fallback = purpose ? buildWorkspace(purpose, id) : null
@@ -467,6 +491,7 @@ const useWorkspaceStore = create((set, get) => ({
         containers,
         workers,
         sessions,
+        sessionsError,
         sessionDefaults,
         permissionsSessionScoped: Boolean(activeSessionId),
         permissionContradictions,
@@ -481,6 +506,7 @@ const useWorkspaceStore = create((set, get) => ({
         safetyAdvisory: advisoryForRisk(risk),
         dockerAvailable,
         sessions,
+        sessionsError,
         containerStatus: { ...state.containerStatus, ...containerStatus },
         isLoading: false,
         error: '',
@@ -495,10 +521,15 @@ const useWorkspaceStore = create((set, get) => ({
       workspace.name = (fallbackEntry && fallbackEntry.name) || id
       workspace.root = (fallbackEntry && fallbackEntry.root) || ''
       workspace.path = workspace.root
+      const message = err.message || 'Failed to load workspace config'
+      // The fallback workspace carries sessions: [] — flag it so the session
+      // panel shows "unavailable" instead of claiming the workspace is empty.
+      workspace.sessionsError = message
       set({
         currentWorkspace: workspace,
         isLoading: false,
-        error: err.message || 'Failed to load workspace config',
+        error: message,
+        sessionsError: message,
       })
     }
   },
@@ -606,13 +637,24 @@ const useWorkspaceStore = create((set, get) => ({
       const sessions = Array.isArray(data) ? data : []
       set((state) => ({
         sessions,
+        sessionsError: '',
         currentWorkspace:
           state.currentWorkspace && state.currentWorkspace.id === id
-            ? { ...state.currentWorkspace, sessions }
+            ? { ...state.currentWorkspace, sessions, sessionsError: '' }
             : state.currentWorkspace,
       }))
     } catch (err) {
-      set({ error: err.message || 'Failed to load sessions' })
+      const message = err.message || 'Failed to load sessions'
+      // Keep the previous list, but record the failure: consumers render an
+      // explicit "unavailable" state rather than treating [] as "no sessions".
+      set((state) => ({
+        error: message,
+        sessionsError: message,
+        currentWorkspace:
+          state.currentWorkspace && state.currentWorkspace.id === id
+            ? { ...state.currentWorkspace, sessionsError: message }
+            : state.currentWorkspace,
+      }))
     }
   },
 

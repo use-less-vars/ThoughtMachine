@@ -188,11 +188,14 @@ def test_global_summary_working_and_idle_statuses(
     assert len(by_id) == 2
     assert by_id["ws-a"]["status"] == "working"
     assert by_id["ws-a"]["active_sessions_count"] == 1
+    # s1 (open) + s2 (closed) are registered to ws-a: the total is not open-only.
+    assert by_id["ws-a"]["total_sessions_count"] == 2
     assert by_id["ws-a"]["total_workers"] == 1
     assert by_id["ws-a"]["last_active"] == "2026-01-01T10:00:00Z"
     assert by_id["ws-a"]["allow_host_resources"] is True
     assert by_id["ws-b"]["status"] == "idle"
     assert by_id["ws-b"]["active_sessions_count"] == 0
+    assert by_id["ws-b"]["total_sessions_count"] == 1
     assert by_id["ws-b"]["allow_host_resources"] is False
 
     assert [s["session_id"] for s in body["active_sessions"]] == ["s1"]
@@ -245,6 +248,8 @@ def test_global_summary_build_summary_never_raises(monkeypatch, tmp_path):
         "containers_listed", "providers",
     }
     assert body["workspaces"][0]["status"] == "idle"
+    assert body["workspaces"][0]["active_sessions_count"] == 0
+    assert body["workspaces"][0]["total_sessions_count"] == 0
     assert body["active_sessions"] == []
     assert body["containers_in_use"] == []
     assert body["containers_listed"] == 0

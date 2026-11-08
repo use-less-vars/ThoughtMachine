@@ -46,6 +46,17 @@ def _quarantined(reg: SessionRegistry) -> list[Path]:
     return sorted((reg._path.parent / "quarantine").glob("session_registry.corrupt-*.json"))
 
 
+def _write_session_file(home: Path, sid: str, workspace=None, **extra) -> Path:
+    """Drop a session JSON file where ``rebuild_from_disk`` will scan for it."""
+    data = {"session_id": sid, "metadata": {"name": sid}, **extra}
+    if workspace is None:
+        path = home / ".thoughtmachine" / "sessions" / f"{sid}.json"
+    else:
+        path = home / ".thoughtmachine" / "workspaces" / workspace / "sessions" / f"{sid}.json"
+    _write(path, json.dumps(data))
+    return path
+
+
 def test_corrupt_registry_is_quarantined_and_load_returns_empty(tmp_path, caplog):
     """Guard 1: unparseable JSON is moved aside, its bytes preserved."""
     reg = _registry(tmp_path)
@@ -149,3 +160,67 @@ def test_list_route_never_calls_rebuild_from_disk(monkeypatch):
     monkeypatch.setattr(session_routes, "_get_store", lambda: _Store())
 
     assert asyncio.run(session_routes.list_sessions(workspace_id=None)) == []
+
+
+def test_rebuild_preserves_open_flag_of_known_session(tmp_path, monkeypatch):
+    """Fix 1: a session persisted as open must survive the rebuild as open."""
+    home = _hermetic_home(monkeypatch, tmp_path)
+    reg = _registry(tmp_path)
+    _write_session_file(home, "s1")
+    _write(
+        reg._path,
+        json.dumps({"s1": {"session_id": "s1", "workspace_id": "ws-a", "is_open": True}}),
+    )
+
+    assert reg.rebuild_from_disk() == 1
+
+    saved = json.loads(reg._path.read_text(encoding="utf-8"))
+    assert saved["s1"]["is_open"] is True
+
+
+def test_rebuild_does_not_force_closed_session_open(tmp_path, monkeypatch):
+    """Fix 1: the carry must not invent open sessions either."""
+    home = _hermetic_home(monkeypatch, tmp_path)
+    reg = _registry(tmp_path)
+    _write_session_file(home, "s1")
+    _write(
+        reg._path,
+        json.dumps({"s1": {"session_id": "s1", "workspace_id": "ws-a", "is_open": False}}),
+    )
+
+    assert reg.rebuild_from_disk() == 1
+
+    saved = json.loads(reg._path.read_text(encoding="utf-8"))
+    assert saved["s1"]["is_open"] is False
+
+
+def test_rebuild_defaults_unknown_session_to_closed(tmp_path, monkeypatch):
+    """Fix 1: sessions never seen before keep the scan default (closed)."""
+    home = _hermetic_home(monkeypatch, tmp_path)
+    reg = _registry(tmp_path)
+    _write_session_file(home, "s1")
+    _write(reg._path, json.dumps({"s1": {"session_id": "s1", "is_open": True}}))
+    _write_session_file(home, "s2")
+
+    assert reg.rebuild_from_disk() == 2
+
+    saved = json.loads(reg._path.read_text(encoding="utf-8"))
+    assert saved["s1"]["is_open"] is True
+    assert saved["s2"]["is_open"] is False
+
+
+def test_rebuild_carries_workspace_id_when_file_lacks_one(tmp_path, monkeypatch):
+    """Fix 1b: the scan cannot infer a workspace, so inherit the persisted one."""
+    home = _hermetic_home(monkeypatch, tmp_path)
+    reg = _registry(tmp_path)
+    _write_session_file(home, "s1")  # file records no workspace_id
+    _write(
+        reg._path,
+        json.dumps({"s1": {"session_id": "s1", "workspace_id": "ws-a", "is_open": True}}),
+    )
+
+    assert reg.rebuild_from_disk() == 1
+
+    saved = json.loads(reg._path.read_text(encoding="utf-8"))
+    assert saved["s1"]["workspace_id"] == "ws-a"
+

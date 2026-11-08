@@ -154,18 +154,31 @@ class SessionRegistry:
                         self._read_session_file(f, ws_dir.name, registry)
 
         with self._file_lock:
+            # One snapshot of the persisted registry, reused by the guard below
+            # and by the is_open carry further down.
+            existing = self._load() if self._path.exists() else {}
             # Refuse to overwrite a populated registry with an empty scan: a
             # scan that finds nothing while the registry on disk still holds
             # entries means the scan is broken (wrong HOME, unreadable dir,
             # mid-migration layout), not that every session vanished.
-            if not registry and self._path.exists():
-                existing = self._load()
-                if existing:
-                    raise RuntimeError(
-                        f"Refusing to rebuild session registry: disk scan found 0 "
-                        f"sessions but the existing registry at {self._path} holds "
-                        f"{len(existing)} entries; rebuild aborted to avoid data loss."
-                    )
+            if not registry and existing:
+                raise RuntimeError(
+                    f"Refusing to rebuild session registry: disk scan found 0 "
+                    f"sessions but the existing registry at {self._path} holds "
+                    f"{len(existing)} entries; rebuild aborted to avoid data loss."
+                )
+            # The disk scan hardcodes is_open=False and cannot know a session's
+            # workspace when the file itself does not record it, so carry both
+            # over from the registry we just replaced. Sessions the scan found
+            # that were not persisted before keep the scan defaults (closed).
+            if existing:
+                for sid, prior in existing.items():
+                    entry = registry.get(sid)
+                    if entry is None or not isinstance(prior, dict):
+                        continue
+                    entry["is_open"] = bool(prior.get("is_open", False))
+                    if not entry.get("workspace_id") and prior.get("workspace_id"):
+                        entry["workspace_id"] = prior["workspace_id"]
             self._save(registry)
         return len(registry)
 
