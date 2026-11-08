@@ -146,6 +146,17 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const config = sessionConfig?.config ?? null
   const providers = sessionConfig?.providers ?? []
   const availableTools = sessionConfig?.tools ?? []
+  // ── Host-shell danger flag ──
+  // host_bash runs commands on the HOST, outside the sandbox, so an ENABLED
+  // grant must never read as just another permission: it earns a danger badge
+  // in the header. Levels rank banned < ask < allow (mirrors
+  // data/permissionVocab.js SESSION_RESOURCE_VOCAB.host_bash and
+  // security/security_gate.py _HOST_BASH_CEILING_RANKS); 'allow' and the
+  // boolean true are the ENABLED forms. The live WS-sourced effective grants
+  // win over the config snapshot, and every other value (ask / banned / false /
+  // absent) shows NOTHING — an unknown grant is never painted as dangerous.
+  const hostBashGrant = sessionConfig?.permissions?.host_bash ?? config?.session_permissions?.host_bash
+  const hostBashEnabled = hostBashGrant === 'allow' || hostBashGrant === true || hostBashGrant === 'true'
   const history = sessionMessages ?? EMPTY_MESSAGES
   // Streaming view: history plus (only while a turn is streaming) the in-flight
   // assistant bubble. Kept out of `history` because the store may not hold a
@@ -1296,6 +1307,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
               >
                 Rename
               </button>
+              {hostBashEnabled ? (
+                <span
+                  className="session-header-host-bash-badge"
+                  title="Host shell (host_bash) is ENABLED for this session: the agent may run commands on the host, outside the sandbox."
+                >
+                  host_bash
+                </span>
+              ) : null}
               <div className="session-header-spacer" />
               <button
                 className="session-header-btn session-header-details-btn"
