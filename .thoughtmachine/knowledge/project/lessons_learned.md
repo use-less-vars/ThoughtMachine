@@ -51,3 +51,18 @@ Each of these was stated with confidence and was wrong. Each one inverted a plan
 Housekeeping files were written into `.thoughtmachine/knowledge/`, declared complete, and were invisible to git: `project/**/*.md` is ignored wholesale and only a named set is re-included by `!` negations. A new file with no negation line does not appear in `git status`, stages as a silent no-op, and dies on the next clone.
 
 **Rule.** Create the `.gitignore` negation in the same commit as the KB file, and verify with `git ls-tree <branch> <path>` — not `git status`, which will happily show an already-tracked-but-ignored file as unchanged. A document that does not survive a clone was never written (see `vision_ledger.md` V5).
+
+---
+
+## Gen 61 — tooling problems hit live, C1/C2 dispatch (2026-11)
+
+Shortcomings of the system observed while dispatching the C1/C2 test-authoring work, recorded as the operator asked. These are properties of the tooling, not of the task.
+
+1. **`Worker spawn` rejects a context-only spawn with `{"error": "worker_name is required for action 'spawn'"}`** even though the tool's own documentation says the name defaults to the default worker. Every spawn needs `worker_name: "default"` spelled out. The error text and the schema description disagree.
+2. **`git_write checkout` is unverifiable from its own output.** Previously it returned a plausible success line ("Your branch is up to date with 'origin/...'") while HEAD stayed put, and only a second identical call moved it. This session the first call moved HEAD correctly and printed no output at all. The only reliable check is `git_read rev_parse ref=HEAD abbrev=true` afterwards, every time. Related: `rev_parse` with `abbrev=true` returns the **branch name**, not a short hash (`HEAD` -> `dev`), which reads like a bug until you know.
+3. **A merged-and-deleted branch is indistinguishable from data loss on the agent side.** `git_read rev_parse ref=docs/gen60-housekeeping` returned `fatal: ambiguous argument '...': unknown revision or path not in the working tree`, which reads exactly like the branch never existed. The truth was in `git_read log`: PR #311 had merged it (`5eb33d12 Merge pull request #311 ...`). When a ref vanishes, read the log before concluding anything; deletion after merge is normal and the commit is still reachable through the merge commit.
+4. **Worker `ApplyEdits` was refused mid-task with reason `token`** ("tool access restricted at the critical context threshold"). The worker called `SummarizeTool` and the same edit then applied cleanly. A context-threshold refusal can look like a permissions failure, and it can arrive in the middle of an edit sequence, so a worker's file may be half-edited when it stops.
+5. **`KnowledgeBaseTool` `domain=lessons_learned` resolves to `personal/lessons_learned.md`, not `project/lessons_learned.md`.** The two files genuinely coexist (the tracked generation-scoped one and the large historical one), and the domain name silently picks the personal one. Anything that must survive a clone has to be written to the project file another way.
+
+No stop/pause procedure failed. The standing V1 workaround (park the brief in a `WorkingDocument`, send a 3-5 line query naming the `doc_id`) worked again.
+
