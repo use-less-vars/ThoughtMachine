@@ -43,7 +43,7 @@ port migration filed as `design/host-port-git-authorization`."
 
 **Machine state: STABLE. The stabilization sprint is CLOSED — W7, W8 and W9 are all complete as of this block. No new feature work, no further audits, and no new code is starting from this close.** This section supersedes the Gen 60 close block immediately below; that block and every older `## Current state` block are kept as history, not as current truth.
 
-**Where this close sits in history:** `dev` HEAD at the time of writing is `d28d8faa` (merge of PR #306). The Phase 9 work is *not* in that commit — it lives on `fix/phase9-registry-recovery`, stacked as `527ae5a7` (plan ticket + restart-badge fix) → `980af2df` (the three registry guards) → `fbc563d5` (the fix below). The infra engineer reports that branch pushed and awaiting merge. This `status.md` update lands on `docs/gen60-final-close`, branched from `dev` so that its PR carries documentation and nothing else.
+**Where this close sits in history:** this block was written when `dev` HEAD was `d28d8faa` and the Phase 9 fix was still in flight on `fix/phase9-registry-recovery`. Both facts have since been overtaken. **`dev` is now at `e88e067b`** (merge of PR #310). Phase 9 landed as PR #309 → merge commit `13fdba8c`, which contains the stack `527ae5a7` → `980af2df` → `fbc563d5`. The documentation close-out landed as PR #310 from `docs/gen60-final-close`, which was merged and its branch deleted. Both are checked by ancestry, not by report: `git merge-base --is-ancestor fbc563d5 dev` exits 0.
 
 ### Phase 9 — the last open defect: "0 sessions" on a healthy registry
 
@@ -75,7 +75,17 @@ Every "the machine is broken" report adjacent to Phase 9 had the same shape: **t
 
 The transferable rule: before believing any report about state, establish **which tree, which layer, and which boolean** the renderer is actually reading. `git read` the exact file on the exact branch first — cheapest check available, and it would have saved all three detours.
 
-**Standing state after this close:** `dev` HEAD `d28d8faa` locally. `fix/phase9-registry-recovery` @ `fbc563d5` pushed, awaiting merge. `docs/gen60-final-close` carries this document update. No branch in flight from this seat. No audit running. The machine is back to a normal, stable state.
+### Handoff — where Gen 61 leaves the machine
+
+**The engine is safe, the state layer is honest, but the process seams need structural verification (see `vision_ledger.md` V1 and V2).**
+
+- `dev` @ `e88e067b` = PR #310, this documentation close-out. Phase 9 merged as PR #309 → `13fdba8c`, which contains `fbc563d5`. Verified by ancestry, not by report: `git merge-base --is-ancestor fbc563d5 dev` exits 0.
+- **Closed:** W7, W8 and W9. The session-registry truth fix (`fbc563d5`) and the state-honesty pass are in `dev`; `total_sessions_count` and `sessionsError` are the two surfaces that stop an open-only number from being read as a workspace's total.
+- **Open, and structural rather than cosmetic:** worker dispatch is not trustworthy in either direction (V1 — `context["meta"]` is dropped, long inline queries are truncated, and `status` / `telemetry` can contradict the content they arrive with). Every seam that crosses a process boundary needs an artifact check rather than a testimony check (V2 — worker git access is not uniform, worker `host_bash` fails closed, the vault is unreachable from workers).
+- **Standing mitigations that must not be quietly dropped:** park long worker payloads in a `WorkingDocument` and name the `doc_id` in the query; re-verify every claim with the orchestrator's own git tools before anything is committed; add the `.gitignore` negation in the same commit as any new KB file and confirm it with `git ls-tree`.
+- **Standing gap, deliberately not closed here:** `project/core.md` — the single home for pending core work, 39.6 kB, pointed at by `KB_MAP.md` and `INFRA_ONBOARDING.md` — is **untracked and gitignored**, so it does not survive a clone. Committing it is a tier ruling, not a housekeeping change, so this commit leaves it untouched and the Vision Ledger lives in its own tracked file with a non-colliding V namespace.
+- **Next seat's first three reads:** `vision_ledger.md` (V1–V5), then `MAIN_ONBOARDING.md` tier 1, then the newest block in this file. New documents since this close: `vision_ledger.md` (the Vision Ledger), `MAIN_ONBOARDING.md` (the entry point), `lessons_learned.md` ("Gen 60 — The Heat of the Moment").
+- **Do not re-litigate:** the registry was never wiped and no recovery code exists or should exist (Guards 1–3 all still hold); `vault_repair` does not delete directories; there is no `.githooks/pre-commit`; `core.md`'s C1–C9 are backlog items and are unrelated to the Vision Ledger's V1–V5.
 
 ## Current state — Gen 60 close: stabilization sprint COMPLETE
 
