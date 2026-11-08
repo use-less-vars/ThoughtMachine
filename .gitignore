@@ -259,6 +259,22 @@ web_ui/frontend/.npmrc
 # have. Everything else under project/ stays ignored, as KB_POLICY intends.
 !.thoughtmachine/knowledge/project/architecture_invariants.md
 
+# Gen 61 housekeeping (2026-11) — three read-on-entry KB files added to the
+# onboarding-contract set. `.thoughtmachine/knowledge/project/**/*.md` is ignored
+# wholesale above, so a file created without its own negation line is never
+# staged, never committed, and gone on the next clone while the tracked documents
+# that point at it survive. Each line below is therefore load-bearing:
+#   vision_ledger.md   — the Vision Ledger (V1–V5); named by MAIN_ONBOARDING tier 1
+#   MAIN_ONBOARDING.md — the default seat's entry point
+#   lessons_learned.md — "Gen 60 — The Heat of the Moment"; named by the status handoff
+#
+# Deliberately NOT re-included: project/core.md (pending core work, 39.6 kB).
+# It is untracked and gitignored today and this commit does not change that —
+# publishing an operator backlog is a tier ruling, not a housekeeping decision.
+!.thoughtmachine/knowledge/project/vision_ledger.md
+!.thoughtmachine/knowledge/project/MAIN_ONBOARDING.md
+!.thoughtmachine/knowledge/project/lessons_learned.md
+
 # Gen 50 design pass: auth layer — re-included because docs/* is a catch-all.
 !docs/design-auth-layer.md
 
