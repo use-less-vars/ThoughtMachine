@@ -40,9 +40,12 @@ from tools.workspace.worker_runtime_process import (
 from tools.workspace.worker_runtime_protocol import (
     DIRECTION_FROM_RUNTIME,
     DIRECTION_TO_RUNTIME,
+    Cancel,
+    Control,
     DispatchQuery,
     FrameDecoder,
     FrameEmitter,
+    Ping,
     Shutdown,
 )
 from tools.workspace.worker_thread import WorkerThread
@@ -50,7 +53,57 @@ from tools.workspace.worker_thread import WorkerThread
 mp = multiprocessing.get_context("spawn")
 
 
-def build_fake_worker(*, delay: float = 0.0, hang: bool = False, marker: str = "ok"):
+# ── C1 fakes: a container manager mirroring tests/test_worker_sync_stop.py ────
+#
+# Local copies rather than imports: the sync-stop helper ends with
+# ``thread.send_query = _timeout``, which forces every test built on it down the
+# timeout branch. Nothing in this file may inherit that, so the two fakes below
+# are a deliberate sibling, not a reuse.
+
+#: The one container the C1 worker owns; asserted by id so a "no containers at
+#: all" bug cannot satisfy "it was not stopped".
+C1_CONTAINER_ID = "c1-owned-ctr"
+
+
+class _C1Container:
+    """Stand-in for a docker container object (id / name / labels only)."""
+
+    def __init__(self, cid, name, labels=None):
+        self.id = cid
+        self.name = name
+        self.labels = dict(labels or {})
+        self.status = "running"
+
+
+class _C1ContainerManager:
+    """Mirror of ``_FakeContainerManager``; ``remove()`` drops from the listing."""
+
+    def __init__(self, containers):
+        self.containers = list(containers)
+        self.stopped = []
+        self.removed = []
+
+    def list_containers(self):
+        return list(self.containers)
+
+    def stop(self, container, **kwargs):
+        self.stopped.append(container)
+
+    def remove(self, container, **kwargs):
+        self.removed.append(container)
+        if container in self.containers:
+            self.containers.remove(container)
+
+
+def build_fake_worker(
+    *,
+    delay: float = 0.0,
+    hang: bool = False,
+    marker: str = "ok",
+    blocked_tool: bool = False,
+    report_path=None,
+    release_path=None,
+):
     """A duck-typed stand-in for ``WorkerThread``, built inside the child.
 
     It is named by ``module:attr`` in the runtime spec, so the child resolves
@@ -68,6 +121,17 @@ def build_fake_worker(*, delay: float = 0.0, hang: bool = False, marker: str = "
             self.current_task = None
             self.error = None
             self._manual_only_pause = False
+            # C1 -- the control/cancel surface the runtime's frames reach. The
+            # runtime sets ``_frame_sink`` and ``_turn_cancel`` on whatever
+            # object the factory returns, so those two names are the contract.
+            self._turn_cancel = threading.Event()
+            self._stop_event = threading.Event()
+            self._frame_sink = None
+            self._container_manager = (
+                _C1ContainerManager([_C1Container(C1_CONTAINER_ID, "c1-ctr")])
+                if blocked_tool
+                else None
+            )
 
         def run(self) -> None:
             while True:
@@ -84,6 +148,8 @@ def build_fake_worker(*, delay: float = 0.0, hang: bool = False, marker: str = "
                     # reply may ever be produced.
                     self._stop.wait()
                     return
+                if blocked_tool:
+                    self._run_blocked_tool_loop()
                 if delay:
                     time.sleep(delay)
                 reply_q.put(
@@ -95,6 +161,58 @@ def build_fake_worker(*, delay: float = 0.0, hang: bool = False, marker: str = "
                         }
                     )
                 )
+
+        # -- C1 reporting -------------------------------------------------
+        def _report(self, **fields) -> None:
+            """Append one JSON line the parent can watch (cross-process channel)."""
+            if not report_path:
+                return
+            with open(report_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(fields, sort_keys=True) + "\n")
+
+        def _run_blocked_tool_loop(self) -> None:
+            """Block in a 'long tool' that WATCHES THIS CHILD'S OWN cancel flag.
+
+            The loop exits for one of exactly two reasons, and reports which:
+            the runtime's ``cancel`` frame reached ``_turn_cancel`` (the
+            property C1 is about), or the test's release file appeared (the
+            fallback, which is only ever created after the assertion window).
+            ``cause`` is the ordering artifact the test asserts on -- never a
+            wall-clock sleep.
+            """
+            self.status = "running"
+            self._report(event="tool_loop_entered")
+            while not self._turn_cancel.is_set():
+                if release_path and os.path.exists(release_path):
+                    self._report(event="tool_loop_exited", cause="release")
+                    return
+                time.sleep(0.01)
+            self._report(event="tool_loop_exited", cause="cancel")
+
+        # -- C1 control surface (mirrors WorkerThread's verbs) --------------
+        def stop(self) -> None:
+            self.detach()
+
+        def detach(self) -> None:
+            """Park without terminating: thread, status and containers survive."""
+            self.status = "detached"
+            self._report(
+                event="detached",
+                cm_stopped=[c.id for c in self._container_manager.stopped],
+                cm_removed=[c.id for c in self._container_manager.removed],
+                cm_listed=[c.id for c in self._container_manager.list_containers()],
+                worker_alive=self.is_alive(),
+            )
+
+        def kill(self) -> None:
+            """Terminate: reclaim owned containers, then exit (the kill path)."""
+            if self._container_manager is not None:
+                for c in list(self._container_manager.list_containers()):
+                    self._container_manager.stop(c)
+                    self._container_manager.remove(c)
+            self.status = "killed"
+            self._stop.set()
+            self._stop_event.set()
 
     return _Fake()
 
@@ -441,3 +559,183 @@ def test_spec_from_worker_accepts_a_real_worker_thread(tmp_path):
     assert isinstance(spec["worker_kwargs"]["workspace_dir"], str)
     assert spec["worker"] == "probe-w"
     assert spec["instance"] == 1
+
+
+# ── C1: cancel must reach a worker that is blocked inside a long tool ─────────
+
+
+def test_cancel_reaches_a_worker_blocked_in_a_long_tool_and_detaches(tmp_path):
+    """C1 (§4.3, §4.4, §5.4): a blocked tool is cancellable, and ``stop`` detaches.
+
+    The child's worker blocks in a "long tool" that polls *its own*
+    ``_turn_cancel`` -- the very flag ``worker_runtime_main._handle_cancel``
+    sets. The release file is a fallback that is only created in ``finally``, so
+    it cannot be what ends the block; the child itself reports which of the two
+    conditions fired, and the assertions are made against that report rather
+    than against a wall-clock sleep.
+    """
+    report_path = str(tmp_path / "c1-report.jsonl")
+    release_path = str(tmp_path / "c1-release")
+    Path(report_path).write_text("", encoding="utf-8")
+
+    proc, parent_sock, frames, emitter = _drive_child(
+        blocked_tool=True, report_path=report_path, release_path=release_path
+    )
+
+    def _events() -> "list[dict]":
+        out = []
+        try:
+            text = Path(report_path).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return out
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # a torn tail line is simply not an event yet
+        return out
+
+    def _wait_event(name: str, timeout: float = 15.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for event in _events():
+                if event.get("event") == name:
+                    return event
+            if not proc.is_alive():
+                break
+            time.sleep(0.02)
+        return None
+
+    def _next_of(kind: str, timeout: float = 5.0) -> dict:
+        seen = []
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"no {kind} frame within {timeout}s; saw {seen}")
+            try:
+                frame = frames.next(timeout=remaining)
+            except AssertionError as exc:
+                raise AssertionError(
+                    f"no {kind} frame within {timeout}s; saw {seen}"
+                ) from exc
+            seen.append(frame["kind"])
+            if frame["kind"] == kind:
+                return frame
+
+    try:
+        hello = frames.next(timeout=15)
+        # catches: a runtime that never announces itself to the parent, which
+        # would make every later frame unattributable to this instance/epoch.
+        assert hello["kind"] == "hello"
+
+        parent_sock.sendall(
+            emitter.encode(
+                DispatchQuery(
+                    query_id="c" * 32, query="long task", timeout_seconds=300.0
+                )
+            )
+        )
+        accepted = _next_of("query_accepted", timeout=10.0)
+        # catches: the query being swallowed instead of accepted-and-tracked, so
+        # the later cancel would have nothing to cancel.
+        assert accepted["payload"]["query_id"] == "c" * 32
+
+        entered = _wait_event("tool_loop_entered", timeout=20.0)
+        # catches: the worker never getting as far as the blocked tool, which
+        # would make every cancellation assertion below vacuously true.
+        assert entered is not None, "the fake worker never entered the tool loop"
+
+        # -- assertion 1: cancel is acknowledged, within 5s ------------------
+        request_id = "r" * 32
+        parent_sock.sendall(
+            emitter.encode(
+                Cancel(
+                    request_id=request_id,
+                    reason="operator: cancel a blocked tool",
+                    deadline_ms=5000,
+                )
+            )
+        )
+        cancel_ack = _next_of("cancel_ack", timeout=5.0)
+        # catches: the cancel being dropped (a worker blocked in a tool that
+        # never reaches the runtime's reader is exactly the C1 defect), or the
+        # ack losing the correlation id that makes it an ack.
+        assert cancel_ack["payload"]["request_id"] == request_id
+        # catches: a first rung that answers "refused" for a live, cancellable
+        # worker -- i.e. the terminal-status check mis-firing on status
+        # "running".
+        assert cancel_ack["payload"]["phase"] == "accepted"
+
+        # -- assertion 2: the tool loop exits, and the cancel is why ---------
+        exited = _wait_event("tool_loop_exited", timeout=10.0)
+        # catches: the ack being emitted while nothing actually interrupts the
+        # blocked loop -- the cancel reaches the flag but never the tool.
+        assert exited is not None, "the blocked tool loop never exited"
+        # catches: the loop ending because the test released it rather than
+        # because the cancel propagated.
+        assert exited["cause"] == "cancel"
+        # catches: the release fallback having fired inside the assertion
+        # window, which would make the ordering claim above unfalsifiable.
+        assert not os.path.exists(release_path)
+
+        # -- assertion 3: stop means DETACH, not kill ------------------------
+        parent_sock.sendall(
+            emitter.encode(Control(request_id="s" * 32, action="stop"))
+        )
+        control_ack = _next_of("control_ack", timeout=5.0)
+        # catches: the control frame not being routed to a verb at all.
+        assert control_ack["payload"]["action"] == "stop"
+        # catches: an unroutable verb, a vanished worker, or an exception
+        # swallowed into ok=False.
+        assert control_ack["payload"]["ok"] is True
+        # catches: "stop" being wired to the kill path -- the §4.3 / §11.2
+        # rule 7 defect this test exists for.
+        assert control_ack["payload"]["status"] not in ("killed", "terminated")
+        # catches: a status reported that is not the detach the caller needs in
+        # order to know the worker was parked rather than destroyed.
+        assert control_ack["payload"]["status"] == "detached"
+
+        # -- assertion 4: the owned container is neither stopped nor removed --
+        detached = _wait_event("detached", timeout=5.0)
+        # catches: detach() being reached without the worker observing it.
+        assert detached is not None, "no detach was reported by the child"
+        # catches: a detach that reclaims containers it does not own back --
+        # the resource leak the caller relies on being absent.
+        assert detached["cm_stopped"] == []
+        # catches: the container being removed instead of merely parked, which
+        # silently discards the workspace the worker was using.
+        assert detached["cm_removed"] == []
+        # catches: the container having disappeared from the manager entirely
+        # (a "not in stopped/removed" pass achieved by owning nothing).
+        assert detached["cm_listed"] == [C1_CONTAINER_ID]
+
+        # -- assertion 5: the worker survives the detach ---------------------
+        # catches: detach() terminating the worker thread, which would make
+        # "detach" indistinguishable from "kill" despite the status string.
+        assert detached["worker_alive"] is True
+        # catches: the process exiting on stop, i.e. a detach that is really a
+        # shutdown.
+        assert proc.is_alive() is True
+        parent_sock.sendall(emitter.encode(Ping(nonce=61)))
+        pong = _next_of("pong", timeout=5.0)
+        # catches: a process that is still running but no longer reading its
+        # socket -- alive in the OS sense only.
+        assert pong["payload"]["nonce"] == 61
+    finally:
+        # Fallback, created only here: the assertion window above is already
+        # closed, so this can never be what ended the blocked loop.
+        Path(release_path).write_text("release", encoding="utf-8")
+        try:
+            parent_sock.sendall(emitter.encode(Shutdown(grace_ms=100)))
+        except OSError:
+            pass
+        parent_sock.close()
+        proc.join(15)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5)
+
