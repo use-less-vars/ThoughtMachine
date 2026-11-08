@@ -1,6 +1,6 @@
 # ThoughtMachine -- Status
 
-Updated: Gen 60 close — stabilization sprint COMPLETE. See "Current state — Gen 60 close" below; this banner supersedes the Gen 54 and Gen 56 wording.
+Updated: Gen 61 close — Phase 9 CLOSED, W7/W8/W9 stabilization COMPLETE. See "Current state — Gen 61 close" below; this banner supersedes the Gen 60, Gen 54 and Gen 56 wording.
 
 **Gen 48 close-out snapshot (historical):** **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
@@ -38,6 +38,44 @@ after W4 merges." Status line for this wave, verbatim: "Credential
 injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
 port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
+
+## Current state — Gen 61 close: Phase 9 CLOSED — W7/W8/W9 stabilization COMPLETE
+
+**Machine state: STABLE. The stabilization sprint is CLOSED — W7, W8 and W9 are all complete as of this block. No new feature work, no further audits, and no new code is starting from this close.** This section supersedes the Gen 60 close block immediately below; that block and every older `## Current state` block are kept as history, not as current truth.
+
+**Where this close sits in history:** `dev` HEAD at the time of writing is `d28d8faa` (merge of PR #306). The Phase 9 work is *not* in that commit — it lives on `fix/phase9-registry-recovery`, stacked as `527ae5a7` (plan ticket + restart-badge fix) → `980af2df` (the three registry guards) → `fbc563d5` (the fix below). The infra engineer reports that branch pushed and awaiting merge. This `status.md` update lands on `docs/gen60-final-close`, branched from `dev` so that its PR carries documentation and nothing else.
+
+### Phase 9 — the last open defect: "0 sessions" on a healthy registry
+
+**Symptom reported:** the UI showed "0 sessions", "idle", and "No active sessions." for workspaces that existed and worked. The standing hypothesis was that the session registry had been destroyed and needed a recovery pass.
+
+**Root cause — measured, not inferred.** `SessionRegistry.rebuild_from_disk()` (`session/session_registry.py`) hardcodes `is_open: False` on every entry produced by its disk scan, and on `dev` it ran **unconditionally at every startup**. Every restart therefore flattened the registry to all-closed; only sessions opened afterwards were re-marked open. The live registry at the time: **17,300 bytes, 50 entries, all 50 with a valid `workspace_id`, and only 4 with `is_open: true`** — 46 sessions silently closed by a restart.
+
+**Nothing was lost.** No session data was missing, corrupt, or unreachable. No recovery code exists in this repository and none should be written; the 15 empty workspace directories observed during the investigation are simply unused workspaces, not damage. The registry was lying about one boolean — and every UI surface labelled "sessions" (`active_sessions_count` in `global_routes._build_summary`, the `WorkspaceSelector` card, the `WorkspaceDetailPage` stats) was in fact counting **open** sessions only. The renderer was honest; the state layer was not.
+
+**The fix — `fbc563d5`, 12 files, +237/−21:**
+
+1. `rebuild_from_disk()` takes **one** `_load()` snapshot and reuses it both for the empty-scan guard and to carry `is_open` (plus a `workspace_id` the scan could not derive) over from the registry being replaced. A session the scan has never seen still defaults to closed. Both existing guards keep their exact prior behaviour: `_quarantine` on unparseable session files, and `RuntimeError` when a scan returns zero entries over a registry that still holds some — both still inside `_file_lock`.
+2. `total_sessions_count` added beside the open-only `active_sessions_count` in `_build_summary()` and in `GET /api/workspace/{id}/summary`. The UI now says "open sessions" explicitly and shows the total next to it, so an open-only number can never again be read as a workspace's session count.
+3. `tryGetResult()` → `sessionsError` in the frontend store: a **failed** session fetch is no longer collapsed to `[]` by `tryGet`'s `null` contract. The panel renders "Sessions could not be loaded" rather than "No sessions yet." when the backend is unreachable. A stale list that fails to refresh stays on screen instead of being replaced by a false empty state.
+
+**Verified, not taken on trust:** a worker's report was treated as a claim, checked against `git status` / `git diff` and re-run from a clean tree before the commit was signed. Summary lines verbatim: `17 passed` (registry + both summary suites), `300 passed, 5 xfailed` (backend), `Test Files 60 passed (60) / Tests 751 passed (751)` (frontend). `git diff --stat` at stage time: 12 files, +237/−21.
+
+### W7 / W8 / W9 — declared complete
+
+- **W7** — isolation wave: design and implementation landed (see the 2026-11-02 block below and the Gen 60 close above).
+- **W8** — the residual backlog filed at Gen 56b is closed; no W8 item is carried forward by this close.
+- **W9** — this phase. The session-registry truth fix plus the UI honesty pass above.
+
+These closures are declared by the infra engineer at Gen 61; the W9 specifics are the ones documented here and are the only part this seat verified end to end.
+
+### The pattern worth remembering (three instances in one session)
+
+Every "the machine is broken" report adjacent to Phase 9 had the same shape: **the state was fine and something in the middle was lying.** (a) A stale restart badge kept claiming a restart was pending after the restarts had happened. (b) "The guards were never committed" — the working tree was checked out on `dev`, so `git show` rendered pre-fix code and an agent confidently reported that hardening that existed was absent. (c) This one: a healthy 17,300-byte registry reporting 46 of its 50 sessions closed.
+
+The transferable rule: before believing any report about state, establish **which tree, which layer, and which boolean** the renderer is actually reading. `git read` the exact file on the exact branch first — cheapest check available, and it would have saved all three detours.
+
+**Standing state after this close:** `dev` HEAD `d28d8faa` locally. `fix/phase9-registry-recovery` @ `fbc563d5` pushed, awaiting merge. `docs/gen60-final-close` carries this document update. No branch in flight from this seat. No audit running. The machine is back to a normal, stable state.
 
 ## Current state — Gen 60 close: stabilization sprint COMPLETE
 
