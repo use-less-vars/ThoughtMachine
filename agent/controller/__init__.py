@@ -11,6 +11,7 @@ from typing import Optional, Callable, List, Dict, Any
 from agent.logging import log
 from agent.core.state import ExecutionState
 from thoughtmachine.security import cancel_pending_prompts
+from tools.cancellation import bind_pause_event
 
 class AgentController:
     """
@@ -803,6 +804,14 @@ class AgentController:
                 stop_reason = None
                 try:
                     # ── Controller diagnostic ───────────────────────────────────────
+                    # PAUSE PLUMBING: a pause request reaches a thread that is
+                    # blocked INSIDE the turn (a tool's wait, the between-turn
+                    # rate-limit delay) only as a per-thread reference to the
+                    # event this controller owns, so bind it to THIS -- the
+                    # turn-running -- thread for the duration of the turn.  The
+                    # event itself is never set or cleared here; released in the
+                    # finally below on every exit path.
+                    bind_pause_event(self.pause_event)
                     local_agent = self.agent
                     if local_agent is not None:
                         if hasattr(local_agent, 'conversation'):
@@ -828,6 +837,11 @@ class AgentController:
                     traceback.print_exc()
                     stop_reason = 'error'
                 finally:
+                    # Drop THIS thread's pause reference. ``bind_pause_event(None)``
+                    # rather than ``unbind()``: process_query binds its own
+                    # turn-cancel token on this same thread, and only the pause
+                    # slot is ours to release.
+                    bind_pause_event(None)
                     # A halt is scoped to the turn that was running; clear it so
                     # the next query is not truncated immediately.
                     self.halt_event.clear()

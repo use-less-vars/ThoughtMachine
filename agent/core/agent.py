@@ -30,6 +30,7 @@ from llm_providers.exceptions import ProviderError, RateLimitExceeded
 from tools import SIMPLIFIED_TOOL_CLASSES
 from tools.utils import model_to_openai_tool
 from tools.summarize_tool import SummarizeTool
+from tools.cancellation import _active_pause_event
 from agent.core.message import Message, is_system_notice_text, make_system_notice
 from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
@@ -421,6 +422,41 @@ def _discard_session_main_pause(session_id: Optional[str], *, worker_mode: bool)
         return False
     paused.discard(session_id)
     return True
+
+
+def _pause_aware_sleep(seconds: float) -> bool:
+    """Sleep *seconds* on this thread, waking early when a pause is requested.
+
+    The two rate-limit waits in :meth:`Agent.process_query` block the
+    turn-running thread for up to a minute, and a pause request has no way to
+    reach a thread that is sitting in ``time.sleep``.  The pause signal does
+    reach it as the SHARED ``Event`` the controller owns and
+    ``tools.cancellation.bind_pause_event`` holds a per-thread reference to, so
+    the wait is taken one slice at a time and that event ends it within one
+    slice -- the same plumbing ``Sleep`` uses for a tool call.
+
+    The event is resolved ONCE for the calling thread.  ``None`` (unbound: the
+    worker/direct path, tests) means a plain ``time.sleep`` with no early
+    return, so without a pause binding the behaviour is what it was.  Nothing
+    here sets or clears the event: it belongs to the controller.
+
+    Returns:
+        True when a pause request cut the wait short, False when the full
+        duration elapsed.
+    """
+    pause_event = _active_pause_event()
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # 0.1 s slices bound the pause latency, and each slice is clipped to
+        # what is left so the wait never runs past the deadline.
+        slice_seconds = min(0.1, remaining)
+        if pause_event is None:
+            time.sleep(slice_seconds)
+        elif pause_event.wait(slice_seconds):
+            return True
 
 
 class Agent:
@@ -1604,7 +1640,9 @@ class Agent:
                     if delay > 0:
                         if self.logger and hasattr(self.logger, 'py_logger'):
                             log('INFO', 'core.agent', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
-                        time.sleep(delay)
+                        # Pause-aware: a pause request ends this wait within one
+                        # slice instead of holding the turn thread for `delay`.
+                        _pause_aware_sleep(delay)
                 tools = self.llm_client.format_tools(self.tool_definitions)
                 # EMERGENCY TRACE: dump conversation and messages before LLM call
                 log('DEBUG', 'core.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
@@ -1860,7 +1898,10 @@ class Agent:
                     event_dict = {'type': 'rate_limit_warning', 'message': f'Rate limit exceeded. Waiting {wait_time}s before retrying. Delay between turns: {self.rate_limit_delay}s', 'wait_time': wait_time, 'turn_delay': self.rate_limit_delay, 'rate_limit_count': self.rate_limit_count, 'turn': self._display_turn}
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
-                    time.sleep(wait_time)
+                    # Only the WAIT is pause-aware: the event / notification
+                    # sequence below is unchanged, it just stops waiting out the
+                    # full backoff once a pause has been requested.
+                    _pause_aware_sleep(wait_time)
                     if self.session is not None:
                         self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts', is_system_notification=True))
                     stop_reason_event = {'type': 'stop_reason', 'stop_reason': 'rate_limit', 'message': f'Rate limit exceeded after {self.rate_limit_count} attempts', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
