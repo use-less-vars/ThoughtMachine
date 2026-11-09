@@ -1143,6 +1143,11 @@ class GitReadTool(ToolBase):
         resolved via ``ensure_resource("git")``; otherwise it is obtained
         through ``_ensure_resource_container()`` (which raises a clear
         RuntimeError when the resource is unavailable).
+
+        Raises:
+            RuntimeError: when the exec reports ``status="interrupted"``, i.e. the
+                operator cancelled the turn while the command was in flight.
+                Cancellation FAILS CLOSED and never degrades to a returned tuple.
         """
         # Containerized commits run workspace-local hooks from the policy-owned
         # .githooks directory (mounted at /workspace/.githooks). The explicit
@@ -1236,6 +1241,23 @@ class GitReadTool(ToolBase):
             environment=environment,
             timeout=timeout,
         )
+        # Operator cancellation FAILS CLOSED (security, not diagnostics).  The
+        # resource manager stops WAITING on the command and returns
+        # status="interrupted" with exit_code=None/empty stdio (the command may
+        # still be running inside the untouched container;
+        # infra/resource_container_manager.py).  Returning that as a tuple made
+        # a cancelled git call indistinguishable from a failed one -- and an
+        # exit code of None reads as "0" to every `== 0` probe, so the write
+        # path's duplicate/locked/dirty-worktree probes skipped their refusals
+        # and a cancel was treated as permission to proceed.  Never return a
+        # tuple on this path: raise, so every caller (and the ToolExecutor
+        # above it) sees a hard, unmistakable error.
+        if result.get("status") == "interrupted":
+            reason = result.get("reason") or "unknown"
+            raise RuntimeError(
+                "git execution interrupted by operator cancellation "
+                f"(reason: {reason}, command: git {' '.join(args)})"
+            )
         return (result["exit_code"], result["stdout"], result["stderr"])
 
     def _git_repo_root(self, repo_root: Path) -> Optional[Path]:
@@ -1250,6 +1272,10 @@ class GitReadTool(ToolBase):
         (missing binary, exit 127, or an unspawnable process) this raises
         ``GitUnavailableError`` instead, so an unavailable git is never
         conflated with a genuine "not a git repository" result.
+
+        An ``exit_code`` of ``None`` (an exec that stopped waiting on a
+        cancelled turn) is likewise a definitive ``None``: cancellation fails
+        closed, it is never "inconclusive".
         """
         dot_git = repo_root / ".git"
         if dot_git.exists() and dot_git.is_dir():
@@ -1266,6 +1292,14 @@ class GitReadTool(ToolBase):
             raise GitUnavailableError(
                 f"git command could not be executed: {e}"
             ) from e
+        if exit_code is None:
+            # Fail CLOSED: no exit code means git never reported one (an exec
+            # that stopped waiting on a cancelled turn).  "We do not know" is
+            # a definitive NEGATIVE for "is this a git repository", never
+            # "probably fine": treat it exactly like a failed rev-parse and
+            # let the caller refuse with "Not a git repository".  Explicit,
+            # because relying on `None != 0` being truthy is accidental.
+            return None
         if exit_code != 0 or not stdout.strip():
             if _git_run_indicates_missing_git(exit_code, stderr):
                 raise GitUnavailableError(
