@@ -24,9 +24,22 @@ def bind_turn_cancel(event: threading.Event) -> None:
 
 
 def unbind() -> None:
-    """Drop the current thread's binding (owning worker calls this at turn end)."""
+    """Drop the current thread's binding (owning worker calls this at turn end).
+
+    The thread's FALLBACK token is cleared as well, so that an ``interrupt()``
+    issued while no turn event was bound cannot stay set forever and poison the
+    thread's later work (the next turn of the same worker, or any direct
+    unbound call).  Only the fallback is cleared: a token the worker actually
+    bound belongs to the caller and is never touched here.
+    """
     _tls.event = None
     _tls.reason = None
+    # C12: a sticky fallback event would leak this turn's cancel into the next
+    # one on this thread.  Clear it if it exists -- never create one here, or
+    # unbind() would allocate state in threads that never needed it.
+    fallback = getattr(_tls, "fallback", None)
+    if fallback is not None:
+        fallback.clear()
 
 
 def _fallback_event() -> threading.Event:
