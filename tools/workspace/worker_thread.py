@@ -875,6 +875,55 @@ def _resolve_worker_thread(
         f"instances ({', '.join(labels)}). Specify instance_id."
     )
 
+
+def _pause_join_target(thread, worker_name: str) -> bool:
+    """Proxy the session main-agent pause onto the ONE worker a join waits on.
+
+    Operator ruling (b): "If Main is paused while waiting on a worker, the
+    worker must be paused."  The scope is deliberately the single worker the
+    caller is ACTIVELY waiting on (the ``join`` / ``wait_for_job`` target, and
+    only that thread) -- async workers the caller is not waiting on keep
+    running, which is what ``want_all`` already controls and what this helper
+    must never touch.
+
+    Idempotent by construction, because ``_action_join`` re-enters this branch
+    on every join call while the pause lasts:
+
+    * ``status == 'paused'``: the worker already parked -- do nothing.
+    * ``_park_event`` already set: ``WorkerThread.pause()`` was already issued
+      for this pause (the event is set synchronously by ``pause()``, the thread
+      status only flips later, at the run loop's next boundary).  Bailing here
+      is what stops a re-park, a fresh cross-process ``pause`` command write
+      and a repeated log line per call.
+    * the worker's own agent already carries a ``'pause'`` restriction:
+      leave it alone (never steal or re-own an existing pause restriction).
+
+    Never sets ``_manual_only_pause``: the proxied pause must stay
+    auto-resumable by the existing paths (``_action_query``'s paused branch,
+    ``_action_spawn``'s sole-paused path, the operator resume route).
+
+    Returns True only when this call actually issued ``thread.pause()``.
+    """
+    if getattr(thread, "status", None) == "paused":
+        return False
+    park = getattr(thread, "_park_event", None)
+    if park is not None and bool(getattr(park, "is_set", lambda: False)()):
+        return False
+    agent = getattr(thread, "_agent", None)
+    state = getattr(agent, "state", None)
+    if state is not None and getattr(state, "restriction_reason", None) == "pause":
+        return False
+    try:
+        thread.pause()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Main-pause proxy: pause failed for worker '%s': %s", worker_name, exc)
+        return False
+    logger.info(
+        "Main-pause proxy: paused worker '%s' (the join target of the paused caller)",
+        worker_name,
+    )
+    return True
+
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
 # ---------------------------------------------------------------------------
@@ -6816,6 +6865,12 @@ class Worker(ToolBase):
             # blocking wait is pointless — return paused promptly. Pause
             # propagates INTO join waits this way.
             if self.session_id and self.session_id in _SESSION_MAIN_PAUSED:
+                # PHASE 2f (operator ruling (b)): Main is paused while waiting
+                # on THIS worker, so this worker is paused too.  Scoped to the
+                # join target only -- async workers the caller is not waiting
+                # on are untouched (that is the ``want_all`` axis, not this
+                # one).  Idempotent; see _pause_join_target.
+                _pause_join_target(thread, self.worker_name)
                 return {
                     "worker_name": self.worker_name,
                     "instance_id": iid,

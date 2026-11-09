@@ -382,7 +382,7 @@ class ContainerExecTool(_ContainerControlBase):
                     False,
                     status="interrupted",
                     interrupted=True,
-                    exit_code=-3,
+                    exit_code=None,
                     reason=result.get("reason"),
                     stdout=result.get("stdout", "") or "",
                     stderr=result.get("stderr", "") or "",
