@@ -849,7 +849,8 @@ resume of a stopped turn, and it never clears the token restriction (§6.3).
 | interrupt recognition | `is_interrupted_tool_entry(entry)` plus a dispatch-loop gate | helper `agent/core/tool_executor.py:164`; batch stop + per-id padding `tool_executor.py:412-437`; gate `agent/core/agent.py:2123-2137`, i.e. AFTER `turn_transaction.commit()` (`:2033-2034`), the `tool_call`/`tool_result` yields (`:2035-2042`) and the pause-notice flush (`:2119-2122`) | 2c |
 | implicit unpause | `send_query` clears the pause restriction only, ownership-safe (no invented `thread._controller`) | `tools/workspace/worker_thread.py` (`send_query`) | 2d |
 | interrupted envelope | `status: "interrupted"`, `exit_code: None` instead of `-3` | `tools/docker_code_runner.py:465-484` | 2e |
-| worker-tool pause proxy | an agent-side pause must reach the detached worker's own `Agent` | helper `tools/workspace/worker_thread.py:879` (`_pause_join_target`), called from `_action_join` at `:6873` | 2f |
+| worker-tool pause proxy | an agent-side pause must reach the detached worker's own `Agent` | helper `tools/workspace/worker_thread.py:879` (`_pause_join_target`), called from `_action_join` at `:7005` | 2f |
+| symmetric resume | lifting the session main-pause must lift the worker pauses the proxy applied, and only those | recorder `tools/workspace/worker_thread.py:928` (`_record_proxied_join_target`), called at `:7006` only when `_pause_join_target` (`:879`) returned True at `:7005`; per-session record `:4874` (`_PROXIED_JOIN_TARGETS`); lifter `:959` (`_resume_proxied_join_targets`), called from `_discard_session_main_pause` at `agent/core/agent.py:430` | 2g |
 
 **How the gate actually concludes a paused turn — five facts, with sites.**
 

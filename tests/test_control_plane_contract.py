@@ -113,8 +113,10 @@ class TestInterruptSignal:
         * ``tools.cancellation.bind_pause_event(controller.pause_event)`` can
           hand the SAME event to a blocked tool, and ``Event.wait()``'s
           existing return value then means "interrupted" with no adapter.
-        * ``Agent.process_query``'s sleep sites (``agent/core/agent.py``) become
-          ``pause_event.wait(...)`` and wake on pause, not on resume.
+        * ``Agent.process_query``'s sleep sites now run through
+          ``_pause_aware_sleep()`` (``agent/core/agent.py:439``), which reads the
+          bound event via ``_active_pause_event()`` (``:459``) and wakes on
+          pause, not on resume.
 
         Phase 2b flipped the polarity: ``__init__`` leaves the event cleared,
         ``pause()`` sets it and ``resume()`` clears it, which is what the three
@@ -216,11 +218,15 @@ class TestExecutionStateTransitions:
     def test_controller_pause_lands_on_paused_not_pausing(self):  # PIN
         """``controller.pause()`` must land the agent on PAUSED by value.
 
-        Today ``pause()`` writes ``ExecutionState.PAUSING`` straight onto
-        ``agent.state`` (bypassing ``set_execution_state``, so no logger
-        notification either).  The settled state after a pause is PAUSED:
-        PAUSING exists only for the window in which the wind-down is still in
-        flight.
+        ``pause()`` sets ``pause_event`` and ``_pause_requested``, then writes
+        ``ExecutionState.PAUSING`` through the controller's own
+        ``_set_execution_state()`` (``agent/controller/__init__.py:559``), which
+        routes to ``AgentState.set_execution_state`` and so logs the transition
+        and emits the flat ``execution_state_change`` event.  With no turn in
+        flight nothing has to wind down, so it settles straight on
+        ``ExecutionState.PAUSED`` (``agent/controller/__init__.py:575``).  The
+        settled state after a pause is PAUSED: PAUSING exists only for the
+        window in which the wind-down is still in flight.
         """
         agent = _make_agent()
         controller = _make_controller(agent)
@@ -238,12 +244,14 @@ class TestPauseReachesBlockedTool:
     def test_sleep_envelope_reports_paused_reason(self):  # PIN
         """A pause-interrupted ``sleep`` reports ``reason == 'paused'``.
 
-        ``tools.cancellation.bind_pause_event(event)`` is the specified (and
-        currently missing) symbol: it publishes the shared pause-REQUESTED
+        ``tools.cancellation.bind_pause_event(event)``
+        (``tools/cancellation.py:58``) publishes the shared pause-REQUESTED
         event to the executing thread, so ``Sleep`` waits on the pause signal
-        itself instead of on the turn-cancel token.  Today the only binding is
-        the turn token and the reason falls back to ``'turn_cancelled'``,
-        which the window cannot distinguish from a Stop.
+        itself instead of on the turn-cancel token: ``tools/sleep_tool.py`` has
+        a pause branch of its own (``:190-194``) that returns
+        ``reason == "paused"``, and only the cancel branch after it
+        (``:197-201``) falls back to ``'turn_cancelled'``, which the window
+        cannot distinguish from a Stop.
         """
         from tools.cancellation import bind_pause_event, unbind
 
@@ -302,9 +310,10 @@ class TestToolReturnContract:
         (keys ``name``/``arguments``/``result``/``success``/``tool_call_id``)
         that says "this batch stopped because the turn was interrupted; the
         loop must conclude with Respond instead of feeding the result back as
-        an ordinary observation".  It does not exist yet, so the local import
-        below fails -- that IS the red state, and it keeps module-level
-        collection clean for the rest of the file.
+        an ordinary observation".  It lives at
+        ``agent/core/tool_executor.py:164``.  The import below is kept function
+        local so that a missing symbol would fail this test alone, which keeps
+        module-level collection clean for the rest of the file.
         """
         from agent.core.tool_executor import is_interrupted_tool_entry
 
@@ -395,10 +404,12 @@ class TestDockerCodeRunnerInterrupt:
         ``interrupted=True``, ``exit_code=None`` -- there IS no exit code,
         because the wait was abandoned and the process was never reaped.
 
-        ``DockerCodeRunner`` does not pass it through: it rewrites the envelope
-        with ``exit_code=-3`` and ``success=False``, which reads as a failed
-        command instead of an interruption.  ``None`` is canonical; DCR must
-        align in Phase 2.
+        ``DockerCodeRunner`` passes it through verbatim: on
+        ``result.get("status") == "interrupted"`` it rebuilds the envelope with
+        that status, ``interrupted=True``, ``exit_code=None`` and an ``error``
+        naming the abandoned wait (``tools/docker_code_runner.py:465-484``).
+        ``None`` is canonical; a ``-3`` exit code would read as a failed
+        command instead of an interruption.
         """
         import tools.docker_code_runner as dcr_mod
 
