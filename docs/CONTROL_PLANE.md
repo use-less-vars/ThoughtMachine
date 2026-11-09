@@ -843,10 +843,10 @@ resume of a stopped turn, and it never clears the token restriction (§6.3).
 | Piece | Symbol | Owner site (file:line today) | Phase slice |
 |---|---|---|---|
 | run-state values | `ExecutionState.PAUSED`, `ExecutionState.STOPPED` | enum home `agent/core/state.py` (imported from there at `tests/test_control_plane_contract.py:47`); consumed by `agent/controller/__init__.py` | 2a |
-| setter routing | `set_execution_state()` for every transition | `agent/controller/__init__.py:542` | 2a |
-| canonical interrupt | `controller.pause_event` (cleared = running, set = pause requested); `tools.cancellation.bind_pause_event(event)` | init `agent/controller/__init__.py:34-35`, set on pause `:538`, cleared on resume `:560`; new binding beside `bind_turn_cancel` in `tools/cancellation.py:20` | 2b |
-| wait conversion | `Sleep` wakes on `pause_event` with `reason == "paused"`; `time.sleep` becomes `Event` waits | `agent/core/agent.py:1607`, `agent/core/agent.py:1863` | 2b |
-| interrupt recognition | `is_interrupted_tool_entry(entry)` plus a dispatch-loop gate | helper `agent/core/tool_executor.py:164`; batch stop + per-id padding `tool_executor.py:412-437`; gate `agent/core/agent.py:2123-2137`, i.e. AFTER `turn_transaction.commit()` (`:2033-2034`), the `tool_call`/`tool_result` yields (`:2035-2042`) and the pause-notice flush (`:2119-2122`) | 2c |
+| setter routing | `set_execution_state()` for every transition | `_set_execution_state()` at `agent/controller/__init__.py:415`; the pause write goes through it at `:559` (`PAUSING`) and `:575` (`PAUSED`) | 2a |
+| canonical interrupt | `controller.pause_event` (cleared = running, set = pause requested); `tools.cancellation.bind_pause_event(event)` | created `agent/controller/__init__.py:39`, set on pause `:554`, cleared on resume `:582`; the binding is `tools/cancellation.py:58` (`bind_pause_event`), installed on the turn thread at `agent/controller/__init__.py:814` | 2b |
+| wait conversion | `Sleep` wakes on `pause_event` with `reason == "paused"`; `time.sleep` becomes `Event` waits | helper `agent/core/agent.py:439` (`_pause_aware_sleep`), reading the bound event at `:459`; the two sleep sites are `agent/core/agent.py:1668` and `agent/core/agent.py:1929` | 2b |
+| interrupt recognition | `is_interrupted_tool_entry(entry)` plus a dispatch-loop gate | helper `agent/core/tool_executor.py:164`; batch stop + per-id padding `tool_executor.py:412-437`; gate `agent/core/agent.py:2147-2152` (the tool-less terminal is the `:2153` branch that follows it), i.e. AFTER the assistant commit (`:1997`) and the `turn` yield (`:2006`), and after `_apply_pause_reading_mode()` at `:2133` plus its notice flush (`:2134-2136`) | 2c |
 | implicit unpause | `send_query` clears the pause restriction only, ownership-safe (no invented `thread._controller`) | `tools/workspace/worker_thread.py` (`send_query`) | 2d |
 | interrupted envelope | `status: "interrupted"`, `exit_code: None` instead of `-3` | `tools/docker_code_runner.py:465-484` | 2e |
 | worker-tool pause proxy | an agent-side pause must reach the detached worker's own `Agent` | helper `tools/workspace/worker_thread.py:879` (`_pause_join_target`), called from `_action_join` at `:7005` | 2f |
@@ -887,7 +887,7 @@ resume of a stopped turn, and it never clears the token restriction (§6.3).
    `range(self.config.max_turns)` (`:1536`).
 
 `tests/test_control_plane_contract.py` is the executable form of this section:
-12 tests, all green today, every one tagged `# PIN` — including the ones that
+13 tests, all green today, every one tagged `# PIN` — including the ones that
 were written red-first and are now satisfied (`ExecutionState` defines
 `paused`/`stopped`, the controller settles on `PAUSED`, the interrupted
 envelope is recognised).
