@@ -117,6 +117,31 @@ different file, different name. Never rename one to the other.
   `None` with an explicit refusal (making the window loud). Deciding here would prejudge
   that design pass.
   **Numbering.** C22 was assigned by operator ruling; C15–C21 are unused.
+  **Correction (dispatch 14):** the `state=None` hole does not reproduce on the worker path —
+  `Agent.__init__` re-binds `self.tool_executor.state = self.state` (agent.py:531), and the
+  worker-path test now fails loudly if `executor.state` ever becomes `None`.
+
+- **C23: Control plane — unprobed paths (worker lazy build, resume-side clear).** **Open.**
+  Test-coverage gap, not a bug claim: no failing behaviour is known on any of these paths;
+  they simply have no test that reads the instrumentation.
+  **Proven identical, therefore ruled out.** Direct path dispatch 13 and worker path
+  dispatch 14: loop, executor and dispatch gate all hold ONE `AgentState` — the
+  `[CONTROL_PLANE_GATE]` state id equals the `[CONTROL_PLANE_STATE]` mutation id, and the
+  worker test asserts `worker._agent.tool_executor.state is worker._agent.state`.
+  Identity propagation is not a live defect on either path; what is missing is coverage.
+  **Unprobed surfaces (four).** (1) the worker's TRUE lazy build — `Agent(...)` constructed
+  inside `run()` when `_agent is None`; (2) the resume-side clear — `Controller.resume()` →
+  `agent.leave_reading_mode('pause')`; (3) the restart re-point — `Agent.restart()`
+  rebuilding `ToolExecutor` from the new config; (4) the controller's idle pause branch —
+  `_agent_enter_reading_mode('request_pause[idle]')`.
+  **Why the lazy build needs its own test.**
+  `tests/test_control_plane_instrumentation.py::test_worker_pause_executor_observes_the_same_state_object`
+  assigns `worker._agent` directly, so it probes the post-build wiring only. A test of the
+  real lazy build needs a started worker thread, a stubbed provider, and a
+  poll-until-built (not a fixed sleep) before the states' ids can be read.
+  **Grep contract for whoever writes those tests:** `[CONTROL_PLANE_STATE]`,
+  `[CONTROL_PLANE_PAUSE]`, `[CONTROL_PLANE_GATE]`, `[CONTROL_PLANE_RESTART]`,
+  `[CONTROL_PLANE_CONTROLLER]`, `[CONTROL_PLANE_WORKER_CLEAR]`.
 
 ---
 
