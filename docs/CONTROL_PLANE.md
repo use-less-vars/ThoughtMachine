@@ -144,12 +144,19 @@ does the same *and* sets the park flag
    The gate is `agent/core/tool_executor.py:272-280`: a refused tool becomes
    `self._create_tool_rejection_message(tool_name)` (`tool_executor.py:882`,
    reason at 890, message text at 894/897) and the loop `continue`s.
-6. **The turn is never truncated** (pre-Gen 61 history) — the comment at
-   `agent.py:1900-1908` states this explicitly: tools still reach the executor,
-   which refuses them. As of Gen 61 a pause *does* truncate the turn: the
-   tool-dispatch loop gate on `is_interrupted_tool_entry(...)` concludes it with
-   a forced summary, which is what makes Pause a wind-down rather than an
-   advisory notice.
+6. **The turn is concluded, not truncated** — nothing amputates the turn and
+   no terminal message is injected in the model's name. Tools the executor has
+   already reached are stopped at the batch boundary: once an entry reports an
+   interrupt and `state.restriction_reason == 'pause'`, every remaining call in
+   the batch is answered with the interrupted envelope, one result per
+   `tool_call` id (`tool_executor.py:412-437`), so the assistant `tool_calls`
+   message keeps its pairing and the provider accepts it. The dispatch-loop gate
+   on `is_interrupted_tool_entry(...)` (`agent.py:2123-2137`) then sets
+   `_pause_winddown` and `continue`s to another turn; the only new instruction
+   the model receives is the existing pause notice
+   (`agent.py:1361-1396`, text `:1387-1393`), and the turn ends when the model
+   calls Respond (`agent.py:2081-2109`). That — not a hard truncation — is what
+   makes Pause a wind-down rather than an advisory notice.
 7. **The worker parks** — in the run loop, `if self._park_event.is_set():`
    (`worker_thread.py:2974`) reports the pause exactly once
    (2975-2986: `request_pause()`, `status = "paused"`, status file, a
@@ -803,7 +810,7 @@ session*, which is the ambiguity this section exists to remove.
 | From | Event | To | Side effects |
 |---|---|---|---|
 | `RUNNING` | `pause()` | `PAUSING` | `pause_event` set, pause restriction applied, `execution_state_change` emitted |
-| `PAUSING` | turn winds down | `PAUSED` | forced summary, worker parks |
+| `PAUSING` | turn winds down | `PAUSED` | the model's own summary, worker parks |
 | `PAUSED` | `resume()` | `RUNNING` | `pause_event` cleared, restriction cleared |
 | `PAUSED` | new operator query | `RUNNING` | implicit unpause, only while `restriction_reason == 'pause'` |
 | `RUNNING` | `stop()` | `STOPPED` | turn token set, partial output discarded, no summary, worker parked or detached |
@@ -839,14 +846,50 @@ resume of a stopped turn, and it never clears the token restriction (§6.3).
 | setter routing | `set_execution_state()` for every transition | `agent/controller/__init__.py:542` | 2a |
 | canonical interrupt | `controller.pause_event` (cleared = running, set = pause requested); `tools.cancellation.bind_pause_event(event)` | init `agent/controller/__init__.py:34-35`, set on pause `:538`, cleared on resume `:560`; new binding beside `bind_turn_cancel` in `tools/cancellation.py:20` | 2b |
 | wait conversion | `Sleep` wakes on `pause_event` with `reason == "paused"`; `time.sleep` becomes `Event` waits | `agent/core/agent.py:1607`, `agent/core/agent.py:1863` | 2b |
-| interrupt recognition | `is_interrupted_tool_entry(entry)` plus a dispatch-loop gate | new helper in `agent/core/tool_executor.py`; gate at `agent/core/agent.py:1959`, assistant commit at `:1979`, before any yields | 2c |
+| interrupt recognition | `is_interrupted_tool_entry(entry)` plus a dispatch-loop gate | helper `agent/core/tool_executor.py:164`; batch stop + per-id padding `tool_executor.py:412-437`; gate `agent/core/agent.py:2123-2137`, i.e. AFTER `turn_transaction.commit()` (`:2033-2034`), the `tool_call`/`tool_result` yields (`:2035-2042`) and the pause-notice flush (`:2119-2122`) | 2c |
 | implicit unpause | `send_query` clears the pause restriction only, ownership-safe (no invented `thread._controller`) | `tools/workspace/worker_thread.py` (`send_query`) | 2d |
 | interrupted envelope | `status: "interrupted"`, `exit_code: None` instead of `-3` | `tools/docker_code_runner.py:465-484` | 2e |
 | worker-tool pause proxy | an agent-side pause must reach the detached worker's own `Agent` | `tools/workspace/worker_thread.py:4794` | 2f |
 
+**How the gate actually concludes a paused turn — five facts, with sites.**
+
+1. *Recognition is a helper, not a sniff.* `is_interrupted_tool_entry(entry)`
+   (`agent/core/tool_executor.py:164`) accepts both dialects a stop can leave
+   behind: the sleep dialect
+   (`{"tool":"sleep","ok":false,"interrupted":true,"reason":...}`) and the
+   container dialect (`{"status":"interrupted","interrupted":true,
+   "exit_code":null}`).
+2. *The batch is stopped at the boundary, never dropped.*
+   `tool_executor.py:412-437`: every call after the interrupted one is answered
+   with `{"status":"interrupted","interrupted":true,"reason":"paused",
+   "skipped":true,...}` and recorded in `executed_tools`, one result per
+   `tool_call` id — the provider rejects an assistant `tool_calls` message whose
+   ids are not all answered, so padding is mandatory.
+3. *The gate continues the loop; it does not synthesise a summary.*
+   `agent/core/agent.py:2123-2137`: if any executed entry is interrupted and the
+   restriction is `'pause'`, the loop sets `_pause_winddown` and `continue`s to
+   another turn. No hardcoded terminal message is handed to the model.
+4. *Ordering: persistence and emission come first.* The gate sits after
+   `turn_transaction.commit()` (`agent.py:2033-2034`), after the `tool_call`
+   (`:2035-2038`) and `tool_result` (`:2039-2042`) yields, after the pending
+   warning flush (`:2043-2052`), and after `_apply_pause_reading_mode()` at
+   `:2119` plus its notice flush (`:2120-2122`). Nothing already sent to the
+   frontend is retracted.
+5. *The summary is the model's own, prompted by the existing notice, and the
+   wind-down is bounded.* `_apply_pause_reading_mode()` (`agent.py:1361-1396`,
+   text `:1387-1393`) is the only new instruction the model sees ("Do not start
+   new work and do not call tools … Summarize what you have done and what
+   remains, then reply with Respond."). The grant is scoped to one query
+   (reset at `agent.py:1506-1507`, released by `leave_reading_mode('pause')` at
+   `:1352-1357`), the turn-start checkpoint skips `stop_check` only while it is
+   held (`:1544-1550`), and the loop is bounded by
+   `range(self.config.max_turns)` (`:1536`).
+
 `tests/test_control_plane_contract.py` is the executable form of this section:
-12 tests, 10 red by design, 2 green pins — `SessionState` keeps exactly three
-values, and a new query does not clear a token restriction.
+12 tests, all green today, every one tagged `# PIN` — including the ones that
+were written red-first and are now satisfied (`ExecutionState` defines
+`paused`/`stopped`, the controller settles on `PAUSED`, the interrupted
+envelope is recognised).
 
 ### 10.5 What is still not interrupted
 
