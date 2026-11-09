@@ -719,16 +719,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         })
         const notes = visibleMessages.filter(m => m.is_system_notification);
         if (notes.length > 0) console.log('🔔 SYSTEM NOTIFICATIONS:', notes);
-        // Detect context compaction messages — force scroll to bottom (R3)
-        if (notes.some(m => {
-          const text = (m.content || '').toLowerCase()
-          return text.includes('context now free') ||
-                 text.includes('summar') ||
-                 text.includes('compact') ||
-                 text.includes('messages removed')
-        })) {
-          setScrollToBottomKey(k => k + 1)
-        }
+        // No substring-triggered scrolling here: stick-to-bottom is owned by
+        // useStickToBottom inside the panels, so message TEXT must never move the
+        // viewport (compaction/summary notices used to force-scroll via markers
+        // like 'summar'/'compact').
         // Server-authoritative replace, but client-only notices (e.g. the
         // CASE-3 cold-start status notice) are not part of the server payload,
         // so keep them instead of letting this replace wipe them.
