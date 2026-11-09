@@ -1,8 +1,15 @@
 # Control Plane: Pause, Stop, and Timeout
 
-**Status:** design / contract document. Nothing described in
-"Code changes needed to enforce this contract" is implemented today; every
-such item is marked **NOT YET IMPLEMENTED**.
+**Status:** design / contract document, partly landed. Nothing described in
+"Code changes needed to enforce this contract" was implemented when this
+document was written, and every such item is marked **NOT YET IMPLEMENTED** —
+but two things have moved since. The instrumentation pass — §6.5 "step 0", §8
+item 3 — **HAS LANDED**. The run-state machine (`ExecutionState.PAUSED` /
+`ExecutionState.STOPPED`, with `controller.pause_event` as the canonical
+interrupt) is being implemented under the Gen 61 control-plane work. The
+behaviour changes — Stop discarding the turn (§8 item 4) and the fail-closed
+allow-list (§8 item 1) — remain **NOT YET IMPLEMENTED**, and §8 still marks
+each item individually.
 
 **Scope:** the three operator-visible ways to interrupt work — **Pause**,
 **Stop**, **Timeout** — across the main agent and detached workers, plus one
@@ -24,9 +31,12 @@ flagged as *unverified* rather than asserted.
 | **Timeout** | caller gives up waiting | **yes**, in the worker | the worker keeps working and answers later | worker keeps running; caller got a `timeout` envelope |
 
 The three are deliberately different mechanisms, not three settings of one
-knob: Pause is *advisory* (a system notice + a tool allow-list),
-Stop is *preemptive* (a per-turn cancellation token that tools poll), and
-Timeout is *degenerate* (the caller stops waiting; nothing is cancelled).
+knob: once `controller.pause_event` is bound, Pause **is** *preemptive* — it
+interrupts sleeps and in-flight tool waits as well as refusing the next batch,
+and the tool allow-list is still the single enforcement point for *what* may
+run; Stop is *preemptive-plus-discard* (a per-turn cancellation token that
+tools poll, plus the turn itself thrown away); and Timeout is *degenerate* (the
+caller stops waiting; nothing is cancelled).
 
 The bug: the tool allow-list — the only thing that actually makes Pause and
 Stop hard, because the tool gate is the single enforcement point — is
@@ -79,8 +89,8 @@ operator action ──► flag/token ──► checkpoint ──► tool gate �
 | | **PAUSE** | **STOP** | **TIMEOUT** |
 |---|---|---|---|
 | Operator-visible name | "Pause" | "Stop" | (none — a wall-clock budget expires) |
-| Signal | `state.restrict('pause')` + `_pause_requested` | `_turn_cancel_event.set()` (main) / `_turn_cancel.set()` (worker) | `thread.send_query(..., timeout=…)` raises |
-| Reaches a blocked tool? | indirectly: the tool batch already dispatched is *allowed to finish*, the next batch is refused | yes: tools poll `is_interrupted()` between wait slices | no: nothing is cancelled |
+| Signal | `state.restrict('pause')` + `_pause_requested` + `controller.pause_event` (set) | `_turn_cancel_event.set()` (main) / `_turn_cancel.set()` (worker) | `thread.send_query(..., timeout=…)` raises |
+| Reaches a blocked tool? | yes, once `pause_event` is bound: sliced waits observe the event, the in-flight tool returns an `interrupted` envelope and the turn winds down (before Gen 61: indirectly — the batch already dispatched was *allowed to finish*, only the next batch was refused) | yes: tools poll `is_interrupted()` between wait slices | no: nothing is cancelled |
 | Current turn's LLM output | kept, committed | **should be** dropped (§4 gap) | kept by the worker |
 | Extra LLM call | **no** — the nudge rides the existing turn | **no** | **no** |
 | Final message to operator | one `Respond` (the agent's own summary) | a machine envelope, not prose | the timeout envelope |
@@ -134,8 +144,12 @@ does the same *and* sets the park flag
    The gate is `agent/core/tool_executor.py:272-280`: a refused tool becomes
    `self._create_tool_rejection_message(tool_name)` (`tool_executor.py:882`,
    reason at 890, message text at 894/897) and the loop `continue`s.
-6. **The turn is never truncated** — the comment at `agent.py:1900-1908`
-   states this explicitly: tools still reach the executor, which refuses them.
+6. **The turn is never truncated** (pre-Gen 61 history) — the comment at
+   `agent.py:1900-1908` states this explicitly: tools still reach the executor,
+   which refuses them. As of Gen 61 a pause *does* truncate the turn: the
+   tool-dispatch loop gate on `is_interrupted_tool_entry(...)` concludes it with
+   a forced summary, which is what makes Pause a wind-down rather than an
+   advisory notice.
 7. **The worker parks** — in the run loop, `if self._park_event.is_set():`
    (`worker_thread.py:2974`) reports the pause exactly once
    (2975-2986: `request_pause()`, `status = "paused"`, status file, a
@@ -160,7 +174,10 @@ does the same *and* sets the park flag
   "tool calls are refused" is true only for the *next* batch. That is the
   intended semantic ("finish the current call"), but it means the pause is
   not instantaneous by construction — a long single tool call can run for
-  minutes after Pause.
+  minutes after Pause. (Pre-Gen 61 that was true by construction; it no longer
+  is once `pause_event` is bound, because the wait is interruptible. A process
+  already running *inside* a container is still not killed, though — see §9
+  question 2 for that residual.)
 
 ### 3.4 PAUSE state table
 
@@ -757,3 +774,95 @@ the operator sees when they press Stop and should be reviewed against the UI's
    must a session pause be a process-wide fact that any agent, present or
    future, is born subject to? The second reading needs the registry — and then
    needs a rule for when a stale entry must not pause a fresh turn.
+
+---
+
+## 10. Implementation: the four pieces and the run-state machine
+
+§1-§9 fix the behaviour; this section fixes which object owns which fact, so the
+implementation cannot grow a second pause flag next to the first. Every
+statement below is a ruling unless a `file:line` is cited, in which case the
+citation is current behaviour and is exactly what may have to change.
+
+### 10.1 Three axes, three objects
+
+| Axis | Object | Values | Owner | Must never be used for |
+|---|---|---|---|---|
+| session lifecycle | `SessionState` | `new`, `continuing`, `resetting` | session / bridge layer | pause or stop |
+| run state | `ExecutionState` | `running`, `pausing`, `ready` today; `paused`, `stopped` added here | `AgentController` | session existence |
+| worker availability | worker `status` | worker-defined string | worker run loop | operator intent |
+
+**Adding `PAUSED` to `SessionState` is rejected.** A paused session has not
+ended, and neither has a stopped one; session lifecycle and run state answer
+different questions, and a single enum cannot answer both. Conflating them makes
+the verb "resume" ambiguous between *continue this turn* and *start a new
+session*, which is the ambiguity this section exists to remove.
+
+### 10.2 The run-state machine
+
+| From | Event | To | Side effects |
+|---|---|---|---|
+| `RUNNING` | `pause()` | `PAUSING` | `pause_event` set, pause restriction applied, `execution_state_change` emitted |
+| `PAUSING` | turn winds down | `PAUSED` | forced summary, worker parks |
+| `PAUSED` | `resume()` | `RUNNING` | `pause_event` cleared, restriction cleared |
+| `PAUSED` | new operator query | `RUNNING` | implicit unpause, only while `restriction_reason == 'pause'` |
+| `RUNNING` | `stop()` | `STOPPED` | turn token set, partial output discarded, no summary, worker parked or detached |
+| `PAUSED` | `stop()` | `STOPPED` | as above |
+| `STOPPED` | `resume()` | `RUNNING` | `pause_event` cleared, restriction cleared |
+| `STOPPED` | new operator query | `STOPPED` | none — implicit unpause does not apply |
+
+Every transition goes through `set_execution_state()` so that
+`execution_state_change` is emitted. `agent/controller/__init__.py:542`
+currently assigns `PAUSING` to the field directly, so that one transition
+emits nothing; Phase 2a must route it through the setter. The event payload is
+flat — `old_state` and `new_state` at the top level, no `data` sub-dict.
+
+### 10.3 The four semantics
+
+**Pause** is a soft wind-down: the current turn is asked to stop, is summarised,
+and the agent parks with state intact and resumable.
+
+**Stop** is a hard abort: the turn is abandoned, its partial output is not
+committed, no summary is produced, and the worker is parked or detached.
+
+**Timeout** is a detach: the caller stops waiting; it says nothing about what
+the work is doing. Resumability is §9 question 3.
+
+**Implicit unpause** clears the pause restriction and nothing else. It is not a
+resume of a stopped turn, and it never clears the token restriction (§6.3).
+
+### 10.4 The eight pieces and their Phase-2 owner sites
+
+| Piece | Symbol | Owner site (file:line today) | Phase slice |
+|---|---|---|---|
+| run-state values | `ExecutionState.PAUSED`, `ExecutionState.STOPPED` | enum home `agent/core/state.py` (imported from there at `tests/test_control_plane_contract.py:47`); consumed by `agent/controller/__init__.py` | 2a |
+| setter routing | `set_execution_state()` for every transition | `agent/controller/__init__.py:542` | 2a |
+| canonical interrupt | `controller.pause_event` (cleared = running, set = pause requested); `tools.cancellation.bind_pause_event(event)` | init `agent/controller/__init__.py:34-35`, set on pause `:538`, cleared on resume `:560`; new binding beside `bind_turn_cancel` in `tools/cancellation.py:20` | 2b |
+| wait conversion | `Sleep` wakes on `pause_event` with `reason == "paused"`; `time.sleep` becomes `Event` waits | `agent/core/agent.py:1607`, `agent/core/agent.py:1863` | 2b |
+| interrupt recognition | `is_interrupted_tool_entry(entry)` plus a dispatch-loop gate | new helper in `agent/core/tool_executor.py`; gate at `agent/core/agent.py:1959`, assistant commit at `:1979`, before any yields | 2c |
+| implicit unpause | `send_query` clears the pause restriction only, ownership-safe (no invented `thread._controller`) | `tools/workspace/worker_thread.py` (`send_query`) | 2d |
+| interrupted envelope | `status: "interrupted"`, `exit_code: None` instead of `-3` | `tools/docker_code_runner.py:465-484` | 2e |
+| worker-tool pause proxy | an agent-side pause must reach the detached worker's own `Agent` | `tools/workspace/worker_thread.py:4794` | 2f |
+
+`tests/test_control_plane_contract.py` is the executable form of this section:
+12 tests, 10 red by design, 2 green pins — `SessionState` keeps exactly three
+values, and a new query does not clear a token restriction.
+
+### 10.5 What is still not interrupted
+
+The shared `Event` solves wake-up and in-flight waits: anything blocking on that
+event returns promptly with `interrupted: True`. A process already running
+inside a container is not killed, and the envelope must say so rather than
+report a fake success or a fake exit code (see §9 question 2). That is the one
+residual gap, and it is accepted.
+
+### 10.6 Invariants that must not regress
+
+- `tests/test_agent_reading_mode.py:150-165` — the after-turn checkpoint must
+  not move `execution_state`; `PAUSED` is owned by `controller.pause()` and
+  `enter_reading_mode`.
+- `tests/test_worker_pause_reading_mode.py:102-113` — the worker's `pause()`
+  must not write `status`; the worker run loop owns that field.
+- `tests/test_state_pause_restriction.py:104-108` — `get_allowed_tools()`
+  returns `[]` when unrestricted, so §6.3 Option A's `None` sentinel
+  (doc L421-424) is unavailable without a fresh operator ruling.
