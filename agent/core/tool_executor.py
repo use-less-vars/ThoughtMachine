@@ -160,6 +160,48 @@ def _ensure_gate_imported() -> bool:
 # agent/config/defaults.py so existing importers keep seeing it here).
 from agent.config.defaults import DEFAULT_SESSION_PERMISSIONS
 
+
+def is_interrupted_tool_entry(entry: Any) -> bool:
+    """Report whether an executed tool entry records an interrupted result.
+
+    An interrupted tool result is a CONTROL signal, not an observation: it
+    says the call did not complete because the turn was paused or cancelled.
+    The dispatch loop must recognise it (via this predicate) so the turn can
+    be concluded with Respond instead of feeding the envelope back to the
+    model as if it were an ordinary tool observation.
+
+    Two envelope dialects are accepted:
+
+    * the sleep tool reports ``{"tool": "sleep", "ok": false,
+      "interrupted": true, "reason": "paused" | "turn_cancelled"}`` -- a
+      boolean flag and no ``status`` key at all;
+    * container / DockerCodeRunner calls report ``{"status":
+      "interrupted", "interrupted": true, "exit_code": null}``.
+
+    Args:
+        entry: An entry from ``execute_tool_calls``' returned list. Its
+            ``result`` may be a JSON string (the normal case), an already
+            parsed dict, or absent.
+
+    Returns:
+        True if the entry's result is an interrupted envelope, otherwise
+        False. Malformed input (non-dict entry, missing/unparseable result,
+        non-dict result) is simply not an interruption; this predicate never
+        raises and never mutates its argument.
+    """
+    if not isinstance(entry, dict):
+        return False
+    result = entry.get("result")
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(result, dict):
+        return False
+    return result.get("interrupted") is True or result.get("status") == "interrupted"
+
+
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
 
@@ -362,6 +404,37 @@ class ToolExecutor:
             if 'success' in tool_execution_result:
                 tool_entry['success'] = tool_execution_result['success']
             executed_tools.append(tool_entry)
+            # Pause wind-down: an interrupted tool result is a CONTROL signal,
+            # not an observation.  When the interruption was caused by a pause,
+            # stop running this batch instead of feeding the envelope back to
+            # the model as if it were an ordinary result -- the caller then
+            # lets the model write its own summary.
+            if (is_interrupted_tool_entry(tool_entry)
+                    and getattr(self.state, 'restriction_reason', None) == 'pause'):
+                remaining_content = json.dumps({
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "reason": "paused",
+                    "skipped": True,
+                    "message": "Not run: the session was paused while an earlier tool was executing.",
+                })
+                # One tool result per tool_call id is REQUIRED for pairing: the
+                # provider rejects an assistant tool_calls message whose ids are
+                # not all answered, so the skipped calls are padded (the same
+                # idiom as the stop_check early exit above), never dropped.
+                for tc in tool_calls[_tc_index + 1:]:
+                    add_tool_result({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": remaining_content,
+                    })
+                    executed_tools.append({
+                        "name": tc["function"]["name"],
+                        "arguments": {},
+                        "result": remaining_content,
+                        "tool_call_id": tc.get("id", ""),
+                    })
+                return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
         return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
 
     def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns, session_id: str = "", workspace_id: str = "") -> Dict[str, Any]:

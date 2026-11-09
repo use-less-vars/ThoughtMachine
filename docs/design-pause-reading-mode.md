@@ -337,6 +337,9 @@ while denying it agency.
    (`agent/core/tool_executor.py:272`), so a tool already executing when Pause
    lands runs to completion — a long `DockerCodeRunner` call is not interrupted.
    Pause bounds *further* actions, not the current one.
+
+> **AMENDED — Gen 61.** This section is superseded on two points. (1) Pause now interrupts in-flight waits: the tool-facing binding is `tools.cancellation.bind_pause_event(controller.pause_event)`, a process-wide `threading.Event` shared across the bridge thread and the turn thread (the thread-local `tools.cancellation.interrupt()` cannot cross threads, which is why the event exists). Polarity: CLEARED = running, SET = pause requested. `Sleep` wakes promptly and reports `reason == 'paused'`. (2) What is still NOT interrupted: a process already running inside a container is not killed — `DockerCodeRunner` returns `status: interrupted` with `exit_code: None`, and the process may still be running. The rest of this item stands.
+
 2. **Paused-but-not-parked workers are still "busy", and the bridge filter
    misses them.** `bridge.resume()` only touches workers whose status it reads
    as `"paused"` (`web_ui/backend/bridge.py:1761` —

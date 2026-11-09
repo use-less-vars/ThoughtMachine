@@ -169,7 +169,7 @@ def test_cancelled_exec_still_stops_the_container(monkeypatch, tmp_path):
     # on that path, so a status check is the only thing that separates them.
     assert payload["interrupted"] is True
     # catches: dropping the explicit ``interrupted`` marker (line 469).
-    assert payload["exit_code"] == -3
+    assert payload["exit_code"] is None
     # catches: a cancelled turn being reported with a real exit code (0/-1/-2),
     # which callers would read as success / timeout / failure (line 470).
     assert payload["success"] is False

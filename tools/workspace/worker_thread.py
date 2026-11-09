@@ -875,6 +875,178 @@ def _resolve_worker_thread(
         f"instances ({', '.join(labels)}). Specify instance_id."
     )
 
+
+def _pause_join_target(thread, worker_name: str) -> bool:
+    """Proxy the session main-agent pause onto the ONE worker a join waits on.
+
+    Operator ruling (b): "If Main is paused while waiting on a worker, the
+    worker must be paused."  The scope is deliberately the single worker the
+    caller is ACTIVELY waiting on (the ``join`` / ``wait_for_job`` target, and
+    only that thread) -- async workers the caller is not waiting on keep
+    running, which is what ``want_all`` already controls and what this helper
+    must never touch.
+
+    Idempotent by construction, because ``_action_join`` re-enters this branch
+    on every join call while the pause lasts:
+
+    * ``status == 'paused'``: the worker already parked -- do nothing.
+    * ``_park_event`` already set: ``WorkerThread.pause()`` was already issued
+      for this pause (the event is set synchronously by ``pause()``, the thread
+      status only flips later, at the run loop's next boundary).  Bailing here
+      is what stops a re-park, a fresh cross-process ``pause`` command write
+      and a repeated log line per call.
+    * the worker's own agent already carries a ``'pause'`` restriction:
+      leave it alone (never steal or re-own an existing pause restriction).
+
+    Never sets ``_manual_only_pause``: the proxied pause must stay
+    auto-resumable by the existing paths (``_action_query``'s paused branch,
+    ``_action_spawn``'s sole-paused path, the operator resume route).
+
+    Returns True only when this call actually issued ``thread.pause()``.
+    """
+    if getattr(thread, "status", None) == "paused":
+        return False
+    park = getattr(thread, "_park_event", None)
+    if park is not None and bool(getattr(park, "is_set", lambda: False)()):
+        return False
+    agent = getattr(thread, "_agent", None)
+    state = getattr(agent, "state", None)
+    if state is not None and getattr(state, "restriction_reason", None) == "pause":
+        return False
+    try:
+        thread.pause()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Main-pause proxy: pause failed for worker '%s': %s", worker_name, exc)
+        return False
+    logger.info(
+        "Main-pause proxy: paused worker '%s' (the join target of the paused caller)",
+        worker_name,
+    )
+    return True
+
+
+def _record_proxied_join_target(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: int,
+) -> None:
+    """Remember a worker that ``_pause_join_target`` actually parked for *session_id*.
+
+    This record is the whole safety story for the symmetric unpause (PHASE 2g):
+    ``_resume_proxied_join_targets`` can only ever resume a worker this proxy
+    itself paused -- never one the operator paused -- because only calls that got
+    ``True`` back from :func:`_pause_join_target` are recorded here.
+
+    Idempotent (a set of ``(worker_name, instance_id)`` triples) and defensive:
+    bookkeeping must never break the join that triggered it, so failures are
+    logged and swallowed.
+    """
+    if not session_id:
+        return
+    try:
+        with _PROXIED_JOIN_TARGETS_LOCK:
+            _PROXIED_JOIN_TARGETS.setdefault(session_id, set()).add(
+                (worker_name, int(instance_id))
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Main-pause proxy: could not record paused target '%s': %s",
+            worker_name,
+            exc,
+        )
+
+
+def _resume_proxied_join_targets(session_id: Optional[str]) -> list[str]:
+    """Lift the worker pauses that the session main-pause proxy applied.
+
+    Exact symmetry for :func:`_pause_join_target`: when the session-level "main
+    agent paused" marker is discarded at the start of a new operator turn
+    (``Agent._discard_session_main_pause``), the join targets this process
+    parked on its behalf are resumed as well.  This is strictly the RECORDED
+    targets -- never a sweep of the session's workers -- so a worker the
+    operator paused by hand is not touched here.
+
+    The record is popped before any resume happens (the lock guards the dict
+    mutation only and is never held across ``resume()``), so a failing or slow
+    resume cannot wedge the bookkeeping and a repeat call is a no-op.
+
+    Every target is independent and defensive: a missing/dead/ambiguous worker
+    (``_WorkerAmbiguityError``) is skipped, a killed worker refuses the resume
+    itself (``resume() -> False``), a detached worker is an operator stop and is
+    left alone, and an already-running worker is a silent no-op.  Never raises;
+    returns the worker names actually resumed.
+    """
+    if not session_id:
+        return []
+    with _PROXIED_JOIN_TARGETS_LOCK:
+        targets = _PROXIED_JOIN_TARGETS.pop(session_id, set())
+    resumed: list[str] = []
+    for worker_name, instance_id in sorted(targets):
+        try:
+            thread, _sid, _iid = _resolve_worker_thread(
+                worker_name,
+                instance_id=instance_id,
+                session_id=session_id,
+            )
+        except _WorkerAmbiguityError as exc:
+            logger.info(
+                "Main-pause proxy: leaving worker '%s' instance %s alone: %s",
+                worker_name,
+                instance_id,
+                exc,
+            )
+            continue
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Main-pause proxy: could not resolve worker '%s' to resume it: %s",
+                worker_name,
+                exc,
+            )
+            continue
+        status = getattr(thread, "status", None)
+        park = getattr(thread, "_park_event", None)
+        parked = park is not None and bool(getattr(park, "is_set", lambda: False)())
+        if getattr(thread, "_detach_requested", False) or status in (
+            "detached",
+            "detaching",
+            "killed",
+            "killing",
+        ):
+            logger.info(
+                "Main-pause proxy: not resuming worker '%s' (status=%s)",
+                worker_name,
+                status,
+            )
+            continue
+        if status != "paused" and not parked:
+            logger.info(
+                "Main-pause proxy: worker '%s' is already running; nothing to resume",
+                worker_name,
+            )
+            continue
+        try:
+            if thread.resume():
+                resumed.append(worker_name)
+                logger.info(
+                    "Main-pause proxy: resumed worker '%s' (symmetric unpause of "
+                    "the session main-pause, session '%s')",
+                    worker_name,
+                    session_id,
+                )
+            else:
+                logger.info(
+                    "Main-pause proxy: worker '%s' refused resume (killed); left as is",
+                    worker_name,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Main-pause proxy: resume failed for worker '%s': %s",
+                worker_name,
+                exc,
+            )
+    return resumed
+
+
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
 # ---------------------------------------------------------------------------
@@ -1603,6 +1775,36 @@ class WorkerThread(threading.Thread):
 
     def send_query(self, query: str, timeout: float = 120.0) -> str:
         """Send a query to this worker and block for a response."""
+        # Implicit UNPAUSE: a new query IS the resume.
+        #
+        # Pause is a wind-down, not a latch -- so a query arriving on a
+        # pause-restricted worker must find it RUNNING again *before* the turn
+        # is dispatched, otherwise the model is nudged to conclude a turn it
+        # has only just been asked to start.  A worker has no controller in its
+        # object graph (no pause_event to poke): the signals are this thread's
+        # own agent state plus the two park flags.
+        #
+        # The release is OWNER-SCOPED -- Agent.leave_reading_mode('pause') ->
+        # AgentState.clear_restriction('pause') -- so a 'token'/'timeout'/'turn'
+        # restriction owned by the agent's monitors survives untouched:
+        # clearing it here would let an operator escape a context-window
+        # restriction just by asking another question.  The park flags move to
+        # the running position ONLY on this path; an ordinary query leaves them
+        # exactly as it found them.
+        _qp_agent = getattr(self, "_agent", None)
+        _qp_state = getattr(_qp_agent, "state", None)
+        if _qp_state is not None and getattr(_qp_state, "restriction_reason", None) == "pause":
+            try:
+                _qp_agent.leave_reading_mode("pause")
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"Implicit unpause failed for worker '{self.worker_name}': {exc}")
+            self._park_event.clear()
+            self._resume_event.set()
+            log("DEBUG", "tools.worker",
+                f"Implicit unpause for worker '{self.worker_name}': new query resumes a "
+                f"pause-restricted worker (one query = resume; owner-scoped 'pause' "
+                f"release, park flags -> running)")
         # Workspace Lifecycle Manager fast path (feature-flagged, default off)
         try:
             used, reply = self._process_query_via_wlm(query, timeout=timeout)
@@ -4663,6 +4865,15 @@ class WorkerThread(threading.Thread):
 # their next safe loop boundary via WorkerThread.pause(); no thread is killed.
 _SESSION_MAIN_PAUSED: set[str] = set()
 
+# PHASE 2g: the join targets THIS process's proxy actually parked, per session
+# id: ``{session_id: {(worker_name, instance_id), ...}}``.  Written only where
+# ``_pause_join_target`` returned True and popped (never swept) by
+# ``_resume_proxied_join_targets`` when the session main-pause is discarded, so
+# the symmetric unpause can only ever touch a worker this proxy paused.  The
+# lock guards the dict mutation only -- never held across ``resume()``.
+_PROXIED_JOIN_TARGETS: dict[str, set[tuple[str, int]]] = {}
+_PROXIED_JOIN_TARGETS_LOCK = threading.Lock()
+
 
 # ============================================================================
 # workspace capabilities (CAPABILITIES_AVAILABLE, resolve_workspace_id, _load_template_workers, _workspace_dir)  (moved verbatim from tools.workspace.worker; W4 facade extraction)
@@ -6786,6 +6997,13 @@ class Worker(ToolBase):
             # blocking wait is pointless — return paused promptly. Pause
             # propagates INTO join waits this way.
             if self.session_id and self.session_id in _SESSION_MAIN_PAUSED:
+                # PHASE 2f (operator ruling (b)): Main is paused while waiting
+                # on THIS worker, so this worker is paused too.  Scoped to the
+                # join target only -- async workers the caller is not waiting
+                # on are untouched (that is the ``want_all`` axis, not this
+                # one).  Idempotent; see _pause_join_target.
+                if _pause_join_target(thread, self.worker_name):
+                    _record_proxied_join_target(self.session_id, self.worker_name, iid)
                 return {
                     "worker_name": self.worker_name,
                     "instance_id": iid,

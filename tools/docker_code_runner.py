@@ -467,7 +467,7 @@ chmod +x "{script_path}"
                     "success": False,
                     "status": "interrupted",
                     "interrupted": True,
-                    "exit_code": -3,
+                    "exit_code": None,
                     "reason": result.get("reason"),
                     "stdout": result.get("stdout", "") or "",
                     "stderr": result.get("stderr", "") or "",

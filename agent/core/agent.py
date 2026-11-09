@@ -30,6 +30,7 @@ from llm_providers.exceptions import ProviderError, RateLimitExceeded
 from tools import SIMPLIFIED_TOOL_CLASSES
 from tools.utils import model_to_openai_tool
 from tools.summarize_tool import SummarizeTool
+from tools.cancellation import _active_pause_event
 from agent.core.message import Message, is_system_notice_text, make_system_notice
 from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
@@ -40,7 +41,7 @@ from .token_counter import TokenCounter
 from .llm_client import LLMClient, LLMError
 from .stream_events import Done, Interrupted, ReasoningDelta, TextDelta, ToolCallComplete, UsageUpdate
 from .conversation_manager import ConversationManager
-from .tool_executor import ToolExecutor
+from .tool_executor import ToolExecutor, is_interrupted_tool_entry
 from .turn_transaction import TurnTransaction
 from .debug_context import DebugContext
 from .message_utils import group_messages_into_turns, group_messages_into_turns_with_indices
@@ -420,7 +421,54 @@ def _discard_session_main_pause(session_id: Optional[str], *, worker_mode: bool)
     if not paused or session_id not in paused:
         return False
     paused.discard(session_id)
+    # PHASE 2g (operator ruling): the session pause is over, so the worker
+    # pauses this proxy applied on its behalf must be lifted too.  The marker
+    # could not have been set unless the worker stack was already imported, so
+    # reusing ``module`` here cannot create the agent <-> tools import cycle.
+    # Scoped to the targets this process actually recorded, never a sweep.
+    # Wrapped so a failed resume can never break the operator's turn.
+    resume_proxied = getattr(module, "_resume_proxied_join_targets", None)
+    if resume_proxied is not None:
+        try:
+            resume_proxied(session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log('WARNING', 'core.agent', f'process_query: lifting proxied worker pauses failed: {exc}')
     return True
+
+
+def _pause_aware_sleep(seconds: float) -> bool:
+    """Sleep *seconds* on this thread, waking early when a pause is requested.
+
+    The two rate-limit waits in :meth:`Agent.process_query` block the
+    turn-running thread for up to a minute, and a pause request has no way to
+    reach a thread that is sitting in ``time.sleep``.  The pause signal does
+    reach it as the SHARED ``Event`` the controller owns and
+    ``tools.cancellation.bind_pause_event`` holds a per-thread reference to, so
+    the wait is taken one slice at a time and that event ends it within one
+    slice -- the same plumbing ``Sleep`` uses for a tool call.
+
+    The event is resolved ONCE for the calling thread.  ``None`` (unbound: the
+    worker/direct path, tests) means a plain ``time.sleep`` with no early
+    return, so without a pause binding the behaviour is what it was.  Nothing
+    here sets or clears the event: it belongs to the controller.
+
+    Returns:
+        True when a pause request cut the wait short, False when the full
+        duration elapsed.
+    """
+    pause_event = _active_pause_event()
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # 0.1 s slices bound the pause latency, and each slice is clipped to
+        # what is left so the wait never runs past the deadline.
+        slice_seconds = min(0.1, remaining)
+        if pause_event is None:
+            time.sleep(slice_seconds)
+        elif pause_event.wait(slice_seconds):
+            return True
 
 
 class Agent:
@@ -519,6 +567,9 @@ class Agent:
         self._pause_requested = False
         # Reading mode: at most ONE pause nudge per turn.
         self._pause_nudge_sent = False
+        # Pause wind-down: set while the loop is re-entering so the model can
+        # write its own summary after an interrupted tool batch.
+        self._pause_winddown = False
         # Stop: at most ONE stop notice per turn.
         self._stop_notice_sent = False
         self.rate_limit_delay = 1.0
@@ -1314,6 +1365,8 @@ class Agent:
         if released:
             self._pause_requested = False
             self._pause_nudge_sent = False
+            # The wind-down grant is over the moment the pause is released.
+            self._pause_winddown = False
         pause_debug(f'leave_reading_mode({reason!r}) -> released={released}')
         return released
 
@@ -1462,6 +1515,8 @@ class Agent:
             self._pause_requested = False
             self._pause_nudge_sent = False
             self._stop_notice_sent = False
+            # The wind-down grant is scoped to a single query.
+            self._pause_winddown = False
             current_exec_state = self.state.execution_state
             if current_exec_state == ExecutionState.RUNNING:
                 log('WARNING', 'core.agent', f'process_query called while already in RUNNING state')
@@ -1499,7 +1554,11 @@ class Agent:
                     if turn % 5 == 0:
                         self.logger.log_system_resources()
                 log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start')
-                if self.stop_check and self.stop_check():
+                _winddown = (getattr(self, '_pause_winddown', False)
+                             and getattr(self.state, 'restriction_reason', None) == 'pause')
+                if _winddown:
+                    log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start: waved through -- pause wind-down in progress, stop_check suppressed so the model can write its summary')
+                if not _winddown and self.stop_check and self.stop_check():
                     log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start: DETECTED')
                     events = self.state.set_execution_state(ExecutionState.PAUSING)
                     for event in events:
@@ -1604,7 +1663,9 @@ class Agent:
                     if delay > 0:
                         if self.logger and hasattr(self.logger, 'py_logger'):
                             log('INFO', 'core.agent', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
-                        time.sleep(delay)
+                        # Pause-aware: a pause request ends this wait within one
+                        # slice instead of holding the turn thread for `delay`.
+                        _pause_aware_sleep(delay)
                 tools = self.llm_client.format_tools(self.tool_definitions)
                 # EMERGENCY TRACE: dump conversation and messages before LLM call
                 log('DEBUG', 'core.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
@@ -1640,6 +1701,8 @@ class Agent:
                     output_tokens = 0
                     final_pending = False
                     halted = False
+                    # Per-turn tool observations; empty on a tool-less turn.
+                    executed_tools: list = []
                     stream_agen = self.llm_client.stream_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
                     for stream_event in _iter_stream_events(stream_agen):
                         # In-stream HARD STOP interception. A cooperative pause is
@@ -1860,7 +1923,10 @@ class Agent:
                     event_dict = {'type': 'rate_limit_warning', 'message': f'Rate limit exceeded. Waiting {wait_time}s before retrying. Delay between turns: {self.rate_limit_delay}s', 'wait_time': wait_time, 'turn_delay': self.rate_limit_delay, 'rate_limit_count': self.rate_limit_count, 'turn': self._display_turn}
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
-                    time.sleep(wait_time)
+                    # Only the WAIT is pause-aware: the event / notification
+                    # sequence below is unchanged, it just stops waiting out the
+                    # full backoff once a pause has been requested.
+                    _pause_aware_sleep(wait_time)
                     if self.session is not None:
                         self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts', is_system_notification=True))
                     stop_reason_event = {'type': 'stop_reason', 'stop_reason': 'rate_limit', 'message': f'Rate limit exceeded after {self.rate_limit_count} attempts', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
@@ -2068,6 +2134,22 @@ class Agent:
                 for warning in self._pending_warnings:
                     self._add_to_conversation(warning)
                 self._pending_warnings.clear()
+                # ── PAUSE WIND-DOWN GATE ──────────────────────────────────
+                # An interrupted tool batch is a CONTROL signal (see
+                # ToolExecutor.is_interrupted_tool_entry): the model must read
+                # the interrupted results plus the pause notice flushed above
+                # and write its OWN summary, ending the turn when it calls
+                # Respond -- never be handed a hardcoded terminal with empty
+                # content.  Everything that had to be persisted or yielded
+                # (turn_transaction.commit(), the tool_call/tool_result events,
+                # the notice flush) is already behind us, so continuing the
+                # loop here is safe.
+                if (tool_calls
+                        and any(is_interrupted_tool_entry(entry) for entry in executed_tools)
+                        and getattr(self.state, 'restriction_reason', None) == 'pause'):
+                    self._pause_winddown = True
+                    log('DEBUG', 'core.pause', f'PAUSE WIND-DOWN: interrupted tool batch in turn {turn}; continuing the loop so the model writes the summary')
+                    continue
                 if not tool_calls:
                     log('DEBUG', 'core.agent', f'No tool calls in turn {turn}, committing directly and yielding final')
                     if turn_transaction and turn_transaction.has_assistant_message():

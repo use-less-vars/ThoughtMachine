@@ -13,6 +13,11 @@ Cancellation plumbing that exists today
   a single in-flight ``execute()`` is never interrupted.
 * ``agent/config/models.py`` *strips* ``stop_check`` from serialisation, so it
   does not reach tools inside ``agent_config`` either.
+* PAUSE is a second, independent signal and it travels differently: it is
+  published to the executing thread by ``bind_pause_event`` as a reference to
+  the SAME shared ``Event`` the controller owns (normal cancel polarity, so
+  ``Event.wait()``'s return already means "interrupted").  ``Sleep`` reports
+  ``reason == 'paused'`` for it so the window can tell a pause from a Stop.
 
 Therefore the cancellation token is a per-worker ``threading.Event`` owned by
 ``WorkerThread`` (``_turn_cancel``) and bound to the *executing thread* here by
@@ -50,10 +55,12 @@ SLICE_SECONDS: float = 0.1
 from .cancellation import (  # noqa: F401  (re-exported public API)
     _active_event,
     _tls,
+    bind_pause_event,
     bind_turn_cancel,
     cancel_reason,
     interrupt,
     is_interrupted,
+    pause_requested,
     reset,
     unbind,
 )
@@ -168,11 +175,23 @@ class Sleep(ToolBase):
         else:
             cancel_event = bound
 
+        # The pause signal is a SEPARATE shared ``Event`` the controller owns
+        # (normal cancel polarity: set = pause requested).  Resolved once here,
+        # exactly like the turn token; ``None`` means no pause binding exists
+        # and this whole branch is inert.
+        pause_event = getattr(_tls, "pause_event", None)
+
         deadline = started + requested
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+            # Pause first: it is a request to wind down, not a cancel, and the
+            # UI distinguishes them by ``reason``.
+            if pause_event is not None and pause_event.is_set():
+                return self._envelope(
+                    False, True, time.monotonic() - started, requested, "paused",
+                )
             # Event.wait() -- not time.sleep() -- so a cancel wakes the slice
             # immediately instead of finishing it.
             if cancel_event.wait(min(SLICE_SECONDS, remaining)):
