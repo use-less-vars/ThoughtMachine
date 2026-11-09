@@ -23,6 +23,8 @@ class ExecutionState(enum.Enum):
     """Unified execution state for agent and GUI."""
     RUNNING = 'running'
     PAUSING = 'pausing'
+    PAUSED = 'paused'
+    STOPPED = 'stopped'
     READY = 'ready'
 
 class TimeState(enum.Enum):

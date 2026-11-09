@@ -408,6 +408,23 @@ class AgentController:
             return False
         return getattr(getattr(agent, 'state', None), 'restriction_reason', None) == 'pause'
 
+    def _set_execution_state(self, new_state: ExecutionState) -> Optional[ExecutionState]:
+        """Route a run-state write through ``AgentState.set_execution_state``.
+
+        Every controller-side transition goes through the setter so the logger
+        is notified and an ``execution_state_change`` event reaches the UI.
+        Returns the previous state, or ``None`` when there is no agent yet.
+        """
+        agent = self.agent
+        state = getattr(agent, 'state', None) if agent is not None else None
+        if state is None:
+            return None
+        old_state = state.execution_state
+        for event in state.set_execution_state(new_state):
+            self._emit_event(event)
+        log('DEBUG', 'core.controller', f'Execution state {old_state.value} -> {new_state.value} (via set_execution_state)')
+        return old_state
+
     def request_pause(self):
         """Request agent to pause after current turn.
 
@@ -422,28 +439,22 @@ class AgentController:
             log('DEBUG', 'core.controller', f'Agent processing query, calling pause()')
             self.pause()
             # ── PAUSING state set immediately (processing branch) ──
+            # pause() above has already emitted running -> pausing through the
+            # setter; this guard only re-asserts it if the state is still RUNNING.
             if self.agent is not None and self.agent.state.execution_state == ExecutionState.RUNNING:
-                self.agent.state.execution_state = ExecutionState.PAUSING
-                self._emit_event({
-                    'type': 'execution_state_change',
-                    'old_state': 'running',
-                    'new_state': 'pausing',
-                })
+                self._set_execution_state(ExecutionState.PAUSING)
                 log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request (processing)')
         else:
             log('DEBUG', 'core.controller', f'Agent idle (not processing query); setting PAUSING state then emitting session_stop')
             self.pause_event.clear()
             self._pause_requested = True
-            # ── PAUSING state set immediately (idle branch) ──
+            # ── PAUSING then PAUSED, both through the setter (idle branch) ──
             if self.agent is not None:
-                old_state = self.agent.state.execution_state.value
-                self.agent.state.execution_state = ExecutionState.PAUSING
-                self._emit_event({
-                    'type': 'execution_state_change',
-                    'old_state': old_state,
-                    'new_state': 'pausing',
-                })
+                self._set_execution_state(ExecutionState.PAUSING)
                 log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request (idle)')
+                # Nothing is in flight in this branch, so the wind-down is
+                # already complete: settle on PAUSED.
+                self._set_execution_state(ExecutionState.PAUSED)
             # Reading mode: the agent concludes whatever it is doing and takes
             # no new action. PAUSING above is the session-level 'no new turns'
             # signal for the UI -- it does not mean 'abort the running turn'.
@@ -538,16 +549,12 @@ class AgentController:
         log('DEBUG', 'core.controller', f'pause() called, clearing pause_event, setting _pause_requested=True')
         self.pause_event.clear()
         self._pause_requested = True
-        # ── PAUSING state set immediately so GUI shows feedback ──
-        if self.agent is not None:
-            old_state = self.agent.state.execution_state.value
-            self.agent.state.execution_state = ExecutionState.PAUSING
-            self._emit_event({
-                'type': 'execution_state_change',
-                'old_state': old_state,
-                'new_state': 'pausing',
-            })
-            log('DEBUG', 'core.pause', f'PAUSE REQUESTED by user (state before: {old_state}), execution_state_change emitted')
+        # ── RUNNING -> PAUSING set immediately so GUI shows feedback; the write
+        # goes through set_execution_state so the transition is logged and the
+        # flat execution_state_change event is emitted. ──
+        old_state = self._set_execution_state(ExecutionState.PAUSING)
+        if old_state is not None:
+            log('DEBUG', 'core.pause', f'PAUSE REQUESTED by user (state before: {old_state.value}), execution_state_change emitted')
         # Reading mode: conclude the current turn, refuse further tool calls.
         self._agent_enter_reading_mode('pause')
         if hasattr(self, 'agent') and self.agent is not None:
@@ -557,6 +564,11 @@ class AgentController:
                 self.agent.conversation = ContextBuilder._cleanup_orphaned_tool_messages(self.agent.conversation)
                 if original_len != len(self.agent.conversation):
                     log('WARNING', 'core.controller', f'Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on pause')
+        # ── PAUSING -> PAUSED: with no turn in flight there is nothing to wind
+        # down, so the agent is parked already. A turn that *is* in flight lands
+        # on PAUSED when it finishes (the _run() finally block). ──
+        if not self._processing_query:
+            self._set_execution_state(ExecutionState.PAUSED)
 
     def resume(self):
         """Resume a paused agent."""
@@ -810,12 +822,15 @@ class AgentController:
                     # the next query is not truncated immediately.
                     self.halt_event.clear()
                     self._processing_query = False
-                    # Reset agent's internal execution state to READY so the next query
-                    # triggers a proper ready→running transition.
+                    # Settle the RUN axis: a pause that is still in force parks the
+                    # agent on PAUSED (the wind-down has just completed); otherwise
+                    # READY, so the next query triggers a proper ready→running
+                    # transition.
                     if hasattr(self, 'agent') and self.agent is not None:
-                        self.agent.state.set_execution_state(ExecutionState.READY)
+                        settled = ExecutionState.READY if self.pause_event.is_set() else ExecutionState.PAUSED
+                        self._set_execution_state(settled)
                         log('INFO', 'core.controller',
-                            f'Query finished. Agent state reset to READY. '
+                            f'Query finished. Agent state settled to {settled.value}. '
                             f'_keep_alive={self._keep_alive} | '
                             f'_running={self._running} | '
                             f'thread alive={self.thread.is_alive() if self.thread else False} | '
