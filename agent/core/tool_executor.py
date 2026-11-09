@@ -160,6 +160,48 @@ def _ensure_gate_imported() -> bool:
 # agent/config/defaults.py so existing importers keep seeing it here).
 from agent.config.defaults import DEFAULT_SESSION_PERMISSIONS
 
+
+def is_interrupted_tool_entry(entry: Any) -> bool:
+    """Report whether an executed tool entry records an interrupted result.
+
+    An interrupted tool result is a CONTROL signal, not an observation: it
+    says the call did not complete because the turn was paused or cancelled.
+    The dispatch loop must recognise it (via this predicate) so the turn can
+    be concluded with Respond instead of feeding the envelope back to the
+    model as if it were an ordinary tool observation.
+
+    Two envelope dialects are accepted:
+
+    * the sleep tool reports ``{"tool": "sleep", "ok": false,
+      "interrupted": true, "reason": "paused" | "turn_cancelled"}`` -- a
+      boolean flag and no ``status`` key at all;
+    * container / DockerCodeRunner calls report ``{"status":
+      "interrupted", "interrupted": true, "exit_code": null}``.
+
+    Args:
+        entry: An entry from ``execute_tool_calls``' returned list. Its
+            ``result`` may be a JSON string (the normal case), an already
+            parsed dict, or absent.
+
+    Returns:
+        True if the entry's result is an interrupted envelope, otherwise
+        False. Malformed input (non-dict entry, missing/unparseable result,
+        non-dict result) is simply not an interruption; this predicate never
+        raises and never mutates its argument.
+    """
+    if not isinstance(entry, dict):
+        return False
+    result = entry.get("result")
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(result, dict):
+        return False
+    return result.get("interrupted") is True or result.get("status") == "interrupted"
+
+
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
 
