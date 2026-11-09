@@ -670,3 +670,58 @@ def test_ws_close_session_idle_state_changed(contract_server):
         f"close_session state_changed.is_running must be EXACTLY False "
         f"(got {evt.get('is_running')!r})"
     )
+
+
+def test_session_loaded_payload_carries_mapped_state_key():
+    """``session_loaded`` exposes the mapped execution state as a TOP-LEVEL key.
+
+    The frontend needs the initial execution state at load time; the bridge must
+    therefore carry the *mapped* frontend token (``PAUSED`` for the controller's
+    ``ExecutionState.PAUSED``) in the ``session_loaded`` payload itself, not only
+    in later ``state_changed`` events.
+    """
+    from agent.core.state import ExecutionState
+    from session.models import Session
+
+    events = []
+    bridge = _make_bridge(events, exec_state=ExecutionState.PAUSED)
+
+    session_id = "session-loaded-state-key"
+    bridge._session_store.save_session(Session.from_persistable_dict({
+        "session_id": session_id,
+        "metadata": {"name": "State Key"},
+        "user_history": [],
+    }))
+
+    assert bridge.load_session(session_id) is True
+
+    loaded = [e for e in events if e.get("type") == "session_loaded"]
+    assert len(loaded) == 1, f"expected exactly one session_loaded, got {loaded!r}"
+
+    # Events are FLAT dicts -- there is no "payload"/"data" wrapper, so the
+    # state key sits at the top level of the very dict we matched on.
+    payload = loaded[0]
+    assert "state" in payload, f"session_loaded lacks a top-level 'state': {payload!r}"
+    assert payload["state"] == "PAUSED", payload["state"]
+
+    # And the value must NEVER be None: a present-but-None ``state`` makes the
+    # server-side debug log slice it (event.get("state", ...)[:60]), which
+    # raises TypeError and silently DROPS the whole session_loaded frame.  A
+    # controller-less bridge must still emit a usable frontend token.
+    bare_events = []
+    bare_bridge = _make_bridge(bare_events)
+    bare_sid = "session-loaded-state-key-no-controller"
+    bare_bridge._session_store.save_session(Session.from_persistable_dict({
+        "session_id": bare_sid,
+        "metadata": {"name": "No Controller"},
+        "user_history": [],
+    }))
+    assert bare_bridge.load_session(bare_sid) is True
+
+    bare_loaded = [e for e in bare_events if e.get("type") == "session_loaded"]
+    assert len(bare_loaded) == 1, f"expected one session_loaded, got {bare_loaded!r}"
+    assert "state" in bare_loaded[0], bare_loaded[0]
+    assert isinstance(bare_loaded[0]["state"], str), bare_loaded[0]["state"]
+    assert bare_loaded[0]["state"] in {
+        "IDLE", "RUNNING", "PAUSED", "PAUSING", "STOPPED"
+    }, bare_loaded[0]["state"]
