@@ -407,4 +407,5 @@ web_ui/frontend/.npmrc
 # catch-all, so the negation is required or the file is never versioned and
 # vanishes on the next clone.
 !docs/CONTROL_PLANE.md
+!docs/history-worker-control.md
 
