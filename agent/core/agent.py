@@ -1689,6 +1689,8 @@ class Agent:
                     output_tokens = 0
                     final_pending = False
                     halted = False
+                    # Per-turn tool observations; empty on a tool-less turn.
+                    executed_tools: list = []
                     stream_agen = self.llm_client.stream_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
                     for stream_event in _iter_stream_events(stream_agen):
                         # In-stream HARD STOP interception. A cooperative pause is
@@ -2130,7 +2132,8 @@ class Agent:
                 # (turn_transaction.commit(), the tool_call/tool_result events,
                 # the notice flush) is already behind us, so continuing the
                 # loop here is safe.
-                if (any(is_interrupted_tool_entry(entry) for entry in executed_tools)
+                if (tool_calls
+                        and any(is_interrupted_tool_entry(entry) for entry in executed_tools)
                         and getattr(self.state, 'restriction_reason', None) == 'pause'):
                     self._pause_winddown = True
                     log('DEBUG', 'core.pause', f'PAUSE WIND-DOWN: interrupted tool batch in turn {turn}; continuing the loop so the model writes the summary')
