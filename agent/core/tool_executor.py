@@ -404,6 +404,37 @@ class ToolExecutor:
             if 'success' in tool_execution_result:
                 tool_entry['success'] = tool_execution_result['success']
             executed_tools.append(tool_entry)
+            # Pause wind-down: an interrupted tool result is a CONTROL signal,
+            # not an observation.  When the interruption was caused by a pause,
+            # stop running this batch instead of feeding the envelope back to
+            # the model as if it were an ordinary result -- the caller then
+            # lets the model write its own summary.
+            if (is_interrupted_tool_entry(tool_entry)
+                    and getattr(self.state, 'restriction_reason', None) == 'pause'):
+                remaining_content = json.dumps({
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "reason": "paused",
+                    "skipped": True,
+                    "message": "Not run: the session was paused while an earlier tool was executing.",
+                })
+                # One tool result per tool_call id is REQUIRED for pairing: the
+                # provider rejects an assistant tool_calls message whose ids are
+                # not all answered, so the skipped calls are padded (the same
+                # idiom as the stop_check early exit above), never dropped.
+                for tc in tool_calls[_tc_index + 1:]:
+                    add_tool_result({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": remaining_content,
+                    })
+                    executed_tools.append({
+                        "name": tc["function"]["name"],
+                        "arguments": {},
+                        "result": remaining_content,
+                        "tool_call_id": tc.get("id", ""),
+                    })
+                return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
         return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
 
     def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns, session_id: str = "", workspace_id: str = "") -> Dict[str, Any]:

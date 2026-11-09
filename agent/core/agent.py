@@ -41,7 +41,7 @@ from .token_counter import TokenCounter
 from .llm_client import LLMClient, LLMError
 from .stream_events import Done, Interrupted, ReasoningDelta, TextDelta, ToolCallComplete, UsageUpdate
 from .conversation_manager import ConversationManager
-from .tool_executor import ToolExecutor
+from .tool_executor import ToolExecutor, is_interrupted_tool_entry
 from .turn_transaction import TurnTransaction
 from .debug_context import DebugContext
 from .message_utils import group_messages_into_turns, group_messages_into_turns_with_indices
@@ -555,6 +555,9 @@ class Agent:
         self._pause_requested = False
         # Reading mode: at most ONE pause nudge per turn.
         self._pause_nudge_sent = False
+        # Pause wind-down: set while the loop is re-entering so the model can
+        # write its own summary after an interrupted tool batch.
+        self._pause_winddown = False
         # Stop: at most ONE stop notice per turn.
         self._stop_notice_sent = False
         self.rate_limit_delay = 1.0
@@ -1350,6 +1353,8 @@ class Agent:
         if released:
             self._pause_requested = False
             self._pause_nudge_sent = False
+            # The wind-down grant is over the moment the pause is released.
+            self._pause_winddown = False
         pause_debug(f'leave_reading_mode({reason!r}) -> released={released}')
         return released
 
@@ -1498,6 +1503,8 @@ class Agent:
             self._pause_requested = False
             self._pause_nudge_sent = False
             self._stop_notice_sent = False
+            # The wind-down grant is scoped to a single query.
+            self._pause_winddown = False
             current_exec_state = self.state.execution_state
             if current_exec_state == ExecutionState.RUNNING:
                 log('WARNING', 'core.agent', f'process_query called while already in RUNNING state')
@@ -1535,7 +1542,11 @@ class Agent:
                     if turn % 5 == 0:
                         self.logger.log_system_resources()
                 log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start')
-                if self.stop_check and self.stop_check():
+                _winddown = (getattr(self, '_pause_winddown', False)
+                             and getattr(self.state, 'restriction_reason', None) == 'pause')
+                if _winddown:
+                    log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start: waved through -- pause wind-down in progress, stop_check suppressed so the model can write its summary')
+                if not _winddown and self.stop_check and self.stop_check():
                     log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start: DETECTED')
                     events = self.state.set_execution_state(ExecutionState.PAUSING)
                     for event in events:
@@ -2109,6 +2120,21 @@ class Agent:
                 for warning in self._pending_warnings:
                     self._add_to_conversation(warning)
                 self._pending_warnings.clear()
+                # ── PAUSE WIND-DOWN GATE ──────────────────────────────────
+                # An interrupted tool batch is a CONTROL signal (see
+                # ToolExecutor.is_interrupted_tool_entry): the model must read
+                # the interrupted results plus the pause notice flushed above
+                # and write its OWN summary, ending the turn when it calls
+                # Respond -- never be handed a hardcoded terminal with empty
+                # content.  Everything that had to be persisted or yielded
+                # (turn_transaction.commit(), the tool_call/tool_result events,
+                # the notice flush) is already behind us, so continuing the
+                # loop here is safe.
+                if (any(is_interrupted_tool_entry(entry) for entry in executed_tools)
+                        and getattr(self.state, 'restriction_reason', None) == 'pause'):
+                    self._pause_winddown = True
+                    log('DEBUG', 'core.pause', f'PAUSE WIND-DOWN: interrupted tool batch in turn {turn}; continuing the loop so the model writes the summary')
+                    continue
                 if not tool_calls:
                     log('DEBUG', 'core.agent', f'No tool calls in turn {turn}, committing directly and yielding final')
                     if turn_transaction and turn_transaction.has_assistant_message():
