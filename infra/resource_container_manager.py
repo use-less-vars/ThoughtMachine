@@ -1592,15 +1592,19 @@ class ResourceContainerManager:
         # killable handle, so the payload reports that we stopped WAITING on a
         # command that may still be running inside an untouched container.
         _WAIT_SLICE_SECONDS = 0.5
-        try:  # per-thread turn token; a no-op when nothing is bound
+        try:  # per-thread turn token / pause reference; no-ops when nothing is bound
             from tools.cancellation import cancel_reason as _cancel_reason
             from tools.cancellation import is_interrupted as _is_interrupted
+            from tools.cancellation import pause_requested as _pause_requested
         except Exception:  # pragma: no cover - tools package is a hard dep
             def _is_interrupted():
                 return False
 
             def _cancel_reason():
                 return None
+
+            def _pause_requested():
+                return False
 
         def _interrupt_reason():
             """Why this turn was cancelled: thread-local reason first, then the event's."""
@@ -1613,6 +1617,28 @@ class ResourceContainerManager:
             except Exception:  # pragma: no cover - defensive
                 return "turn_cancelled"
 
+        def _interrupted_payload(reason, why):
+            """The ONE interrupted return shape: cancel and pause agree on it."""
+            return {
+                "status": "interrupted",
+                "interrupted": True,
+                "reason": reason,
+                "exec": "container_exec",
+                "container_id": container_id,
+                "command": " ".join(cmd),
+                "elapsed": round(time.monotonic() - _wait_started, 3),
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "container_killed": False,
+                "container_removed": False,
+                "note": (
+                    f"Stopped WAITING for the {self.RESOURCE_KIND} command {why}. "
+                    "The container was NOT killed and NOT removed; the command "
+                    "may still be running inside it."
+                ),
+            }
+
         _wait_started = time.monotonic()
         _deadline = _wait_started + timeout
         while thread.is_alive():
@@ -1620,26 +1646,18 @@ class ResourceContainerManager:
             if not thread.is_alive():
                 break
             if _is_interrupted():
-                return {
-                    "status": "interrupted",
-                    "interrupted": True,
-                    "reason": _interrupt_reason(),
-                    "exec": "container_exec",
-                    "container_id": container_id,
-                    "command": " ".join(cmd),
-                    "elapsed": round(time.monotonic() - _wait_started, 3),
-                    "exit_code": None,
-                    "stdout": "",
-                    "stderr": "",
-                    "container_killed": False,
-                    "container_removed": False,
-                    "note": (
-                        f"Stopped WAITING for the {self.RESOURCE_KIND} command "
-                        "because the turn was cancelled. The container was NOT "
-                        "killed and NOT removed; the command may still be "
-                        "running inside it."
-                    ),
-                }
+                return _interrupted_payload(
+                    _interrupt_reason(), "because the turn was cancelled"
+                )
+            if _pause_requested():
+                # A pause is NOT a cancel: the worker's pause is cooperative and
+                # its turn is supposed to conclude.  But a tool blocked here
+                # would sit out the WHOLE timeout first, so the conclusion never
+                # starts.  Abandon the WAIT for the same payload the cancel path
+                # returns, with its own reason so callers/tests can tell the two
+                # apart.  This container is a persistent sandbox: it stays
+                # untouched, exactly as the cancel path leaves it.
+                return _interrupted_payload("paused", "because the worker was paused")
             if time.monotonic() >= _deadline:
                 break
 

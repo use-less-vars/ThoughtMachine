@@ -2580,15 +2580,19 @@ class ContainerManager:
         # in-container pid) and signalled explicitly -- future work, not this
         # layer's business.
         _WAIT_SLICE_SECONDS = 0.5
-        try:  # per-thread turn token; a no-op when nothing is bound
+        try:  # per-thread turn token / pause reference; no-ops when nothing is bound
             from tools.cancellation import cancel_reason as _cancel_reason
             from tools.cancellation import is_interrupted as _is_interrupted
+            from tools.cancellation import pause_requested as _pause_requested
         except Exception:  # pragma: no cover - tools package is a hard dep
             def _is_interrupted():
                 return False
 
             def _cancel_reason():
                 return None
+
+            def _pause_requested():
+                return False
 
         def _interrupt_reason():
             """Why this turn was cancelled: thread-local reason first, then the event's."""
@@ -2601,6 +2605,22 @@ class ContainerManager:
             except Exception:  # pragma: no cover - defensive
                 return "turn_cancelled"
 
+        def _interrupted_payload(reason, note):
+            """The ONE interrupted return shape: cancel and pause agree on it."""
+            return {
+                "status": "interrupted",
+                "interrupted": True,
+                "reason": reason,
+                "exec": "container_exec",
+                "container_id": container_id,
+                "command": command,
+                "elapsed": round(time.monotonic() - _wait_started, 3),
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "note": note,
+            }
+
         _wait_started = time.monotonic()
         _deadline = _wait_started + timeout
         while thread.is_alive():
@@ -2608,24 +2628,27 @@ class ContainerManager:
             if not thread.is_alive():
                 break
             if _is_interrupted():
-                return {
-                    "status": "interrupted",
-                    "interrupted": True,
-                    "reason": _interrupt_reason(),
-                    "exec": "container_exec",
-                    "container_id": container_id,
-                    "command": command,
-                    "elapsed": round(time.monotonic() - _wait_started, 3),
-                    "exit_code": None,
-                    "stdout": "",
-                    "stderr": "",
-                    "note": (
-                        "Stopped WAITING because the turn was cancelled. The "
-                        "process inside the container was NOT killed and may "
-                        "still be running: interrupting the wait cannot kill a "
-                        "process that was never launched as a killable handle."
-                    ),
-                }
+                return _interrupted_payload(
+                    _interrupt_reason(),
+                    "Stopped WAITING because the turn was cancelled. The "
+                    "process inside the container was NOT killed and may "
+                    "still be running: interrupting the wait cannot kill a "
+                    "process that was never launched as a killable handle.",
+                )
+            if _pause_requested():
+                # A pause is NOT a cancel: the worker's pause is cooperative and
+                # its turn is supposed to conclude.  But a tool blocked here
+                # would sit out the WHOLE timeout first, so the conclusion never
+                # starts.  Abandon the WAIT for the same payload the cancel path
+                # returns, with its own reason so callers/tests can tell the two
+                # apart.  The in-container process is still not killed.
+                return _interrupted_payload(
+                    "paused",
+                    "Stopped WAITING because the worker was paused. The "
+                    "process inside the container was NOT killed and may "
+                    "still be running: interrupting the wait cannot kill a "
+                    "process that was never launched as a killable handle.",
+                )
             if time.monotonic() >= _deadline:
                 break
 
