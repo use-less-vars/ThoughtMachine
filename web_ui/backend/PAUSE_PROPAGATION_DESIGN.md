@@ -1,5 +1,14 @@
 # Pause Propagation: Main Agent → Workers
 
+## STATUS: PARTIALLY SUPERSEDED (Gen 61)
+
+- **Stop is a HARD ABORT, not "finish current turn"** (operator Ruling 1). Stop discards the partial assistant message and must **not** fabricate a `kind='stop_notice'` resume notice ("You were stopped by the user. Review your current progress and resume."). The code as it stands still commits the partial message and injects that notice around the stop branch in `agent/core/agent.py`; that gap is filed as a defect, not fixed here.
+- **Pause is PROCESS-WIDE / SESSION-WIDE** (operator Ruling 2), not a per-agent or per-turn property. It lives in a central registry in the session manager and is checked by `ToolExecutor` at dispatch. Per-agent pause, per-turn pause, and copy-on-spawn propagation are **not** the contract; nothing below should be read as designing them.
+- **This document's pause design predates reading mode.** Pause is now `AgentState.restrict('pause')`, which narrows the allow-list to `['Respond']`. The turn is never truncated.
+- **Authoritative doc:** `docs/CONTROL_PLANE.md`, branch `docs/gen61-control-plane-semantics`, commit `7c97ce89` — not merged to `dev`. Its sections 3, 4, 6 and 9 prevail over this document wherever they disagree.
+
+---
+
 ## Goal
 
 When the user clicks "Pause" on the main agent, all running workers should also be paused (soft stop — finish current turn, then pause). Workers should show a **"paused"** status separately from "completed" or "error", so the user knows the worker can be resumed later.
@@ -303,6 +312,12 @@ Workers in `"paused"` state can be resumed:
 - **Pause**: Soft stop — finish current turn, preserve context, show as paused
 - **Stop**: Hard stop — finish current turn, preserve context, show as completed
 
+**Resolved (Gen 61, operator Ruling 1):** the `- **Stop**` line above is wrong. Stop is a **hard
+abort** at both levels — it does not finish the turn. The main agent's Stop must discard its own
+partial assistant message and must not fabricate a `kind='stop_notice'` resume notice. Worker stop
+already behaves correctly (it parks the turn and journals the abandonment reason), so that is the
+reference behaviour to copy, not a second design to write.
+
 ### What about workers that are "ready" (idle) when pause is triggered?
 
 Idle workers should also transition to `"paused"`. Since they're not actively processing, the transition is instantaneous:
@@ -354,3 +369,5 @@ Total: **~2 hours**
 3. **Agent restart?** If the main agent is paused and then the user closes the browser, should workers be stopped (not left paused)? Recommendation: yes — treat browser disconnect as session end, which already triggers `shutdown_workers()`.
 
 4. **Race condition?** What if the pause command file is written just as the worker finishes its last turn naturally? The worker would see `"paused"` status, then the `run()` loop's else block would try to set `"completed"` — but the `if self.status != "paused"` guard prevents that. Safe.
+
+5. **Deferred — where must pause state live, and which fail-open edges remain?** Both are now tracked in `docs/CONTROL_PLANE.md` sections 6 and 9. Do not answer them here; this document must not become a second source of truth.

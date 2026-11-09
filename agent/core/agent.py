@@ -1286,6 +1286,7 @@ class Agent:
         call changed the restriction, False when 'pause' was already in force.
         """
         changed = self.state.restrict(reason)
+        log('INFO', '[CONTROL_PLANE_PAUSE]', f'event=enter_reading_mode reason={reason} session_id={self.session_id} state_id={id(self.state)}')
         self._pause_requested = True
         pause_debug(f'enter_reading_mode({reason!r}) -> changed={changed}')
         return changed

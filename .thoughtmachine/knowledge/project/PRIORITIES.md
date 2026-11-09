@@ -97,6 +97,27 @@ different file, different name. Never rename one to the other.
   work be detected/preserved before teardown; should a timeout instead be
   surfaced to the model as a retryable condition rather than a hard failure.
 
+- **C22: `ToolExecutor` is constructed with `state=None`, and the dispatch gate has no `None` guard.** **Open.**
+  Filed by Gen 61 (dispatch 13) under the operator's Ruling 4: file it, do not fix it on
+  the instrumentation branch. Found while instrumenting the control plane, not while
+  looking for it. Construction sites are `agent/core/agent.py:497` (patched `ToolExecutor`
+  wired at `:531`) and `agent/core/agent.py:802` (patched at `:807`) — snapshot
+  `verified at dev@1fe89e70`, i.e. a dated stamp, not a stable address.
+  **Consequence.** Any tool dispatch landing inside either window reaches
+  `if not self.state.is_tool_allowed(tool_name)` with `self.state is None` and raises
+  `AttributeError: 'NoneType' object has no attribute 'is_tool_allowed'`. That is a crash,
+  not a clean refusal — and **not** a silent allow.
+  **Why it matters past the crash.** The gate cannot tell "no state yet" from "state says
+  allowed", so any future `None`-tolerant variant of that check is fail-open by
+  construction — the same class as the `getattr(..., default)` fail-open recorded in
+  `docs/CONTROL_PLANE.md` 6.2. Crash is the safe failure; a fix must not trade it for a
+  permissive one.
+  **Fix direction: deliberately NOT decided.** The dispatch that owns it must choose between
+  passing a real `AgentState` at construction (closing the window) and failing closed on
+  `None` with an explicit refusal (making the window loud). Deciding here would prejudge
+  that design pass.
+  **Numbering.** C22 was assigned by operator ruling; C15–C21 are unused.
+
 ---
 
 ## Archived (pre-Gen 42 brain dump — do not read as current work)
