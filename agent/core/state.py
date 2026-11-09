@@ -416,6 +416,15 @@ class AgentState:
         self.restrictions_active = True
         self.restrictions_pending = False
         self.restriction_reason = reason
+        # Control-plane instrumentation (Gen 61 dispatch 13). Diagnostic only:
+        # logged so the mutation site's state identity can be compared with the
+        # identity seen by ToolExecutor's dispatch gate. Removed once the
+        # propagation question is answered. AgentState carries no session id;
+        # the join key is the id() stamped here.
+        log('INFO', '[CONTROL_PLANE_STATE]',
+            f'event=restriction-set reason={reason} state_id={id(self)} '
+            f'restrictions_active={self.restrictions_active} '
+            f'restriction_reason={self.restriction_reason}')
         return not already
 
     def clear_restriction(self, reason: Optional[str] = None) -> bool:

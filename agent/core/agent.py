@@ -945,7 +945,13 @@ class Agent:
             # Rebuild tool_classes and tool_definitions
             self.tool_classes = new_config.get_filtered_tool_classes()
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
+            _cp_state_before = getattr(self, 'state', None)
+            _cp_exec_state_before = getattr(getattr(self, 'tool_executor', None), 'state', None)
+            log('INFO', '[CONTROL_PLANE_RESTART]', f'phase=before state_id={id(_cp_state_before) if _cp_state_before is not None else None} executor_state_id={id(_cp_exec_state_before) if _cp_exec_state_before is not None else None} same_object={_cp_exec_state_before is _cp_state_before}')
             self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self, event_bus=old_event_bus or global_event_bus, is_worker_context=new_config.worker_mode)
+            _cp_state_after = getattr(self, 'state', None)
+            _cp_exec_state_after = getattr(getattr(self, 'tool_executor', None), 'state', None)
+            log('INFO', '[CONTROL_PLANE_RESTART]', f'phase=after state_id={id(_cp_state_after) if _cp_state_after is not None else None} executor_state_id={id(_cp_exec_state_after) if _cp_exec_state_after is not None else None} same_object={_cp_exec_state_after is _cp_state_after}')
 
             # Rebuild context builder
             self.context_builder = self.llm_client.create_context_builder()
@@ -1286,6 +1292,7 @@ class Agent:
         call changed the restriction, False when 'pause' was already in force.
         """
         changed = self.state.restrict(reason)
+        log('INFO', '[CONTROL_PLANE_PAUSE]', f'event=enter_reading_mode reason={reason} session_id={self.session_id} state_id={id(self.state)}')
         self._pause_requested = True
         pause_debug(f'enter_reading_mode({reason!r}) -> changed={changed}')
         return changed

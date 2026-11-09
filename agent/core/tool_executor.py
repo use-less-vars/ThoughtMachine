@@ -269,6 +269,18 @@ class ToolExecutor:
                     })
                 return (executed_tools, False, None, None, None)
             tool_name = tool_call['function']['name']
+            # Control-plane instrumentation (Gen 61 dispatch 13). Diagnostic only:
+            # prints the identity of the state object that reached the gate so it
+            # can be compared with the identity stamped at the mutation site.
+            # getattr() is READ-ONLY here: it does not change the fail-open
+            # semantics under test, it only reports them.
+            logger.info(
+                '[CONTROL_PLANE_GATE] event=gate-check tool=%s state_id=%s '
+                'restrictions_active=%s restriction_reason=%s session_id=%s',
+                tool_name, id(self.state),
+                getattr(self.state, 'restrictions_active', None),
+                getattr(self.state, 'restriction_reason', None), session_id,
+            )
             if not self.state.is_tool_allowed(tool_name):
                 tool_result = self._create_tool_rejection_message(tool_name)
                 add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
