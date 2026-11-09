@@ -924,6 +924,129 @@ def _pause_join_target(thread, worker_name: str) -> bool:
     )
     return True
 
+
+def _record_proxied_join_target(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: int,
+) -> None:
+    """Remember a worker that ``_pause_join_target`` actually parked for *session_id*.
+
+    This record is the whole safety story for the symmetric unpause (PHASE 2g):
+    ``_resume_proxied_join_targets`` can only ever resume a worker this proxy
+    itself paused -- never one the operator paused -- because only calls that got
+    ``True`` back from :func:`_pause_join_target` are recorded here.
+
+    Idempotent (a set of ``(worker_name, instance_id)`` triples) and defensive:
+    bookkeeping must never break the join that triggered it, so failures are
+    logged and swallowed.
+    """
+    if not session_id:
+        return
+    try:
+        with _PROXIED_JOIN_TARGETS_LOCK:
+            _PROXIED_JOIN_TARGETS.setdefault(session_id, set()).add(
+                (worker_name, int(instance_id))
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Main-pause proxy: could not record paused target '%s': %s",
+            worker_name,
+            exc,
+        )
+
+
+def _resume_proxied_join_targets(session_id: Optional[str]) -> list[str]:
+    """Lift the worker pauses that the session main-pause proxy applied.
+
+    Exact symmetry for :func:`_pause_join_target`: when the session-level "main
+    agent paused" marker is discarded at the start of a new operator turn
+    (``Agent._discard_session_main_pause``), the join targets this process
+    parked on its behalf are resumed as well.  This is strictly the RECORDED
+    targets -- never a sweep of the session's workers -- so a worker the
+    operator paused by hand is not touched here.
+
+    The record is popped before any resume happens (the lock guards the dict
+    mutation only and is never held across ``resume()``), so a failing or slow
+    resume cannot wedge the bookkeeping and a repeat call is a no-op.
+
+    Every target is independent and defensive: a missing/dead/ambiguous worker
+    (``_WorkerAmbiguityError``) is skipped, a killed worker refuses the resume
+    itself (``resume() -> False``), a detached worker is an operator stop and is
+    left alone, and an already-running worker is a silent no-op.  Never raises;
+    returns the worker names actually resumed.
+    """
+    if not session_id:
+        return []
+    with _PROXIED_JOIN_TARGETS_LOCK:
+        targets = _PROXIED_JOIN_TARGETS.pop(session_id, set())
+    resumed: list[str] = []
+    for worker_name, instance_id in sorted(targets):
+        try:
+            thread, _sid, _iid = _resolve_worker_thread(
+                worker_name,
+                instance_id=instance_id,
+                session_id=session_id,
+            )
+        except _WorkerAmbiguityError as exc:
+            logger.info(
+                "Main-pause proxy: leaving worker '%s' instance %s alone: %s",
+                worker_name,
+                instance_id,
+                exc,
+            )
+            continue
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Main-pause proxy: could not resolve worker '%s' to resume it: %s",
+                worker_name,
+                exc,
+            )
+            continue
+        status = getattr(thread, "status", None)
+        park = getattr(thread, "_park_event", None)
+        parked = park is not None and bool(getattr(park, "is_set", lambda: False)())
+        if getattr(thread, "_detach_requested", False) or status in (
+            "detached",
+            "detaching",
+            "killed",
+            "killing",
+        ):
+            logger.info(
+                "Main-pause proxy: not resuming worker '%s' (status=%s)",
+                worker_name,
+                status,
+            )
+            continue
+        if status != "paused" and not parked:
+            logger.info(
+                "Main-pause proxy: worker '%s' is already running; nothing to resume",
+                worker_name,
+            )
+            continue
+        try:
+            if thread.resume():
+                resumed.append(worker_name)
+                logger.info(
+                    "Main-pause proxy: resumed worker '%s' (symmetric unpause of "
+                    "the session main-pause, session '%s')",
+                    worker_name,
+                    session_id,
+                )
+            else:
+                logger.info(
+                    "Main-pause proxy: worker '%s' refused resume (killed); left as is",
+                    worker_name,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Main-pause proxy: resume failed for worker '%s': %s",
+                worker_name,
+                exc,
+            )
+    return resumed
+
+
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
 # ---------------------------------------------------------------------------
@@ -4742,6 +4865,15 @@ class WorkerThread(threading.Thread):
 # their next safe loop boundary via WorkerThread.pause(); no thread is killed.
 _SESSION_MAIN_PAUSED: set[str] = set()
 
+# PHASE 2g: the join targets THIS process's proxy actually parked, per session
+# id: ``{session_id: {(worker_name, instance_id), ...}}``.  Written only where
+# ``_pause_join_target`` returned True and popped (never swept) by
+# ``_resume_proxied_join_targets`` when the session main-pause is discarded, so
+# the symmetric unpause can only ever touch a worker this proxy paused.  The
+# lock guards the dict mutation only -- never held across ``resume()``.
+_PROXIED_JOIN_TARGETS: dict[str, set[tuple[str, int]]] = {}
+_PROXIED_JOIN_TARGETS_LOCK = threading.Lock()
+
 
 # ============================================================================
 # workspace capabilities (CAPABILITIES_AVAILABLE, resolve_workspace_id, _load_template_workers, _workspace_dir)  (moved verbatim from tools.workspace.worker; W4 facade extraction)
@@ -6870,7 +7002,8 @@ class Worker(ToolBase):
                 # join target only -- async workers the caller is not waiting
                 # on are untouched (that is the ``want_all`` axis, not this
                 # one).  Idempotent; see _pause_join_target.
-                _pause_join_target(thread, self.worker_name)
+                if _pause_join_target(thread, self.worker_name):
+                    _record_proxied_join_target(self.session_id, self.worker_name, iid)
                 return {
                     "worker_name": self.worker_name,
                     "instance_id": iid,

@@ -421,6 +421,18 @@ def _discard_session_main_pause(session_id: Optional[str], *, worker_mode: bool)
     if not paused or session_id not in paused:
         return False
     paused.discard(session_id)
+    # PHASE 2g (operator ruling): the session pause is over, so the worker
+    # pauses this proxy applied on its behalf must be lifted too.  The marker
+    # could not have been set unless the worker stack was already imported, so
+    # reusing ``module`` here cannot create the agent <-> tools import cycle.
+    # Scoped to the targets this process actually recorded, never a sweep.
+    # Wrapped so a failed resume can never break the operator's turn.
+    resume_proxied = getattr(module, "_resume_proxied_join_targets", None)
+    if resume_proxied is not None:
+        try:
+            resume_proxied(session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log('WARNING', 'core.agent', f'process_query: lifting proxied worker pauses failed: {exc}')
     return True
 
 
