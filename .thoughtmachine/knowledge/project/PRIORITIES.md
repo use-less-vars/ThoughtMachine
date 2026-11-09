@@ -79,6 +79,24 @@ different file, different name. Never rename one to the other.
   note is stale on this path (says "may still be running" after the container
   was destroyed) — cosmetic but misleading.
 
+- **C13: Persistent Container Timeout Self-Healing.** **Open.** Filed by Gen 61
+  (dispatch 6) under the operator's Ruling 1. `ResourceContainerManager.exec`
+  now has three outcomes: success; timeout (`container.kill()` but deliberately
+  NOT remove, then `TimeoutError`); interrupted (returns a payload, container
+  untouched). The timeout path leaves a **killed-but-retained** container:
+  `_container_id()` resolves it by label, so every later git command on that
+  workspace targets a dead container and fails until someone intervenes.
+  Deliberately NOT fixed in C11-prime: the green tests
+  `tests/test_resource_container_exec_timeout_survival.py` and
+  `..._recovery.py` pin `container.removed == []` ("survive the timeout, do not
+  delete"), and rebuilding the git sandbox on a timeout risks uncommitted work.
+  **Ruling in force (Option A):** status quo plus explicit reporting in the
+  payload (`container_killed=False`, `container_removed=False`). Do not
+  self-heal via `ensure_container()` without a dedicated design pass.
+  **Open questions for that pass:** who owns sandbox recreation; can uncommitted
+  work be detected/preserved before teardown; should a timeout instead be
+  surfaced to the model as a retryable condition rather than a hard failure.
+
 ---
 
 ## Archived (pre-Gen 42 brain dump — do not read as current work)
