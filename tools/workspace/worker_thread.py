@@ -1603,6 +1603,36 @@ class WorkerThread(threading.Thread):
 
     def send_query(self, query: str, timeout: float = 120.0) -> str:
         """Send a query to this worker and block for a response."""
+        # Implicit UNPAUSE: a new query IS the resume.
+        #
+        # Pause is a wind-down, not a latch -- so a query arriving on a
+        # pause-restricted worker must find it RUNNING again *before* the turn
+        # is dispatched, otherwise the model is nudged to conclude a turn it
+        # has only just been asked to start.  A worker has no controller in its
+        # object graph (no pause_event to poke): the signals are this thread's
+        # own agent state plus the two park flags.
+        #
+        # The release is OWNER-SCOPED -- Agent.leave_reading_mode('pause') ->
+        # AgentState.clear_restriction('pause') -- so a 'token'/'timeout'/'turn'
+        # restriction owned by the agent's monitors survives untouched:
+        # clearing it here would let an operator escape a context-window
+        # restriction just by asking another question.  The park flags move to
+        # the running position ONLY on this path; an ordinary query leaves them
+        # exactly as it found them.
+        _qp_agent = getattr(self, "_agent", None)
+        _qp_state = getattr(_qp_agent, "state", None)
+        if _qp_state is not None and getattr(_qp_state, "restriction_reason", None) == "pause":
+            try:
+                _qp_agent.leave_reading_mode("pause")
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"Implicit unpause failed for worker '{self.worker_name}': {exc}")
+            self._park_event.clear()
+            self._resume_event.set()
+            log("DEBUG", "tools.worker",
+                f"Implicit unpause for worker '{self.worker_name}': new query resumes a "
+                f"pause-restricted worker (one query = resume; owner-scoped 'pause' "
+                f"release, park flags -> running)")
         # Workspace Lifecycle Manager fast path (feature-flagged, default off)
         try:
             used, reply = self._process_query_via_wlm(query, timeout=timeout)
