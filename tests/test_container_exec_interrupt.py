@@ -254,5 +254,5 @@ def test_docker_code_runner_surfaces_interrupted_payload(monkeypatch, tmp_path):
 
     assert '"status": "interrupted"' in payload
     assert '"interrupted": true' in payload
-    assert '"exit_code": -3' in payload
+    assert '"exit_code": null' in payload
     assert "stopped_by_operator" in payload

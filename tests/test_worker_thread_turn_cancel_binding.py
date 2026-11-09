@@ -233,7 +233,7 @@ def test_blocked_tool_call_returns_within_a_poll_slice_of_cancel(monkeypatch, tm
     # reporting a clean exit for a process that never finished, or the timeout
     # path firing first -- would make the promptness assertion above vacuous.
     assert payload["status"] == "interrupted"
-    assert payload["exit_code"] == -3
+    assert payload["exit_code"] is None
     assert payload["reason"] == "turn_cancelled"
 
 
