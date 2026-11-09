@@ -777,3 +777,53 @@ class TestWorkspaceIdResolutionPrecedence:
         assert result["result"] == "Container OK", result["result"]
         assert spy.resolved_workspace_id == "ws-A", spy.calls
 
+
+
+# ---------------------------------------------------------------------------
+# The 'pause' restriction refuses tool calls at the executor
+# ---------------------------------------------------------------------------
+
+class _SpyTool(ToolBase):
+    """Records whether execute() ran; requires no special category."""
+
+    tool: str = "_SpyTool"
+    required_categories: ClassVar[List[str]] = []
+    ran: ClassVar[List[str]] = []
+
+    def execute(self) -> str:
+        type(self).ran.append("ran")
+        return "SPY OK"
+
+
+class TestPauseRestrictionRefusesToolCalls:
+    """``restriction_reason == 'pause'`` allows only Respond, so a paused
+    worker cannot execute any other tool even though the permission gate would
+    let it through."""
+
+    def test_paused_state_refuses_tool_and_names_the_reason(self):
+        from agent.core.state import AgentState
+
+        state = AgentState(config=FakeConfig(None))
+        state.restrictions_active = True
+        state.restriction_reason = "pause"
+        assert state.is_tool_allowed("_SpyTool") is False
+
+        _SpyTool.ran.clear()
+        executor = ToolExecutor(
+            tool_classes=[_SpyTool],
+            config=FakeConfig(None),
+            state=state,
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+        executed, *_ = executor.execute_tool_calls(
+            [{"id": "tc-1", "function": {"name": "_SpyTool", "arguments": "{}"}}],
+            add_to_conversation_func=lambda _m: None,
+        )
+
+        assert _SpyTool.ran == [], "the tool executed despite the pause restriction"
+        assert "not allowed" in executed[0]["result"], executed[0]["result"]
+        assert "pause" in executed[0]["result"], executed[0]["result"]
+        assert executed[0]["success"] is False
+

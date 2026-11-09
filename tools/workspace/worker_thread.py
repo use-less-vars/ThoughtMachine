@@ -1603,6 +1603,22 @@ class WorkerThread(threading.Thread):
 
     def send_query(self, query: str, timeout: float = 120.0) -> str:
         """Send a query to this worker and block for a response."""
+        # The operator's "run" gesture must mean RESUME.  A paused worker has
+        # every tool call refused at the executor (the 'pause' restriction
+        # leaves Respond only), so queueing this query onto a still-paused
+        # worker would run it with zero usable tools.  Resume first, then queue
+        # as usual; a refused resume (e.g. killed worker) is logged and the
+        # call falls through unchanged.
+        agent_state = getattr(getattr(self, "_agent", None), "state", None)
+        if (
+            self._manual_only_pause
+            or self.status == "paused"
+            or getattr(agent_state, "restriction_reason", None) == "pause"
+        ):
+            if not self.resume():
+                log("WARNING", "tools.worker",
+                    f"Worker '{self.worker_name}' could not be resumed before "
+                    f"send_query (status={self.status}); queueing anyway")
         # Workspace Lifecycle Manager fast path (feature-flagged, default off)
         try:
             used, reply = self._process_query_via_wlm(query, timeout=timeout)

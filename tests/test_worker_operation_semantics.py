@@ -2085,6 +2085,41 @@ def test_a_correctly_fenced_command_is_still_obeyed(tmp_path):
     assert _rejected(thread) == []
 
 
+class TestSendQueryAutoResume(unittest.TestCase):
+    """A queued query must never run against a still-paused worker."""
+
+    def test_send_query_resumes_paused_worker_only(self):
+        """Paused (any of the three pause markers) → resume before queueing;
+        an unpaused worker is left alone.  The WLM fast path answers the call
+        so the real send_query body runs without a live run() loop."""
+        # paused by status
+        paused = _live_thread(status="paused")
+        paused.resume.return_value = True
+        paused._process_query_via_wlm.return_value = (True, "paused-reply")
+        self.assertEqual(
+            WorkerThread.send_query(paused, "go", timeout=0.1), "paused-reply"
+        )
+        paused.resume.assert_called_once()
+
+        # paused only by the manual-only marker
+        manual = _live_thread(status="ready")
+        manual._manual_only_pause = True
+        manual.resume.return_value = True
+        manual._process_query_via_wlm.return_value = (True, "manual-reply")
+        self.assertEqual(
+            WorkerThread.send_query(manual, "go", timeout=0.1), "manual-reply"
+        )
+        manual.resume.assert_called_once()
+
+        # unpaused worker: no resume
+        ready = _live_thread(status="ready")
+        ready._process_query_via_wlm.return_value = (True, "ready-reply")
+        self.assertEqual(
+            WorkerThread.send_query(ready, "go", timeout=0.1), "ready-reply"
+        )
+        ready.resume.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
 
