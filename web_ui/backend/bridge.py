@@ -151,6 +151,36 @@ _workspace_id_cache: Dict[str, str] = {}
 _workspace_cache_lock = threading.Lock()
 
 
+# ── Execution state → frontend token mapping ────────────────────────────────
+# The single source of truth for translating an agent ExecutionState onto the
+# token the React frontend stores (`sessionStates[id].state`).  It is used by
+# BOTH live updates (``_map_and_emit``) and the ``session_loaded`` snapshot, so
+# a reconnect can never disagree with the live stream.
+_FRONTEND_EXECUTION_STATE: Dict[str, str] = {
+    "running": "RUNNING",
+    "pausing": "PAUSING",
+    "paused": "PAUSED",
+    "idle": "IDLE",
+    "error": "IDLE",
+    "stopped": "IDLE",
+    "completed": "IDLE",
+    "ready": "IDLE",
+    "waiting": "WAITING_FOR_USER",
+}
+
+
+def _to_frontend_state(raw: Optional[str]) -> str:
+    """Map a raw execution state to its frontend token.
+
+    ``raw`` is either an ``ExecutionState.value`` (lowercase, e.g. ``"paused"``)
+    or a raw event string.  Unknown values upper-case through unchanged (the
+    historical behaviour); a missing / non-string value yields ``""`` (the old
+    inline expression would have raised ``AttributeError`` on ``None``).
+    """
+    new_state = raw if isinstance(raw, str) else ""
+    return _FRONTEND_EXECUTION_STATE.get(new_state.lower(), new_state.upper())
+
+
 # ── Worker instance label helpers ──────────────────────────────────────────────────
 # Instance labels mirror WorkerRegistry.instance_label semantics: "<name>" for
 # instance 1 and "<name>#<N>" for N>1.  The worker registry keys per-worker
@@ -2764,17 +2794,43 @@ class WebAgentBridge:
                 _fe_config = self._config_manager.frontend_config_from_bridge(self)
             except Exception:
                 _fe_config = None
+            # The live execution state, mapped through the SAME helper the live
+            # state_changed path uses.  An unreadable chain (no controller / no
+            # agent / any breakage) leaves the mapped token empty, and the block
+            # right below substitutes RUNNING/IDLE from is_running -- so the
+            # payload value is ALWAYS a non-empty string.  That is required: the
+            # server-side debug log slices this field, and a None there raises
+            # and silently drops the whole frame.
+            try:
+                _raw_exec_state = self._controller.agent.state.execution_state
+                _fe_state = _to_frontend_state(
+                    getattr(_raw_exec_state, "value", _raw_exec_state)
+                )
+            except Exception:
+                _fe_state = None
+            _is_running = self._controller.is_busy if self._controller else False
+            # The value is NEVER None and never empty: the server-side debug log
+            # slices this field (event.get("state", ...)[:60]), so a present-but-None
+            # value raises TypeError there and the generic ``except`` swallows it,
+            # silently DROPPING the whole session_loaded frame.  The fallback
+            # reproduces exactly what the frontend derived before this change
+            # (is_running ? RUNNING : IDLE), so no information is lost.
+            if not isinstance(_fe_state, str) or not _fe_state:
+                _fe_state = "RUNNING" if _is_running else "IDLE"
             self._forwarder.broadcast(self._session_id, "session_loaded", {
                 "session_id": session_id,
                 "session_name": session.metadata.get('name', 'Untitled Session'),
                 "message_count": len(session.user_history),
                 "workspace_id": self.workspace_id,
                 "workspace_path": self._workspace_path or '',
-                # is_running mirrors the live state_changed semantics (controller.is_busy:
-                # RUNNING/PAUSING) so the reconnect/load path agrees with live updates —
-                # the server no longer sends a separate state_changed after
-                # session_loaded (Fix 2a).
-                "is_running": self._controller.is_busy if self._controller else False,
+                # The snapshot now carries the FULL state token (mapped exactly
+                # like a live state_changed, via _to_frontend_state) alongside
+                # is_running (controller.is_busy: RUNNING/PAUSING), so the
+                # reconnect/load path restores e.g. PAUSED instead of collapsing
+                # it to RUNNING/IDLE.  The server still does NOT send a separate
+                # state_changed after session_loaded (Fix 2a intact).
+                "is_running": _is_running,
+                "state": _fe_state,
                 "config": _fe_config,
                 # Full tool list (name/enabled/description) so the store's
                 # receiveSessionLoaded can populate the tools panel without a
@@ -3233,17 +3289,7 @@ class WebAgentBridge:
 
         if event_type == "execution_state_change":
             new_state = raw_event.get("new_state", "")
-            frontend_state = {
-                "running": "RUNNING",
-                "pausing": "PAUSING",
-                "paused": "PAUSED",
-                "idle": "IDLE",
-                "error": "IDLE",
-                "stopped": "IDLE",
-                "completed": "IDLE",
-                "ready": "IDLE",
-                "waiting": "WAITING_FOR_USER",
-            }.get(new_state.lower(), new_state.upper())
+            frontend_state = _to_frontend_state(new_state)
             self._forwarder.broadcast(self._session_id, "state_changed", {
                 "state": frontend_state,
                 "is_running": _is_busy,
