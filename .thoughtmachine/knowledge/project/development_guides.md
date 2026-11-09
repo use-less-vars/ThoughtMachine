@@ -584,3 +584,22 @@ Corrections to earlier notes, now tested live:
 - **`web_ui/frontend` has no `node_modules`** and there is no network, so vitest/vite cannot run. Frontend changes therefore ship **unverified by execution** — the only defence is checking every helper/import you use line-by-line against the existing test file. Say "NOT EXECUTED" explicitly rather than implying green.
 - **No Docker at all** in the worker sandbox (unchanged): no CLI, no socket, SDK ping `FileNotFoundError`. Any test needing a live container is unrunnable; report it as blocked, not as skipped.
 - Interpreter: `/workspace/.venv/bin/python` is broken (3.13.5, no deps). Use `PYTHONPATH=/workspace/.venv/lib/python3.12/site-packages /usr/local/bin/python3`, and always add `-p no:warnings`.
+
+## 2026-11-09 — ## Live tooling problems found by the agent while shipping C...
+
+## Live tooling problems found by the agent while shipping C11-prime (Gen 61, dispatch 5) — reproducible, each cost real time
+
+1. **`git_write` `branch_create` silently ignores any requested start point.** I passed `branch=fix/..., commit=8188a558` (the exact SHA I wanted) and the tool created the branch **at HEAD** (`a068dbe1`), answering: `Created branch 'fix/gen61-c11-prime-resource-cancel' at a068dbe1 (base: HEAD); working tree HEAD not moved`. No error, no hint that `commit`/`base` were dropped. Combined with item 2 there is then **no way to correct it** — the branch is permanently in the wrong place.
+   *Workaround used:* content transplant — read the accepted commit's diff with `git_read diff <base> <sha>`, hand the verbatim text to a worker, commit on the correct branch, then prove equivalence with `git_read diff <old-sha> <new-sha>` (only the unrelated docs delta showed up).
+
+2. **`git_write` has no branch-delete, no branch-move/rename, no cherry-pick, no rebase, no merge.** Operations are only: commit, init, clone, push, branch_create, checkout, stage, unstage, worktree_add/remove, stash_push/pop. Consequences: an agent cannot fix a mis-placed branch, cannot port a commit onto a new base (must re-apply the diff by hand, which is *worse* than cherry-pick for reviewability — the same change lands under a new SHA), and cannot tidy up the branch it abandoned. All of it goes back to the human.
+
+3. **`git_read diff` ignores untracked files.** `git_read diff commit1=<sha> file_path=<new file>` reports the file as *deleted* (`+++ /dev/null`, whole body with `-` prefixes) because a never-staged path is not in that tree. Reads like "the worker's new file is missing/destroyed" — a false alarm every time. Byte-equality for a NEW file can only be proven *after* committing it (`git_read diff <old> <new>` then shows nothing). A *modified* tracked file compares correctly, so a mixed new+modified change set gives a misleading asymmetry.
+
+4. **`Worker` `spawn` requires `worker_name` explicitly.** The tool description says "no `worker_name` needed; it defaults to the default worker", but omitting it fails with `{"error": "worker_name is required for action 'spawn'"}`. Pass `worker_name="default"`. Same for `action="query"`. Also: the success envelope still reports `"spawned": false` even though the worker ran to completion and returned a full result — the flag is meaningless, do not branch on it.
+
+5. **`tool_call_count` is useless as a flail signal.** Two well-behaved tasks this session reported 342 and 386 tool calls for ~100s and ~345s of work, both clean, no repeated work. Treat anything below ~400 as normal.
+
+6. **`/tmp` does not survive between worker tool calls** (fresh ephemeral container per call) — but a *single* self-contained shell call CAN write a backup to `/tmp`, mutate, test and restore within that one call. That is how the C11-prime mutation proof was done safely; conversely `cp backup.py /tmp/` in one call and `cp /tmp/backup.py back` in the next silently yields "No such file".
+
+7. **`KnowledgeBaseTool` append needs the payload in `entry` (and `mode` is mandatory)** — passing `content` returns `Error: entry parameter is required for append mode`; omitting `mode` returns a pydantic validation error listing the valid fields. The field names differ from every other tool's payload shape.
