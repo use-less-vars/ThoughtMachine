@@ -20,14 +20,14 @@
 #   kb_rel_path <root> <abs>     path made relative to <root> when possible
 
 # Section heading: "##" + whitespace + "2" + "." (title deliberately ignored).
-KB_SECTION_RE=${KB_SECTION_RE:-'^##[[:space:]]+2\.'}
+KB_SECTION_RE=${KB_SECTION_RE:-'^##[[:space:]]+2[.]'}
 
 # Numbered list item whose FIRST token is backticked, e.g.
 #   1. `PRIORITIES.md` -- active work queue
 # A second backticked span later in the prose is NOT part of the entry.
 # The regex lives in a variable because quoting the right-hand side of =~ would
 # make bash compare it literally instead of as a regex.
-KB_ENTRY_RE=${KB_ENTRY_RE:-'^[[:space:]]*[0-9]+\.?[[:space:]]+`([^`]+)`'}
+KB_ENTRY_RE=${KB_ENTRY_RE:-'^[[:space:]]*[0-9]+[.]?[[:space:]]+`([^`]+)`'}
 
 KB_DEFAULT_HANDOFF_REL=${KB_DEFAULT_HANDOFF_REL:-.thoughtmachine/knowledge/project/HANDOFF.md}
 
@@ -63,7 +63,7 @@ kb_entries() {
 
   if [ "$status" -eq 3 ]; then
     printf 'ERROR: %s: no section heading matching %s (expected a "## 2. <title>" section).\n' \
-      "$router" "'^##[[:space:]]+2\\.'" >&2
+      "$router" "'^##[[:space:]]+2\[.]'" >&2
     return 1
   fi
   if [ "$status" -ne 0 ]; then
