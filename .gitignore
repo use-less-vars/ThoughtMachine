@@ -398,3 +398,6 @@ web_ui/frontend/.npmrc
 # `docs/*` above is a catch-all, so the negation is required or the file is never
 # versioned and vanishes on the next clone.
 !docs/design_permission_bins_shape.md
+!.thoughtmachine/knowledge/project/PRIORITIES.md
+!docs/W11_NORTH_STAR.md
+!.thoughtmachine/knowledge/project/HANDOFF.md

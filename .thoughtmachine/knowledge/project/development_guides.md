@@ -528,3 +528,59 @@ Admission **refuses, it does not evict**: `infra/container_manager.py:1709-1719`
 1) **Sandbox verdict ≠ CI verdict — name the tests, run them by name.** A split/sharded run reporting "4522 + 299 passed" still missed the seeding invariant that CI caught. For every PR: `grep -rlnE '<the symbols you touched>|<the functions you touched>' --include='*.py' tests/ web_ui/backend/tests/`, then run those files EXPLICITLY (batches of ~5 per worker turn), and treat any `FAILED`/`ERROR` in a `.pytest-*.log` as CI's answer arriving early. Do not present shard counts as a suite verdict. Verify numbers from the log files (`grep -cE '^(FAILED|ERROR)'`, `tail -n 3`), never from a worker's summary table; and always re-run a "N skipped" batch with `-rs` — two "green" e2e files in PR 2 were pure `pytest.importorskip("playwright.sync_api")` no-ops with zero coverage.
 
 2) **Immutability-admits-one-exception is one-design + one-audited-call-site, enforced at review.** `Session.workspace_id` is immutable via `__setattr__` except through `Session.rebind_workspace()` (PR 2, commit `5b13ff9a`). The moment a second caller appears, the exception becomes the pattern and deny-by-default is gone. Its caller list is therefore a REVIEW invariant, not a comment: grep `rebind_workspace` on every PR that touches `session/` or `web_ui/backend/`, and refuse any new call site that is not the owning apply_config switch. Same test applies to any future "single escape hatch" API.
+
+## 2026-11-09 — Gen 61 TOOLING PROBLEMS (live, agent-observed — please fix o...
+
+Gen 61 TOOLING PROBLEMS (live, agent-observed — please fix or document):
+
+1. **Worker sandbox has NO Docker.** `docker` CLI absent (`shutil.which('docker') -> None`), `/var/run/docker.sock` absent, `docker` SDK 7.2.0 imports fine but `from_env().ping()` raises `DockerException ... FileNotFoundError(2)`. Consequence: any task requiring live container observation ("is the PID still there", "is the container still running") is IMPOSSIBLE from worker context and must be reported as inconclusive. For a project whose whole subject matter is container orchestration, that is a significant blind spot: workers can only test against fakes, never against the real daemon they are simulating.
+
+2. **Two interpreters, and the obvious one is broken for repo code.** `/workspace/.venv/bin/python` resolves to `/usr/bin/python3` (3.13.5) WITHOUT the project deps; repo code only runs under `/usr/local/bin/python3` (3.12.15) with `PYTHONPATH=/workspace/.venv/lib/python3.12/site-packages`. Symptom is `ModuleNotFoundError: pydantic` from a venv that appears to exist and be active. This burned a worker probe and will burn every new seat; either fix the venv shim or put the working invocation in `INFRA_ONBOARDING.md`.
+
+3. **DockerCodeRunner gives a FRESH EPHEMERAL CONTAINER per call.** `/tmp` writes and any filesystem state do NOT survive between tool calls. Any multi-step probe must be a single self-contained heredoc; a backup saved in one call is gone in the next. This silently breaks the standard mutate-test-restore workflow — the restore step must happen in the same call as the mutation, or identity must be proven by a recorded hash. Worth stating in the tool description rather than being discovered mid-mutation on a production file.
+
+4. **`ReadFile` truncates at 10000 tokens** on big files (`infra/container_manager.py`); workers must fall back to `sed -n` via DockerCodeRunner. Fine, but combined with the no-range-support in `show_file` it makes 3000-line files awkward.
+
+5. **`tail -40` of a `-v` pytest run is swallowed** by ~25 Pydantic/UserWarning blocks, so the per-test PASSED lines are invisible in exactly the window a brief tells the worker to paste. A `-p no:warnings` pass is needed to see test names — the brief should ask for that instead of `tail -40`.
+
+6. **`git_write` has no branch-delete.** An agent told to do branch hygiene can create and checkout a branch but cannot remove an abandoned one; it had to hand that back to the human. Minor, but it breaks "atomic cleanup" instructions.
+
+## 2026-11-09 — ## TESTING `tools/cancellation` — the STICKY FALLBACK trap (...
+
+## TESTING `tools/cancellation` — the STICKY FALLBACK trap (found live, Gen 61)
+
+`cancellation.is_interrupted()` can read `True` for reasons your test did not cause:
+
+- `bind_turn_cancel(event)` sets a **per-thread** binding (`tools/cancellation.py` is `threading.local`).
+- `interrupt(reason)` raises **whatever event is active**. If NOTHING is bound, that is a per-thread **FALLBACK event** — and it is **sticky**: `unbind()` does **not** clear it. Every later cancellation read on that same thread then returns `True` for the rest of the process.
+
+**Symptom it caused:** a new cancellation test poisoned a sibling. `tests/test_container_exec_interrupt.py::test_timeout_path_still_kills_and_drops` started failing with "DID NOT RAISE TimeoutError" *only when the new file ran first*, because the main thread entered the test already "cancelled".
+
+**Mandatory fixture for any test that raises a cancel token:**
+```python
+@pytest.fixture(autouse=True)
+def _clean_cancel_token():
+    cancellation.unbind()
+    cancellation.reset()      # clears the sticky fallback too — unbind() alone is NOT enough
+    yield
+    cancellation.unbind()
+    cancellation.reset()
+```
+And prefer raising the token you bound (`token.set()`) over `cancellation.interrupt()`; if you do call `interrupt()`, bind a real token FIRST so the fallback is never armed.
+
+**Existing files:** `tests/test_worker_thread_turn_cancel_binding.py` (C10) only ever calls `token.set()`, never `cancellation.interrupt()`, so it does not arm the fallback — but its fixture lacks `cancellation.reset()`, so it is *vulnerable* to an earlier test that does. Worth one line of hardening.
+`tests/test_docker_code_runner_cancel_cleanup.py` (C11) documents the trap in its fixture docstring and calls reset() on both sides.
+
+## 2026-11-09 — ## Worker sandbox — corrected tool facts (Gen 61, dispatch 3...
+
+## Worker sandbox — corrected tool facts (Gen 61, dispatch 3)
+
+Corrections to earlier notes, now tested live:
+
+- **`git_read` DOES work in the worker sandbox** (status/diff/ls_tree/cat_file, `execution_mode: containerized`). Only git *writes* are unavailable. Earlier guidance "workers have no git" was too strong — workers can be asked for `git status`/`git diff` as scope proof.
+- **Path roots differ per tool.** `FileEditor` resolves relative paths against the repo root `/home/jojo/PycharmProjects/ThoughtMachine-dev` and **rejects** absolute `/workspace/...`; `DockerCodeRunner` sees the same repo as `/workspace`. Do not hardcode either.
+- **`FilePreviewTool` `line_numbers` must be an ARRAY** — `[1540, 1600]`, not the string `"1540-1600"`.
+- **`DirectoryTreeTool` with `include_dirs=true` still lists only files.**
+- **`web_ui/frontend` has no `node_modules`** and there is no network, so vitest/vite cannot run. Frontend changes therefore ship **unverified by execution** — the only defence is checking every helper/import you use line-by-line against the existing test file. Say "NOT EXECUTED" explicitly rather than implying green.
+- **No Docker at all** in the worker sandbox (unchanged): no CLI, no socket, SDK ping `FileNotFoundError`. Any test needing a live container is unrunnable; report it as blocked, not as skipped.
+- Interpreter: `/workspace/.venv/bin/python` is broken (3.13.5, no deps). Use `PYTHONPATH=/workspace/.venv/lib/python3.12/site-packages /usr/local/bin/python3`, and always add `-p no:warnings`.
