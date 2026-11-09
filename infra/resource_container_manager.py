@@ -52,8 +52,20 @@ Exec semantics
 --------------
 ``exec()`` runs the command as a raw argv list via ``container.exec_run``
 (``cmd=...``, NO ``/bin/sh -c`` wrapper) with a thread+queue timeout guard
-mirroring ``ContainerManager.exec``: on timeout the container is killed but
-NOT removed (so it can be reused/restarted), and ``TimeoutError`` is raised.
+mirroring ``ContainerManager.exec``. THREE outcomes:
+
+- success: ``{"exit_code": int, "stdout": str, "stderr": str}``;
+- timeout: the container is killed but NOT removed (so it can be
+  reused/restarted) and ``TimeoutError`` is raised;
+- interrupted (the turn was cancelled while the command was in flight): the
+  wait returns promptly with a structured payload -- ``status="interrupted"``,
+  ``interrupted=True``, ``reason=...``, ``exec="container_exec"``,
+  ``container_id``, ``command``, ``elapsed``, plus ``exit_code=None``,
+  ``stdout=""``, ``stderr=""`` (the three keys the git tool hard-indexes) and
+  ``container_killed=False`` / ``container_removed=False``. The container is
+  NOT killed and NOT removed: this is a persistent git sandbox, and the
+  command we stopped waiting on may still be running inside it.
+
 ``NotFound``/``APIError`` from the
 daemon are converted to clear structured results or raised as ``RuntimeError``
 with actionable messages (see per-method docstrings).
@@ -66,6 +78,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 
 try:
@@ -1511,6 +1524,14 @@ class ResourceContainerManager:
         on timeout the container is killed but NOT removed, so a later
         ``ensure_container()`` can restart it; then ``TimeoutError`` is raised.
 
+        The wait is INTERRUPTIBLE: it is sliced and the current turn's
+        cancellation token is polled between the slices, so a cancelled turn
+        stops waiting promptly instead of blocking for the whole ``timeout``.
+        The interrupt path never kills and never removes the container (it is
+        a persistent git sandbox); it only stops WAITING and returns the
+        structured ``status="interrupted"`` payload documented at module
+        level.
+
         Raises:
             RuntimeError: if the container does not exist (call
                 ``ensure_container()`` first) or the exec thread died without
@@ -1519,7 +1540,9 @@ class ResourceContainerManager:
             NotFound/APIError: propagated from the daemon for other failures.
 
         Returns:
-            dict: ``{"exit_code": int, "stdout": str, "stderr": str}``
+            dict: ``{"exit_code": int, "stdout": str, "stderr": str}`` on
+            completion, or the interrupted payload documented at module level
+            when the turn is cancelled before the command finishes.
         """
         container_id = self._container_id()
         if container_id is None:
@@ -1553,7 +1576,72 @@ class ResourceContainerManager:
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
-        thread.join(timeout)
+
+        # ── Interruptible wait ────────────────────────────────────────────
+        # The exec itself runs on the daemon thread above; what used to block
+        # here was a SINGLE full-timeout ``join``, so a cancelled turn could
+        # not be honoured until the timeout expired.  Wait in short slices
+        # instead and poll the CURRENT TURN's cancellation token between them
+        # (0.5 s: quick enough that a cancel feels immediate, coarse enough
+        # that we are not spinning a core through a long git command).
+        #
+        # Interrupting the WAIT is all that happens here.  This container is a
+        # long-lived, workspace-scoped PERSISTENT git sandbox, so the timeout
+        # path's ``container.kill()`` is NOT an option on this path: it would
+        # destroy the workspace's git sandbox.  ``exec_run`` also hands us no
+        # killable handle, so the payload reports that we stopped WAITING on a
+        # command that may still be running inside an untouched container.
+        _WAIT_SLICE_SECONDS = 0.5
+        try:  # per-thread turn token; a no-op when nothing is bound
+            from tools.cancellation import cancel_reason as _cancel_reason
+            from tools.cancellation import is_interrupted as _is_interrupted
+        except Exception:  # pragma: no cover - tools package is a hard dep
+            def _is_interrupted():
+                return False
+
+            def _cancel_reason():
+                return None
+
+        def _interrupt_reason():
+            """Why this turn was cancelled: thread-local reason first, then the event's."""
+            reason = _cancel_reason()
+            if reason:
+                return reason
+            try:
+                from tools.cancellation import _active_event
+                return getattr(_active_event(), "reason", None) or "turn_cancelled"
+            except Exception:  # pragma: no cover - defensive
+                return "turn_cancelled"
+
+        _wait_started = time.monotonic()
+        _deadline = _wait_started + timeout
+        while thread.is_alive():
+            thread.join(max(0.0, min(_WAIT_SLICE_SECONDS, _deadline - time.monotonic())))
+            if not thread.is_alive():
+                break
+            if _is_interrupted():
+                return {
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "reason": _interrupt_reason(),
+                    "exec": "container_exec",
+                    "container_id": container_id,
+                    "command": " ".join(cmd),
+                    "elapsed": round(time.monotonic() - _wait_started, 3),
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "",
+                    "container_killed": False,
+                    "container_removed": False,
+                    "note": (
+                        f"Stopped WAITING for the {self.RESOURCE_KIND} command "
+                        "because the turn was cancelled. The container was NOT "
+                        "killed and NOT removed; the command may still be "
+                        "running inside it."
+                    ),
+                }
+            if time.monotonic() >= _deadline:
+                break
 
         if thread.is_alive():
             try:
