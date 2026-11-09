@@ -18,13 +18,17 @@ seam a Phase-2 implementation must satisfy:
    the restriction is owned by ``'pause'``: a ``'token'``/``'timeout'``/
    ``'turn'`` restriction is never auto-cleared.
 
-Every test is tagged in its ``def`` line:
+Every test carries a ``# PIN`` tag -- on its ``def`` line, or at the end of a
+multi-line signature's closing ``):``:
 
-* ``# PIN`` -- passes today; it pins behaviour a Phase-2 change must NOT break.
-* ``# RED`` -- MUST fail today; it is the specification Phase 2 has to make
-  green.  No assertion here is written to be "close enough": each RED test
-  fails on the behaviour it names (a missing enum member, a wrong value, a
-  missing symbol), never on an incidental import error of the module itself.
+* ``# PIN`` -- a deliberate, currently-green pin of approved behaviour: it
+  passes today and a Phase-2 change must NOT break it.  The tests were
+  authored red-first -- tagged ``# RED`` while the behaviour they name was
+  still missing -- and every one of them is green today, so the tag now
+  records a pin rather than a specification.  No assertion here is written to
+  be "close enough": each test fails on the behaviour it names (a missing enum
+  member, a wrong value, a missing symbol), never on an incidental import error
+  of the module itself.
 
 Run with::
 
@@ -135,7 +139,7 @@ class TestInterruptSignal:
 # ────────────────────────────────────────────────────────────────────────────
 
 class TestRunStateAxis:
-    def test_execution_state_defines_paused_and_stopped(self):  # RED
+    def test_execution_state_defines_paused_and_stopped(self):  # PIN
         """The RUN axis must be able to say "paused" and "stopped".
 
         PAUSED is a settled state (the agent has wound down and parked);
@@ -166,7 +170,7 @@ class TestRunStateAxis:
 # ────────────────────────────────────────────────────────────────────────────
 
 class TestExecutionStateTransitions:
-    def test_set_execution_state_walks_running_pausing_paused_stopped(self):  # RED
+    def test_set_execution_state_walks_running_pausing_paused_stopped(self):  # PIN
         """One transition = one ``execution_state_change`` event, old + new.
 
         The walk is the whole RUN axis in order: ready -> running -> pausing ->
@@ -191,7 +195,7 @@ class TestExecutionStateTransitions:
             assert events[0]["old_state"] == expected_old
             assert events[0]["new_state"] == expected_new
 
-    def test_set_execution_state_notifies_logger_with_paused(self):  # RED
+    def test_set_execution_state_notifies_logger_with_paused(self):  # PIN
         """The logger is told about the transition, with STRING state values.
 
         ``AgentLogger.log_execution_state_change`` takes the ``.value``
@@ -209,7 +213,7 @@ class TestExecutionStateTransitions:
         assert logger.log_execution_state_change.call_count == 1
         logger.log_execution_state_change.assert_called_once_with("running", "paused")
 
-    def test_controller_pause_lands_on_paused_not_pausing(self):  # RED
+    def test_controller_pause_lands_on_paused_not_pausing(self):  # PIN
         """``controller.pause()`` must land the agent on PAUSED by value.
 
         Today ``pause()`` writes ``ExecutionState.PAUSING`` straight onto
@@ -231,7 +235,7 @@ class TestExecutionStateTransitions:
 # ────────────────────────────────────────────────────────────────────────────
 
 class TestPauseReachesBlockedTool:
-    def test_sleep_envelope_reports_paused_reason(self):  # RED
+    def test_sleep_envelope_reports_paused_reason(self):  # PIN
         """A pause-interrupted ``sleep`` reports ``reason == 'paused'``.
 
         ``tools.cancellation.bind_pause_event(event)`` is the specified (and
@@ -258,7 +262,7 @@ class TestPauseReachesBlockedTool:
         assert payload["interrupted"] is True
         assert payload["reason"] == "paused"
 
-    def test_sleep_wakes_promptly_on_pause(self):  # RED
+    def test_sleep_wakes_promptly_on_pause(self):  # PIN
         """A 30 s sleep returns in well under a second when paused.
 
         The pause signal is raised from ANOTHER thread (the bridge thread, in
@@ -290,7 +294,7 @@ class TestPauseReachesBlockedTool:
 # ────────────────────────────────────────────────────────────────────────────
 
 class TestToolReturnContract:
-    def test_interrupted_tool_result_is_recognised_as_interrupt(self):  # RED
+    def test_interrupted_tool_result_is_recognised_as_interrupt(self):  # PIN
         """An interrupted tool result is a control signal, not a tool failure.
 
         Specified symbol: ``agent.core.tool_executor:is_interrupted_tool_entry``
@@ -348,7 +352,7 @@ class TestImplicitUnpauseOnNewQuery:
         assert agent.state.restriction_reason == "token"
         assert agent.state.get_allowed_tools() == ["Respond", "SummarizeTool"]
 
-    def test_send_query_unpauses_a_pause_restricted_worker(self, tmp_path, monkeypatch):  # RED
+    def test_send_query_unpauses_a_pause_restricted_worker(self, tmp_path, monkeypatch):  # PIN
         """A new query returns a paused worker to RUNNING.
 
         Pause is a wind-down, not a latch: the operator's next question is the
@@ -383,7 +387,7 @@ class TestImplicitUnpauseOnNewQuery:
 class TestDockerCodeRunnerInterrupt:
     def test_docker_code_runner_returns_interrupted_envelope_on_pause(
         self, tmp_path, monkeypatch,
-    ):  # RED
+    ):  # PIN
         """DCR must pass the container layer's interrupted payload through.
 
         The container layer (``infra/container_manager.py``) already returns

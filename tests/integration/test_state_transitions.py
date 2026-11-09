@@ -20,18 +20,28 @@ DELTA TABLE — spec vs REAL behaviour (all verified against current code):
                        | (agent/core/agent.py:898-906) mapped by
                        | bridge._map_and_emit (bridge.py:1983-1999) to
                        | state_changed {"state":"RUNNING","is_running":_is_busy}.
-    2. pause           | controller.pause() (controller/__init__.py:475-500)
-       RUNNING→        | sets PAUSING + emits execution_state_change pausing →
-       PAUSING→        | state_changed {"state":"PAUSING","is_running":True}.
-       PAUSED          | The legacy raw 'paused' event maps to NOTHING
-                       | (_map_and_emit has no branch for it, bridge.py:1952-
-                       | 2112) and ExecutionState (agent/core/state.py) has NO
-                       | 'paused' member — the 'PAUSED' mapping line
-                       | (bridge.py:1987) is DEAD CODE. Completion: controller
-                       | emits session_stop stop_reason='paused'
-                       | (controller/__init__.py:376-399) → state_changed IDLE.
-                       | REAL sequence: RUNNING → PAUSING → IDLE.
-    3. resume          | controller.resume() (controller/__init__.py:502-514)
+    2. pause           | controller.pause() (controller/__init__.py:550-578)
+       RUNNING→        | sets pause_event, enters reading mode and walks the
+       PAUSING→        | state through the setter: RUNNING → PAUSING, emitted
+       PAUSED          | as execution_state_change pausing → state_changed
+                       | {"state":"PAUSING","is_running":…}. ExecutionState DOES
+                       | define PAUSED (agent/core/state.py:22-28) and the
+                       | 'paused' → 'PAUSED' entry in _map_and_emit's frontend
+                       | map (bridge.py:3239) is LIVE. With nothing in flight
+                       | pause() settles on PAUSED at once
+                       | (controller/__init__.py:573-575); a turn that *is* in
+                       | flight lands there from the _run() finally block
+                       | (:854). The legacy raw 'paused' event still maps to
+                       | NOTHING (_map_and_emit has no branch for it,
+                       | bridge.py:3234-3407). Completion: the controller emits
+                       | session_stop (stop_reason 'paused' in the idle branch,
+                       | :473; otherwise the _run() reason, :862) and the
+                       | bridge's session_stop branch turns that into
+                       | state_changed {"state":"IDLE"} (bridge.py:3409-3420).
+                       | REAL sequence: RUNNING → PAUSING → PAUSED. The
+                       | IDLE on the wire is only a label riding session_stop,
+                       | never an ExecutionState member.
+    3. resume          | controller.resume() (controller/__init__.py:580-601)
        PAUSED→         | emits NO events → no state_changed. RUNNING only
        RUNNING         | returns when the agent re-enters process_query
                        | (another execution_state_change running).
