@@ -100,7 +100,7 @@ def _unstarted_thread(tmp_path, name: str = "test-worker",
 # ────────────────────────────────────────────────────────────────────────────
 
 class TestInterruptSignal:
-    def test_pause_event_polarity_is_pause_requested(self):  # RED
+    def test_pause_event_polarity_is_pause_requested(self):  # PIN
         """``pause_event`` means "a pause is REQUESTED", not "allowed to run".
 
         Polarity is normal cancel polarity: **cleared = running, set =
@@ -112,8 +112,11 @@ class TestInterruptSignal:
         * ``Agent.process_query``'s sleep sites (``agent/core/agent.py``) become
           ``pause_event.wait(...)`` and wake on pause, not on resume.
 
-        Today the polarity is INVERTED (``__init__`` sets the event,
-        ``pause()`` clears it), so this test fails on the first assertion.
+        Phase 2b flipped the polarity: ``__init__`` leaves the event cleared,
+        ``pause()`` sets it and ``resume()`` clears it, which is what the three
+        assertions below pin.  (Before the flip the event was INVERTED --
+        ``__init__`` set it and ``pause()`` cleared it -- and this test failed on
+        the first assertion.)
         """
         agent = _make_agent()
         controller = _make_controller(agent)
