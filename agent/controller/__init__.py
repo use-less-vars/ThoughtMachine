@@ -389,6 +389,8 @@ class AgentController:
             if hasattr(agent, 'enter_reading_mode'):
                 changed = agent.enter_reading_mode('pause')
                 log('DEBUG', 'core.controller', f'{where}: enter_reading_mode(pause) -> changed={changed}')
+                _cp_state = getattr(agent, 'state', None)
+                log('INFO', '[CONTROL_PLANE_CONTROLLER]', f'phase=pause state_id={id(_cp_state) if _cp_state is not None else None} restrictions_active={getattr(_cp_state, "restrictions_active", None)} restriction_reason={getattr(_cp_state, "restriction_reason", None)} session_id={getattr(self, "current_session_id", None) or "unknown"}')
             elif hasattr(agent, 'request_pause'):
                 agent.request_pause()
                 log('DEBUG', 'core.controller', f'{where}: request_pause() (legacy alias)')
@@ -571,6 +573,8 @@ class AgentController:
                 try:
                     released = self.agent.leave_reading_mode('pause')
                     log('DEBUG', 'core.controller', f'resume(): leave_reading_mode(pause) -> released={released}')
+                    _cp_state = getattr(self.agent, 'state', None)
+                    log('INFO', '[CONTROL_PLANE_CONTROLLER]', f'phase=resume state_id={id(_cp_state) if _cp_state is not None else None} restrictions_active={getattr(_cp_state, "restrictions_active", None)} restriction_reason={getattr(_cp_state, "restriction_reason", None)} session_id={getattr(self, "current_session_id", None) or "unknown"}')
                 except Exception as e:
                     log('WARNING', 'core.controller', f'resume(): leave_reading_mode failed: {e}')
             if hasattr(self.agent, '_pause_requested'):

@@ -3751,9 +3751,12 @@ class WorkerThread(threading.Thread):
                     if TurnState is not None:
                         self._agent.state.turn_state = TurnState.LOW
                         self._agent.state.last_turn_warning_state = TurnState.LOW
+                    _cp_before_restrictions_active = getattr(self._agent.state, 'restrictions_active', None)
+                    _cp_before_restriction_reason = getattr(self._agent.state, 'restriction_reason', None)
                     self._agent.state.restrictions_active = False
                     self._agent.state.restrictions_pending = False
                     self._agent.state.restriction_reason = None
+                    log('INFO', '[CONTROL_PLANE_WORKER_CLEAR]', f'state_id={id(self._agent.state)} before_restrictions_active={_cp_before_restrictions_active} before_restriction_reason={_cp_before_restriction_reason} after_restrictions_active={getattr(self._agent.state, "restrictions_active", None)} after_restriction_reason={getattr(self._agent.state, "restriction_reason", None)} session_id={self.session_id or "unknown"}')
                     # wall-clock time; agent.py uses time.time() for consistency
                     self._agent.state.time_start = time.time()
                     if TimeState is not None:
