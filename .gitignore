@@ -401,3 +401,10 @@ web_ui/frontend/.npmrc
 !.thoughtmachine/knowledge/project/PRIORITIES.md
 !docs/W11_NORTH_STAR.md
 !.thoughtmachine/knowledge/project/HANDOFF.md
+
+# Gen 61 control plane design pass (2026-11): the Pause/Stop/Timeout
+# state-machine contract, public tier, ships with the repo. `docs/*` above is a
+# catch-all, so the negation is required or the file is never versioned and
+# vanishes on the next clone.
+!docs/CONTROL_PLANE.md
+
