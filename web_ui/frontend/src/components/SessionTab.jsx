@@ -39,22 +39,40 @@ const CONFIG_PANEL_DEFAULT_WIDTH = 280
 // ChatPanel re-renders (and re-runs its scroll effects) on every update.
 const EMPTY_MESSAGES = []
 // Chat messages carry no id/message_id in this app (verified: only session /
-// workspace metadata has ids), so compare role + content of the FIRST and
-// LAST messages. Length + first/last-message equality matches the store's
-// update pattern (streaming mutates the LAST message; earlier messages are
-// immutable, so the first message pins the conversation start).
+// workspace metadata has ids). The previous version only compared role +
+// content of the FIRST and LAST message, so a change in the MIDDLE of the list
+// was invisible: inserting a message (e.g. a system notice) anywhere between
+// the first and last element left length, first and last identical, the
+// equality fn returned true and the selector handed back the stale array —
+// ChatPanel never rendered the new message.  Hence the full walk below.
+// It is deliberately allocation-free (no joined string / hash / JSON dump):
+// this runs as the zustand equality fn on every store update, i.e. once per
+// streamed token, so it must stay a cheap early-exit loop.
 function messagesEqual(a, b) {
   if (a === b) return true
   if (!a || !b) return false
-  if (a.length !== b.length) return false
-  if (a.length === 0) return true
-  const fa = a[0]
-  const fb = b[0]
-  const la = a[a.length - 1]
-  const lb = b[b.length - 1]
-  return !!(fa && fb && la && lb) &&
-    fa.role === fb.role && fa.content === fb.content &&
-    la.role === lb.role && la.content === lb.content
+  const len = a.length
+  if (len !== b.length) return false
+  for (let i = 0; i < len; i++) {
+    const ma = a[i]
+    const mb = b[i]
+    if (ma === mb) continue
+    // One side empty/undefined: differ unless BOTH are (handled above).
+    if (!ma || !mb) return false
+    if (
+      ma.role !== mb.role ||
+      ma.content !== mb.content ||
+      ma.is_system_notification !== mb.is_system_notification ||
+      ma.is_final !== mb.is_final ||
+      ma.is_summary !== mb.is_summary ||
+      ma.client_only !== mb.client_only ||
+      ma.is_streaming !== mb.is_streaming ||
+      ma.response_type !== mb.response_type
+    ) {
+      return false
+    }
+  }
+  return true
 }
 
 // ────────────────────────────────────────────────────────────────────────────

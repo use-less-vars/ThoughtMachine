@@ -455,5 +455,63 @@ class TestDockerCodeRunnerInterrupt:
         assert "not killed" in json.dumps(payload).lower()
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 13. loop gate: the tool-less turn must not touch the interrupted batch
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestToolLessTurnSurvivesThePauseGate:
+    def test_pause_gate_survives_tool_less_turn(self):  # PIN
+        """An ordinary conversational turn survives the pause wind-down gate.
+
+        Pins the fix for the crash reported as 93cfc9cf.  The wind-down gate
+        reads the per-turn ``executed_tools`` list, but that list is only
+        populated inside the ``if tool_calls:`` branch -- on a turn where the
+        model answers WITHOUT calling a tool it is never assigned.  The gate was
+        written as ``any(is_interrupted_tool_entry(entry) for entry in
+        executed_tools) and ...``, so on every tool-less turn it evaluated
+        ``executed_tools`` before anything had bound it: ``UnboundLocalError``
+        on the most common turn shape there is, not on an edge case.
+
+        The fix has two halves, both pinned here by driving the whole turn:
+
+        * ``tool_calls and`` is the FIRST conjunct, so a tool-less turn
+          short-circuits before ``executed_tools`` is ever named; and
+        * ``executed_tools`` is initialised once per turn (next to
+          ``content``/``tool_calls``) instead of only inside the tool branch.
+
+        Why the suite missed it: every test here asserted on a SYMBOL (a
+        predicate, an envelope, an enum member) and never ran
+        ``Agent.process_query`` end to end, so no test exercised the control
+        flow that binds a local in one branch and reads it in another.  This
+        one does: the fake stream returns text and ``Done()`` with zero tool
+        calls, and the 'pause'-owned restriction is set for the whole run so
+        the gate's THIRD conjunct is also true -- the run reaches the gate with
+        all the other conjuncts live, which is what makes the old code fail
+        deterministically instead of by luck.
+        """
+        from agent.core.stream_events import Done, TextDelta
+        from tests.test_agent_stop_midstream import _ScriptedLLM
+
+        agent = _make_agent("test-tool-less-pause-gate")
+        llm = _ScriptedLLM([[TextDelta(text="Four."), Done()]])
+        agent.llm_client.stream_completion = llm.stream_completion
+        # The gate's owner test: restriction owned by 'pause' for the whole run.
+        agent.state.restrict("pause")
+        assert agent.state.restriction_reason == "pause"
+
+        events = list(agent.process_query("what is 2 + 2?"))
+
+        types = [event["type"] for event in events]
+        # No exception was swallowed into an error terminal...
+        assert "error" not in types, types
+        # ...and the turn reached its normal terminal exactly once.
+        terminals = [event for event in events if event["type"] == "agent_responded"]
+        assert len(terminals) == 1, types
+        assert terminals[0]["content"] == "Four."
+        assert terminals[0]["response_type"] == "answer"
+        # One LLM call, one turn: the gate did not loop back around.
+        assert llm.calls == 1, llm.calls
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

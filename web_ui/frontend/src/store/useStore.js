@@ -170,13 +170,19 @@ const useStore = create((set) => ({
           isLoaded: true,
         },
       },
-      // is_running from the payload is authoritative; a missing is_running
-      // (older payloads) defaults to IDLE/False so nothing breaks.
+      // `state` from the payload is authoritative: the server maps the live
+      // execution state through the same table the live state_changed path
+      // uses, so it is already a frontend token and is stored VERBATIM (it can
+      // express PAUSED/PAUSING, which is_running alone cannot).  Only when the
+      // payload has no usable state (older payloads / null snapshot) do we fall
+      // back to the is_running-derived RUNNING/IDLE token so nothing breaks.
       sessionStates: {
         ...state.sessionStates,
         [sessionId]: {
           ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE),
-          state: payload?.is_running ? 'RUNNING' : 'IDLE',
+          state: typeof payload?.state === 'string'
+            ? payload.state
+            : (payload?.is_running ? 'RUNNING' : 'IDLE'),
           isRunning: !!payload?.is_running,
         },
       },

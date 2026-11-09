@@ -242,6 +242,34 @@ describe('receiveSessionLoaded', () => {
       isLoaded: true,
     });
   });
+
+  // The server's authoritative `state` string now travels in the session_loaded
+  // payload. It must win over the is_running boolean — a PAUSED session reports
+  // is_running:false (which would read as IDLE) and a PAUSING session reports
+  // is_running:true (which would read as RUNNING).
+  it('takes the payload state string over is_running (PAUSED, is_running:false)', () => {
+    useStore.getState().receiveSessionLoaded('s1', { state: 'PAUSED', is_running: false });
+    expect(useStore.getState().sessionStates.s1.state).toBe('PAUSED');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(false);
+  });
+
+  it('takes the payload state string over is_running (PAUSING, is_running:true)', () => {
+    useStore.getState().receiveSessionLoaded('s1', { state: 'PAUSING', is_running: true });
+    expect(useStore.getState().sessionStates.s1.state).toBe('PAUSING');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(true);
+  });
+
+  it('falls back to RUNNING when state is null and is_running is true', () => {
+    useStore.getState().receiveSessionLoaded('s1', { state: null, is_running: true });
+    expect(useStore.getState().sessionStates.s1.state).toBe('RUNNING');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(true);
+  });
+
+  it('falls back to IDLE when the payload has no state key and is_running is false', () => {
+    useStore.getState().receiveSessionLoaded('s1', { config: { mode: 'custom' }, is_running: false });
+    expect(useStore.getState().sessionStates.s1.state).toBe('IDLE');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(false);
+  });
 });
 
 // ==========================================================================
