@@ -46,6 +46,7 @@ class _HungExecContainer:
         self.labels = dict(labels)
         self.attrs = {"State": {"Status": "running"}}
         self.started = []
+        self.restarted = []
         self.removed = []
         self.killed = []
         self.stopped = []
@@ -54,6 +55,10 @@ class _HungExecContainer:
 
     def start(self):
         self.started.append(True)
+        self.status = "running"
+
+    def restart(self):
+        self.restarted.append(True)
         self.status = "running"
 
     def kill(self):
@@ -176,6 +181,11 @@ def test_exec_timeout_does_not_remove_resource_container(monkeypatch):
         # Invariant: the container still exists (docker ps -a). The timeout
         # guard must NOT run the self-destruct ``self.remove()``.
         assert seed.removed == []
+
+        # C13: recovery is IN PLACE via ``restart()`` (the handle exposes it),
+        # not the bare ``kill()`` the pre-C13 timeout path used.
+        assert seed.restarted == [True]
+        assert seed.killed == []
     finally:
         # Release the leaked daemon thread so it unwinds before teardown.
         release.set()
