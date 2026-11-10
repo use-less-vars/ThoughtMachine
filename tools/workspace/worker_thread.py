@@ -91,6 +91,13 @@ _NO_SESSION_KEY = "<no-session>"
 # silently drop every query queued behind it.
 _PARK_SENTINEL: Any = object()
 
+# Reply-wait granularity for ``WorkerThread.send_query``.  The wait is taken one
+# slice at a time so a pause / turn-cancel raised while the CALLER is blocked in
+# it lands within one slice instead of at the deadline (300 s + 60 s grace) --
+# unsliced, the pause stayed invisible for minutes and the turn was finally
+# reported as "timeout" (audit D16).
+QUERY_WAIT_SLICE_SECONDS: float = 0.5
+
 #: Reason stamped on a turn the DETACH park ABANDONED. It rides on the journal
 #: record the park flips to ``recoverable`` and on the envelope of the job the
 #: same park terminalizes as ``interrupted``, so one grep finds both halves.
@@ -1773,8 +1780,65 @@ class WorkerThread(threading.Thread):
             return False
         return payload["query_id"] == query_id
 
+    def _wait_interrupt_reason(self) -> Optional[str]:
+        """``reason`` when the CALLER's turn was paused/cancelled, else ``None``.
+
+        Read from the bindings of the thread that is blocked in ``send_query``
+        (the turn-running thread the controller/agent binds), exactly as
+        ``Sleep.execute`` and ``Worker._join_cancel_check`` do:
+
+          * **pause** (``tools.cancellation.pause_requested``): the SHARED event
+            the controller owns.  It is the only pause signal that can cross
+            into a thread blocked inside a tool, which is why the controller
+            binds it to the turn-running thread for the turn.
+          * **turn cancel**: the turn token (``detach()``/``kill()``/a
+            cross-process 'stop').  Only a BOUND token counts, so an unbound
+            thread keeps the legacy full-deadline wait -- a leftover fallback
+            interrupt must never abort an unrelated wait.
+
+        Pause is checked first: it is a request to wind down, not a cancel, and
+        the two are distinguished by ``reason`` (see ``Sleep``).
+        """
+        from tools.sleep_tool import _tls, cancel_reason, is_interrupted, pause_requested
+        try:
+            if pause_requested():
+                return "paused"
+            if getattr(_tls, "event", None) is not None and is_interrupted():
+                return cancel_reason() or "turn_cancelled"
+        except Exception:  # pragma: no cover - defensive
+            return None
+        return None
+
+    def _interrupted_reply(self, query_id: str, reason: str, started: float) -> str:
+        """The envelope ``send_query`` returns when its WAIT is interrupted.
+
+        A JSON string, like every reply that method returns, using the same
+        interruption vocabulary as ``join``/``sleep`` (``status='interrupted'``,
+        ``interrupted=True``, ``reason``).  Only the WAIT is over: the worker may
+        still be running the query, so the envelope says so rather than
+        implying the turn completed.
+        """
+        return json.dumps({
+            "status": "interrupted",
+            "interrupted": True,
+            "reason": reason,
+            "query_id": query_id,
+            "worker_name": self.worker_name,
+            "elapsed_seconds": round(time.monotonic() - started, 1),
+            "note": (
+                "Wait interrupted; the query was NOT cancelled and the worker "
+                "may still be running it."
+            ),
+        }, default=str)
+
     def send_query(self, query: str, timeout: float = 120.0) -> str:
-        """Send a query to this worker and block for a response."""
+        """Send a query to this worker and block for a response.
+
+        The wait is interruptible: when the CALLING thread's pause event or
+        turn-cancel token is set, it returns an ``interrupted`` envelope within
+        ``QUERY_WAIT_SLICE_SECONDS`` instead of blocking out ``timeout``.  Only
+        the wait ends -- the query itself is not cancelled.
+        """
         # Implicit UNPAUSE: a new query IS the resume.
         #
         # Pause is a wind-down, not a latch -- so a query arriving on a
@@ -1835,12 +1899,33 @@ class WorkerThread(threading.Thread):
         # defense in depth.
         reply_q: queue.Queue = queue.Queue()
         self._input_queue.put((query_id, query, reply_q))
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
         while True:
             remaining = deadline - time.monotonic()
+            # One SLICE at a time.  A reply still arrives on the private
+            # queue, but the wait never blocks longer than
+            # QUERY_WAIT_SLICE_SECONDS without re-reading the caller's
+            # pause/cancel signals, so an interruption lands within one slice
+            # instead of at the deadline.
+            slice_timeout = min(QUERY_WAIT_SLICE_SECONDS, remaining)
             try:
-                response = reply_q.get(timeout=remaining if remaining > 0 else 0)
+                response = reply_q.get(
+                    timeout=slice_timeout if slice_timeout > 0 else 0
+                )
             except queue.Empty:
+                # Interruption BEFORE the deadline: a pause (or a turn cancel)
+                # raised while this call is blocked is a request to wind the
+                # wait down, not a timeout.  Reporting it as "timeout" is what
+                # kept the pause invisible for minutes (audit D16) -- so this
+                # check deliberately precedes the deadline check.
+                interrupt_reason = self._wait_interrupt_reason()
+                if interrupt_reason is not None:
+                    return self._interrupted_reply(query_id, interrupt_reason, started)
+                if time.monotonic() < deadline:
+                    # Slice elapsed, deadline not reached: keep waiting for our
+                    # own envelope.
+                    continue
                 # Drain our private queue AND the shared fallback queue so a
                 # late reply (on either channel) cannot leak into the next
                 # call. Our queue is dropped anyway (local to this call), but
