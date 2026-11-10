@@ -53,6 +53,83 @@ import { fetchPermissionDefaults } from '../globalApi'
 const DEFAULT_SESSION_CONFIG = { config: null, permissions: null, providers: [], tools: [], isLoaded: false }
 const DEFAULT_SESSION_STATE = { isRunning: false, state: null, contextLength: 0, tokensIn: 0, tokensOut: 0 }
 
+/* -------------------------------------------------------------------------
+ * Tool-call folding (chat transcript)
+ *
+ * The backend emits a tool call and its outcome as TWO conversation rows that
+ * share one backend `tool_call_id`: role 'tool_call' carries the name/args
+ * JSON in `content`, role 'tool_result' carries the outcome in `content`.
+ * MessageBubble renders ONE bubble per call (args on top, outcome below), so
+ * the conversation slice folds the pair by id and puts the outcome where the
+ * bubble reads it — the `result` field.  `content` therefore stays the call's
+ * name/args JSON.
+ *
+ * This is deliberately NOT components/chat/adaptWorkerEvent.js#mergeToolMessages():
+ * that helper stamps the caller's `_seq` counter onto every row it appends or
+ * merges (a WorkerOutputPanel ordering artifact; chat rows must stay exactly
+ * the server's shape) and its match path force-keeps `base.content` while
+ * letting the incoming `role` overlay — which only holds because every
+ * worker-stream phase is role 'tool_call'.  In the conversation the two
+ * phases have DIFFERENT roles, so those rules would either flip the bubble to
+ * 'tool_result' (drawing the args JSON as the outcome) or keep the outcome as
+ * the bubble's args when the call arrives later (prepend/pagination).  Hence
+ * the dedicated, narrower fold below.
+ * ---------------------------------------------------------------------- */
+
+// The id that pairs a call with its outcome; anything else is not foldable.
+function pairId(msg) {
+  const tcId = msg && msg.tool_call_id
+  return typeof tcId === 'string' && tcId.length > 0 ? tcId : null
+}
+
+// First value that is actually text (undefined / null / '' count as absent).
+function firstText(...values) {
+  for (const v of values) {
+    if (v !== undefined && v !== null && String(v) !== '') return v
+  }
+  return undefined
+}
+
+// Collapse two rows carrying the SAME tool_call_id into one 'tool_call' bubble:
+// `content` = the call's name/args JSON, `result` = the outcome text.  The
+// earlier row owns identity, position and every field it already had; only
+// fields the incoming row actually defines are overlaid.
+function foldToolPair(base, msg) {
+  const merged = { ...base }
+  for (const key of Object.keys(msg)) {
+    if (msg[key] !== undefined) merged[key] = msg[key]
+  }
+  // The call side owns `content` — it is what ToolCallContent parses.  When the
+  // call arrives second (prepend), its content wins over the outcome text the
+  // earlier row had in `content`.
+  const callRow = base.role === 'tool_call' ? base : msg.role === 'tool_call' ? msg : null
+  merged.content = callRow ? callRow.content : base.content
+  if (callRow) merged.role = 'tool_call'
+  // The outcome travels in `result`; a result row may carry it in `content`
+  // only (no explicit `result` field).
+  const incomingOutcome =
+    msg.role === 'tool_result' ? firstText(msg.result, msg.content) : firstText(msg.result)
+  const baseOutcome =
+    base.role === 'tool_result' ? firstText(base.result, base.content) : firstText(base.result)
+  const outcome = incomingOutcome !== undefined ? incomingOutcome : baseOutcome
+  if (outcome !== undefined) merged.result = outcome
+  return merged
+}
+
+// Upsert-by-tool_call_id fold.  Rows without a usable id are appended verbatim
+// (never merged); distinct ids never merge; a matched row keeps its position
+// and never leaves the list.
+function foldToolRows(list, incoming) {
+  const next = list.slice()
+  for (const msg of incoming) {
+    const tcId = pairId(msg)
+    const idx = tcId ? next.findIndex((m) => m && m.tool_call_id === tcId) : -1
+    if (idx === -1) next.push(msg)
+    else next[idx] = foldToolPair(next[idx], msg)
+  }
+  return next
+}
+
 // Normalize a tools list to plain names: string entries stay as-is,
 // object entries (e.g. { name, enabled }) become their name.
 function normalizeTools(tools) {
@@ -268,20 +345,29 @@ const useStore = create((set) => ({
   //               otherwise silently wipe them on the next conversation_changed.
   //   'append'  — append the incoming messages after the existing history.
   //   'prepend' — insert the incoming (older) messages before the history.
+  //
+  // In ALL THREE modes the incoming rows are folded by `tool_call_id` (see
+  // foldToolRows above): a tool call and its outcome share ONE bubble, and the
+  // outcome lands in `result` whatever order the two phases arrive in.
+  // Rows without a `tool_call_id` are never merged, so nothing else changes.
   receiveConversationChanged: (sessionId, messages, { mode = 'replace', preserveClientOnly = false } = {}) =>
     set((state) => {
       const incoming = messages || [];
       const prev = state.sessionMessages[sessionId] || [];
       let next;
       if (mode === 'append') {
-        next = [...prev, ...incoming];
+        next = foldToolRows(prev, incoming);
       } else if (mode === 'prepend') {
-        next = [...incoming, ...prev];
+        // Older rows go first; a call arriving here folds into the outcome that
+        // is already on screen (and keeps its own, older position).
+        next = foldToolRows(incoming, prev);
       } else {
         const preserved = preserveClientOnly
           ? prev.filter((m) => m && m.client_only === true)
           : [];
-        next = [...incoming, ...preserved];
+        // The payload is authoritative, so discarded rows never fold into it —
+        // but the payload itself may carry both phases of one call.
+        next = [...foldToolRows([], incoming), ...preserved];
       }
       return { sessionMessages: { ...state.sessionMessages, [sessionId]: next } };
     }),

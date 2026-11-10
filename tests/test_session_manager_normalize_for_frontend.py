@@ -127,3 +127,30 @@ def test_get_conversation_drops_genuinely_empty_assistant(tmp_path):
     assert all(m.get("role") != "assistant" for m in out), (
         f"genuinely-empty assistant message survived: {out!r}"
     )
+
+
+def test_get_conversation_exposes_tool_call_ids(tmp_path):
+    """The paginated conversation payload must pair call and result by id."""
+    manager = _make_manager(tmp_path)
+    session = Session(user_history=[
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "contents"},
+    ])
+
+    out = manager.get_conversation(session)
+
+    call = [m for m in out if m.get("role") == "tool_call"][0]
+    result = [m for m in out if m.get("role") == "tool_result"][0]
+    assert call["tool_call_id"] == "call_1"
+    assert result["tool_call_id"] == "call_1"
+
