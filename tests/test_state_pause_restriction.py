@@ -116,6 +116,16 @@ def test_is_tool_allowed_on_paused_state():
     assert state.is_tool_allowed('ContainerExecTool') is False
 
 
+# j) fail-closed: an object missing `restrictions_active` is NOT unrestricted
+#    (docs/CONTROL_PLANE.md 6.3 Option B / 6.4)
+def test_is_tool_allowed_fail_closed_when_restrictions_active_missing():
+    # A plain object has no `restrictions_active` attribute at all -- exactly
+    # the fail-open edge the pre-Option-B implementation walked through.
+    stub = object()
+    assert AgentState.is_tool_allowed(stub, 'Respond') is True
+    assert AgentState.is_tool_allowed(stub, 'ContainerExecTool') is False
+
+
 # h) last writer wins on the reason, which is what makes ownership meaningful
 def test_last_writer_wins_on_reason():
     state = _state()
