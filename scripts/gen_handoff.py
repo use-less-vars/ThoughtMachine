@@ -73,6 +73,15 @@ def main() -> int:
         out.append(f"- **{cid}** -- {body}")
     out += [
         "",
+        "## Rules of Engagement (Gen 62 Protocol)",
+        "",
+        "- **The Operator is a relay, not a bash environment.** Do not ask the Operator to run `sed`, `python`, `awk` or multi-line shell to accomplish a change; dispatch the Agent instead.",
+        "- **Heredocs are banned.** They mangle the Operator's terminal. Any change over five lines is written and committed by the Agent, not pasted by the Operator.",
+        "- **Investigation is delegated.** The Engineer reads diffs and summaries, not source files; source reading belongs to the Agent.",
+        "- **Onboarding reading is 100-150 kB in one to three massive chunks.** Do not chop the reading into thirty small turns.",
+    ]
+    out += [
+        "",
         "## Carried traps (do not re-discover)",
         "",
         "- `PRIORITIES.md` did not contain C25 or \"Phase 10\" at the Gen 62 correction. The pre-Gen-62 handoff hallucinated both.",
