@@ -485,8 +485,26 @@ class AgentState:
         return ['Respond']
 
     def is_tool_allowed(self, tool_name: str) -> bool:
-        """Check if a specific tool is allowed in current state."""
-        allowed = self.get_allowed_tools()
-        if not allowed:
+        """Check if a specific tool is allowed in current state.
+
+        Fail-closed by construction (docs/CONTROL_PLANE.md 6.3 Option B):
+        the decision is computed here, inline, from `restrictions_active`
+        and `restriction_reason` -- never from an empty allow-list.
+        `get_allowed_tools()` remains display-only.
+
+        A missing `restrictions_active` attribute is treated as RESTRICTED
+        (Respond-only), not as unrestricted. The prior implementation read
+        `getattr(..., False)` through `get_allowed_tools()` and then treated
+        `[]` as "allow everything", so any object without the attribute --
+        an older pickled state, a stub, a state-class refactor, a mock --
+        silently became a fully-armed agent.
+        """
+        if not getattr(self, 'restrictions_active', True):
             return True
-        return tool_name in allowed
+        reason = getattr(self, 'restriction_reason', None)
+        if reason == 'token':
+            return tool_name in ('Respond', 'SummarizeTool')
+        # 'timeout', 'turn', 'pause' and every unrecognised reason (including
+        # a missing `restriction_reason`): fail safe to Respond-only rather
+        # than assuming the token allow-list.
+        return tool_name == 'Respond'
