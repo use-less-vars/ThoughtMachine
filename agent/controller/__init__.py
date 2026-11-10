@@ -598,6 +598,33 @@ class AgentController:
                 if os.environ.get('PAUSE_DEBUG'):
                     log('WARNING', 'presenter.pause_flow', f'Controller.resume: clearing agent._pause_requested')
                 self.agent._pause_requested = False
+        # ── Release the RUN axis out of PAUSING/PAUSED ───────────────────
+        # Pause is the ONLY owner of those two states and this is the release
+        # of that pause, so the state has to leave them HERE: nothing else
+        # does.  The UI's status banner is driven by this token, so without
+        # this transition it stays on '⏸ Paused' until a page reload re-reads
+        # the session_loaded snapshot.  The write goes through
+        # _set_execution_state so the execution_state_change event reaches the
+        # bridge (→ state_changed) exactly like the pause direction does.
+        # The target is the REAL live state, not a guess: a turn still being
+        # concluded in reading mode is in flight (RUNNING); otherwise READY,
+        # the same settle value ``_run``'s finally block uses.
+        cur_state = getattr(getattr(self, 'agent', None), 'state', None)
+        # The ``set_execution_state`` guard keeps duck-typed / partial state
+        # objects (test doubles, half-constructed agents) on the old quiet
+        # no-op path: only a state object that can actually take the write is
+        # transitioned here.
+        if (
+            cur_state is not None
+            and hasattr(cur_state, 'set_execution_state')
+            and cur_state.execution_state in (
+                ExecutionState.PAUSED, ExecutionState.PAUSING
+            )
+        ):
+            target = ExecutionState.RUNNING if self._processing_query else ExecutionState.READY
+            self._set_execution_state(target)
+            log('DEBUG', 'core.controller',
+                f'resume(): released pause state, settled to {target.value}')
 
     def _emit_event(self, event):
         """Emit event to queue, plain callbacks, and global event bus."""

@@ -364,8 +364,25 @@ def _assert_quiet(ws, path_label: str, timeout: float = 1.5):
     pytest.fail(f"{path_label}: expected NO further WS events, but got {_val!r}")
 
 
+def _make_agent_state(exec_state):
+    """Real ``AgentState`` parked in ``exec_state``.
+
+    ``AgentController.resume()`` routes the pause release through
+    ``state.set_execution_state()``, so the fixture has to hand it an object
+    that really implements that transition instead of a duck-typed fake.
+    No logger and a MagicMock config: nothing on these paths reads either.
+    """
+    from unittest.mock import MagicMock
+
+    from agent.core.state import AgentState
+
+    state = AgentState(config=MagicMock())
+    state.set_execution_state(exec_state)
+    return state
+
+
 def _make_bridge(events, exec_state=None):
-    """Fresh WebAgentBridge with an optional fake controller (no threads)."""
+    """Fresh WebAgentBridge with an optional controller (no threads)."""
     from types import SimpleNamespace
 
     from web_ui.backend.bridge import WebAgentBridge
@@ -375,8 +392,10 @@ def _make_bridge(events, exec_state=None):
     bridge = WebAgentBridge(session_store=FileSystemSessionStore())
     if exec_state is not None:
         ctrl = AgentController()
-        # Stub the agent so controller.is_busy reads our fake execution_state.
-        ctrl.agent = SimpleNamespace(state=SimpleNamespace(execution_state=exec_state))
+        # Stub the AGENT (controller.is_busy reads agent.state.execution_state)
+        # but wrap a REAL AgentState: resume() transitions the state object
+        # through set_execution_state(), which a SimpleNamespace fake lacks.
+        ctrl.agent = SimpleNamespace(state=_make_agent_state(exec_state))
         bridge.set_controller(ctrl)
     bridge.set_event_callback(events.append)
     return bridge
@@ -527,18 +546,62 @@ def test_session_stop_maps_to_idle_state_changed(contract_server):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# F. resume emits NO events (delta 3)
+# F. resume releases PAUSED and emits exactly one state_changed (supersedes delta 3)
 # ══════════════════════════════════════════════════════════════════════════
 
-def test_resume_emits_no_events(contract_server):
-    """controller.resume() emits NOTHING → no state_changed (delta 3)."""
+def test_resume_from_non_paused_emits_no_events(contract_server):
+    """resume() on a NON-paused controller emits NOTHING (no spurious events).
+
+    Supersedes ``test_resume_emits_no_events`` (delta 3), which asserted the
+    same "resume emits no events" claim for a PAUSING controller — but only
+    ever passed VACUOUSLY: the fixture's fake state object had no
+    ``set_execution_state``, so ``Controller.resume()`` never reached the
+    release block and the claim was never exercised against a real
+    transition.  The engineer has formally superseded that pin (authorised
+    ruling, not a test weakening): the anti-spurious-events intent is kept
+    here, where resume genuinely has no state to release, and the release
+    path itself is pinned by the test below.
+    """
     from agent.core.state import ExecutionState
 
     events = []
-    bridge = _make_bridge(events, exec_state=ExecutionState.PAUSING)
+    bridge = _make_bridge(events, exec_state=ExecutionState.READY)
     bridge.resume()
 
-    assert events == [], f"resume must not emit any events (got {events!r})"
+    assert events == [], f"resume from READY must not emit any events (got {events!r})"
+
+
+@pytest.mark.parametrize("paused_state", ["PAUSED", "PAUSING"])
+def test_resume_from_paused_emits_exactly_one_state_changed(contract_server, paused_state):
+    """resume() out of PAUSED/PAUSING emits EXACTLY ONE state_changed.
+
+    Pause is the only owner of those two states, so resume is the only writer
+    that can release them; the UI status banner is driven by this token, so
+    the transition must reach the bridge (→ state_changed) exactly once.  The
+    controller settles on READY when no query is processing, and the bridge
+    maps the raw ``ready`` value to the frontend token 'IDLE' (see the
+    section-A parametrisation ``("ready", "IDLE")``) — hence IDLE here, not
+    READY.
+    """
+    from agent.core.state import ExecutionState
+
+    events = []
+    bridge = _make_bridge(events, exec_state=ExecutionState[paused_state])
+    bridge.resume()
+
+    state_events = [e for e in events if e.get("type") == "state_changed"]
+    assert len(state_events) == 1, (
+        f"resume from {paused_state} must emit exactly one state_changed "
+        f"(got {events!r})"
+    )
+    assert state_events[0].get("state") in ("IDLE", "RUNNING"), (
+        f"state_changed.state after resume must be IDLE (or RUNNING while a "
+        f"turn is in flight), got {state_events[0].get('state')!r}"
+    )
+    assert isinstance(state_events[0].get("is_running"), bool), (
+        f"state_changed.is_running must be a bool "
+        f"(got {state_events[0].get('is_running')!r})"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
