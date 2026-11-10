@@ -155,11 +155,31 @@ class ContextBuilder(ABC):
                         extra_tool_messages.append(tool_msg)
                         logger.warning(f'[DEBUG_CONTEXT] Removing tool message with non-matching tool_call_id: {tool_call_id}')
                 if len(tool_call_id_to_message) < len(tool_call_id_to_call):
+                    missing_count = len(tool_call_id_to_call) - len(tool_call_id_to_message)
+                    missing_ids = [tc_id for tc_id in tool_call_id_to_call
+                                   if tc_id not in tool_call_id_to_message]
                     cleaned_msg = msg.copy()
+                    # A committed Respond's answer lives only in its call
+                    # arguments: Respond.execute() returns self.content as the
+                    # tool result, so nothing copies it into assistant content.
+                    # If that result never landed, popping tool_calls below
+                    # would erase the only copy of the answer. Recover it first.
+                    _content = cleaned_msg.get('content')
+                    if isinstance(_content, str):
+                        _empty_content = not _content.strip()
+                    else:
+                        _empty_content = not _content
+                    recovered = ''
+                    if _empty_content:
+                        recovered = ContextBuilder._recover_orphaned_payloads(tool_calls, missing_ids)
+                        if recovered:
+                            cleaned_msg['content'] = recovered
                     cleaned_msg.pop('tool_calls', None)
                     result.append(cleaned_msg)
-                    missing_count = len(tool_call_id_to_call) - len(tool_call_id_to_message)
                     logger.debug(f'[DEBUG_CONTEXT] Removing incomplete tool sequence: {len(tool_call_id_to_call)} calls but only {len(tool_call_id_to_message)} valid tool messages ({missing_count} missing)')
+                    if _empty_content and not recovered:
+                        missing_names = sorted({str((tc.get('function') or {}).get('name') or tc.get('name') or 'unknown') for tc in tool_calls if tc.get('id') in missing_ids})
+                        logger.warning(f'[DEBUG_CONTEXT] Dropping tool_calls with no committed result leaves an EMPTY assistant message: tool_calls={missing_names} tool_call_ids={missing_ids} ({missing_count} missing) - any payload carried only by those calls is no longer visible to the model')
                     i = j
                 else:
                     result.append(msg)
@@ -191,6 +211,37 @@ class ContextBuilder(ABC):
                 result.append(msg)
                 i += 1
         return result
+
+    @staticmethod
+    def _recover_orphaned_payloads(tool_calls, missing_ids):
+        """Recover terminal payloads carried only in the arguments of tool
+        calls whose results never landed. Only Respond is recovered: its
+        `content` argument is the user-visible answer and is otherwise
+        unrecoverable once `tool_calls` is dropped."""
+        import json
+        missing = set(missing_ids)
+        parts = []
+        for tc in tool_calls:
+            if tc.get('id') not in missing:
+                continue
+            fn = tc.get('function') or {}
+            name = fn.get('name') or tc.get('name')
+            if name != 'Respond':
+                continue
+            raw = fn.get('arguments')
+            if isinstance(raw, str):
+                try:
+                    args = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+            elif isinstance(raw, dict):
+                args = raw
+            else:
+                continue
+            content = args.get('content') if isinstance(args, dict) else None
+            if isinstance(content, str) and content.strip():
+                parts.append(content)
+        return '\n\n'.join(parts)
 
 class SummaryBuilder(ContextBuilder):
     """
@@ -244,11 +295,20 @@ class SummaryBuilder(ContextBuilder):
         keep_turns = self.default_keep_turns
         if summary_msg is not None:
             keep_turns = summary_msg.get('pruning_keep_recent_turns', self.default_keep_turns)
-        log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: keep_turns={keep_turns}')
-        if summary_idx >= 0:
-            post_summary = user_history[summary_idx + 1:]
+        # Window selection: everything after the summary UNION the last keep_turns
+        # turns of user_history. A summary must never silently drop the turns it
+        # explicitly claims to keep, so keep_turns is authoritative, not advisory.
+        start = summary_idx + 1 if summary_idx >= 0 else 0
+        if keep_turns and keep_turns > 0:
+            kept_turns = self._group_messages_into_turns(user_history)[-keep_turns:]
+            kept_message_ids = {id(m) for turn in kept_turns for m in turn}
+            selected = [i for i in range(len(user_history))
+                        if i >= start or id(user_history[i]) in kept_message_ids]
         else:
-            post_summary = user_history
+            kept_turns = []
+            selected = list(range(start, len(user_history)))
+        post_summary = [user_history[i] for i in selected]
+        log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: keep_turns={keep_turns}, kept {len(kept_turns)} turn(s), selected {len(post_summary)}/{len(user_history)} messages (summary_idx={summary_idx})')
 
         system_warnings = []
         non_system = []
