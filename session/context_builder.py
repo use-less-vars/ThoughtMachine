@@ -155,24 +155,29 @@ class ContextBuilder(ABC):
                         extra_tool_messages.append(tool_msg)
                         logger.warning(f'[DEBUG_CONTEXT] Removing tool message with non-matching tool_call_id: {tool_call_id}')
                 if len(tool_call_id_to_message) < len(tool_call_id_to_call):
-                    cleaned_msg = msg.copy()
-                    cleaned_msg.pop('tool_calls', None)
-                    result.append(cleaned_msg)
                     missing_count = len(tool_call_id_to_call) - len(tool_call_id_to_message)
-                    logger.debug(f'[DEBUG_CONTEXT] Removing incomplete tool sequence: {len(tool_call_id_to_call)} calls but only {len(tool_call_id_to_message)} valid tool messages ({missing_count} missing)')
-                    # Make the erasure observable. Emitted only when dropping the
-                    # tool_calls leaves an assistant message with no text, i.e. when
-                    # the only copy of a terminal payload (e.g. Respond's answer,
-                    # which lives in its call arguments) is about to be lost. Names
-                    # and ids only: message bodies are never logged here.
-                    _content = msg.get('content')
+                    missing_ids = [tc_id for tc_id in tool_call_id_to_call
+                                   if tc_id not in tool_call_id_to_message]
+                    cleaned_msg = msg.copy()
+                    # A committed Respond's answer lives only in its call
+                    # arguments: Respond.execute() returns self.content as the
+                    # tool result, so nothing copies it into assistant content.
+                    # If that result never landed, popping tool_calls below
+                    # would erase the only copy of the answer. Recover it first.
+                    _content = cleaned_msg.get('content')
                     if isinstance(_content, str):
                         _empty_content = not _content.strip()
                     else:
                         _empty_content = not _content
+                    recovered = ''
                     if _empty_content:
-                        missing_ids = [tc_id for tc_id in tool_call_id_to_call
-                                       if tc_id not in tool_call_id_to_message]
+                        recovered = ContextBuilder._recover_orphaned_payloads(tool_calls, missing_ids)
+                        if recovered:
+                            cleaned_msg['content'] = recovered
+                    cleaned_msg.pop('tool_calls', None)
+                    result.append(cleaned_msg)
+                    logger.debug(f'[DEBUG_CONTEXT] Removing incomplete tool sequence: {len(tool_call_id_to_call)} calls but only {len(tool_call_id_to_message)} valid tool messages ({missing_count} missing)')
+                    if _empty_content and not recovered:
                         missing_names = sorted({str((tc.get('function') or {}).get('name') or tc.get('name') or 'unknown') for tc in tool_calls if tc.get('id') in missing_ids})
                         logger.warning(f'[DEBUG_CONTEXT] Dropping tool_calls with no committed result leaves an EMPTY assistant message: tool_calls={missing_names} tool_call_ids={missing_ids} ({missing_count} missing) - any payload carried only by those calls is no longer visible to the model')
                     i = j
@@ -206,6 +211,37 @@ class ContextBuilder(ABC):
                 result.append(msg)
                 i += 1
         return result
+
+    @staticmethod
+    def _recover_orphaned_payloads(tool_calls, missing_ids):
+        """Recover terminal payloads carried only in the arguments of tool
+        calls whose results never landed. Only Respond is recovered: its
+        `content` argument is the user-visible answer and is otherwise
+        unrecoverable once `tool_calls` is dropped."""
+        import json
+        missing = set(missing_ids)
+        parts = []
+        for tc in tool_calls:
+            if tc.get('id') not in missing:
+                continue
+            fn = tc.get('function') or {}
+            name = fn.get('name') or tc.get('name')
+            if name != 'Respond':
+                continue
+            raw = fn.get('arguments')
+            if isinstance(raw, str):
+                try:
+                    args = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+            elif isinstance(raw, dict):
+                args = raw
+            else:
+                continue
+            content = args.get('content') if isinstance(args, dict) else None
+            if isinstance(content, str) and content.strip():
+                parts.append(content)
+        return '\n\n'.join(parts)
 
 class SummaryBuilder(ContextBuilder):
     """

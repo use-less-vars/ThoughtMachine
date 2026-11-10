@@ -153,15 +153,6 @@ def test_two_turn_respond_answer_survives():
 
 # ── 2. Orphaned Respond tool call (commit_assistant_only / halt) ─────────────
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        'ContextBuilder._cleanup_orphaned_tool_messages (session/context_builder.py:157-163) '
-        "pops 'tool_calls' off an assistant whose tool results never landed, and that assistant's "
-        "'content' is empty -- the Respond payload (the answer) lived only in the tool call "
-        "arguments, so turn 1's answer is silently dropped from turn 2's request."
-    ),
-)
 def test_respond_answer_survives_orphaned_tool_call():
     """No tool result ever lands; the answer must not silently vanish.
 
