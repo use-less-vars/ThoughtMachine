@@ -26,6 +26,19 @@ f250b724 fix(state): fail-closed is_tool_allowed; drop the []-means-allow edge
 - **C2** -- Worker Process Boundary (workspace confinement).
 - **C3** -- Host Bash Danger Color.
 - **C4** -- Agent Sysprompt Addendum.
+- **C5** -- Vision Tool.
+- **C11** -- `ContainerManager.exec()` abandons the PID by design; callers own cleanup, and three don't.
+- **C13** -- Persistent Container Timeout Self-Healing.
+- **C22** -- `ToolExecutor` is constructed with `state=None`, and the dispatch gate has no `None` guard.
+- **C23** -- Control plane — unprobed paths (worker lazy build, resume-side clear).
+- **C31** -- Pre-commit gate covers ~630 of ~6482 tests.
+- **C32** -- `git_read` selectors silently ignored.
+- **C33** -- `gen_handoff.py` open-item parser mis-files and re-slices the queue.
+- **C34** -- `scripts/gen_handoff.py` cannot run without a `git` binary.
+- **C35** -- Worker force-summarisation drops pending dispatch payloads.
+- **C36** -- `personal/bugs_and_fixes.md` is ~81,000 tokens and effectively unreadable.
+- **C25** -- Worker State Reattachment.
+- **C30** -- Expose `cpu_quota` on container recreate/restart.
 
 ## Rules of Engagement (Gen 62 Protocol)
 
