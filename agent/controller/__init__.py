@@ -858,6 +858,7 @@ class AgentController:
                             if self.pause_event.is_set() and not self._agent_in_reading_mode():
                                 log('DEBUG', 'core.controller', f'pause requested between events, breaking loop')
                                 self._pause_requested = False
+                                stop_reason = 'paused'
                                 break
                 except Exception as e:
                     log('ERROR', 'core.controller', f'Unhandled exception during process_query: {e}')

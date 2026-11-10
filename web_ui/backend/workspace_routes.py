@@ -1295,10 +1295,6 @@ def _stop_worker_instance(
     * write ``command.json`` with ``{"action": "stop"}`` (detach) or
       ``{"action": "kill"}`` (terminate) so the polling worker thread picks
       the signal up (within its poll interval),
-    * optimistically write ``status.json`` with the matching
-      ``runtime_status`` (``"detached"`` for stop, ``"killed"`` for kill) so
-      the UI sees the new state immediately (instead of "jumping back" to
-      "busy" before the worker processes the command),
     * fast-path the in-memory registry thread, optionally narrowed by
       ``session_id`` and ``instance_id``: ``thread.stop()`` (which detaches,
       PHASE 2.1a) or, when ``terminate`` is set, ``thread.kill()``.
@@ -1371,17 +1367,6 @@ def _stop_worker_instance(
         worker_name=name,
         instance_id=resolved_instance_id,
     )
-
-    # Immediately write status.json with the state the worker is heading for
-    # ("detached" on stop, "killed" on kill) so the UI doesn't "jump back"
-    # to "busy" on the next poll before the worker thread has a chance to
-    # process the command.
-    _atomic_write_json({
-        "runtime_status": "killed" if terminate else "detached",
-        "current_task": None,
-        "last_heartbeat": datetime.now(timezone.utc).isoformat(),
-        "error": None,
-    }, worker_dir / "status.json")
 
     # Fast-path: if the thread is in-memory (same process), signal directly.
     # Registry keys are tuples (session_id, worker_name[, instance_id]), so
@@ -1462,8 +1447,7 @@ async def stop_all_workers(
     Enumerates instances from the same on-disk layout the per-worker ``stop``
     route uses (``workers/<session_id>/<name>[/<name>#<N>]`` and legacy
     ``workers/<name>``/``workers/<name>#<N>``) and stops each one through the
-    shared per-worker helper: a file-based ``command.json`` signal plus an
-    optimistic ``status.json`` (``runtime_status: "detached"``) plus the
+    shared per-worker helper: a file-based ``command.json`` signal plus the
     in-memory registry fast-path.  PHASE 2.1a: ``stop`` DETACHES — no
     ``Thread.kill``, the workers park and can be resumed; terminate with the
     per-worker ``kill`` route.  No job_registry or container changes.
@@ -1545,11 +1529,6 @@ async def stop_worker(
     registry.  Returns immediately — the worker will transition to
     ``detached`` asynchronously.
 
-    Also immediately writes ``status.json`` with ``runtime_status: "detached"``
-    so the web UI's next poll sees the new state right away (instead of
-    "jumping back" to "busy" when the optimistic update gets overwritten
-    before the worker processes the stop).
-
     Returns:
         200 with ``{"status": "ok", "name": name}`` on success.
         404 if the worker directory does not exist.
@@ -1592,11 +1571,6 @@ async def kill_worker(
     Also attempts an in-memory kill as a fast path if the thread is in the
     registry.  Returns immediately — the worker will transition to ``killed``
     asynchronously.
-
-    Also immediately writes ``status.json`` with ``runtime_status: "killed"``
-    so the web UI's next poll sees the terminal state right away (instead of
-    "jumping back" to "busy" when the optimistic update gets overwritten
-    before the worker processes the kill).
 
     Returns:
         200 with ``{"status": "ok", "name": name}`` on success.
@@ -1840,12 +1814,8 @@ async def pause_worker(
     registry.  Returns immediately — the worker will transition to ``paused``
     asynchronously.
 
-    Also immediately writes ``status.json`` with ``runtime_status: "pausing"``
-    so the web UI's next poll shows the pending pause right away.  The worker
-    transitions to ``"paused"`` only once its current turn actually completes.
-
     Returns:
-        200 with ``{"status": "pausing", "name": name}`` on success.
+        200 with ``{"status": "accepted", "name": name}`` on success.
         404 if the worker directory does not exist.
     """
     ensure_workspace_dirs(ws_id)
@@ -1911,15 +1881,6 @@ async def pause_worker(
         instance_id=resolved_instance_id,
     )
 
-    # Immediately write status.json as "pausing" (the pause is in flight).
-    # The worker flips to "paused" only when its current turn completes.
-    _atomic_write_json({
-        "runtime_status": "pausing",
-        "current_task": None,
-        "last_heartbeat": datetime.now(timezone.utc).isoformat(),
-        "error": None,
-    }, worker_dir / "status.json")
-
     # Fast-path: if the thread is in-memory (same process), signal directly.
     # Registry keys are tuples (session_id, worker_name[, instance_id]), so
     # iterate all entries matching the worker name — optionally narrowed to
@@ -1936,7 +1897,7 @@ async def pause_worker(
             except Exception:
                 pass  # File-based pause will still work
 
-    resp = {"status": "pausing", "name": name}
+    resp = {"status": "accepted", "name": name}
     if target_label is not None:
         resp["instance_id"] = instance_id
         resp["instance_label"] = target_label

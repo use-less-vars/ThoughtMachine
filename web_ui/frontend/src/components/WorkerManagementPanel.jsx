@@ -366,7 +366,7 @@ function StopAllConfirm({ onConfirm, onCancel }) {
           Stop All Workers
         </h3>
         <p style={{ fontSize: '0.85rem', color: '#a6adc8', margin: '0 0 1rem' }}>
-          Stop every running worker instance in this workspace? This cannot be undone.
+          Stop every running worker instance in this workspace? They park as detached and can be resumed later.
         </p>
         <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
           <button style={{ ...btnGhost, color: '#cdd6f4', borderColor: '#585b70' }} onClick={onCancel}>

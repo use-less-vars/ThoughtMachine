@@ -215,7 +215,7 @@ def test_pause_route_does_not_500_when_the_runtime_handle_raises(
         response = client.post(f"/api/workspace/{WS_ID}/workers/w1/pause")
 
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == "pausing"
+    assert response.json()["status"] == "accepted"
     # The worker still gets its command, fenced, despite the runtime failure.
     assert _command_payload(worker_dir) == {
         "action": "pause",

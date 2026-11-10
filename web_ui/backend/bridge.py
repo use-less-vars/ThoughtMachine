@@ -1851,8 +1851,6 @@ class WebAgentBridge:
                     else:
                         sid, wname = key
                     if sid == self._session_id:
-                        if getattr(thread, "status", None) != "paused":
-                            continue
                         try:
                             # resume() returns False when a stop is already in
                             # flight; the thread will die without ever
@@ -3485,6 +3483,7 @@ class WebAgentBridge:
                 self._forwarder.broadcast(self._session_id, "state_changed", {
                     "state": "IDLE",
                     "is_running": _is_busy,
+                    "stop_reason": stop_reason,
                 })
             # Emit final conversation snapshot so the frontend gets the last
             # messages even if session_stop is the only event emitted.
