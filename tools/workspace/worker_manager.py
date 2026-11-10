@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -946,6 +947,40 @@ class WorkerManager:
         return wait_for_worker_exit(thread, worker_name)
 
 
+# -- stale-check opt-in flag --------------------------------------------------
+
+_STALE_CHECK_ENV = "WORKER_STALE_CHECK_ENABLED"
+_STALE_CHECK_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def stale_check_enabled() -> bool:
+    """Whether the interrupting stale-worker reaper should be wired.
+
+    OFF by default. The reaper's ``_check_detached_ttl`` is the only thing
+    that enforces detached-worker TTL, but its ``_interrupt`` also kills
+    in-flight executions of heartbeat-stale workers -- which the
+    announce-only watchdog deliberately never does. Opt in explicitly.
+    """
+    return (os.environ.get(_STALE_CHECK_ENV) or "").strip().lower() in _STALE_CHECK_TRUTHY
+
+
+def ensure_stale_check(manager) -> bool:
+    """Wire the stale-worker reaper if it is enabled, else say so loudly.
+
+    Returns True when the reaper was started.
+    """
+    if stale_check_enabled():
+        manager.start_stale_check()
+        return True
+    logger.warning(
+        "%s is not set: the stale-worker reaper is DISABLED. Detached "
+        "workers will NOT be reaped and will stay parked until an operator "
+        "resumes or kills them by hand.",
+        _STALE_CHECK_ENV,
+    )
+    return False
+
+
 # -- module-level singleton accessor ------------------------------------------
 
 _MANAGER_LOCK = threading.Lock()
@@ -967,6 +1002,7 @@ def get_manager() -> WorkerManager:
                 _MANAGER_INSTANCE = WorkerManager()
     try:
         _MANAGER_INSTANCE.ensure_stale_monitor()
+        ensure_stale_check(_MANAGER_INSTANCE)
     except Exception as exc:  # noqa: BLE001 - a monitor must not break the caller
-        logger.warning("stale monitor could not be started: %s", exc)
+        logger.warning("stale monitor/reaper could not be started: %s", exc)
     return _MANAGER_INSTANCE

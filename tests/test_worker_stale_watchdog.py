@@ -42,7 +42,12 @@ from agent.config.defaults import (  # noqa: E402
     WORKER_STALE_PROBE_TIMEOUT_S,
     WORKER_STALE_WATCHDOG_INTERVAL_S,
 )
-from tools.workspace.worker_manager import PeriodicStaleCheck, WorkerManager  # noqa: E402
+from tools.workspace.worker_manager import (  # noqa: E402
+    PeriodicStaleCheck,
+    WorkerManager,
+    ensure_stale_check,
+    stale_check_enabled,
+)
 from tools.workspace.worker_stale_watchdog import (  # noqa: E402
     WorkerStaleWatchdog,
     ensure_watchdog,
@@ -443,6 +448,70 @@ def test_departed_worker_is_forgotten_and_can_announce_again():
     registry._workers[key] = worker
     assert len(watchdog.tick()) == 1
     assert len(announced) == 2
+
+
+# -- stale-check opt-in flag --------------------------------------------------
+# `ensure_stale_check` wires the INTERRUPTING reaper (PeriodicStaleCheck), whose
+# `_interrupt` kills in-flight executions -- exactly what the announce-only
+# watchdog above never does. So it is OFF unless an operator opts in, and its
+# absence must be announced loudly enough to find.
+
+
+class _RecordingStaleCheckManager:
+    """Manager stub: the only seam `ensure_stale_check` touches."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def start_stale_check(self):
+        self.calls += 1
+        return object()
+
+
+def test_stale_check_disabled_by_default(monkeypatch, caplog):
+    """No flag -> no reaper thread, and one warning that names the flag."""
+    monkeypatch.delenv("WORKER_STALE_CHECK_ENABLED", raising=False)
+    fake = _RecordingStaleCheckManager()
+
+    with caplog.at_level("WARNING", logger="tools.workspace.worker_manager"):
+        caplog.clear()
+        assert ensure_stale_check(fake) is False
+
+    assert fake.calls == 0, "the reaper must not start without the flag"
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    text = warnings[0].getMessage()
+    assert "WORKER_STALE_CHECK_ENABLED" in text
+    assert "will NOT be reaped" in text
+
+
+def test_stale_check_enabled_starts_the_reaper(monkeypatch):
+    """Flag set -> exactly one start, and the helper reports True."""
+    monkeypatch.setenv("WORKER_STALE_CHECK_ENABLED", "1")
+    fake = _RecordingStaleCheckManager()
+
+    assert ensure_stale_check(fake) is True
+    assert fake.calls == 1
+
+
+def test_stale_check_flag_parsing(monkeypatch):
+    """Only explicit truthy spellings opt in; everything else stays OFF."""
+    cases = [
+        (None, False),
+        ("0", False),
+        ("false", False),
+        ("", False),
+        ("1", True),
+        ("TRUE", True),
+        ("yes", True),
+        ("on", True),
+    ]
+    for value, expected in cases:
+        if value is None:
+            monkeypatch.delenv("WORKER_STALE_CHECK_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("WORKER_STALE_CHECK_ENABLED", value)
+        assert stale_check_enabled() is expected, f"value={value!r}"
 
 
 if __name__ == "__main__":  # pragma: no cover
