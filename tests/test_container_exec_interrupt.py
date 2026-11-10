@@ -116,8 +116,12 @@ def _make_manager(container, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _clean_token():
+    # ``unbind()`` drops the turn token AND the pause reference; the explicit
+    # pause clear is stated anyway so a leak can never survive a refactor.
     cancellation.unbind()
+    cancellation.bind_pause_event(None)
     yield
+    cancellation.bind_pause_event(None)
     cancellation.unbind()
 
 
@@ -142,6 +146,40 @@ def test_interrupted_wait_returns_promptly_without_killing(tmp_path):
     assert result["status"] == "interrupted"
     assert result["interrupted"] is True
     assert result["reason"] == "stopped_by_operator"
+    assert result["exec"] == "container_exec"
+    assert result["container_id"] == "c1"
+    assert result["command"] == "sleep 30"
+    assert result["exit_code"] is None
+    # Honest note: we stopped waiting, the process was not killed.
+    assert "NOT killed" in result["note"]
+    # Quick: nowhere near the 25 s timeout, and no kill / drop happened.
+    assert elapsed < 5.0
+    assert ctr.killed is False
+    assert cm.dropped == []
+
+
+def test_paused_wait_returns_promptly(tmp_path):
+    """A worker PAUSE must abandon the wait, with its own reason string.
+
+    Pause is not a cancel: the turn is meant to CONCLUDE (reading mode).  But a
+    tool blocked here would sit out the whole timeout first, so the conclusion
+    could never start.  Same payload shape as the cancel path, different
+    ``reason`` so callers and tests can tell the two apart.
+    """
+    ctr = _BlockingContainer(block_seconds=30.0)
+    cm = _make_manager(ctr, tmp_path)
+    pause_event = threading.Event()
+    cancellation.bind_pause_event(pause_event)
+
+    threading.Timer(0.2, pause_event.set).start()
+    started = time.monotonic()
+    result = cm.exec("c1", command="sleep 30", timeout=25)
+    elapsed = time.monotonic() - started
+    ctr.release.set()
+
+    assert result["status"] == "interrupted"
+    assert result["interrupted"] is True
+    assert result["reason"] == "paused"
     assert result["exec"] == "container_exec"
     assert result["container_id"] == "c1"
     assert result["command"] == "sleep 30"
@@ -256,3 +294,82 @@ def test_docker_code_runner_surfaces_interrupted_payload(monkeypatch, tmp_path):
     assert '"interrupted": true' in payload
     assert '"exit_code": null' in payload
     assert "stopped_by_operator" in payload
+
+
+# ---------------------------------------------------------------------------
+# Worker direction -- the tool loop BINDS the worker's own park event
+# ---------------------------------------------------------------------------
+
+
+class _NullStateBridge:
+    """Keep the loop's presenter lazy-init out of the test (same stand-in as
+    ``tests/test_worker_pause_midturn_cooperative.py``)."""
+
+    context_length = 0
+
+
+def _unstarted_worker(tmp_path):
+    """A REAL ``WorkerThread`` that is never ``start()``ed (house pattern)."""
+    from tools.workspace.worker_thread import WorkerThread
+
+    return WorkerThread(
+        name="test-worker-pause-binding",
+        definition={"name": "test-worker-pause-binding",
+                    "system_prompt": "You are a test worker."},
+        agent_config={},
+        workspace_dir=tmp_path,
+        session_id="sess-pause-binding",
+        container_manager=None,
+        max_container_count=4,
+        max_token_usage=None,
+        max_runtime_s=None,
+    )
+
+
+def test_worker_tool_loop_binds_the_pause_event(tmp_path):
+    """THE PIN: the tool thread must SEE the worker's park event.
+
+    Without this binding ``pause_requested()`` is False inside every tool on the
+    worker's thread, so an in-flight container exec can never notice a pause --
+    it waits out its full timeout instead.
+    """
+    thread = _unstarted_worker(tmp_path)
+    thread._state_bridge = _NullStateBridge()
+    thread._publish_event = lambda etype, data: None
+    seen = {}
+
+    class _Agent:
+        def process_query(self, query):
+            seen["start"] = cancellation.pause_requested()
+            thread.pause()
+            seen["paused"] = cancellation.pause_requested()
+            thread.resume()
+            seen["resumed"] = cancellation.pause_requested()
+            thread.pause()
+            seen["paused_again"] = cancellation.pause_requested()
+            yield {"type": "assistant_message", "content": "working on it..."}
+            yield {"type": "agent_responded", "content": "done",
+                   "status": "success", "confidence": "high"}
+
+        def enter_reading_mode(self, reason="pause"):
+            return None
+
+        def leave_reading_mode(self, reason="pause"):
+            return None
+
+        def request_pause(self):
+            return None
+
+    thread._agent = _Agent()
+
+    thread._run_tool_loop("do the thing")
+
+    assert seen["start"] is False, seen
+    assert seen["paused"] is True, seen
+    assert seen["resumed"] is False, seen
+    assert seen["paused_again"] is True, seen
+
+    # Turn end DROPS the reference -- even though the event itself is still set
+    # (it belongs to the worker, not to the turn).
+    assert thread._park_event.is_set() is True
+    assert cancellation.pause_requested() is False

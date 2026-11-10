@@ -3021,9 +3021,20 @@ class WorkerThread(threading.Thread):
         # inline on this thread (agent/core/tool_executor.py:689), so binding at
         # the turn boundary is the narrowest point that covers every tool call
         # without touching the executor.
+        from tools.sleep_tool import bind_pause_event as _bind_pause_event
         from tools.sleep_tool import bind_turn_cancel as _bind_turn_cancel
         from tools.sleep_tool import unbind as _unbind_turn_cancel
         _bind_turn_cancel(self._turn_cancel)
+        # PAUSE PLUMBING: pause has no thread-local token of its own.  It is
+        # raised by the bridge/controller on ANOTHER thread, so the only way a
+        # tool blocked on THIS (the turn-running) thread can see it is a shared
+        # reference.  Bind this worker's own ``_park_event`` -- cleared =
+        # running, set = pause requested, exactly the polarity
+        # ``bind_pause_event`` documents -- so a tool that waits
+        # (``ContainerManager.exec``, ``Sleep``) wakes on a pause instead of
+        # blocking until its own timeout.  The event is never set or cleared
+        # here: it belongs to the worker, and ``pause()``/``resume()`` own it.
+        _bind_pause_event(self._park_event)
 
         # ── S7b-4a: ADOPT the dead predecessor's turn, ONCE, before WP1 ─────
         # A crashed incarnation leaves an ``inflight`` record in THIS directory
@@ -3400,6 +3411,11 @@ class WorkerThread(threading.Thread):
             logger.exception("Worker _run_tool_loop failed")
             final_content = json.dumps({"error": f"Worker execution failed: {exc}"})
         finally:
+            # Drop THIS thread's pause reference (``_unbind_turn_cancel`` below
+            # would clear it too, but the pairing is stated here so the turn
+            # boundary stays readable).  The event itself is untouched: it is
+            # the worker's, not this module's.
+            _bind_pause_event(None)
             _unbind_turn_cancel()
             if _worker_ctx_token is not None and WORKER_NAME_CONTEXTVAR is not None:
                 WORKER_NAME_CONTEXTVAR.reset(_worker_ctx_token)
