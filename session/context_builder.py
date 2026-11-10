@@ -160,6 +160,21 @@ class ContextBuilder(ABC):
                     result.append(cleaned_msg)
                     missing_count = len(tool_call_id_to_call) - len(tool_call_id_to_message)
                     logger.debug(f'[DEBUG_CONTEXT] Removing incomplete tool sequence: {len(tool_call_id_to_call)} calls but only {len(tool_call_id_to_message)} valid tool messages ({missing_count} missing)')
+                    # Make the erasure observable. Emitted only when dropping the
+                    # tool_calls leaves an assistant message with no text, i.e. when
+                    # the only copy of a terminal payload (e.g. Respond's answer,
+                    # which lives in its call arguments) is about to be lost. Names
+                    # and ids only: message bodies are never logged here.
+                    _content = msg.get('content')
+                    if isinstance(_content, str):
+                        _empty_content = not _content.strip()
+                    else:
+                        _empty_content = not _content
+                    if _empty_content:
+                        missing_ids = [tc_id for tc_id in tool_call_id_to_call
+                                       if tc_id not in tool_call_id_to_message]
+                        missing_names = sorted({str((tc.get('function') or {}).get('name') or tc.get('name') or 'unknown') for tc in tool_calls if tc.get('id') in missing_ids})
+                        logger.warning(f'[DEBUG_CONTEXT] Dropping tool_calls with no committed result leaves an EMPTY assistant message: tool_calls={missing_names} tool_call_ids={missing_ids} ({missing_count} missing) - any payload carried only by those calls is no longer visible to the model')
                     i = j
                 else:
                     result.append(msg)
@@ -244,11 +259,20 @@ class SummaryBuilder(ContextBuilder):
         keep_turns = self.default_keep_turns
         if summary_msg is not None:
             keep_turns = summary_msg.get('pruning_keep_recent_turns', self.default_keep_turns)
-        log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: keep_turns={keep_turns}')
-        if summary_idx >= 0:
-            post_summary = user_history[summary_idx + 1:]
+        # Window selection: everything after the summary UNION the last keep_turns
+        # turns of user_history. A summary must never silently drop the turns it
+        # explicitly claims to keep, so keep_turns is authoritative, not advisory.
+        start = summary_idx + 1 if summary_idx >= 0 else 0
+        if keep_turns and keep_turns > 0:
+            kept_turns = self._group_messages_into_turns(user_history)[-keep_turns:]
+            kept_message_ids = {id(m) for turn in kept_turns for m in turn}
+            selected = [i for i in range(len(user_history))
+                        if i >= start or id(user_history[i]) in kept_message_ids]
         else:
-            post_summary = user_history
+            kept_turns = []
+            selected = list(range(start, len(user_history)))
+        post_summary = [user_history[i] for i in selected]
+        log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: keep_turns={keep_turns}, kept {len(kept_turns)} turn(s), selected {len(post_summary)}/{len(user_history)} messages (summary_idx={summary_idx})')
 
         system_warnings = []
         non_system = []
