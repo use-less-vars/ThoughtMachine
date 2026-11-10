@@ -38,7 +38,7 @@ def main() -> int:
         if not m:
             continue
         cid, body = m.group(1), m.group(2)
-        if "Landed" in body:
+        if "Landed" in line:
             continue
         open_items.append((cid, body))
     if not open_items:

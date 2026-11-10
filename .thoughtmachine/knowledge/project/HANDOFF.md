@@ -23,9 +23,9 @@ f250b724 fix(state): fail-closed is_tool_allowed; drop the []-means-allow edge
 
 ## First task (from the live queue)
 
-- **C1** -- Stop Signal Propagation (transport).
 - **C2** -- Worker Process Boundary (workspace confinement).
 - **C3** -- Host Bash Danger Color.
+- **C4** -- Agent Sysprompt Addendum.
 
 ## Rules of Engagement (Gen 62 Protocol)
 
