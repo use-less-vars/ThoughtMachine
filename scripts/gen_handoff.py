@@ -19,6 +19,39 @@ def sh(*args: str) -> str:
     return subprocess.check_output(args, text=True).strip()
 
 
+def _parse_open_items(active: str) -> list:
+    """Return ``[(cid, title), ...]`` for every open C-item in ``active``.
+
+    The unit of parsing is a BLOCK, not a physical line: a block starts at any
+    line beginning ``- `` and absorbs every following line up to the next such
+    line. A block whose bold title wraps across two lines is therefore parsed
+    intact instead of vanishing. The done-marker test runs over the whole
+    joined block, and the title is the same capture as before.
+    """
+    blocks = []
+    current = None
+    for line in active.splitlines():
+        if line.startswith("- "):
+            if current is not None:
+                blocks.append(current)
+            current = [line]
+        elif current is not None:
+            current.append(line)
+    if current is not None:
+        blocks.append(current)
+    open_items = []
+    for block_lines in blocks:
+        block = " ".join(" ".join(block_lines).split())
+        m = re.match(r"^- \*\*(C\d+):\s+(.*?)\*\*", block)
+        if not m:
+            continue
+        cid, body = m.group(1), m.group(2)
+        if re.search(r"\*\*Landed\*\*", block):
+            continue
+        open_items.append((cid, " ".join(body.split()).strip()))
+    return open_items
+
+
 def main() -> int:
     root = pathlib.Path(sh("git", "rev-parse", "--show-toplevel"))
     priorities = root / ".thoughtmachine/knowledge/project/PRIORITIES.md"
@@ -32,15 +65,7 @@ def main() -> int:
     dev_subj = sh("git", "log", "-1", "--format=%s", "dev")
     recent = sh("git", "log", "-5", "--oneline", "dev")
     active = priorities.read_text().split("## Archived")[0]
-    open_items = []
-    for line in active.splitlines():
-        m = re.match(r"^- \*\*(C\d+):\s+(.*?)\*\*", line)
-        if not m:
-            continue
-        cid, body = m.group(1), m.group(2)
-        if "Landed" in body:
-            continue
-        open_items.append((cid, body))
+    open_items = _parse_open_items(active)
     if not open_items:
         print("ERROR: no open C-items parsed; refusing.", file=sys.stderr)
         return 1
@@ -69,8 +94,17 @@ def main() -> int:
     for i, entry in enumerate(manifest, 1):
         out.append(f"{i}. {entry}")
     out += ["", "## First task (from the live queue)", ""]
-    for cid, body in open_items[:3]:
+    for cid, body in open_items:
         out.append(f"- **{cid}** -- {body}")
+    out += [
+        "",
+        "## Rules of Engagement (Gen 62 Protocol)",
+        "",
+        "- **The Operator is a relay, not a bash environment.** Do not ask the Operator to run `sed`, `python`, `awk` or multi-line shell to accomplish a change; dispatch the Agent instead.",
+        "- **Heredocs are banned.** They mangle the Operator's terminal. Any change over five lines is written and committed by the Agent, not pasted by the Operator.",
+        "- **Investigation is delegated.** The Engineer reads diffs and summaries, not source files; source reading belongs to the Agent.",
+        "- **Onboarding reading is 100-150 kB in one to three massive chunks.** Do not chop the reading into thirty small turns.",
+    ]
     out += [
         "",
         "## Carried traps (do not re-discover)",
