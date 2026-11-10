@@ -155,6 +155,12 @@ different file, different name. Never rename one to the other.
 
 ---
 
+
+- **C30: Expose `cpu_quota` on container recreate/restart.** **Open.** Filed by Gen 62, per Main ruling. `infra/container_manager.py` hardcodes `cpu_quota=100000` (0.5 CPU) on the persistent-container create path, so an operator (or EE engineer running scientific solves) cannot raise it. **Ruling in force: the container envelope is its birth certificate — do not mutate cgroups at runtime.** The Stop -> Edit Config -> Restart (recreate) flow is the correct architecture. **Fix path:** allow the caller (`docker_code_runner.py`, or a new operator/agent action) to pass `cpu_quota` when stopping and recreating a persistent container; wire it through `container_manager` create. **Do not fix on the Gen 62 onboarding branch — file only.** This is the container-strand work the EE engineer is blocked on.
+
+- **Correction (Gen 62):** the pre-Gen-62 `HANDOFF.md` referenced "Phase 10 (EM-Solver / Resources) OPEN" and "C25 (Worker State Reattachment) open". **Neither exists in this queue — no C25, no Phase 10 section. The prior handoff hallucinated them.** Do not search the queue for either; if either is real work, it needs a fresh ID and a real scope, not an inheritance.
+
+
 ## Archived (pre-Gen 42 brain dump — do not read as current work)
 
 - **W11 (Resource Composition):** Bins (granular permissions), Dynamic Imports,
