@@ -63,6 +63,37 @@ Shortcomings of the system observed while dispatching the C1/C2 test-authoring w
 3. **A merged-and-deleted branch is indistinguishable from data loss on the agent side.** `git_read rev_parse ref=docs/gen60-housekeeping` returned `fatal: ambiguous argument '...': unknown revision or path not in the working tree`, which reads exactly like the branch never existed. The truth was in `git_read log`: PR #311 had merged it (`5eb33d12 Merge pull request #311 ...`). When a ref vanishes, read the log before concluding anything; deletion after merge is normal and the commit is still reachable through the merge commit.
 4. **Worker `ApplyEdits` was refused mid-task with reason `token`** ("tool access restricted at the critical context threshold"). The worker called `SummarizeTool` and the same edit then applied cleanly. A context-threshold refusal can look like a permissions failure, and it can arrive in the middle of an edit sequence, so a worker's file may be half-edited when it stops.
 5. **`KnowledgeBaseTool` `domain=lessons_learned` resolves to `personal/lessons_learned.md`, not `project/lessons_learned.md`.** The two files genuinely coexist (the tracked generation-scoped one and the large historical one), and the domain name silently picks the personal one. Anything that must survive a clone has to be written to the project file another way.
+6. **`npm run test` does not work here:** no summary and exit 124. Run named files instead — `cd web_ui/frontend && TMPDIR=/tmp timeout 150 npx vitest run --maxWorkers=2 <files>`.
+7. **`TMPDIR=/tmp` is mandatory.** `/var/tmp` is read-only and the failure surfaces as a misleading `ENOENT` about a file that exists.
+8. **A worker's turn is hard-cut at roughly 150–175 s,** and `timeout_seconds` is NOT an upper bound: a 175 s request returned at 154.8 s with `timeout_triggered` set. The cut lands precisely when verification begins, so write every edit first, verify last, and spend a separate cheap turn on verification alone.
+9. **A worker that has burned its context is not reusable** — one sat at 84k tokens against an 80k `critical_threshold_tokens` holding nothing but `Respond`/`SummarizeTool`. Re-spawn with `force=True` rather than querying it. Ceilings differ per worker (85k vs 80k); never assume the default.
+10. **`git` is absent from the worker sandbox (`host_bash` banned),** so workers cannot inspect history or commit. Git is the orchestrator's job; never put git commands in a worker brief.
+11. **`FileSearchTool` over `.` fails on this repo (~42k files).** Always scope a search to a subdirectory.
+12. **`FileEditor` under-reports multi-line appends** ("1 line(s)" for a whole section). Verify by re-reading.
+13. **`FileSearchTool` can render synthetic bold markers that do not exist in the file,** which breaks a later exact-match edit. Build anchors from a plain read, not from search output.
+14. **`git_read cat_file` silently ignores `line_start`/`line_end`** and dumps the file from the top — ~10k tokens on a large source file.
+15. **`git_read diff` returns an empty result rather than an error when `file_path` is a list.** Pass one path, or loop per file.
+16. **`git_read merge_base` takes its operands as `a` and `b`, not `commit1`/`commit2`,** and reports a non-ancestor as a sentence rather than a failure — read the text, not the exit status.
+17. **A worker's context can be summarised mid-turn, destroying a long verbatim payload it was told to transcribe.** Keep payloads short, or split them across turns.
 
 No stop/pause procedure failed. The standing V1 workaround (park the brief in a `WorkingDocument`, send a 3-5 line query naming the `doc_id`) worked again.
 
+---
+
+## Gen 61 — the control plane
+
+### 1. The Stale Prompt Trap
+
+A resumed agent obeyed a `[System Notice: You are paused]` that was three turns old and refused a fresh query, because the notice was still sitting in its history and nothing ever contradicted it. The agent was not confused about what it could do; it had been told, once, and the telling never expired.
+
+**Rule.** Every unpause must inject a counter-notice as explicit as the pause notice was, and both must be written by symmetric code paths. The delivery path matters as much as the text: the pause notice is buffered in `_pending_warnings` and every flush site for that buffer runs *after* the LLM call, so a resume notice put in the same buffer would miss the first post-resume call — exactly the turn the stale notice poisons. Use `Agent.leave_reading_mode()`, the only `clear_restriction()` caller outside `state.py`, and write straight to history.
+
+**Corollary.** An instruction the agent can read is an instruction the agent will keep obeying. Anything injected into history needs a stated lifetime, and something must revoke it.
+
+### 2. The Split-Brain UI
+
+The backend sent a tool call and its result as two independent events with no shared id, and the UI dutifully rendered both — one call, two bubbles, one of them a result with no visible cause. Neither half was wrong; the pairing simply did not exist anywhere in the system.
+
+**Rule.** Every IPC/WebSocket event needs a unique id, so the consumer can upsert idempotently instead of appending blindly. For history written before the id existed, derive a synthetic one from position (`legacy:{msg}:{tc}:{name}`, `legacy:result:{msg}`) — position keeps genuinely repeated identical calls distinct, and a reserved prefix cannot collide with a real id. Never pair a result that has no id: an unpaired row is honest, a wrongly paired row is a lie.
+
+**Corollary.** "The frontend should have known" is not a diagnosis. If the wire format cannot express the relationship, the fix belongs on the wire.
