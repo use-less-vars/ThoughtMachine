@@ -151,6 +151,10 @@ different file, different name. Never rename one to the other.
 
 - **C29: Worker pause never reached container exec.** **Landed** `9082e2cd` (in `dev`). `bind_pause_event` was bound only for the main agent, so a paused worker's in-flight container command ran to completion. It is now bound at the worker turn boundary via `_park_event` and polled in both container managers, sharing `_interrupted_payload(reason="paused")`.
 
+- **C31: Pre-commit gate covers ~630 of ~6482 tests.** **Open.** File only. The pre-commit hook runs a subset; ~90% of the suite is not gated at commit. Quantify the gap and decide whether that is intentional — do not change the hook here.
+
+- **C32: `git_read` selectors silently ignored.** **Open.** File only. `git_read log`, `git_read rev_parse` and `git_read show_file` ignore `commit`/`ref` and return HEAD (except `rev_parse`, which honours `ref` but not `commit`). Produces plausible wrong history — an agent can report SHAs that never contained the work.
+
 - **C25: Worker State Reattachment.** **Open.** Named in the Gen 61 close dispatch as a recommended start after the Control Plane, but it was carried as a name with no scope, and nothing else is known about it. **The first task is to write the scope** — do not infer a design from the title, and do not assume the worker's saved context and its containers are re-attached by the same mechanism until that is read in the code.
 
 ---

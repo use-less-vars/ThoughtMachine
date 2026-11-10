@@ -471,6 +471,8 @@ The last line is the one that is false today.
 
 ### 6.5 Where the pause state must live (the propagation question)
 
+> **RESOLVED (Gen 62, `dev@684f066d`):** the mutation point and the dispatch gate hold the same `AgentState` (`state_id` match) in both tests that reach the gate. No propagation fix is required. Coverage caveat: only 2 of 46 tests exercise a pause→gate path; expanding that is filed as C31.
+
 §6.3 fixes the *representation* of a restriction. It says nothing about
 *which object* holds it — and today a restriction only stops tools on the agent
 object that happened to receive it. The pause decision is applied to one
@@ -705,16 +707,16 @@ list is a work plan, and each item is independently reviewable.
 2. **NOT YET IMPLEMENTED — Collapse to one predicate (Option B).**
    Make `is_tool_allowed` compute the decision from `restrictions_active` +
    `restriction_reason`; keep `get_allowed_tools()` display-only.
-3. **NOT YET IMPLEMENTED — Instrument the pause gate, then choose the propagation
-   fix (§6.5).** Step 0 first: log `id(state)` at the `restrict()` mutation
-   point, at `is_tool_allowed` (`state.py:476`) and immediately before the
-   dispatch gate (`tool_executor.py:272`, with `current_worker_name()`, already
-   imported at `tool_executor.py:48-52`); log `self.tool_executor.state is
-   self.state` at `agent.py:531` and `agent.py:807`. Only if the ids disagree,
-   make the pause record per-turn and explicit: add it as a parameter of
-   `execute_tool_calls` (`tool_executor.py:193`) and pass it from the
-   main-agent call site (`agent.py:1952`), rather than adding a process-wide
-   registry. The registry is the fallback, not the default (§6.5).
+3. **DONE (instrumentation) / CLOSED (propagation).** Instrumentation landed Gen 61 dispatch 13 at `state.py:426`, `agent.py:1351`, `tool_executor.py:319-320`. §6.5 answered: same object. No propagation fix needed.
+   **Step 0 was the instrumentation itself** (Gen 61 dispatch 13). It logged
+   `id(state)` at the `restrict()` mutation point, at `is_tool_allowed`
+   (`state.py:476`) and immediately before the dispatch gate
+   (`tool_executor.py:272`, with `current_worker_name()`), plus
+   `self.tool_executor.state is self.state` at `agent.py:531` and
+   `agent.py:807`. The ids agree (§6.5), so the conditional follow-up —
+   making the pause record per-turn and explicit via a parameter of
+   `execute_tool_calls` (`tool_executor.py:193`) — is **not required**. The
+   process-wide registry remains the last-resort fallback, never the default.
 4. **NOT YET IMPLEMENTED — Make Stop drop the turn on the main agent (§4.3).**
    `agent.py:1721-1741`: do not `commit_assistant_only()` the partial content
    and do not inject the `stop_notice`; yield the `interrupted` event
