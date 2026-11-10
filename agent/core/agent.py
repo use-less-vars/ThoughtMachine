@@ -567,6 +567,11 @@ class Agent:
         self._pause_requested = False
         # Reading mode: at most ONE pause nudge per turn.
         self._pause_nudge_sent = False
+        # Resume notice: armed by leave_reading_mode() when a 'pause'-owned
+        # restriction is actually released, consumed ONCE by
+        # _apply_resume_notice() on the turn thread.  Starts disarmed, so a
+        # session that was never paused never emits a resume notice.
+        self._resume_notice_pending = False
         # Pause wind-down: set while the loop is re-entering so the model can
         # write its own summary after an interrupted tool batch.
         self._pause_winddown = False
@@ -1361,12 +1366,23 @@ class Agent:
 
         Returns True only when this call actually released the restriction.
         """
+        prior_reason = getattr(self.state, 'restriction_reason', None)
         released = self.state.clear_restriction(reason)
         if released:
             self._pause_requested = False
             self._pause_nudge_sent = False
             # The wind-down grant is over the moment the pause is released.
             self._pause_winddown = False
+            # RESUME NOTICE (symmetric with the pause nudge): the model was
+            # told "tool calls are refused, the session stays paused until it
+            # is resumed".  Without the matching notice on the way OUT it stays
+            # latched in that state.  Flag only -- no Message is built here
+            # (see the cross-thread rule above); the turn thread materialises
+            # it once via _apply_resume_notice().  Guarded on prior_reason so
+            # an owner-agnostic clear that released a 'token'/'timeout'/'turn'
+            # restriction never claims a pause was lifted.
+            if prior_reason == 'pause':
+                self._resume_notice_pending = True
         pause_debug(f'leave_reading_mode({reason!r}) -> released={released}')
         return released
 
@@ -1411,6 +1427,39 @@ class Agent:
         if self._pause_requested:
             pause_debug('Consuming _pause_requested: reading mode is in force')
             self._pause_requested = False
+
+    def _apply_resume_notice(self) -> None:
+        """Emit the one-shot resume notice, mirroring the pause nudge.
+
+        Runs ON THE TURN THREAD, before the next LLM call -- the exact
+        counterpart of _apply_pause_reading_mode().  leave_reading_mode()
+        arms ``_resume_notice_pending`` from whatever thread performs the
+        resume; this method is the only place a Message is constructed, so
+        the cross-thread contract on enter/leave_reading_mode() holds.
+
+        Delivered straight to history rather than via _pending_warnings:
+        every _pending_warnings flush site sits AFTER the LLM call, so a
+        notice buffered there would not be in the messages the model reads
+        on the first call after the resume -- which is the whole point.
+        The stop-notice path writes to history the same way.
+
+        Once per resume: the flag is cleared before the message is built, so
+        a second resume would have to arm it again, and calling resume twice
+        does not (leave_reading_mode() returns False the second time because
+        nothing is left to release).
+
+        It is a no-op when nothing is armed, which is the never-paused case.
+        """
+        if not getattr(self, '_resume_notice_pending', False):
+            return
+        self._resume_notice_pending = False
+        notice = make_system_notice(
+            'You are resumed. The pause is lifted. Tool calls are allowed.',
+            kind='resume_notice',
+            resume_notice=True,
+        )
+        self._add_to_conversation(notice)
+        log('DEBUG', 'core.pause', 'RESUME NOTICE: pause lifted, resume notice written to history')
 
     def request_pause(self):
         """Request pause at the next atomic turn boundary.
@@ -1517,6 +1566,9 @@ class Agent:
             self._stop_notice_sent = False
             # The wind-down grant is scoped to a single query.
             self._pause_winddown = False
+            # A resume that happened while the session was IDLE delivers its
+            # notice here, at the start of the next turn.
+            self._apply_resume_notice()
             current_exec_state = self.state.execution_state
             if current_exec_state == ExecutionState.RUNNING:
                 log('WARNING', 'core.agent', f'process_query called while already in RUNNING state')
@@ -1548,6 +1600,10 @@ class Agent:
             for turn in range(self.config.max_turns):
                 turn_start_time = time.time()
                 log('DEBUG', 'core.agent', f'process_query: starting turn {turn}/{self.config.max_turns}, conversation length={len(self.conversation)}')
+                # A resume that lands WHILE this turn is running delivers its
+                # notice at the top of the next iteration, before messages are
+                # built, so the model reads it on this turn's next LLM call.
+                self._apply_resume_notice()
 
                 if self.logger:
                     self.logger.log_turn_start(turn)
