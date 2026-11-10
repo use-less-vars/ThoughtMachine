@@ -409,3 +409,10 @@ web_ui/frontend/.npmrc
 !docs/CONTROL_PLANE.md
 !docs/history-worker-control.md
 
+# Gen 61 → Gen 62 (T0 handoff): BOOTSTRAP.md is the paste-in entry point for a
+# fresh web-LLM operator and is named as read #1 by HANDOFF.md.
+# `.thoughtmachine/knowledge/project/**/*.md` above is a wholesale ignore, so
+# without this negation the file is never staged, never committed, and does not
+# survive a clone — while the tracked HANDOFF.md that points at it does.
+!.thoughtmachine/knowledge/project/BOOTSTRAP.md
+
