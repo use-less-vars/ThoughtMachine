@@ -38,7 +38,7 @@ def main() -> int:
         if not m:
             continue
         cid, body = m.group(1), m.group(2)
-        if "Landed" in line:
+        if re.search(r"\*\*Landed\*\*", line):
             continue
         open_items.append((cid, body))
     if not open_items:
