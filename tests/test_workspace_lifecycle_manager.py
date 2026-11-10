@@ -64,7 +64,7 @@ class FakeContainerManager:
         self.removed.append(container_id)
         return {"status": "removed", "container_id": container_id}
 
-    def start(self, image=None, name=None, note=None):
+    def start(self, image=None, name=None, note=None, cpu_quota=None):
         self.started.append({"image": image, "name": name, "note": note})
         if self.start_result is not None:
             return self.start_result

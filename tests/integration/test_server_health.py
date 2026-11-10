@@ -177,7 +177,7 @@ class _FakeContainerManager:
             "note": "",
         }
 
-    def start(self, image=None, name=None, note=None):
+    def start(self, image=None, name=None, note=None, cpu_quota=None):
         self.start_calls.append({"image": image, "name": name, "note": note})
         if self.start_result is not None:
             return self.start_result
