@@ -1436,7 +1436,8 @@ class ContainerManager:
               heal_missing: bool = False,
               created_by: str | None = None,
               network_mode: str | None = None,
-              workspace_mode: str | None = None):
+              workspace_mode: str | None = None,
+              cpu_quota: int | None = None):
         """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
         Reuse order: in-memory registry -> label lookup -> fresh create.
@@ -1503,6 +1504,11 @@ class ContainerManager:
         drift comparison.  Empty/``None`` means "no recorded envelope => use the
         resolved policy", so a create with no override is byte-for-byte
         unchanged and stays fail-closed.
+
+        ``cpu_quota`` (optional) is the CPU quota (microseconds per 100ms
+        period) for the FRESH create only.  ``None`` keeps the manager's
+        instance default (``self.cpu_quota``); the recreate paths resolve
+        their quota from the record's intent snapshot instead and ignore it.
         """
         # Root-host refusal: the container user MUST match the host user so
         # bind-mounted workspace files are owned correctly. A host running as
@@ -2099,6 +2105,7 @@ class ContainerManager:
             lifecycle_class=lifecycle_class,
             network_mode=network_mode, workspace_mode=workspace_mode,
             permissions=effective,
+            cpu_quota=cpu_quota,
         )
 
     def _run_container(self, *, image, name, labels, mounts, tmpfs,
@@ -2322,7 +2329,7 @@ class ContainerManager:
             image=None,
             name=name,
             mem_limit=self.mem_limit,
-            cpu_quota=self.cpu_quota,
+            cpu_quota=cpu_quota,
             oom_score_adj=1000,
             network_mode=network_mode,
             read_only=True,

@@ -373,3 +373,89 @@ class TestRecording:
         monkeypatch.setattr(cc, "record_creation", boom)
         create_hardened_container(fake_client, spec, record=True)
         assert fake_client.containers.run.call_count == 1
+
+
+# ── cpu_quota reaches the create spec (C30) ───────────────────────────────────
+
+
+class TestCpuQuotaReachesCreateSpec:
+    """``ContainerManager.start(cpu_quota=...)`` must reach the create spec.
+
+    The admission spec used to read the manager's INSTANCE default while
+    ``_run_container`` read the argument, so the admitted envelope and the
+    container actually created could disagree.
+    """
+
+    def test_start_cpu_quota_reaches_admission_and_create_specs(
+        self, fake_client, monkeypatch
+    ):
+        import contextlib
+
+        import infra.container_manager as cm_mod
+        from infra.container_manager import ContainerManager
+        from security.admission_gate import Allow
+
+        quota = 200000  # deliberately NOT DEFAULT_CPU_QUOTA
+        admitted_quotas = []
+
+        class _Handle:
+            def attach(self, container, state=None):
+                pass
+
+        @contextlib.contextmanager
+        def _record_creation(**kwargs):
+            yield _Handle()
+
+        class _Shadow:
+            tmpfs = {}
+            mounts = []
+
+        monkeypatch.setattr(cm_mod, "_host_ids", lambda: (1000, 1000), raising=True)
+        monkeypatch.setattr(cm_mod, "record_creation", _record_creation)
+        monkeypatch.setattr(cm_mod, "_local_image_present", lambda client, image: True)
+        monkeypatch.setattr(cm_mod, "git_shadow_for_workspace", lambda *a, **k: _Shadow())
+        monkeypatch.setattr(cm_mod, "_reobserve_effective_intent", lambda *a, **k: None)
+        monkeypatch.setattr(cm_mod, "log_container_event", lambda *a, **k: None)
+        monkeypatch.setattr(cm_mod, "audit_event", lambda *a, **k: None)
+        monkeypatch.setattr(
+            cm_mod.ContainerLifecycle,
+            "record_create",
+            classmethod(lambda cls, *a, **k: None),
+        )
+
+        def _admit(request, *, probes=None):
+            admitted_quotas.append(request.spec.cpu_quota)
+            return Allow(request.spec)
+
+        monkeypatch.setattr(cm_mod, "admit", _admit)
+
+        cm = ContainerManager.__new__(ContainerManager)  # skip docker.from_env()
+        cm.client = fake_client
+        cm.workspace_path = "/tmp/ws-c30"
+        cm.workspace_id = "ws-c30"
+        cm.session_id = "sess-c30"
+        cm.session_permissions = {}
+        cm.image = "agent-executor"
+        cm.mem_limit = DEFAULT_MEM_LIMIT
+        cm.cpu_quota = DEFAULT_CPU_QUOTA
+        cm._containers = {}
+        cm.max_containers = 4
+        cm.workspace_config = {"max_containers": 4}
+        cm._compute_config = lambda *a, **k: ("none", "ro")
+        # Identity ladder / bookkeeping: stubbed so only the create path runs.
+        cm._migrate_legacy_notes_once = lambda: None
+        cm._ensure_name_index = lambda: None
+        cm._migrate_records_v3_once = lambda: None
+        cm._name_collision = lambda name: False
+        cm._record_for_name = lambda name: None
+        cm._name_index_register = lambda *a, **k: None
+        cm._find_by_labels = lambda name: None
+        cm.list_containers = lambda *a, **k: []
+
+        result = cm.start(image="agent-executor", name="c30-quota", cpu_quota=quota)
+
+        assert "error" not in result, result
+        assert admitted_quotas == [quota]
+        _, run_kwargs = fake_client.containers.run.call_args
+        assert run_kwargs["cpu_quota"] == quota
+
