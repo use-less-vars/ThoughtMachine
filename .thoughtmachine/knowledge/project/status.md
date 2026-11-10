@@ -2,6 +2,16 @@
 
 Updated: Gen 61 close — Phase 9 CLOSED, W7/W8/W9 stabilization COMPLETE. See "Current state — Gen 61 close" below; this banner supersedes the Gen 60, Gen 54 and Gen 56 wording.
 
+## Current state — Gen 61 close: The Control Plane
+
+The event-driven state machine is live: the agent's run state (`ExecutionState.PAUSED` / `STOPPED`) is server-owned and reaches the UI as an event, so the operator's view is derived from the backend instead of being inferred by the frontend. The four Lego Pieces — Persistent State, Interrupt Signal, Tool Return Contract, Loop Gate — are implemented: state survives the turn, the interrupt reaches a blocked container wait within a poll slice, every tool call returns a paired result envelope, and the loop re-reads the flags at each checkpoint before dispatching work.
+
+The UI is deduplicated: a tool call and its result render as one bubble because both rows carry a `tool_call_id` and the store folds on it, including when a prepend delivers the call after the result. Docker interrupts mid-flight: a paused or stopped worker's in-flight container command comes back as an `interrupted` payload instead of running to completion, though the process inside the container is not killed — only the wait is abandoned.
+
+**Merge state:** C29 is in `dev`; C26, C27 and C28 are on `fix/gen61-control-plane-ui-cases` and await merge. **Next:** Phase 10 (EM-Solver / Resources).
+
+---
+
 **Gen 48 close-out snapshot (historical):** **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
   vacuous scan) *(superseded 2026-10-25 by §Current state below — kept as historical record; see also the 2026-10-22 reading at lines 27–29 for the same convention.)*

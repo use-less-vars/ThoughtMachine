@@ -53,6 +53,8 @@
 
 **Verdict: SATISFIED** as of `fbc563d5` (Gen 61). `rebuild_from_disk()` carries `is_open` through the rebuild instead of hardcoding `False`; `total_sessions_count` sits beside the open-only `active_sessions_count`; `tryGetResult()` → `sessionsError` distinguishes "could not load" from "none". The rule outlives the fix: name the subset, keep failure separate from absence.
 
+**Verdict, extended in this commit: SATISFIED.** A tool call and its result are now one bubble: both rows carry a `tool_call_id` and the panel folds on it, so it can no longer show a call that looks stranded or a result with no visible cause. On reload the UI now reads `PAUSED` from the server instead of re-deriving a cheerful `RUNNING` banner. A stale render is a lie even when the backend is right, and a double render is a lie even when both rows are real.
+
 ---
 
 ## V4 — Destructive action is reversible or preceded by an inspectable dry run
@@ -67,6 +69,8 @@
 - A startup path rebuilds state unconditionally and silently, because a guard that failed closed was removed for convenience.
 
 **Verdict: PARTIAL, and SATISFIED everywhere it is armed.** `Worker stop` detaches — context, containers and queued work are kept — and killing is operator-only. `vault_repair` / `vault_gc` have never been run against the vault from this seat. The three registry guards hold and must not be weakened: `_quarantine` on unparseable session files, `RuntimeError` when a disk scan returns zero entries over a non-empty registry, and no auto-rebuild.
+
+**Verdict, extended in this commit: PARTIAL — and the exception is named.** Stop is now a hard abort of the in-flight turn: `_turn_cancel.set()` plus `_park_event`, the worker's turn is discarded, context is saved and the worker parks `detached` — resumable through `resume()`, never killed. **Honest exception, still open:** on the *main* agent the partial answer is still committed and a `stop_notice` still injected (`docs/CONTROL_PLANE.md` §4.3, §8 item 4). So "Stop drops the partial" is true for workers and not yet true for the main agent. Do not write that Stop drops the partial on the main agent until that lands.
 
 ---
 
