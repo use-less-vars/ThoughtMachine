@@ -7,11 +7,11 @@
 ## Last five commits on dev
 
 ```
-b145111c Merge pull request #330 from use-less-vars/docs/gen62-control-plane-close
-6ed5532f docs(control-plane): resolve propagation question, file C31/C32
-a15beedc Merge pull request #328 from use-less-vars/fix/gen62-option-b-fail-closed-gate
-e6d0b013 Merge pull request #329 from use-less-vars/docs/gen62-kb-truth-fixes
-f250b724 fix(state): fail-closed is_tool_allowed; drop the []-means-allow edge
+b43163dc docs: log security boundary C-items
+10809b2b docs: log security boundary C-items
+88d387bf Merge pull request #336 from use-less-vars/fix/gen62-tier0-honest-state
+0ff6ae6c Merge pull request #337 from use-less-vars/fix/gen62-d16-sliced-wait
+0c907aff test(tier0): assert the pause route's real status in the stale-handle test
 ```
 
 ## 2. Read in this order
