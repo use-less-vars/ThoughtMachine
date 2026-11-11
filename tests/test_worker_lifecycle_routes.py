@@ -136,9 +136,10 @@ def _fake_tool_loop(self, query):  # pragma: no cover - executed by the thread
 
 def test_kill_returns_200_and_writes_kill_artifacts(monkeypatch, tmp_path):
     """``POST .../kill`` is served at that exact URL with 200 and the
-    ``{"status": "ok", "name": ...}`` envelope, and it leaves the TERMINATING
-    artifacts on disk: command.json ``{"action": "kill"}`` plus the optimistic
-    ``runtime_status: "killed"`` status.json (not the detach pair)."""
+    ``{"status": "ok", "name": ...}`` envelope, and it leaves exactly ONE
+    artifact on disk: the fenced command.json ``{"action": "kill"}``.  The
+    route does not fabricate worker state -- no optimistic ``runtime_status``
+    status.json is pre-stamped; runtime status is the worker's own to report."""
     with _client(monkeypatch, tmp_path) as (client, ws_dir):
         worker_dir = _seed_worker_dir(ws_dir, "kw-kill")
         resp = client.post(_url("kw-kill", "kill"))
@@ -150,11 +151,8 @@ def test_kill_returns_200_and_writes_kill_artifacts(monkeypatch, tmp_path):
         worker_dir, "kill", session_id="", worker_name="kw-kill", instance_id=1
     )
 
-    status = _read_json(worker_dir / "status.json")
-    assert status["runtime_status"] == "killed"
-    assert status["current_task"] is None
-    assert status["error"] is None
-    assert isinstance(status["last_heartbeat"], str) and status["last_heartbeat"]
+    # Truth comes from the worker, not the route: nothing pre-stamped a status.
+    assert not (worker_dir / "status.json").exists()
 
 
 def test_kill_unknown_worker_returns_404(monkeypatch, tmp_path):
@@ -277,9 +275,10 @@ def test_resume_unknown_worker_returns_404(monkeypatch, tmp_path):
 
 def test_stop_and_kill_are_distinguishable_over_http(monkeypatch, tmp_path):
     """The two verbs share a success envelope but are NOT interchangeable over
-    HTTP: ``stop`` writes command.json ``{"action": "stop"}`` with the
-    optimistic ``runtime_status: "detached"``, ``kill`` writes
-    ``{"action": "kill"}`` with ``"killed"``."""
+    HTTP: they land DIFFERENT ``command.json`` actions -- ``{"action": "stop"}``
+    vs ``{"action": "kill"}`` -- each with a complete fence.  That action is the
+    only difference the route boundary is responsible for; runtime status is the
+    worker's own to report, so neither verb pre-stamps a ``status.json``."""
     with _client(monkeypatch, tmp_path) as (client, ws_dir):
         stop_dir = _seed_worker_dir(ws_dir, "vw-stop")
         kill_dir = _seed_worker_dir(ws_dir, "vw-kill")
@@ -300,9 +299,6 @@ def test_stop_and_kill_are_distinguishable_over_http(monkeypatch, tmp_path):
     )
     # The two verbs stay distinguishable on disk, fence and all.
     assert _read_json(stop_dir / "command.json") != _read_json(kill_dir / "command.json")
-
-    assert _read_json(stop_dir / "status.json")["runtime_status"] == "detached"
-    assert _read_json(kill_dir / "status.json")["runtime_status"] == "killed"
 
 
 # ── the command fence helpers ────────────────────────────────────────────────

@@ -373,7 +373,7 @@ def test_a_stale_registered_handle_degrades_the_pause_route(
             response = client.post(f"/api/workspace/{_WS_ID}/workers/w1/pause")
 
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == "pausing"
+    assert response.json()["status"] == "accepted"
 
     # The durable channel carried the command, fully fenced.
     payload = json.loads((worker_dir / "command.json").read_text(encoding="utf-8"))

@@ -2840,6 +2840,14 @@ class WorkerThread(threading.Thread):
             # this the command.json would linger forever (no-op on every
             # poll).  Events are thread-safe, so this is safe even if the
             # blocked pause loop is waiting on _resume_event.
+            if self._stop_event.is_set() or self.status == "killed":
+                # Mirror WorkerThread.resume(): a killed worker is terminal and
+                # must not be revived by a channel 'resume'.
+                quarantine(claimed, "resume-on-killed")
+                log("WARNING", "tools.worker",
+                    f"Refusing channel resume for worker '{self.worker_name}': "
+                    f"worker has been killed (status={self.status})")
+                return
             discard(claimed)
             self._park_event.clear()
             self._resume_event.set()

@@ -343,20 +343,38 @@ class TestBridgeResumeReleasesReadingMode:
         assert bare._pause_requested is False
         assert bridge._park_event.is_set() is True
 
-    def test_resume_resumes_paused_workers_only(self, tmp_path, monkeypatch):
+    def test_resume_resumes_every_session_worker_and_keeps_foreign_ones_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        """resume() no longer filters on status: EVERY worker of this session is
+        asked to resume (the worker itself decides whether there is anything to
+        release), workers of other sessions are left alone, and a worker whose
+        resume() reports False (a stop already in flight) is not logged as a
+        resume that did not happen."""
         bridge = _bridge_with(tmp_path)
         bridge._agent = _FakeAgent()
         paused = _FakeWorkerThread("paused")
         ready = _FakeWorkerThread("ready")
-        _patch_registry(monkeypatch, {
+        refusing = _FakeWorkerThread("ready")
+        refusing.resume = lambda: False   # stop in flight -> refuses to resume
+        foreign = _FakeWorkerThread("paused")
+        logged = _patch_registry(monkeypatch, {
             ("sess-bridge", "paused-worker", 1): paused,
             ("sess-bridge", "ready-worker", 1): ready,
+            ("sess-bridge", "refusing-worker", 1): refusing,
+            ("sess-other", "foreign-worker", 1): foreign,
         })
 
         bridge.resume()
 
         assert paused.resume_calls == 1
-        assert ready.resume_calls == 0
+        assert ready.resume_calls == 1
+        assert foreign.resume_calls == 0
+        assert any("refused to resume" in message for _l, _c, message in logged), logged
+        assert not any(
+            "Worker resumed: refusing-worker" in message
+            for _l, _c, message in logged
+        ), logged
 
 
 if __name__ == "__main__":   # pragma: no cover
