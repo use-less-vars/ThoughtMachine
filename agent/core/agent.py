@@ -551,7 +551,7 @@ class Agent:
             self._token_counts = {'input': session.total_input_tokens, 'output': session.total_output_tokens}
         else:
             self._token_counts = {'input': 0, 'output': 0}
-        self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
+        self._ensure_system_prompt()
         self.context_builder = self.llm_client.create_context_builder()
         log('DEBUG', 'core.context_builder', f'Agent init: session is None={session is None}, cb is None={self.context_builder is None}')
         if self.context_builder:
@@ -970,7 +970,6 @@ class Agent:
 
         try:
             # Preserve conversation and token state BEFORE closing
-            current_conversation = self.conversation.copy()
             token_counts = self._token_counts.copy()
 
             # Close old resources
@@ -1022,7 +1021,7 @@ class Agent:
             )
 
             # Restore conversation with updated system prompt
-            self.conversation = self.llm_client.ensure_system_prompt(current_conversation)
+            self._ensure_system_prompt()
             self._token_counts = token_counts
 
             # Restore logger and system event logger
@@ -1105,6 +1104,21 @@ class Agent:
                 self.context_builder._cached_context = None
         else:
             self._conversation = value
+
+    def _ensure_system_prompt(self) -> None:
+        """Refresh the config system prompt unless the caller seeded one.
+
+        A session whose history was seeded by its creator (the worker runtime)
+        owns message 0: ``ensure_system_prompt`` rewrites the list in place, which
+        would mutate the caller's list and discard the seeded prompt.  The
+        short-circuit is conditional on the history actually starting with a
+        system message, so a seeded-but-empty context still gets a prompt.
+        """
+        if (getattr(self._session, 'history_seeded_by_caller', False)
+                and self.conversation
+                and self.conversation[0].get('role') == 'system'):
+            return
+        self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
 
     def _initialize_session_state(self):
         """Initialize session state based on existing history."""
@@ -1559,7 +1573,7 @@ class Agent:
             pause_debug(f'agent.session: {self.session}')
             if self.session:
                 pause_debug(f'agent.session.session_id: {self.session.session_id}')
-            self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
+            self._ensure_system_prompt()
             pause_debug(f'Clearing _pause_requested (was {self._pause_requested})')
             self._pause_requested = False
             self._pause_nudge_sent = False

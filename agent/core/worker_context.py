@@ -60,6 +60,14 @@ class WorkerContext:
     object during ``process_query()``, with no persistence machinery.
     """
 
+    #: The creator of a WorkerContext seeds ``user_history`` itself: the worker's
+    #: own system prompt at index 0, the spawn brief ("Initial context: ...") at
+    #: index 1.  ``Agent`` must not rewrite that leading message with the config
+    #: prompt (``LLMClient.ensure_system_prompt`` replaces it in place), because
+    #: the seeded prompt *is* the worker's prompt.  A plain ``Session`` leaves
+    #: this False and keeps the normal behaviour.
+    history_seeded_by_caller: bool = True
+
     def __init__(
         self,
         session_id: Optional[str] = None,

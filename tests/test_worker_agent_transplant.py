@@ -1785,3 +1785,230 @@ class TestSpawnContextFixes:
         data = json.loads(ctx_path.read_text(encoding="utf-8"))
         assert data["user_history"][0]["content"] == "existing data"
 
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Seeded worker conversation — the caller owns message 0
+# ════════════════════════════════════════════════════════════════════════════
+#
+# The worker runtime does not hand ``Agent`` an empty history: it builds the
+# list itself (``tools/workspace/worker_thread.py``) with the worker's own
+# system prompt at index 0 and the spawn brief ("Initial context: {...}") at
+# index 1, then passes that list in as ``WorkerContext.user_history``.
+#
+# ``Agent`` mutating that list — ``LLMClient.ensure_system_prompt`` strips every
+# ``role='system'`` message that does not carry a preserved prefix and inserts
+# the *config* prompt at index 0 — silently rewrites the caller's data and
+# discards the seeded prompt.  These tests pin the contract: a history seeded
+# by its creator is left alone, and the agent only appends to it.
+#
+# In production the seeded prompt text and ``config.system_prompt`` are the same
+# string (``worker_thread.py`` sets both from the worker definition), so only
+# distinct sentinel texts can observe the difference.
+
+SEEDED_WORKER_PROMPT = "WORKER-SYS-PROMPT-XYZ — you are the worker's own prompt."
+SEEDED_CONFIG_PROMPT = "CONFIG-SYS-PROMPT-ABC — you are the agent config prompt."
+SEEDED_BRIEF = "Initial context: " + json.dumps(
+    {"query": "review the diff", "sentinel": "SENTINEL_CTX_42"}
+)
+
+#: Message the worker runtime inserts at index 0 (the worker's own prompt).
+SEEDED_PROMPT_MSG = {"role": "system", "content": SEEDED_WORKER_PROMPT}
+#: Message the worker runtime inserts at index 1 (the spawn brief).
+SEEDED_BRIEF_MSG = {"role": "system", "content": SEEDED_BRIEF}
+
+
+def _seeded_ctx(session_id: str = "transplant-seeded-001") -> WorkerContext:
+    """A WorkerContext shaped exactly like the worker runtime's (prompt + brief)."""
+    return WorkerContext(
+        session_id=session_id,
+        user_history=[dict(SEEDED_PROMPT_MSG), dict(SEEDED_BRIEF_MSG)],
+    )
+
+
+def _system_contents(conversation: List[Dict[str, Any]]) -> List[str]:
+    """Contents of every ``role='system'`` message, in order."""
+    return [m.get("content", "") for m in conversation if m.get("role") == "system"]
+
+
+def _brief_messages(conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The worker spawn brief messages ("Initial context: ...")."""
+    return [
+        m for m in conversation
+        if m.get("role") == "system"
+        and m.get("content", "").startswith("Initial context: ")
+    ]
+
+
+@pytest.mark.usefixtures("register_scripted_provider")
+class TestSeededWorkerConversationIsCallerOwned:
+    """Constructing an Agent must not rewrite a caller-seeded history."""
+
+    @pytest.fixture
+    def ctx(self) -> WorkerContext:
+        return _seeded_ctx()
+
+    @pytest.fixture
+    def config(self) -> AgentConfig:
+        return AgentConfig(
+            api_key="sk-test-scripted",
+            base_url="http://localhost:9999",
+            model="mock-model",
+            provider_type="scripted",
+            enabled_tools=["Thought"],
+            system_prompt=SEEDED_CONFIG_PROMPT,
+            mode="custom",
+            max_turns=2,
+            enable_logging=False,
+        )
+
+    def test_init_preserves_seeded_prompt_and_brief(
+        self, config: AgentConfig, ctx: WorkerContext
+    ):
+        """Agent.__init__ keeps the seeded prompt + brief and drops neither."""
+        agent = Agent(config, session=ctx)
+
+        # The caller's list *is* the agent's conversation (single source of
+        # truth), so "preserved" has to mean "not rewritten in place".
+        assert agent.conversation is ctx.user_history
+
+        assert len(ctx.user_history) == 2, (
+            f"Seeded history was rewritten: len={len(ctx.user_history)}"
+        )
+        assert ctx.user_history[0] == SEEDED_PROMPT_MSG, (
+            "The worker's seeded system prompt was replaced by the config prompt: "
+            f"{ctx.user_history[0]!r}"
+        )
+        assert ctx.user_history[1] == SEEDED_BRIEF_MSG, (
+            f"The spawn brief was altered or moved: {ctx.user_history[1]!r}"
+        )
+
+        # The spawn brief is present exactly once, payload intact.
+        briefs = _brief_messages(agent.conversation)
+        assert len(briefs) == 1, f"Expected exactly one spawn brief, got {briefs}"
+        assert "SENTINEL_CTX_42" in briefs[0]["content"]
+
+        # What the model will be told: the worker's prompt, not the config's.
+        system_contents = _system_contents(agent.conversation)
+        assert SEEDED_WORKER_PROMPT in system_contents
+        assert SEEDED_CONFIG_PROMPT not in system_contents, (
+            "The config prompt was inserted on top of the seeded prompt"
+        )
+
+    def test_first_turn_preserves_seeded_prompt_and_brief(
+        self, config: AgentConfig, ctx: WorkerContext
+    ):
+        """``process_query`` re-applies the system prompt every turn — check it too."""
+        config._provider_responses = [_text_response("Acknowledged.")]
+
+        original_init = ScriptedProvider.__init__
+        created: List[ScriptedProvider] = []
+
+        def patched_init(self, cfg):
+            original_init(self, cfg)
+            self._responses = list(config._provider_responses)
+            created.append(self)
+
+        ScriptedProvider.__init__ = patched_init
+        try:
+            agent = Agent(config, session=ctx)
+            list(agent.process_query("get on with it"))
+        finally:
+            ScriptedProvider.__init__ = original_init
+
+        assert ctx.user_history[0] == SEEDED_PROMPT_MSG, (
+            "The first turn replaced the worker's seeded prompt: "
+            f"{ctx.user_history[0]!r}"
+        )
+        assert len(_brief_messages(ctx.user_history)) == 1
+        assert SEEDED_CONFIG_PROMPT not in _system_contents(ctx.user_history)
+
+        # The model was actually shown the seeded prompt, not the config prompt.
+        assert created, "ScriptedProvider was never constructed"
+        seen_system = _system_contents(created[0].last_messages or [])
+        assert SEEDED_WORKER_PROMPT in seen_system, (
+            f"Model did not see the seeded prompt. system messages: {seen_system}"
+        )
+        assert SEEDED_CONFIG_PROMPT not in seen_system
+
+    def test_restart_preserves_seeded_prompt_and_brief(
+        self, config: AgentConfig, ctx: WorkerContext
+    ):
+        """``Agent.restart`` re-applies the system prompt on the restored history."""
+        agent = Agent(config, session=ctx)
+
+        assert agent.restart(config) is True
+
+        assert ctx.user_history[0] == SEEDED_PROMPT_MSG, (
+            f"restart() replaced the worker's seeded prompt: {ctx.user_history[0]!r}"
+        )
+        assert len(_brief_messages(ctx.user_history)) == 1
+        assert SEEDED_CONFIG_PROMPT not in _system_contents(ctx.user_history)
+
+    def test_empty_history_worker_context_still_gets_config_prompt(
+        self, config: AgentConfig
+    ):
+        """A WorkerContext that arrived with no history keeps the old behaviour.
+
+        The "seeded history is the caller's" short-circuit is conditional on the
+        history actually starting with a system message, so a worker is never
+        left without any system prompt at all.
+        """
+        ctx = WorkerContext(session_id="transplant-seeded-empty-001")
+
+        agent = Agent(config, session=ctx)
+
+        assert _system_contents(agent.conversation)[0] == SEEDED_CONFIG_PROMPT
+
+
+@pytest.mark.usefixtures("register_scripted_provider")
+class TestSeededHistorySurvivesPersistence:
+    """The seeded prompt + brief round-trip through context.json (worker resume)."""
+
+    @pytest.fixture
+    def config(self) -> AgentConfig:
+        return AgentConfig(
+            api_key="sk-test-scripted",
+            base_url="http://localhost:9999",
+            model="mock-model",
+            provider_type="scripted",
+            enabled_tools=["Thought"],
+            system_prompt=SEEDED_CONFIG_PROMPT,
+            mode="custom",
+            max_turns=2,
+            enable_logging=False,
+        )
+
+    def test_persistable_dict_round_trip_keeps_seeded_messages(self):
+        ctx = _seeded_ctx("transplant-seeded-persist-001")
+        ctx.user_history.append({"role": "user", "content": "first task"})
+        ctx.user_history.append({"role": "assistant", "content": "done"})
+
+        restored = WorkerContext.from_persistable_dict(
+            json.loads(json.dumps(ctx.to_persistable_dict()))
+        )
+
+        assert restored.user_history == ctx.user_history
+        assert restored.user_history[0] == SEEDED_PROMPT_MSG
+        assert restored.user_history[1] == SEEDED_BRIEF_MSG
+        assert len(_brief_messages(restored.user_history)) == 1
+        # The marker is a class attribute, so a reloaded context is still
+        # recognised as caller-seeded and keeps its prompt.
+        assert restored.history_seeded_by_caller is True
+
+    def test_resumed_agent_keeps_seeded_prompt(self, config: AgentConfig):
+        """An agent built on a restored context must not rewrite the prompt."""
+        ctx = _seeded_ctx("transplant-seeded-persist-002")
+        ctx.user_history.append({"role": "user", "content": "first task"})
+        ctx.user_history.append({"role": "assistant", "content": "done"})
+
+        restored = WorkerContext.from_persistable_dict(
+            json.loads(json.dumps(ctx.to_persistable_dict()))
+        )
+
+        agent = Agent(config, session=restored)
+
+        assert restored.user_history[0] == SEEDED_PROMPT_MSG
+        assert len(_brief_messages(agent.conversation)) == 1
+        assert SEEDED_CONFIG_PROMPT not in _system_contents(agent.conversation)
+
