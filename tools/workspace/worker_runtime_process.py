@@ -122,6 +122,10 @@ _OPTIONAL_KWARGS = (
     ("max_container_count", "max_container_count"),
     ("max_token_usage", "max_token_usage"),
     ("max_runtime_s", "max_runtime_s"),
+    # A process-mode rebuild is the same spawn, so the blank-slate opt-in has to
+    # cross with it; otherwise the flag would silently flip to False the moment
+    # the worker moves to a child interpreter.
+    ("fresh_context", "fresh_context"),
 )
 
 

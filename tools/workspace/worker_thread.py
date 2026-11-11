@@ -1375,6 +1375,7 @@ class WorkerThread(threading.Thread):
         max_container_count: Optional[int] = None,
         max_token_usage: Optional[int] = None,
         max_runtime_s: Optional[float] = None,
+        fresh_context: bool = False,
         frame_sink: Optional[Callable[[Any], None]] = None,
     ) -> None:
         # S4a: assigned before anything else -- every other attribute below can
@@ -1382,6 +1383,12 @@ class WorkerThread(threading.Thread):
         # first rather than left to a getattr() default.
         self._frame_sink = frame_sink
         self.instance_id = instance_id
+        # Spawn contract (opt-in, default off): False = resume the persisted
+        # context.json conversation byte-for-byte (today's behaviour); True =
+        # blank slate -- ``_load_context`` refuses the persisted transcript and
+        # run() seeds a new history, so this spawn cannot inherit the previous
+        # spawn's task.
+        self.fresh_context = fresh_context
         instance_label = _WorkerRegistry.instance_label(name, instance_id)
         super().__init__(daemon=True, name=f"worker-{instance_label}")
         self.worker_name = name
@@ -3734,36 +3741,14 @@ class WorkerThread(threading.Thread):
             # Also publish to the per-worker bus for local subscribers
             self._publish_event('worker_spawned', {'status': 'ready'})
             if self._worker_ctx is None:
-                # Load system prompt from definition
-                system_prompt = self.definition.get(
-                    "system_prompt",
-                    DEFAULT_WORKER_SYSTEM_PROMPT,
-                )
-                user_history = [
-                    {"role": "system", "content": system_prompt}
-                ]
-                if self._initial_context:
-                    ic_payload = f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}"
-                    # Auditability without leaking the brief: record only the
-                    # payload length and a short digest of the exact string
-                    # appended. Briefings can carry secrets, so no preview.
-                    logger.debug(
-                        "Initial context payload for worker '%s': %d chars, sha256=%s",
-                        self.worker_name,
-                        len(ic_payload),
-                        hashlib.sha256(ic_payload.encode("utf-8")).hexdigest()[:12],
-                    )
-                    user_history.append({
-                        "role": "system",
-                        "content": ic_payload,
-                    })
+                # No loaded context: a first spawn, or fresh_context=True.
                 # Reset cached token count for a fresh run
                 self._cached_context_tokens = None
                 self._worker_ctx = WorkerContext(
                     session_id=self.session_id,
                     workspace_id=self.workspace_id,
                     worker_name=self.worker_name,
-                    user_history=user_history,
+                    user_history=self._seed_user_history(),
                 )
 
                 # ── Fix 2: Auto-process initial context query ──
@@ -4611,8 +4596,52 @@ class WorkerThread(threading.Thread):
         except (OSError, ValueError):
             return False
 
+    def _seed_user_history(self) -> List[Dict[str, Any]]:
+        """Build the blank-slate history: worker prompt + this spawn's brief.
+
+        Used only when no context is loaded (a first spawn, or any spawn that
+        asked for ``fresh_context=True``). The shape is fixed: the worker's own
+        system prompt first, then -- if the spawn carried context -- exactly one
+        ``"Initial context: ..."`` message. Nothing from an earlier spawn's
+        transcript can appear here.
+        """
+        system_prompt = self.definition.get(
+            "system_prompt",
+            DEFAULT_WORKER_SYSTEM_PROMPT,
+        )
+        user_history = [
+            {"role": "system", "content": system_prompt}
+        ]
+        if self._initial_context:
+            ic_payload = f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}"
+            # Auditability without leaking the brief: record only the
+            # payload length and a short digest of the exact string
+            # appended. Briefings can carry secrets, so no preview.
+            logger.debug(
+                "Initial context payload for worker '%s': %d chars, sha256=%s",
+                self.worker_name,
+                len(ic_payload),
+                hashlib.sha256(ic_payload.encode("utf-8")).hexdigest()[:12],
+            )
+            user_history.append({
+                "role": "system",
+                "content": ic_payload,
+            })
+        return user_history
+
     def _load_context(self) -> Optional[WorkerContext]:
-        """Load WorkerContext from disk, if present. Returns None if not found."""
+        """Load WorkerContext from disk, if present. Returns None if not found.
+
+        ``fresh_context=True`` (opt-in spawn flag) short-circuits to None: the
+        persisted transcript is neither read nor merged, so run() seeds a blank
+        history instead, and the next ``_save_context()`` overwrites the stale
+        context.json. Returning None -- rather than loading and then clearing --
+        is what makes the flag total: no loaded-attempt pruning runs against the
+        old task, no brief from it is merged, and no old message can reach the
+        agent.
+        """
+        if self.fresh_context:
+            return None
         path = self._context_path()
         if path.exists():
             try:
@@ -5198,6 +5227,18 @@ class Worker(ToolBase):
             "If True, stop this session's existing instance(s) of the worker "
             "before spawning a fresh one. Workers of the same name in other "
             "sessions/workspaces are not touched."
+        ),
+    )
+
+    fresh_context: bool = Field(
+        default=False,
+        description=(
+            "Spawn only. If True this spawn gets a blank conversation: the "
+            "worker's persisted context.json transcript is NOT loaded, the "
+            "history is seeded with just the worker's own system prompt plus "
+            "this spawn's 'Initial context: ...' brief, and the stale "
+            "transcript is overwritten at the next context save. Default "
+            "False resumes the persisted conversation."
         ),
     )
 
@@ -6264,6 +6305,7 @@ class Worker(ToolBase):
             workspace_id=ws_id,
             instance_id=spawn_iid,
             container_manager=container_manager,
+            fresh_context=self.fresh_context,
         )
 
         # S5: close the runtime -> supervisor frame seam for this worker. The
@@ -6305,7 +6347,7 @@ class Worker(ToolBase):
         if self.meta is not None:
             thread._initial_context["meta"] = self.meta
 
-        # Context is always preserved — context.json is never deleted on spawn.
+        # Context is preserved by default (fresh_context=False) — context.json is never deleted on spawn.
         # If context.json exists from a previous run, it is loaded in run()
         # and _initial_context is merged into the loaded context rather than
         # replacing it. This ensures worker conversation state persists across
