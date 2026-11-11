@@ -37,9 +37,9 @@
 # Warnings failing the build is the point: CI runs this with --check, so a stale
 # handoff must break a build rather than only log.
 #
-# Portability: digests come from kb_sha256 (shasum -a 256, then sha256sum --
-# hard-fail when neither exists), never from `stat`; bash 3.2 (stock macOS), so
-# no mapfile and no realpath.
+# Portability: digests come from kb_sha256 (shasum -a 256, then sha256sum, then
+# openssl dgst -sha256 -- hard-fail when none exists), never from `stat`; bash
+# 3.2 (stock macOS), so no mapfile and no realpath.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
