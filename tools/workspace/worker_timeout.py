@@ -91,7 +91,9 @@ def _worker_query_wait_timeout(
         source="worker_query_wait",
     )
     if budget.requested is None:
-        return float(budget.effective)
+        # Carried through UNCHANGED (no float()): a whole-second default must not
+        # acquire a '.0' in the user-visible "did not respond within Ns" message.
+        return budget.effective
     if budget.clamped:
         logger.warning("query wait: %s", budget.clamp_reason())
     return float(budget.effective) + QUERY_WAIT_GRACE_SECONDS

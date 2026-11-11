@@ -6887,7 +6887,7 @@ class Worker(ToolBase):
             getattr(thread, "_timeout_seconds", None),
             fallback=DEFAULT_REQUEST_SECONDS,
         )
-        if wait != 300.0:
+        if wait != DEFAULT_REQUEST_SECONDS:
             logger.info(
                 "query wait %.0fs (effective timeout %.0fs + grace); "
                 "no cap applied -- bounded only by the declared ceiling",
