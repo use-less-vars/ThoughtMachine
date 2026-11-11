@@ -86,6 +86,18 @@ def _to_canonical_tool_call(tool_call):
 #: source / pinned) is never rendered, so the model sees prose only.
 ADDENDUM_HEADING = 'Additional session context:'
 
+#: System messages that carry per-session state rather than a stale copy of the
+#: config prompt, and must therefore survive the strip in
+#: ``ensure_system_prompt``. Summaries are needed by ``SummaryBuilder``; a
+#: worker's spawn brief (``"Initial context: {...}"``, injected by
+#: ``tools/workspace/worker_thread.py``) is the worker's instructions for the
+#: whole task, so deleting it would silently leave the worker with nothing but
+#: the generic prompt.
+_PRESERVED_SYSTEM_PREFIXES = (
+    'Summary of previous conversation:',
+    'Initial context:',
+)
+
 
 def _session_addendum(session):
     """Return ``session``'s addendum, or ``None`` when it has none.
@@ -231,10 +243,13 @@ class LLMClient:
         #  Without this guard, the next SummaryBuilder.build() call will find
         #  no summary and fall back to including the ENTIRE history, causing
         #  a ~4.7x token explosion on restart.)
+        #  A worker's spawn brief ("Initial context: ...") is preserved for the
+        #  same reason: it is the worker's standing instructions, not a stale
+        #  system prompt, so stripping it would leave the worker with nothing.
         conversation[:] = [
             msg for msg in conversation
             if not (msg.get('role') == 'system'
-                    and not msg.get('content', '').startswith('Summary of previous conversation:'))
+                    and not msg.get('content', '').startswith(_PRESERVED_SYSTEM_PREFIXES))
         ]
 
         # Insert the fresh system prompt at the front

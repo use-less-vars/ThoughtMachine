@@ -278,3 +278,113 @@ def test_anthropic_adapter_puts_addendum_in_system_param(monkeypatch):
     for message in anthropic_messages:
         assert TEXT_ONE not in str(message.get('content', ''))
         assert TEXT_TWO not in str(message.get('content', ''))
+
+
+# ---------------------------------------------------------------------------
+# (e) A worker's spawn brief survives the strip, and stays put for 3 cycles
+#
+# The brief is injected by tools/workspace/worker_thread.py as a SECOND
+# role='system' message: f"Initial context: {json.dumps(initial_context)}".
+# Before this was pinned, ensure_system_prompt deleted it like any stale system
+# prompt, so a worker never saw its own instructions on its first turn.
+# ---------------------------------------------------------------------------
+
+BRIEF = 'Initial context: {"query": "q", "briefing": "SENTINEL_BRIEF_ALPHA"}'
+BRIEF_SENTINEL = 'SENTINEL_BRIEF_ALPHA'
+SUMMARY_PREFIX = 'Summary of previous conversation:'
+STALE = 'stale system prompt'
+
+
+def _worker_session():
+    """The real worker session: it never defines an addendum attribute."""
+    from agent.core.worker_context import WorkerContext
+
+    return WorkerContext(
+        session_id='stub-session',
+        workspace_id='stub-workspace',
+        worker_name='stub-worker',
+        user_history=[],
+    )
+
+
+def _system_messages(conversation):
+    return [m for m in conversation if m.get('role') == 'system']
+
+
+def _summarisation_cycle(client, conversation, round_index):
+    """One SummarizeTool compaction, then the real composition point.
+
+    Mirrors Agent._apply_summary_pruning: the turns that were summarised are
+    replaced by a single role='system' message starting with the summary
+    prefix. The config prompt and the brief are carried across untouched, so
+    only the strip inside ensure_system_prompt can lose them.
+    """
+    config_prompt = dict(conversation[0])
+    brief_messages = [m for m in conversation if str(m.get('content', '')).startswith('Initial context:')]
+
+    conversation[:] = (
+        [config_prompt]
+        + brief_messages
+        + [{'role': 'system', 'content': STALE}]
+        + [{'role': 'system', 'content': f'{SUMMARY_PREFIX} round {round_index}: earlier turns compressed.'}]
+        + [{'role': 'user', 'content': f'next step {round_index}'}]
+        + [{'role': 'assistant', 'content': f'done {round_index}'}]
+    )
+    return client.ensure_system_prompt(conversation)
+
+
+def test_worker_brief_survives_three_summarisation_cycles(monkeypatch):
+    """The brief is still in the conversation after three summaries in a row."""
+    client, _provider = _make_client(monkeypatch, _worker_session())
+
+    conversation = [
+        {'role': 'system', 'content': BASE_PROMPT},
+        {'role': 'system', 'content': BRIEF},
+        {'role': 'user', 'content': 'turn 0'},
+        {'role': 'assistant', 'content': 'ok 0'},
+    ]
+
+    for round_index in (1, 2, 3):
+        conversation = _summarisation_cycle(client, conversation, round_index)
+
+        system_messages = _system_messages(conversation)
+        brief_messages = [m for m in system_messages if BRIEF_SENTINEL in m['content']]
+        summary_messages = [m for m in system_messages if m['content'].startswith(SUMMARY_PREFIX)]
+
+        assert len(brief_messages) == 1, f'round {round_index}: brief lost or duplicated'
+        assert len(summary_messages) == 1, f'round {round_index}: summary lost or duplicated'
+
+        assert conversation[0].get('role') == 'system', f'round {round_index}: no system prompt first'
+        assert conversation[0]['content'] == BASE_PROMPT, f'round {round_index}: config prompt not first'
+        assert BRIEF_SENTINEL not in conversation[0]['content'], f'round {round_index}: brief leaked into prompt'
+
+        # The brief keeps its own place in history: pinned, not merged.
+        assert conversation[1]['content'] == BRIEF, f'round {round_index}: brief moved out of position 1'
+
+        # Negative control: an unrelated system message is still stripped.
+        assert not [m for m in conversation if m.get('content') == STALE], f'round {round_index}: stale kept'
+
+
+def test_strip_preserves_brief_and_summary_but_drops_other_system_messages(monkeypatch):
+    """The survivor rule itself: brief and summary in, every other system out."""
+    client, _provider = _make_client(monkeypatch, _worker_session())
+
+    conversation = [
+        {'role': 'system', 'content': STALE},
+        {'role': 'system', 'content': BASE_PROMPT},
+        {'role': 'system', 'content': BRIEF},
+        {'role': 'system', 'content': f'{SUMMARY_PREFIX} earlier turns.'},
+        {'role': 'user', 'content': 'hello'},
+    ]
+
+    out = client.ensure_system_prompt(conversation)
+
+    assert [m['role'] for m in out] == ['system', 'system', 'system', 'user']
+    assert [m['content'] for m in out] == [
+        BASE_PROMPT,
+        BRIEF,
+        f'{SUMMARY_PREFIX} earlier turns.',
+        'hello',
+    ]
+    assert STALE not in [m['content'] for m in out]
+
