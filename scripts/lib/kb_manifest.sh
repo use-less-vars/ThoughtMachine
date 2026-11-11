@@ -226,9 +226,10 @@ kb_rel_path() {
 # kb_sha256 <file>
 #   Prints the lowercase hex sha256 digest of <file>'s bytes.
 #   The tool is DISCOVERED, never assumed: `shasum -a 256` ships with stock
-#   macOS, `sha256sum` with GNU coreutils. Probing both is what lets one script
-#   serve both platforms without reaching for `stat`/`openssl`. When neither is
-#   present we HARD-FAIL: silently skipping the comparison would turn a
+#   macOS, `sha256sum` with GNU coreutils, `openssl dgst -sha256` with Git for
+#   Windows (which has neither of the other two). Probing all three is what lets
+#   one script serve every supported host without reaching for `stat`. When none
+#   is present we HARD-FAIL: silently skipping the comparison would turn a
 #   fail-closed gate into a no-op, which is worse than a loud refusal.
 kb_sha256() {
   local file="${1:-}" digest
@@ -245,8 +246,13 @@ kb_sha256() {
     digest=$(shasum -a 256 "$file" | awk '{ print $1 }')
   elif command -v sha256sum >/dev/null 2>&1; then
     digest=$(sha256sum "$file" | awk '{ print $1 }')
+  elif command -v openssl >/dev/null 2>&1; then
+    # Third probe: Git Bash on Windows ships openssl but neither shasum nor
+    # sha256sum. Both OpenSSL 1.1 ("SHA256(f)= <hex>") and 3.x
+    # ("SHA2-256(f)= <hex>") put the digest LAST, so $NF is the hex field.
+    digest=$(openssl dgst -sha256 "$file" | awk '{ print $NF }')
   else
-    printf 'ERROR: kb_sha256: neither "shasum -a 256" nor "sha256sum" is on PATH; cannot compute a checksum. Install one of them (shasum ships with macOS, sha256sum comes with GNU coreutils).\n' >&2
+    printf 'ERROR: kb_sha256: none of "shasum -a 256", "sha256sum" or "openssl dgst -sha256" is on PATH; cannot compute a checksum. Install one of them (shasum ships with macOS, sha256sum comes with GNU coreutils, openssl with Git for Windows).\n' >&2
     return 1
   fi
 

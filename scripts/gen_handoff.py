@@ -12,7 +12,7 @@ as ``- sha256:<64 hex>``. There is deliberately no second lockfile: a lockfile
 drifts away from the section it claims to guard, and the section is what the
 bundle actually ships. The recorded digest is over the file's BYTES. The shell
 side (``kb_sha256`` in scripts/lib/kb_manifest.sh -- it prefers ``shasum -a 256``
-and falls back to ``sha256sum``) must agree with ``hashlib.sha256`` here or
+and falls back to ``sha256sum``, then ``openssl dgst -sha256``) must agree with ``hashlib.sha256`` here or
 every check reports a false positive, so the rule is stated once per language
 and nowhere else.
 
@@ -45,7 +45,10 @@ MANIFEST = [
 
 
 def sh(*args: str) -> str:
-    return subprocess.check_output(args, text=True).strip()
+    # encoding pinned: git emits UTF-8, but a Windows/macOS locale default
+    # (cp1252, ascii) would decode it with the wrong codec and either raise or
+    # mangle non-ASCII subjects.
+    return subprocess.check_output(args, text=True, encoding="utf-8").strip()
 
 
 def _parse_open_items(active: str) -> list:
@@ -194,11 +197,11 @@ def main(argv=None) -> int:
     else:
         dev_subj = sh("git", "log", "-1", "--format=%s", "dev")
     if args.recent_file is not None:
-        recent = pathlib.Path(args.recent_file).read_text().strip()
+        recent = pathlib.Path(args.recent_file).read_text(encoding="utf-8").strip()
     else:
         recent = sh("git", "log", "-5", "--oneline", "dev")
 
-    active = priorities.read_text().split("## Archived")[0]
+    active = priorities.read_text(encoding="utf-8").split("## Archived")[0]
     open_items = _parse_open_items(active)
     if not open_items:
         print("ERROR: no open C-items parsed; refusing.", file=sys.stderr)
@@ -206,7 +209,13 @@ def main(argv=None) -> int:
 
     text = render(root, open_items, dev_sha, dev_subj, recent)
     if args.stdout:
-        sys.stdout.write(text)
+        # Emit UTF-8 BYTES, not locale-encoded text: the router is compared to
+        # the checked-in file byte for byte, and a locale stdout (cp1252 on
+        # Windows) would raise UnicodeEncodeError or mangle the members'
+        # non-ASCII prose before it ever reached the pipe.
+        sys.stdout.flush()
+        sys.stdout.buffer.write(text.encode("utf-8"))
+        sys.stdout.buffer.flush()
         return 0
     handoff.write_text(text, encoding="utf-8", newline="\n")
     print(

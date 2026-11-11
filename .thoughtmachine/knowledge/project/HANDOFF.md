@@ -16,7 +16,7 @@ b43163dc docs: log security boundary C-items
 
 ## 2. Read in this order
 
-1. `.thoughtmachine/knowledge/project/PRIORITIES.md` -- the live work queue. **Read first.** - sha256:7345ef6cf2c246ebf6d844d4a15d0e46f8931bfee41281d7c3bccfb1b396f6d0
+1. `.thoughtmachine/knowledge/project/PRIORITIES.md` -- the live work queue. **Read first.** - sha256:6abc23e6fa6ddec53e6696170ea4f470de61f184ddb3c95c16ea5b2c17b2ad01
 2. `docs/CONTROL_PLANE.md` -- the pause/stop/timeout contract. Doctrine. - sha256:3ecd6a73af659c1daf21c541ec0a5f1edd3dd2c1187028bbe2e7f6ae5402d0e1
 3. `.thoughtmachine/knowledge/project/MANDATORY_STOP.md` -- the read-on-entry rules; none of them are optional. - sha256:6a2f27112c03c00c16a8444909c73bc0ae79f97aeebd4c9021b9cf83da454065
 4. `.thoughtmachine/knowledge/project/architecture_invariants.md` -- the invariants a design must not re-derive. - sha256:d7364ff4686a59dc118d3cb9dbde7a516d64c3e3bf80853756e9e2b713da9645
