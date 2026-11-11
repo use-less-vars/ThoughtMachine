@@ -36,12 +36,16 @@ Exit codes
 
 What this does NOT prove
 ------------------------
-Process isolation is not container isolation.  The third-party
-``docker_code_runner`` backend needs a ``docker`` binary, and this script
-reports whether one is on ``PATH`` rather than pretending the layer was
-exercised.  The PID namespace of the child is printed so the claim stays
-checkable: two processes can share a PID namespace and still be separate
-processes.
+Process isolation is not container isolation.  The ``DockerCodeRunner``
+backend (``tools/docker_code_runner.py``) never shells out to a ``docker``
+CLI: it drives Docker through the Python ``docker`` SDK against the daemon
+socket, so a ``docker`` binary on ``PATH`` is neither required by it nor
+evidence about it.  What the container layer does need is a reachable
+daemon, the ``container`` permission grain and an executor image built from
+the vault-managed workspace ``Dockerfile``; this script exercises none of
+that and does not pretend otherwise.  The PID namespace of the child is
+printed so the claim stays checkable: two processes can share a PID
+namespace and still be separate processes.
 
 Usage
 -----
@@ -54,7 +58,6 @@ import json
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -136,8 +139,9 @@ def exec_backend_pid() -> Optional[int]:
 
     Deliberately a plain ``subprocess`` rather than a claimed backend
     invocation: the real ``host_bash`` / ``docker_code_runner`` backends are
-    gated (workspace policy, permission grain, docker binary) and this script
-    must not pretend it drove one it did not.
+    gated (policy, permission grain, and -- for the latter -- a reachable
+    Docker daemon and a built executor image, not a ``docker`` CLI) and this
+    script must not pretend it drove one it did not.
     """
     try:
         completed = subprocess.run(
@@ -481,14 +485,11 @@ def main(argv: Optional[list] = None) -> int:
     proven, verdict_line = verdict_for(parent_pid, process_obs.worker_pid)
     print()
     print("── limits of this proof ────────────────────────────────────────")
-    docker = shutil.which("docker")
     print(
-        f"{'docker on PATH':<26}: {docker or 'no'}"
-        + (
-            ""
-            if docker
-            else " -- container/PID-namespace isolation NOT exercised here"
-        )
+        f"{'container layer':<26}: NOT exercised here -- DockerCodeRunner "
+        "(tools/docker_code_runner.py) drives Docker through the Python "
+        "`docker` SDK and the daemon socket, so a `docker` binary on PATH is "
+        "neither required by it nor evidence about it"
     )
     print(
         f"{'child pid namespace':<26}: "
