@@ -4,15 +4,44 @@ from live git state. Per Gen 62 ruling: HANDOFF is generated, not hand-written.
 
 The "## 2. Read in this order" section is the manifest that
 scripts/build_onboarding.sh parses (see scripts/lib/kb_manifest.sh, which
-requires a "## 2." heading and backticked numbered items).
+requires a "## 2." heading and backticked numbered items) and that
+scripts/check_kb_staleness.sh verifies for staleness.
+
+Every manifest entry carries the digest of the file it names, recorded inline
+as ``- sha256:<64 hex>``. There is deliberately no second lockfile: a lockfile
+drifts away from the section it claims to guard, and the section is what the
+bundle actually ships. The recorded digest is over the file's BYTES. The shell
+side (``kb_sha256`` in scripts/lib/kb_manifest.sh -- it prefers ``shasum -a 256``
+and falls back to ``sha256sum``) must agree with ``hashlib.sha256`` here or
+every check reports a false positive, so the rule is stated once per language
+and nowhere else.
+
+The git facts (branch head, subject, recent commits) are read from git but each
+one is overridable from the command line, so the generator also runs in a
+checkout with no git binary (see C34).
 
 Asserts every C-item it names exists in PRIORITIES.md. Exit non-zero if any
 required file is missing or the manifest would be empty.
 """
+import argparse
+import hashlib
 import pathlib
 import re
 import subprocess
 import sys
+
+KB = ".thoughtmachine/knowledge/project"
+
+# (repo-relative path, one-line prose) -- the reading order, in order.
+MANIFEST = [
+    (f"{KB}/PRIORITIES.md", "the live work queue. **Read first.**"),
+    ("docs/CONTROL_PLANE.md", "the pause/stop/timeout contract. Doctrine."),
+    (f"{KB}/MANDATORY_STOP.md", "the read-on-entry rules; none of them are optional."),
+    (f"{KB}/architecture_invariants.md", "the invariants a design must not re-derive."),
+    ("docs/ARCHITECTURE_MACHINE_MODEL.md", "what runs where, and what stops it."),
+    (f"{KB}/vision_ledger.md", "the five standing commitments (V1-V5)."),
+    (f"{KB}/INFRA_ONBOARDING.md", "the environment you are working in."),
+]
 
 
 def sh(*args: str) -> str:
@@ -52,29 +81,13 @@ def _parse_open_items(active: str) -> list:
     return open_items
 
 
-def main() -> int:
-    root = pathlib.Path(sh("git", "rev-parse", "--show-toplevel"))
-    priorities = root / ".thoughtmachine/knowledge/project/PRIORITIES.md"
-    handoff = root / ".thoughtmachine/knowledge/project/HANDOFF.md"
-    control_plane = root / "docs" / "CONTROL_PLANE.md"
-    for required in (priorities, control_plane):
-        if not required.is_file():
-            print(f"ERROR: {required} missing; refusing to generate.", file=sys.stderr)
-            return 1
-    dev_sha = sh("git", "rev-parse", "--short", "dev")
-    dev_subj = sh("git", "log", "-1", "--format=%s", "dev")
-    recent = sh("git", "log", "-5", "--oneline", "dev")
-    active = priorities.read_text().split("## Archived")[0]
-    open_items = _parse_open_items(active)
-    if not open_items:
-        print("ERROR: no open C-items parsed; refusing.", file=sys.stderr)
-        return 1
-    manifest = [
-        "`.thoughtmachine/knowledge/project/PRIORITIES.md` -- the live work queue. **Read first.**",
-        "`docs/CONTROL_PLANE.md` -- the pause/stop/timeout contract. Doctrine.",
-        "`.thoughtmachine/knowledge/project/vision_ledger.md` -- the five standing commitments (V1-V5).",
-        "`.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in.",
-    ]
+def sha256_file(path: pathlib.Path) -> str:
+    """Hex sha256 of the file's bytes. Same rule as ``kb_sha256`` in shell."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def render(root, open_items, dev_sha: str, dev_subj: str, recent: str) -> str:
+    """Return the whole HANDOFF text (trailing newline included)."""
     out = [
         "# HANDOFF -- generated, do not hand-edit",
         "",
@@ -91,8 +104,8 @@ def main() -> int:
         "## 2. Read in this order",
         "",
     ]
-    for i, entry in enumerate(manifest, 1):
-        out.append(f"{i}. {entry}")
+    for i, (rel, prose) in enumerate(MANIFEST, 1):
+        out.append(f"{i}. `{rel}` -- {prose} - sha256:{sha256_file(root / rel)}")
     out += ["", "## First task (from the live queue)", ""]
     for cid, body in open_items:
         out.append(f"- **{cid}** -- {body}")
@@ -125,8 +138,81 @@ def main() -> int:
         f"*Generated at `{dev_sha}`. Run `python scripts/gen_handoff.py` to refresh; do not hand-edit.*",
         "",
     ]
-    handoff.write_text("\n".join(out))
-    print(f"Wrote {handoff} ({len(out)} lines, {len(open_items)} open C-items).")
+    return "\n".join(out)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Regenerate the onboarding router (HANDOFF.md).",
+    )
+    parser.add_argument(
+        "--root",
+        default=None,
+        help="repo root (default: git rev-parse --show-toplevel)",
+    )
+    parser.add_argument(
+        "--dev-sha",
+        default=None,
+        help="branch head to record (default: git rev-parse --short dev)",
+    )
+    parser.add_argument(
+        "--dev-subject",
+        default=None,
+        help="head commit subject (default: git log -1 --format=%%s dev)",
+    )
+    parser.add_argument(
+        "--recent-file",
+        default=None,
+        help="file holding the 'last five commits' block (default: git log -5 --oneline dev)",
+    )
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="print the generated text instead of writing HANDOFF.md",
+    )
+    args = parser.parse_args(argv)
+
+    if args.root is not None:
+        root = pathlib.Path(args.root).resolve()
+    else:
+        root = pathlib.Path(sh("git", "rev-parse", "--show-toplevel"))
+    priorities = root / KB / "PRIORITIES.md"
+    handoff = root / KB / "HANDOFF.md"
+    control_plane = root / "docs" / "CONTROL_PLANE.md"
+    required = [priorities, control_plane] + [root / rel for rel, _ in MANIFEST]
+    for path in required:
+        if not path.is_file():
+            print(f"ERROR: {path} missing; refusing to generate.", file=sys.stderr)
+            return 1
+
+    if args.dev_sha is not None:
+        dev_sha = args.dev_sha
+    else:
+        dev_sha = sh("git", "rev-parse", "--short", "dev")
+    if args.dev_subject is not None:
+        dev_subj = args.dev_subject
+    else:
+        dev_subj = sh("git", "log", "-1", "--format=%s", "dev")
+    if args.recent_file is not None:
+        recent = pathlib.Path(args.recent_file).read_text().strip()
+    else:
+        recent = sh("git", "log", "-5", "--oneline", "dev")
+
+    active = priorities.read_text().split("## Archived")[0]
+    open_items = _parse_open_items(active)
+    if not open_items:
+        print("ERROR: no open C-items parsed; refusing.", file=sys.stderr)
+        return 1
+
+    text = render(root, open_items, dev_sha, dev_subj, recent)
+    if args.stdout:
+        sys.stdout.write(text)
+        return 0
+    handoff.write_text(text, encoding="utf-8", newline="\n")
+    print(
+        f"Wrote {handoff} ({len(text.splitlines())} lines, "
+        f"{len(open_items)} open C-items)."
+    )
     return 0
 
 

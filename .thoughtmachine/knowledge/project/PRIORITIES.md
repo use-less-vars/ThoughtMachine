@@ -309,7 +309,8 @@ different file, different name. Never rename one to the other.
   whole tree; `Worker(action="spawn")` rejects a call that omits `worker_name` although
   its documentation says it defaults. The first two are the dangerous ones: reads of
   authority files that quietly answer a different question than the one asked. A fourth
-  report — worker briefings arriving stripped — is under probe and is not filed here.
+  report — worker briefings arriving stripped — is filed as **C45** in the Generation 64
+  section above, and is no longer "under probe and not filed".
 
 ## Archived (pre-Gen 42 brain dump — do not read as current work)
 
