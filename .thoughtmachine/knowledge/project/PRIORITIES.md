@@ -202,7 +202,9 @@ different file, different name. Never rename one to the other.
   `Worker(action="spawn")` itself in process mode and asserts the envelope came back from
   the child. Scope: one hermetic test, spawn then dispatch then envelope, red if the
   runtime falls back to in-process. **The claim is filed unverified** — first task is to
-  confirm the gap by reading the fixtures.
+  confirm the gap by reading the fixtures. If this test fails, the mode wiring is broken on
+  `dev`; if it passes, the tree in the batch-1/2 measurement is the authority and the
+  failing tests come from a different branch. Either way the test stands.
 
 - **C41: `docs/` is a catch-all ignore, so every design deliverable needs its own negation line.**
   **Open.** `.gitignore` carries `docs/*` plus roughly sixty `!docs/<file>` negations, one
