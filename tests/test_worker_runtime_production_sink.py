@@ -22,6 +22,7 @@ objects where they are cheap, duck-typed fakes where they are not, no sleeps.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, List
@@ -30,10 +31,13 @@ import tools.workspace.worker as worker_module
 import tools.workspace.worker_thread as worker_thread_module
 from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_runtime import (
+    MODE_PROCESS,
     MODE_THREAD,
+    WORKER_RUNTIME_MODE_ENV,
     WorkerRuntimeHandle,
     attach_thread_frame_sink,
 )
+from tools.workspace.worker_runtime_process import WorkerRuntimeLost
 from tools.workspace.worker_runtime_protocol import Heartbeat, WorkerState
 from tools.workspace.worker_thread import Worker, WorkerThread
 
@@ -210,14 +214,16 @@ class _FakeThread:
         self.started = True
 
 
-def test_spawn_site_attaches_the_sink_before_starting_the_thread(tmp_path, monkeypatch):
-    """S5-A: the REAL spawn path installs the sink before ``thread.start()``.
+def _spawn_against_a_fake_thread(
+    tmp_path, monkeypatch, mode, *, thread_cls=_FakeThread, context=None
+):
+    """Run the REAL ``Worker._action_spawn`` with ``_FakeThread`` as the class.
 
-    Behavioural, not textual: ``Worker._action_spawn`` runs end to end against a
-    fake thread class, and the real ``attach_thread_frame_sink`` is allowed to
-    run (it only assigns two attributes, so it works on any object). If the
-    attach call is deleted from the spawn site, ``sink_at_start`` is ``None``
-    and this test goes red.
+    Returns ``(result, fake, key)``; the caller pops *key* from the registry.
+
+    The mode is pinned EXPLICITLY (§10): the absent-flag default is ``process``,
+    so a test that inherits it would be silently about a different mode than the
+    one its name claims.
     """
     # Unique per test: the registry is a process-wide singleton, so an id no
     # other test uses keeps the spawn-cap / continue-existing routing out of it.
@@ -225,7 +231,7 @@ def test_spawn_site_attaches_the_sink_before_starting_the_thread(tmp_path, monke
     created: List[_FakeThread] = []
 
     def _factory(**kwargs: Any) -> _FakeThread:
-        fake = _FakeThread(**kwargs)
+        fake = thread_cls(**kwargs)
         created.append(fake)
         return fake
 
@@ -242,6 +248,7 @@ def test_spawn_site_attaches_the_sink_before_starting_the_thread(tmp_path, monke
     # site only needs it to be ``None`` (its own try/except would swallow the
     # failure, but not the cost).
     monkeypatch.setattr(worker_thread_module, "_CM", None)
+    monkeypatch.setenv(WORKER_RUNTIME_MODE_ENV, mode)
 
     tool = Worker(
         action="spawn",
@@ -249,15 +256,27 @@ def test_spawn_site_attaches_the_sink_before_starting_the_thread(tmp_path, monke
         session_id=session_id,
         workspace_path=str(tmp_path),
         agent_config={"provider": "openai", "model": "gpt-4"},
+        context=context,
     )
 
-    key = (session_id, WORKER, 1)
-    try:
-        # A real ws_id is required: with ``None`` the path returns early at
-        # "no workspace directory resolved" and never reaches the ctor.
-        result = tool._action_spawn([{"name": WORKER, "status": "ready"}], "ws-sink-test")
-        (fake,) = created
+    # A real ws_id is required: with ``None`` the path returns early at
+    # "no workspace directory resolved" and never reaches the ctor.
+    result = tool._action_spawn([{"name": WORKER, "status": "ready"}], "ws-sink-test")
+    (fake,) = created
+    return result, fake, (session_id, WORKER, 1)
 
+
+def test_spawn_site_attaches_the_sink_before_starting_the_thread(tmp_path, monkeypatch):
+    """S5-A: the REAL spawn path installs the sink before ``thread.start()``.
+
+    Behavioural, not textual: ``Worker._action_spawn`` runs end to end against a
+    fake thread class, and the real ``attach_thread_frame_sink`` is allowed to
+    run (it only assigns two attributes, so it works on any object). If the
+    attach call is deleted from the spawn site, ``sink_at_start`` is ``None``
+    and this test goes red.
+    """
+    result, fake, key = _spawn_against_a_fake_thread(tmp_path, monkeypatch, MODE_THREAD)
+    try:
         assert fake.started, "the spawn site never started the thread"
         # 1. Ordering + live wiring: the sink was already installed when
         #    start() ran. Delete the attach call and this is None.
@@ -272,6 +291,188 @@ def test_spawn_site_attaches_the_sink_before_starting_the_thread(tmp_path, monke
         assert result["spawned"] is True
         assert result["worker_name"] == WORKER
         assert result["instance_id"] == 1
-        assert worker_module._worker_registry[(session_id, WORKER, 1)] is fake
+        assert worker_module._worker_registry[key] is fake
     finally:
         worker_module._worker_registry.pop(key, None)
+
+
+def test_spawn_site_does_not_start_the_thread_in_process_mode(tmp_path, monkeypatch):
+    """Commit 8: the spawn site starts the thread ONLY in thread mode.
+
+    In process mode the child runtime owns execution (§3.3, D7), so a
+    ``thread.start()`` here would leave two run loops draining the same
+    ``_output_queue``. The fake records whether ``start()`` was reached at all,
+    so deleting the gate and the gate never having existed fail the same way.
+    """
+    result, fake, key = _spawn_against_a_fake_thread(tmp_path, monkeypatch, MODE_PROCESS)
+    try:
+        assert fake.started is False, (
+            "the spawn site started the thread in process mode: the child "
+            "runtime owns execution (§3.3, D7)"
+        )
+        # The mode reached the seam: the sink is the PROCESS handle's, not a
+        # thread-mode one silently attached to a worker nobody will run.
+        assert fake._runtime_handle.mode == MODE_PROCESS
+        assert fake._frame_sink == fake._runtime_handle.on_frame
+        # Dispatching in process mode is still a successful spawn: the gate
+        # changes WHO executes, not whether the worker exists.
+        assert result["spawned"] is True
+        assert result["worker_name"] == WORKER
+        assert result["instance_id"] == 1
+        assert worker_module._worker_registry[key] is fake
+    finally:
+        worker_module._worker_registry.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# 5. Ruling 1: in process mode the initial query is DISPATCHED, not waited on
+# ---------------------------------------------------------------------------
+
+
+class _NoDrainThread(_FakeThread):
+    """A fake thread whose queue must never be drained by the supervisor.
+
+    Process mode hands execution to the child, so nothing in this interpreter
+    reads ``_output_queue`` any more. ``get()`` therefore fails the test the
+    moment it is reached: waiting on a queue that only the child's run loop
+    fills is exactly the hang the dispatch removes.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.queue_gets: List[Any] = []
+        self._output_queue = SimpleNamespace(get=self._queue_get)
+
+    def _queue_get(self, *args: Any, **kwargs: Any) -> Any:
+        self.queue_gets.append((args, kwargs))
+        raise AssertionError(
+            "the spawn site drained the child-owned _output_queue in process "
+            "mode: the supervisor does not run the worker body"
+        )
+
+    def _last_elapsed(self) -> None:
+        # The supervisor-side thread ran no turn, so it has nothing to report.
+        return None
+
+
+def test_process_mode_dispatches_the_initial_query_to_the_child_runtime(
+    tmp_path, monkeypatch
+):
+    """Ruling 1: the auto-query is dispatched through the handle, not awaited.
+
+    With a ``query`` in the context the spawn is blocking, and in process mode
+    the blocking has to happen where the work happens: ``dispatch_query`` starts
+    the child runtime (its first use is the start) and returns the child's
+    reply. Exactly one execution owner -- the child does not re-run
+    ``_initial_context``, ``spec_from_worker`` does not carry it -- so a deleted
+    dispatch call cannot hide behind the child doing the work anyway.
+
+    The child is stubbed at ``_ensure_process_runtime`` (the real one spawns an
+    OS process and handshakes); the spy is the assertion: if the spawn site
+    never dispatched, nothing would have asked the handle for its runtime.
+    """
+    dispatched: List[Any] = []
+
+    class _FakeRuntime:
+        def dispatch_query(self, query: str, timeout: float = 0.0) -> str:
+            dispatched.append((query, timeout))
+            return json.dumps({"response": "child-reply", "elapsed_seconds": 1.9})
+
+    monkeypatch.setattr(
+        WorkerRuntimeHandle,
+        "_ensure_process_runtime",
+        lambda self: _FakeRuntime(),
+    )
+
+    result, fake, key = _spawn_against_a_fake_thread(
+        tmp_path,
+        monkeypatch,
+        MODE_PROCESS,
+        thread_cls=_NoDrainThread,
+        context={"query": "the task"},
+    )
+    try:
+        # 1. The child was started and given THE query, once, on the spawn's own
+        #    wait budget.
+        assert len(dispatched) == 1, (
+            "the spawn site never dispatched the initial query to the child "
+            "runtime: in process mode the supervisor cannot run it itself"
+        )
+        query, timeout = dispatched[0]
+        assert query == "the task"
+        assert timeout > 0
+        # 2. One execution owner: the supervisor neither started the thread nor
+        #    drained a queue only the child fills.
+        assert fake.started is False
+        assert fake.queue_gets == []
+        # 3. The child's reply is the envelope -- parsed, not flattened.
+        assert result["response"] == "child-reply"
+        for field in (
+            "worker_name",
+            "spawned",
+            "instance_id",
+            "instance_label",
+            "worker_self_reported",
+            "spawn_started_at",
+            "dispatch_started_at",
+            "dispatch_finished_at",
+            "dispatch_duration_wall",
+        ):
+            assert field in result, field
+        assert result["worker_name"] == WORKER
+        assert result["spawned"] is True
+        assert result["instance_id"] == 1
+        # The child's own report survives (nothing supervisor-side overwrites it
+        # when there is no supervisor-side turn to report) ...
+        assert result["elapsed_seconds"] == 1.9
+        # ... while ``worker_self_reported`` is the thread's, and it ran nothing.
+        assert result["worker_self_reported"] is None
+        assert result["dispatch_duration_wall"] >= 0
+        assert worker_module._worker_registry[key] is fake
+    finally:
+        worker_module._worker_registry.pop(key, None)
+
+
+def test_process_mode_dispatch_failure_is_reported_as_a_failure(
+    tmp_path, monkeypatch
+):
+    """Ruling 1: a raising dispatch never becomes a fabricated timeout.
+
+    ``dispatch_query`` raises on failure (``WorkerRuntimeLost``,
+    ``WorkerQueryTimeout``); the envelope must say the dispatch failed instead of
+    claiming the worker "did not respond within Ns" -- the supervisor waited on
+    nothing, so it has no timeout to report.
+    """
+    class _FailingRuntime:
+        def dispatch_query(self, query: str, timeout: float = 0.0) -> str:
+            # The exception carries a terminal ``reply`` for mirroring; this test
+            # only cares that the raise reaches the caller as a failure.
+            raise WorkerRuntimeLost(
+                "child exited before replying", reply=SimpleNamespace()
+            )
+
+    monkeypatch.setattr(
+        WorkerRuntimeHandle,
+        "_ensure_process_runtime",
+        lambda self: _FailingRuntime(),
+    )
+
+    result, fake, key = _spawn_against_a_fake_thread(
+        tmp_path,
+        monkeypatch,
+        MODE_PROCESS,
+        thread_cls=_NoDrainThread,
+        context={"query": "the task"},
+    )
+    try:
+        assert "error" in result, result
+        assert "dispatch failed" in result["error"]
+        assert "child exited before replying" in result["error"]
+        assert "did not respond" not in json.dumps(result)
+        assert "note" in result
+        # Still no execution in this interpreter, on either path.
+        assert fake.started is False
+        assert fake.queue_gets == []
+    finally:
+        worker_module._worker_registry.pop(key, None)
+

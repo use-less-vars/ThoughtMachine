@@ -6330,6 +6330,7 @@ class Worker(ToolBase):
         # not because of an import cycle -- worker_runtime imports only the
         # protocol module.
         from tools.workspace.worker_runtime import (
+            MODE_THREAD,
             attach_thread_frame_sink,
             register_runtime_handle,
             resolve_runtime_mode,
@@ -6341,9 +6342,13 @@ class Worker(ToolBase):
         # caller asked for thread" -- not the shipped one, so leaving this
         # call to default would make ``WORKER_RUNTIME_MODE`` unreadable on
         # the only production spawn path and the default a lie.
-        _runtime_handle = attach_thread_frame_sink(
-            thread, mode=resolve_runtime_mode()
-        )
+        #
+        # ONE read, two consumers: this handle's mode and the start gate below.
+        # Resolving twice would let a flag flipped mid-spawn hand the handle one
+        # mode and the gate another, i.e. a supervisor-side start or a silent
+        # never-start depending on which read won.
+        runtime_mode = resolve_runtime_mode()
+        _runtime_handle = attach_thread_frame_sink(thread, mode=runtime_mode)
 
         # Store initial context for the thread to pick up in run().  This is a
         # COPY, not an alias: the caller may reuse one context dict across
@@ -6512,7 +6517,24 @@ class Worker(ToolBase):
 
         # ── Commit 8: dispatch window opens — the worker thread starts here ──
         dispatch_started_at = time.time()
-        thread.start()
+        if runtime_mode == MODE_THREAD:
+            thread.start()
+        else:
+            # Process mode: execution belongs to the child runtime, not to this
+            # interpreter.  ``thread`` is the body the child runs in its own OS
+            # process; starting it here as well would put the worker body back
+            # inside the supervisor (§3.3, D7) -- the one thing the mode exists
+            # to prevent -- and would leave two run loops draining one
+            # ``_output_queue``.  Everything around this line (the handle, its
+            # registration, the returned envelope) is mode-independent.
+            logger.debug(
+                "Spawn: worker '%s' instance %r dispatched in %s mode; the "
+                "child runtime owns execution, so the supervisor does not "
+                "start the thread",
+                self.worker_name,
+                spawn_iid,
+                runtime_mode,
+            )
 
         if missing_tools:
             logger.warning(
@@ -6535,17 +6557,43 @@ class Worker(ToolBase):
                 getattr(thread, "_timeout_seconds", None),
                 fallback=SPAWN_QUEUE_TIMEOUT,
             )
-            try:
-                final_result = thread._output_queue.get(timeout=auto_wait)
-            except queue.Empty:
-                final_result = json.dumps({
-                    "error": f"Worker '{self.worker_name}' did not respond "
-                             f"within {auto_wait}s",
-                    "note": "Worker timed out. The result above is partial work "
-                             "completed before timeout. The worker thread is still "
-                             "alive — you can query it again via action='query' to "
-                             "request continuation.",
-                })
+            if runtime_mode == MODE_THREAD:
+                try:
+                    final_result = thread._output_queue.get(timeout=auto_wait)
+                except queue.Empty:
+                    final_result = json.dumps({
+                        "error": f"Worker '{self.worker_name}' did not respond "
+                                 f"within {auto_wait}s",
+                        "note": "Worker timed out. The result above is partial work "
+                                 "completed before timeout. The worker thread is still "
+                                 "alive — you can query it again via action='query' to "
+                                 "request continuation.",
+                    })
+            else:
+                # Process mode: nothing in this interpreter drains
+                # ``_output_queue`` -- the child's own run loop does, in its own
+                # OS process -- so waiting on it here could only ever time out
+                # and report a timeout that never happened.  The handle owns the
+                # child, and ``dispatch_query`` is synchronous: on first use it
+                # starts the child runtime, sends the query as a
+                # ``dispatch_query`` frame and returns the child's reply, or it
+                # raises (``WorkerRuntimeLost`` / ``WorkerQueryTimeout``).  A
+                # raise becomes an honest error envelope below; it is never
+                # dressed up as a graceful timeout.
+                try:
+                    final_result = _runtime_handle.dispatch_query(
+                        thread._initial_context["query"],
+                        timeout=auto_wait,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    final_result = json.dumps({
+                        "error": f"Worker '{self.worker_name}' initial query "
+                                 f"dispatch failed: {exc}",
+                        "note": "The query was dispatched to the worker's own "
+                                "runtime process, which reported the failure "
+                                "above. This is not a timeout: the dispatch "
+                                "returned no result.",
+                    })
             try:
                 parsed = json.loads(final_result) if final_result else {}
             except (json.JSONDecodeError, TypeError):

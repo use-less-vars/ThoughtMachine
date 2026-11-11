@@ -23,6 +23,7 @@ import pytest
 
 from tools.workspace.check_system import CheckSystem
 from tools.workspace.worker import Worker, WorkerThread, _restrictive_merge
+from tools.workspace.worker_runtime import MODE_THREAD, WORKER_RUNTIME_MODE_ENV
 from agent.core.worker_context import WorkerContext
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1014,12 +1015,18 @@ class TestWorker:
     @patch("tools.workspace.worker._workspace_dir")
     @patch("tools.workspace.worker.WorkerThread")
     @patch("tools.workspace.worker._worker_registry", new_callable=dict)
-    def test_action_spawn_found(self, mock_registry, mock_thread_cls, mock_ws_dir, mock_resolve):
+    def test_action_spawn_found(
+        self, mock_registry, mock_thread_cls, mock_ws_dir, mock_resolve, monkeypatch,
+    ):
         """spawn returns success when worker_name exists in workers.json.
 
         We mock WorkerThread entirely to avoid starting a real thread
         or making LLM calls.  The thread's .start() is a no-op.
         """
+        # Thread mode pinned EXPLICITLY: the absent-flag default is ``process``
+        # (worker_runtime.resolve_runtime_mode), and this test asserts the
+        # in-process delegation that only thread mode performs.
+        monkeypatch.setenv(WORKER_RUNTIME_MODE_ENV, MODE_THREAD)
         mock_dir = MagicMock()
         mock_file = MagicMock()
         mock_file.exists.return_value = True
@@ -1175,6 +1182,7 @@ class TestWorker:
     @patch("tools.workspace.worker._worker_registry", new_callable=dict)
     def test_spawn_strips_by_footprint(
         self, mock_registry, mock_thread_cls, mock_ws_dir, mock_resolve, mock_gate,
+        monkeypatch,
     ):
         """
         4d — Spawn-time stripping test.
@@ -1183,6 +1191,8 @@ class TestWorker:
         FileEditor's default category is ``filesystem:write``, which the
         ``check_required_categories`` mock denies → FileEditor is stripped.
         """
+        # Thread mode pinned EXPLICITLY: the absent-flag default is ``process``.
+        monkeypatch.setenv(WORKER_RUNTIME_MODE_ENV, MODE_THREAD)
         mock_gate.return_value = (False, "footprint denied")
 
         mock_dir = MagicMock()
@@ -1224,7 +1234,7 @@ class TestWorker:
     @patch("tools.workspace.worker.WorkerThread")
     @patch("tools.workspace.worker._worker_registry", new_callable=dict)
     def test_spawn_strips_blocklisted_tools(
-        self, mock_registry, mock_thread_cls, mock_ws_dir, mock_resolve,
+        self, mock_registry, mock_thread_cls, mock_ws_dir, mock_resolve, monkeypatch,
     ):
         """
         4e — Blocklist test.
@@ -1232,6 +1242,8 @@ class TestWorker:
         Worker tool is blocklisted and stripped at spawn.
         FileEditor and DateTimeTool are kept.
         """
+        # Thread mode pinned EXPLICITLY: the absent-flag default is ``process``.
+        monkeypatch.setenv(WORKER_RUNTIME_MODE_ENV, MODE_THREAD)
         mock_dir = MagicMock()
         mock_file = MagicMock()
         mock_file.exists.return_value = True

@@ -25,6 +25,7 @@ Run:  python -m pytest tests/test_worker_fresh_context.py -q
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -38,6 +39,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agent.core.worker_context import WorkerContext  # noqa: E402
+from tools.workspace.worker_runtime import (  # noqa: E402
+    MODE_THREAD,
+    WORKER_RUNTIME_MODE_ENV,
+)
 from tools.workspace.worker_runtime_process import spec_from_worker  # noqa: E402
 from tools.workspace.worker_registry import WorkerRegistry  # noqa: E402
 from tools.workspace.worker_thread import Worker, WorkerThread  # noqa: E402
@@ -271,7 +276,15 @@ def _spawn_harness(*live_instances):
                 registry._worker_registry[
                     (SESSION_ID, WORKER_NAME, live.instance_id)
                 ] = live
-        with mock.patch(
+        # The fake thread models THREAD mode: its reply is sitting in
+        # ``_output_queue`` for the spawn to collect. The mode is therefore
+        # pinned explicitly instead of inherited -- the absent-flag default is
+        # ``process``, where the initial query is dispatched to the child
+        # runtime and this queue is never read -- a test pins the mode it is
+        # actually about, not the default.
+        with mock.patch.dict(
+            os.environ, {WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
+        ), mock.patch(
             "tools.workspace.worker.resolve_workspace_id", return_value="ws_fresh"
         ), mock.patch(
             "tools.workspace.worker._workspace_dir", return_value=mock_ws_dir

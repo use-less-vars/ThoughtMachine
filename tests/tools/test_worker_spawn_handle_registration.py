@@ -214,7 +214,10 @@ def test_the_spawn_site_registers_the_handle_it_attached():
 
     source = inspect.getsource(worker_thread.Worker._action_spawn)
 
-    assert "_runtime_handle = attach_thread_frame_sink(thread)" in source
+    assert (
+        "_runtime_handle = attach_thread_frame_sink(thread, mode=runtime_mode)"
+        in source
+    )
     assert "register_runtime_handle(" in source
     assert "session_id=self.session_id," in source
     assert "instance_id=spawn_iid," in source

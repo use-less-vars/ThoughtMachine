@@ -323,7 +323,11 @@ def test_control_verb_raises_under_a_bumped_epoch(registry):
 def test_spawn_thread_mode_resolves_mode_and_captures_identity(registry):
     seed = FakeWorker(generation=7)
 
-    handle = WorkerRuntimeHandle.spawn(seed, environ={})
+    # Thread mode pinned explicitly: the absent-flag default is ``process``
+    # (§10), and this test is about THREAD mode.
+    handle = WorkerRuntimeHandle.spawn(
+        seed, environ={WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
+    )
 
     assert handle.mode == MODE_THREAD
     assert handle.epoch == 7
