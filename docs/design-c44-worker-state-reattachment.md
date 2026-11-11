@@ -64,9 +64,9 @@ Everything that makes the conversation *live* is a Python object graph owned by 
   empty `[inferred: it is a plain in-process dict, constructed at import/`__init__`, and no
   rehydration path exists]`.
 - The OS thread and its `queue.Queue` input queue, plus the `WorkerJobRegistry` jobs riding on it.
-  Neither is persisted `[inferred from tools/workspace/worker_thread.py:2108 and the absence of any
-  serializer]` — see §2 `[unverified: exact job-registry persistence story; the job registry module
-  was not opened]`.
+  Neither is persisted: the queue is a thread attribute `[verified: tools/workspace/worker_thread.py:2108]`
+  and the job registry is a plain in-memory `dict` (`self._jobs`), fed by events, with no serializer on
+  any path `[verified: tools/workspace/job_registry.py:53-65]` — see §2.
 - The park/resume signalling pair `_park_event` / `_resume_event` — the entire mechanism by which a
   "detached" worker is revivable `[verified: tools/workspace/worker_thread.py:2075-2076, :2291-2292]`.
 - The detached-worker container exemption: a module-level
@@ -81,8 +81,9 @@ Everything that makes the conversation *live* is a Python object graph owned by 
   `[verified: tools/workspace/worker_lifecycle.py]`.
 
 Kill the process and all of that is gone. Not "stale" — gone. There is no boot-time sweep that walks
-`workers/*` and rebuilds any of it `[verified negatively: the only enumeration of `workers/*/context.json`
-outside the worker package is web_ui/backend/bridge.py:3048, and it is read-only — §3.4]`.
+`workers/*` and rebuilds any of it `[verified negatively: the seven enumerations of `workers/*` outside
+the worker package are all inside `web_ui` (bridge.py:3048, workspace_routes.py:1326/:1419/:1625/:1841/:1961,
+health_routes.py:59), and all seven are read-only — §3.4]`.
 
 ### 1.3 The thesis
 
@@ -135,9 +136,9 @@ reaping a detached worker's containers is therefore already durable; what is mis
 
 | In-memory state | Where it lives | Why it matters after a restart | Citations |
 |---|---|---|---|
-| registry entries | `WorkerRegistry._worker_registry`, `_worker_epochs`, `_worker_event_bus_registry`, `_bus_epochs` | nothing can find a worker; `WorkerManager.resume_worker` raises `WorkerControlError` | `[verified: tools/workspace/worker_registry.py; tools/workspace/worker_manager.py:798, :861-887]` |
+| registry entries | `WorkerRegistry._worker_registry`, `_worker_epochs`, `_worker_event_bus_registry`, `_bus_epochs` | nothing can find a worker; `WorkerManager.resume_worker` degrades to a silent `{"found": False, "action": "resume", ...}` no-op (it raises `WorkerControlError` only when a *found* thread lacks a callable method) | `[verified: tools/workspace/worker_registry.py; tools/workspace/worker_manager.py:798, :861-887, :865-872]` |
 | `_input_queue` | `queue.Queue` on the thread | queued queries are lost; a detached worker's backlog vanishes | `[verified: tools/workspace/worker_thread.py:2108, :2174]` |
-| `WorkerJobRegistry` jobs | in-process | `wait_for_job` has nothing to terminalize | `[unverified: module not opened]` |
+| `WorkerJobRegistry` jobs | in-process `self._jobs: dict`, event-fed `[verified: tools/workspace/job_registry.py:53-65]` | `wait_for_job` has nothing to terminalize | `[verified: no serializer exists]` |
 | `_agent`, `_wlm` | thread attributes | tool-loop state, reading-mode lease, WLM registration | `[verified: tools/workspace/worker_thread.py:2265-2271, :2307-2310]` |
 | `_park_event`, `_resume_event` | thread attributes | the revive mechanism itself | `[verified: tools/workspace/worker_thread.py:2075-2076, :2291-2292]` |
 | detached identity set | `infra.container_manager._DETACHED_WORKER_IDENTITIES` (module-level) | the stale-container sweep's only exemption signal | `[verified: infra/container_manager.py:5215, :5218-5238, :5241-5253, :5201-5214]` |
@@ -190,9 +191,10 @@ What actually happens today when the host process dies with a detached worker ou
 3. In Docker: the worker's containers, still labelled, still running or exited.
 4. In the new process: registry empty; `_DETACHED_WORKER_IDENTITIES` empty; `PeriodicStaleCheck`
    just constructed with no threads to walk; lifecycle rings empty.
-5. `resume()` is unreachable — there is no thread object to call it on, and `WorkerManager.resume_worker`
-   needs a *registered* thread or it raises
-   `[verified: tools/workspace/worker_manager.py:798, :861-887]`.
+5. `resume()` is unreachable — there is no thread object to call it on. `WorkerManager.resume_worker` does
+   not raise here: for an unregistered thread it returns `{"found": False, "action": "resume", ...}`, a
+   silent no-op `[verified: tools/workspace/worker_manager.py:865-872]`. `WorkerControlError` is raised
+   only when a thread *is* found but lacks a callable method `[verified: tools/workspace/worker_manager.py:798, :861-887]`.
 6. Any stale-container sweep that runs now sees step 4's empty set and step 3's live containers, and
    — absent a `worker_status` argument — treats them exactly as it would a crashed worker's
    `[verified: infra/container_manager.py:5287-5311]`.
@@ -289,7 +291,8 @@ restart.** Two honest caveats:
 - **It fires at turn start, not at boot.** Adoption requires the successor to already be executing a
   tool loop, i.e. somebody must have sent it a query. There is no boot-time scan that notices "this
   worker directory owes a replay" `[verified negatively: no other caller of
-  `_adopt_predecessor_journal`; no `workers/*` scan outside web_ui/backend/bridge.py:3048]`.
+  `_adopt_predecessor_journal`; no `workers/*` scan anywhere outside `web_ui`, where the seven that do
+  exist are read-only — §3.4]`.
 - **`recoverable` is explicitly not adopted.** `recoverable` is the DETACH park's record and is
   the resume path's business `[verified: tools/workspace/worker_thread.py:1278-1279, :1310-1312]`.
   The docstring says "later slice"; grep found no other `adopt_inflight` caller, so treat
@@ -316,12 +319,12 @@ Taking the four requirements one at a time, none of them exists:
 
 | Requirement | Status | Evidence |
 |---|---|---|
-| boot-time enumeration of worker directories | MISSING in the worker layer | only enumerator is `web_ui/backend/bridge.py:3048` `[verified]` |
+| boot-time enumeration of worker directories | MISSING in the worker layer | seven enumerators exist, all in `web_ui`, all read-only, none creates a thread or registry entry: `bridge.py:3048` plus `workspace_routes.py:1326, :1419, :1625, :1841, :1961` and `health_routes.py:59`, each `for subdir in (ws_dir/"workers").iterdir()` `[verified]` |
 | registry rebuild (a findable handle per worker) | MISSING | `WorkerRegistry` is in-memory only `[verified]` |
 | container re-adoption / exemption reinstatement | MISSING | `_DETACHED_WORKER_IDENTITIES` starts empty `[verified: infra/container_manager.py:5215]` |
 | detached-TTL clock restore | MISSING | `PeriodicStaleCheck` reads `thread._detached_at` off live objects `[verified: tools/workspace/worker_manager.py:208-240]` |
-| queued-query / job restore | MISSING | `_input_queue` and job registry are in-process `[inferred]` |
-| resume reachable without a thread | MISSING | `WorkerManager.resume_worker` requires a registered thread `[verified: tools/workspace/worker_manager.py:798, :861-887]` |
+| queued-query / job restore | MISSING | `_input_queue` is a thread attribute `[verified: tools/workspace/worker_thread.py:2108, :2174]`; `WorkerJobRegistry` is an in-process `dict` with no serializer `[verified: tools/workspace/job_registry.py:53-65]` |
+| resume reachable without a thread | MISSING | `WorkerManager.resume_worker` collapses to a silent `{"found": False, "action": "resume", ...}` no-op for an unregistered thread `[verified: tools/workspace/worker_manager.py:865-872]` |
 
 What *is* available at boot, and is enough to build all six, is `status.json` + `context.json` +
 the `generation` sidecar + the `thoughtmachine.worker` label (§2.1). The gap is a reader, not a
@@ -354,6 +357,20 @@ Relatedly, `web_ui/backend/workspace_routes.py:315-340` `_read_worker_generation
 the `generation` sidecar with `context.json` fallback — proof that an operator/REST client can
 already fence a command against a dead incarnation's epoch from disk alone.
 
+**A second, stronger reader already exists: `web_ui/backend/health_routes.py:59-97`.** It walks
+`(ws_dir/"workers").iterdir()`, reads each `status.json`, and returns a **workspace-wide**, not
+session-scoped, catalogue per worker: `worker_name`, `session_id`, `runtime_status`,
+`last_heartbeat`, `current_task` and the token counts
+`[verified: web_ui/backend/health_routes.py:59-97, reading `data.get("runtime_status", "unknown")`]`.
+That is Option A's L1 reader in miniature and it is already in production, already keyed the way the
+sweep needs it (directory-derived, workspace-wide), and already reading the correct `status.json` key
+(§3.5). It is still read-only: it creates no thread and no registry entry. What it does **not** do is
+the part that costs real work in §5 Option A — it does not read the `generation` sidecar or
+`context.json`, it does not live in the worker layer (so a headless/MCP host gets none of it), and it
+is not fed to any sweep. So Option A's L1 half is an extraction and generalisation of shipping code
+rather than a new subsystem, which is why its cost estimate in §5.1 is lowered accordingly — while the
+L2 half stays expensive for a different reason (§5.1.1).
+
 ### 3.5 Claim audit: "a detached worker keeps its containers and queued queries"
 
 This claim is load-bearing in the product narrative and it is **conditional**. Decomposed:
@@ -364,7 +381,7 @@ This claim is load-bearing in the product narrative and it is **conditional**. D
 | the containers survive | TRUE — exemption via `_set_detached_registration(True)` `[verified: :2096]` → `register_detached_worker` `[verified: infra/container_manager.py:5218-5225]`, and the sweep skips on `_detached_state` `[verified: :5287-5311]` | **FALSE, at risk** — the set is empty in the new process `[verified: :5215]`, so `is_worker_detached` answers False `[verified: :5236-5238]` and the sweep proceeds |
 | the containers are still *found* | TRUE — label `thoughtmachine.worker=<sid>:<name>` `[verified: tools/workspace/worker_container.py:30-51]` | TRUE — labels live in the daemon `[verified]` |
 | queued queries survive | TRUE — they are entries in the thread's `_input_queue` `[verified: :2108]` | FALSE — the queue object does not exist any more `[inferred]` |
-| the worker is resumable | TRUE — `resume()` re-enters the live thread `[verified: :2246-2310]` | FALSE — no thread to call it on; `WorkerManager.resume_worker` raises `[verified: tools/workspace/worker_manager.py:798, :861-887]` |
+| the worker is resumable | TRUE — `resume()` re-enters the live thread `[verified: :2246-2310]` | FALSE — no thread to call it on; `WorkerManager.resume_worker` returns `{"found": False, "action": "resume", ...}`, a silent no-op a caller can mistake for success `[verified: tools/workspace/worker_manager.py:865-872]` |
 | the worker is discoverable | TRUE — registry entry `[verified]` | FALSE — registry empty `[verified]` |
 | TTL policing still applies | TRUE — `PeriodicStaleCheck._check_detached_ttl` `[verified: tools/workspace/worker_manager.py:208-240]` | FALSE — no thread to measure; the TTL clock silently resets, so a detached worker can outlive `WORKER_TIMEOUT_SECONDS` indefinitely `[inferred]` |
 
@@ -373,10 +390,15 @@ graph, and detach only flips park flags and saves context
 `[verified: tools/workspace/worker_thread.py:2058-2108]`. Across a restart the claim is false for a
 structural reason too: each of the four sureties (exemption set, queue, registry entry,
 `_detached_at`) is a Python object, and the only durable witness of "this worker was deliberately
-detached" is `status.json["status"] == "detached"` `[verified: tools/workspace/worker_thread.py:2097-2098;
-tools/workspace/worker_runtime.py:969-985]` — which nothing in the sweep path reads today
-`[verified: the `worker_status` parameter exists at infra/container_manager.py:5256 but the boot-path
-callers do not supply it; `[unverified]` whether any caller does]`.
+detached" is `status.json["runtime_status"] == "detached"` `[verified, and the key is `runtime_status`
+not `status`: written at tools/workspace/worker_thread.py:4767 (`"runtime_status": self.status`), frame
+emit `:4801`, fresh-process reader tools/workspace/worker_runtime.py:953 (`data.get("runtime_status")`),
+and the shipped REST reader web_ui/backend/health_routes.py:59-97
+(`data.get("runtime_status", "unknown")`)]` — which nothing in the sweep path reads today
+`[verified: the `worker_status` parameter exists at infra/container_manager.py:5256, but **no** caller
+supplies it — the single production call site, infra/container_manager.py:2310, passes two positional
+arguments only. The audit resolved the earlier open question: this is not "[unverified] whether any
+caller does"; no caller does. See §5.1.1 for why the obvious fix there is wrong]`.
 
 The consequence to state plainly: **a restart converts every detached worker into a crashed worker
 from the sweep's point of view.** Whether its containers are actually destroyed then depends on
@@ -399,9 +421,13 @@ error surfaced; **DEGRADED** = recoverable by a human with effort; **COSMETIC**.
 
 ### G1 — No boot-time enumeration or registry rebuild (SEVERE, root cause)
 
-Nothing walks `workers/*` at boot and reconstructs any handle. The only enumerator in the tree is
-`web_ui/backend/bridge.py:3048` (§3.4) `[verified]`. Everything else in this list is a consequence of
-G1: because no object exists for a persisted worker, no *method* on that object can be called.
+Nothing walks `workers/*` at boot and reconstructs any handle. There are **seven** enumerators in the
+tree and all seven are in `web_ui` — `bridge.py:3048`, `workspace_routes.py:1326, :1419, :1625, :1841,
+:1961` and `health_routes.py:59`, each a `for subdir in (ws_dir/"workers").iterdir()` `[verified]` —
+and **none of the seven rebuilds a handle**: no `WorkerThread`, no registry entry, no container
+adoption (§3.3, §3.4). So the gap is not "nobody can see the directories"; it is "seeing a directory
+creates nothing callable". Everything else in this list is a consequence of G1: because no object
+exists for a persisted worker, no *method* on that object can be called.
 
 ### G2 — The detached-container exemption is lost, so a detached worker looks crashed (SEVERE)
 
@@ -414,18 +440,29 @@ is in fact detached `[verified: infra/container_manager.py:5236-5238]`, and
 `[verified: infra/container_manager.py:5343-5350]`. This is the gap that turns "we support detaching"
 into "we support detaching until the next deploy".
 
-The mitigation is embarrassingly close: the function already takes `worker_status`, and
-`worker_status == "detached"` ⇒ skip `[verified: infra/container_manager.py:5267-5311]`. The data is
-on disk (`status.json`) `[verified: tools/workspace/worker_runtime.py:969-985]`. What is missing is
-that the boot-path callers pass it.
+The mitigation looks closer than it is. The function already takes `worker_status`, and
+`worker_status == "detached"` ⇒ skip `[verified: infra/container_manager.py:5267-5311]`; the data is
+on disk, under `status.json["runtime_status"]` `[verified: tools/workspace/worker_runtime.py:953;
+web_ui/backend/health_routes.py:59-97]`. What is missing is neither the parameter nor the data but a
+**call site with the right purpose**: there is no boot-path caller of
+`cleanup_stale_worker_containers` at all, and the single production call site is
+`infra/container_manager.py:2310`, inside `ContainerManager.start()`'s pre-create self-heal, which
+reaps on purpose so that "a name collision can never block a worker respawn"
+`[verified: infra/container_manager.py:2305-2310]`. Passing `worker_status="detached"` **there** would
+disable the self-heal for the very worker being respawned. So the discriminator cannot be
+`worker_status` alone; it has to be the calling context's purpose — a supervisor/boot sweep reaps
+nothing a persisted worker owns, a pre-create self-heal reaps by name. §5.1.1 carries this through to
+the cost estimate and the recommendation.
 
 ### G3 — Queued queries are lost without an error (SILENT)
 
 `_input_queue` is a `queue.Queue` attribute of the thread
-`[verified: tools/workspace/worker_thread.py:2108, :2174]`; the job registry is in-process
-`[inferred]`. A detached worker may legitimately hold a backlog (queries accepted while parked are
-queued, by design). After a restart that backlog is gone and nothing records that it existed. The
-caller waiting in `wait_for_job` either times out or — worse — is not waiting because it too died with
+`[verified: tools/workspace/worker_thread.py:2108, :2174]`; `WorkerJobRegistry` is an in-process
+`dict` (`self._jobs`), populated from events, with no serializer on any path
+`[verified: tools/workspace/job_registry.py:53-65]`. A detached worker may legitimately hold a backlog
+(queries accepted while parked are queued, by design). After a restart that backlog is gone and nothing
+records that it existed. The caller waiting in `wait_for_job` either times out or — worse — is not
+waiting because it too died with
 the process; the *only* durable trace of an accepted-but-never-run query would be the inflight
 journal, which by construction only exists once a turn started writing
 
@@ -444,9 +481,16 @@ directions come from the same missing re-attachment.
 
 ### G5 — `resume()` is unreachable without a live thread (SEVERE for the feature)
 
-`WorkerManager.resume_worker` is a thin `_control_worker("resume", ...)`
-`[verified: tools/workspace/worker_manager.py:798, :861-887]` and raises `WorkerControlError` when no
-thread is registered. So after a restart there is literally no API to resume a detached worker. Note
+`WorkerManager.resume_worker` is a thin `_control_worker("resume", ...)`, and for an unregistered thread
+it does **not** raise — `_control_worker` returns `{"found": False, "action": "resume", ...}`
+`[verified: tools/workspace/worker_manager.py:865-872]`. `WorkerControlError` is raised only when a
+thread *is* found but lacks a callable method `[verified: tools/workspace/worker_manager.py:861-887]`.
+So after a restart there is no API to resume a detached worker — and the failure mode is **worse**
+than the raise this section originally claimed: a caller receives a well-formed dict with
+`found: False` and can log or report **success**, so a "resume after restart" path can silently do
+nothing while the user believes the worker is running again. A loud `WorkerControlError` would be the
+safer contract; the silent `found: False` no-op is a safety problem in its own right, independent of
+whether re-attachment ever ships. Note
 `worker_manager.py:919` ("thread.stop() now DETACHES … a manager stop that leaves the instance
 running must call kill()") — the manager's own comments assume liveness, which is exactly the
 assumption a restart violates.
@@ -553,12 +597,35 @@ PersistedWorker(
 
 Then:
 
-1. **Feed it to the sweeper.** Every boot-path call to
-   `cleanup_stale_worker_containers(docker_client, owner_identity, worker_status=...)`
-   passes `worker_status` from the catalogue. `worker_status == "detached"` ⇒ skip
-   `[verified: infra/container_manager.py:5267-5311]`; `"unknown"`/missing ⇒ do not reap
-   (fail-closed, matching `_detached_state()`'s `None` semantics
-   `[verified: infra/container_manager.py:5241-5253]`). **This single line closes G2.**
+1. **Feed it to a boot sweep that does not exist yet — §5.1.1.** This is the one place the first draft
+   of this document was wrong, and the correction changes the shape of Option A.
+
+   **§5.1.1 The missing piece is the call site, not the argument.** The sweep already takes
+   `worker_status`, and `worker_status == "detached"` ⇒ skip
+   `[verified: infra/container_manager.py:5267-5311]`; `"unknown"`/missing ⇒ do not reap (fail-closed,
+   matching `_detached_state()`'s `None` semantics `[verified: infra/container_manager.py:5241-5253]`).
+   But three facts change the picture:
+
+   - **There is no boot-path caller of `cleanup_stale_worker_containers` at all** `[verified: the
+     caller set was enumerated; it is empty]`. So "thread `worker_status` through the boot-path
+     callers" describes a call site that does not exist.
+   - **The single production caller is a pre-create self-heal, and it needs the reap.**
+     `infra/container_manager.py:2310` calls
+     `cleanup_stale_worker_containers(self.client, worker_name)` — two positional arguments, no
+     `worker_status` — immediately before a fresh create, under a comment that states the intent:
+     "Remove them BEFORE the fresh create so a name collision can never block a worker respawn"
+     `[verified: infra/container_manager.py:2305-2310]`.
+   - **Passing `worker_status` there would be a bug.** If that call site supplied
+     `worker_status="detached"` for the worker being respawned, the gate would skip the reap and the
+     respawn would collide with its own leftovers. Its *purpose* is destruction; a boot sweep's purpose
+     is preservation. They must not share a path keyed only on `worker_status`.
+
+   Therefore the discriminator is the **calling context's purpose**, not the argument's value: a new
+   supervisor/boot sweep, living outside `ContainerManager.start()`, that asks "does any persisted
+   worker own these containers?" and answers from the catalogue — while `ContainerManager.start()` keeps
+   its unconditional self-heal untouched. Option A is thus **catalogue + a new call site**, and the new
+   call site is the real unit of work: it needs an owner (the supervisor, §8 q2), a position in the boot
+   order, and its own tests (T4/T5 must exercise the new sweep, not the existing self-heal).
 2. **Expose it as the L1 surface** used by both the UI bridge and any headless consumer, replacing
    `bridge._load_worker_contexts()`'s private dict `[verified: web_ui/backend/bridge.py:3021-3067]`
    with one reader in the worker layer. Keep the bridge's dict as a cache, not the source of truth.
@@ -573,10 +640,20 @@ identity discipline `[verified: tools/workspace/worker_manager.py:463]`; poisoni
 disk-derived epochs invites exactly the double-writer bugs the fenced command channel exists to stop
 `[verified: tools/workspace/command_channel.py:78-84]`.
 
-**Cost:** one enumeration function + one parameter threaded through the sweep call sites + tests.
-**Risk:** low. The reader is read-only; the only behaviour change is *fewer* reaps, i.e. strictly
-fail-closed. The one thing to get right is the `instance_id`/dir-name question (G8): parse
-`<name>_<iid>` deliberately, or key the catalogue by directory and let consumers resolve.
+**Cost (corrected: cheaper on the reader, dearer on delivery).** The reader is cheaper than first
+estimated: `web_ui/backend/health_routes.py:59-97` already enumerates `workers/*`, reads `status.json` and
+returns a workspace-wide per-worker catalogue (`worker_name`, `session_id`, `runtime_status`,
+`last_heartbeat`, `current_task`, token counts), so L1 is an extraction and generalisation of shipping
+code — add the `generation` sidecar and the `context.json` fields, move it into the worker layer — not a
+new subsystem (§3.4). What is *not* cheaper is L2: one enumeration function **+ a new sweep call site
+that does not exist yet** (§5.1.1) **+ its owner in the boot order** (§8 q2) **+ tests**. Still no new
+state, no new thread, no new fence.
+
+**Risk:** low on the reader. The only behaviour change is *fewer* reaps, i.e. strictly fail-closed. The
+two things to get right are (a) the `instance_id`/dir-name question (G8): parse `<name>_<iid>`
+deliberately, or key the catalogue by directory and let consumers resolve; and (b) **not** routing the
+`ContainerManager.start()` self-heal through the catalogue (§5.1.1), which would convert a fail-closed
+change into a fail-open one.
 
 ### 5.2 Option B — full rehydration: resurrect handles for persisted workers (L3, aggressive)
 
@@ -655,9 +732,10 @@ helper never raises `[verified: tools/workspace/worker_thread.py:2176-2197]`).
 ### 5.4 Option D — do nothing, state the truth (L0)
 
 Ship only documentation: "detach survives a restart only in the conversation dimension; operational
-practice must be: resume before restarting the host, or accept container loss." Plus the mandatory
-one-line hardening already available (`worker_status` into the sweep, §5.1.1) if we want to avoid
-destroying detached containers.
+practice must be: resume before restarting the host, or accept container loss." Plus, if we want to
+avoid destroying detached containers, the sweep hardening of §5.1.1 — which is **not** the one-argument
+change this document originally claimed: the argument already exists and no boot call site does, so even
+the hardening needs the new call site.
 
 **When D is the right answer:** if the operational reality is that hosts restart rarely and detach is
 short-lived. **When it is not:** if detach is advertised as "park a worker overnight", because then a
@@ -667,9 +745,18 @@ nightly deploy silently reaps its containers.
 
 Ship **A now** (L1 + L2), with the `instance_id` key question (G8) decided as part of it, and **C as
 the follow-on slice** (L3), which is where `recoverable` replay and backlog restoration belong.
-**Reject B.** Treat **D** as the fallback if A is not funded — but in that case the sweep hardening
-(§5.1.1) should still ship on its own, because it is a one-argument change that prevents data loss,
-and it does not require the catalogue at all.
+**Reject B.** Treat **D** as the fallback if A is not funded.
+
+**This recommendation survives the §5.1.1 correction, with its cost restated.** The correction removes
+"one argument" from the pitch and adds "one new call site with an owner". The *ranking* does not move,
+because the deciding fact is unchanged: **L2 is the only level that prevents data loss**, and it is
+still the cheapest thing that does. What changes is the packaging — the L2 half can no longer be sold
+as a one-line patch that ships without the catalogue, because it needs the catalogue's answer ("is this
+worker persisted and detached?") *and* a place to ask the question. Consequently the previous
+fallback ("ship the sweep hardening on its own if A is not funded") is withdrawn: standalone hardening
+needs the same new call site and the same disk read, i.e. most of A for a fraction of the value. If A is
+not funded, the honest recommendation is **D plus an explicit statement that detached containers are
+reaped on the next restart** (§5.4).
 
 Rationale in one line each:
 
@@ -810,12 +897,25 @@ Option C (L3), when scoped:
 ### 7.3 Documentation-verification tests
 
 The claim "there is no boot-time scan" is a *negative* claim, so it should be pinned mechanically
-rather than by prose: a grep test asserting that (a) `_adopt_predecessor_journal` has exactly one
-production caller `[verified now: tools/workspace/worker_thread.py:3143-3148]`, and (b) `workers/*`
-directory enumeration outside the worker package occurs only in `web_ui/backend/bridge.py`
-`[verified now: :3048]`. If a future slice adds a boot scan, that test fails and points the reader at
-this document. This is cheap and prevents the doc from silently becoming fiction — the exact failure
-mode `worker_runtime_process.py:24-34` already exhibits (§G9).
+rather than by prose. The test must assert three things:
+
+(a) `_adopt_predecessor_journal` has exactly one production caller
+`[verified now: tools/workspace/worker_thread.py:3143-3148]`;
+(b) `workers/*` directory enumeration is **confined to `web_ui`** — `bridge.py`, `workspace_routes.py`,
+`health_routes.py` — and appears nowhere in the worker layer (`tools/workspace/`, `infra/`, `session/`).
+Note this is *not* the assertion this document originally proposed. The original wording — "enumeration
+outside the worker package occurs only in `web_ui/backend/bridge.py`" — was **wrong, and as written the
+test would have failed red on the day it was committed**: there are seven enumerators across three
+`web_ui` modules (`bridge.py:3048`, `workspace_routes.py:1326, :1419, :1625, :1841, :1961`,
+`health_routes.py:59`) `[verified]`. A one-file assertion would have produced a permanently red test
+and, worse, a false "the doc is fiction" signal about a true doc;
+(c) **none of those enumerators constructs anything**: no `WorkerThread(...)`, no `WorkerRegistry`
+registration, no `register_detached_worker(...)` reachable from any of them (§3.4) — the property that
+actually distinguishes "a listing" from "a boot scan", and the one a future slice will break.
+
+If a future slice adds a boot scan or teaches an existing enumerator to build a handle, (b) or (c) goes
+red and points the reader at this document. This is cheap and prevents the doc from silently becoming
+fiction — the exact failure mode `worker_runtime_process.py:24-34` already exhibits (§G9).
 
 ### 7.4 What must NOT be tested with sleeps
 
@@ -853,28 +953,40 @@ the event/command state directly rather than wait for a wall-clock tick.
 
 Listed so the next reader does not mistake silence for confirmation.
 
-1. **Exact persistence story of `WorkerJobRegistry`** — the module was not opened. §2.2's "in-process"
-   and §G3's "lost" both rest on inference from the absence of any serializer at the call sites, not
-   on reading the registry.
-2. **Whether any boot-path caller supplies `worker_status` to
-   `cleanup_stale_worker_containers`** — the parameter exists
-   `[verified: infra/container_manager.py:5256, :5267-5311]`, but the caller set was not enumerated.
-   If some caller already passes `"detached"` read from disk, §G2's severity drops and Option A
-   shrinks to the catalogue only. This is the single highest-value follow-up check.
-3. **Whether a resume-side replay for `recoverable` exists anywhere** — grep found no second
+**Resolved in this revision** (kept visible so the change is auditable rather than quietly vanishing):
+
+- **`WorkerJobRegistry` persistence — was item 1.** Resolved: the module *was* opened.
+  `tools/workspace/job_registry.py:53-65` — `self._jobs: dict = {}`, populated from events, no
+  serializer anywhere. It is verifiably in-memory, so §2.2's "in-process" and G3's "lost" are
+  `[verified]`, not inference.
+- **Callers supplying `worker_status` — was item 2, the "single highest-value follow-up check".**
+  Resolved, and it changed §5.1: **no boot-path caller of `cleanup_stale_worker_containers` exists at
+  all**; the single production caller is `infra/container_manager.py:2310`, inside
+  `ContainerManager.start()`'s pre-create self-heal, passing two positional arguments, and it *needs*
+  the reap `[verified: infra/container_manager.py:2305-2310]`. Consequence: G2's severity stands
+  unchanged, but Option A is a catalogue **plus a new call site**, not a catalogue plus one argument
+  (§5.1.1). The audited `status.json` key is `runtime_status`, not `status` (§3.5).
+- **`resume_worker`'s failure mode — not listed before; found during the audit.** It returns
+  `{"found": False, "action": "resume", ...}` for an unregistered thread rather than raising
+  `[verified: tools/workspace/worker_manager.py:865-872]`. §3.5 and G5 are corrected, and G5's severity
+  reasoning is now "silent no-op mistaken for success", not "loud raise".
+
+Still open:
+
+1. **Whether a resume-side replay for `recoverable` exists anywhere** — grep found no second
    `adopt_inflight` caller, so it is treated as MISSING, but "not found by grep" is not proof for
    dynamic dispatch or a differently-named helper.
-4. **Whether the accept path (`submit` / `request_worker`) records anything durable** for a query that
+2. **Whether the accept path (`submit` / `request_worker`) records anything durable** for a query that
    is queued but not started — determines whether §G3 is "silent loss" or "silent loss with a
    recoverable trace".
-5. **`shutdown_workers` line numbers** — cited from the module's shape (~:350-380) rather than an exact
+3. **`shutdown_workers` line numbers** — cited from the module's shape (~:350-380) rather than an exact
    read of each line; the comment at `:365` was read exactly.
-6. **`worker_lifecycle.py` line numbers** — the observer's fields are cited by name, not by line; the
+4. **`worker_lifecycle.py` line numbers** — the observer's fields are cited by name, not by line; the
    file was read but per-field line anchors were not recorded.
-7. **`WorkerRegistry` internals** — keys and the epoch CAS are cited by name
+5. **`WorkerRegistry` internals** — keys and the epoch CAS are cited by name
    (`_worker_registry`, `_worker_epochs`, `_worker_event_bus_registry`, `_bus_epochs`,
    `stored_epoch_for()`), without line anchors.
-8. **`inflight_journal.adopt_inflight` end line** — cited as `:525-600+`; the body was read past 600
+6. **`inflight_journal.adopt_inflight` end line** — cited as `:525-600+`; the body was read past 600
    but the terminal line was not recorded.
 
 ## Appendix B — cited locations, grouped
@@ -912,7 +1024,9 @@ set + helpers `:5215-5238`; tri-state `:5241-5253`; sweep `:5256-5360` (gate `:5
 
 **UI / REST** `web_ui/backend/bridge.py` (`_persisted_workers` `:624`, `_load_worker_contexts`
 `:3021-3067`, call sites `:2397-2398`, `:2695-2697`, clear `:3005`, `resume_worker` `:3069-3080`);
-`web_ui/backend/workspace_routes.py` (`_read_worker_generation` `:315-340`).
+`web_ui/backend/workspace_routes.py` (`_read_worker_generation` `:315-340`, `workers/*` enumerations
+`:1326, :1419, :1625, :1841, :1961`); `web_ui/backend/health_routes.py` (workspace-wide worker
+catalogue over `(ws_dir/"workers").iterdir()` reading `status.json` `:59-97`).
 
 **Session store** `session/store.py` (`_save_session_metadata` `:311-344`, `save_session` `:346-350`,
 `load_session` `:551-555`).
