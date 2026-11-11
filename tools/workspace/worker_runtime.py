@@ -37,10 +37,11 @@ child-side), where the stream actually is.
 
 Mode selection (§10, D11)
 -------------------------
-One flag, ``WORKER_RUNTIME_MODE`` ∈ ``{thread, process}``, default ``thread``
-through S4, read **at spawn time** so a single worker can be moved between
-modes without restarting the server (§10). The flag is therefore resolved on
-every :meth:`WorkerRuntimeHandle.spawn` call and never cached at import time.
+One flag, ``WORKER_RUNTIME_MODE`` ∈ ``{thread, process}``, default ``process``
+(``thread`` is the explicit opt-out), read **at spawn time** so a single worker
+can be moved between modes without restarting the server (§10). The flag is
+therefore resolved on every :meth:`WorkerRuntimeHandle.spawn` call and never
+cached at import time.
 
 Resolution fails closed: an unrecognised value is refused rather than
 silently treated as ``thread``, because "I did not understand the config"
@@ -65,10 +66,13 @@ from tools.workspace.worker_runtime_protocol import Event, Heartbeat, WorkerStat
 #: The flag that selects the runtime mode (§10, D11).
 WORKER_RUNTIME_MODE_ENV = "WORKER_RUNTIME_MODE"
 
-#: Worker body runs in the supervisor's interpreter. The shipped default.
+#: Worker body runs in the supervisor's interpreter. Opt-in only: the shipped
+#: default is :data:`MODE_PROCESS`, and ``WORKER_RUNTIME_MODE=thread`` is how a
+#: deployment asks for this mode back.
 MODE_THREAD = "thread"
 
-#: Worker body runs in its own OS process (S2: dispatch_query only).
+#: Worker body runs in its own OS process (S2: dispatch_query only). The
+#: shipped default.
 MODE_PROCESS = "process"
 
 #: Exactly what the flag accepts. Nothing else is a mode.
@@ -306,20 +310,20 @@ def resolve_runtime_mode(environ: Optional[Mapping[str, str]] = None) -> str:
     affects the next spawn without a restart. ``environ`` is injectable so the
     resolution rule can be tested without mutating the process environment.
 
-    Absent -> ``thread``. Anything present that is not exactly
+    Absent -> ``process``. Anything present that is not exactly
     :data:`MODE_THREAD` or :data:`MODE_PROCESS` -> :class:`InvalidRuntimeModeError`
     (fail closed: no trimming, no case folding, no empty-string-as-default).
     """
     source: Mapping[str, str] = os.environ if environ is None else environ
     raw = source.get(WORKER_RUNTIME_MODE_ENV)
     if raw is None:
-        return MODE_THREAD
+        return MODE_PROCESS
     if raw in RUNTIME_MODES:
         return raw
     raise InvalidRuntimeModeError(
         f"{WORKER_RUNTIME_MODE_ENV}={raw!r} is not one of {RUNTIME_MODES}; "
         "refusing to guess a runtime mode (unset the variable to get the "
-        f"{MODE_THREAD!r} default)"
+        f"{MODE_PROCESS!r} default)"
     )
 
 

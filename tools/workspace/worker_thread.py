@@ -5238,7 +5238,9 @@ class Worker(ToolBase):
             "history is seeded with just the worker's own system prompt plus "
             "this spawn's 'Initial context: ...' brief, and the stale "
             "transcript is overwritten at the next context save. Default "
-            "False resumes the persisted conversation."
+            "False resumes the persisted conversation. Implies force=True: a "
+            "live instance is replaced rather than reused (reusing it, or "
+            "auto-resuming a paused one, would resume the old conversation)."
         ),
     )
 
@@ -5791,6 +5793,14 @@ class Worker(ToolBase):
         # (see worker_self_reported) — anti-pattern member 4.
         spawn_started_at = time.time()
         from tools.workspace.worker import GATE_AVAILABLE, WorkerThread, _registry_lock, _worker_registry, check_required_categories, resolve_workspace_id
+
+        # ``fresh_context`` is a blank-slate spawn: resuming a live instance (or
+        # auto-resuming a paused one) would hand the caller a conversation the
+        # caller explicitly asked not to have, so the flag IMPLIES ``force``.
+        # One expression, computed once, consulted at every reuse decision
+        # below, so the implication cannot drift site by site.
+        effective_force = self.force or self.fresh_context
+
         definition = self._find_worker(workers, self.worker_name)
         if definition is None:
             return {
@@ -5803,7 +5813,7 @@ class Worker(ToolBase):
         # another workspace) is not this caller's property and must survive
         # untouched.  Session scoping is what makes force workspace-safe.
         session_key = self.session_id or _NO_SESSION_KEY
-        if self.force:
+        if effective_force:
             stale_instances = self._find_all_worker_threads(
                 self.worker_name, session_id=session_key
             )
@@ -5907,7 +5917,7 @@ class Worker(ToolBase):
                     # worker that then reports {"status": "stopped"}.
                     if (
                         existing.status == "paused"
-                        and not self.force
+                        and not effective_force
                         and not _stop_already_pending(existing)
                     ):
                         if getattr(existing, "_manual_only_pause", False):
@@ -5922,7 +5932,7 @@ class Worker(ToolBase):
                             }
                         # Paused worker — auto-resume and re-route the new query.
                         resume_paused_worker = existing
-                    elif self.force or _stop_already_pending(existing):
+                    elif effective_force or _stop_already_pending(existing):
                         # Force (or a stop already in flight): never reuse or
                         # resume. Route to the double-checked spawn at the SAME
                         # explicit id, which re-checks the registry under the
@@ -5950,7 +5960,7 @@ class Worker(ToolBase):
                 if (
                     only_live is not None
                     and only_live.status == "paused"
-                    and not self.force
+                    and not effective_force
                     and not _stop_already_pending(only_live)
                 ):
                     if getattr(live_same[0][1], "_manual_only_pause", False):
@@ -5971,7 +5981,7 @@ class Worker(ToolBase):
                     # NEW id for the replacement instead of colliding with the
                     # dying entry, which is still registered until it exits.
                     spawn_iid = max([iid for iid, _ in live_same], default=0) + 1
-                elif len(live_same) == 1 and not self.force:
+                elif len(live_same) == 1 and not effective_force:
                     # Continue-existing routing: a single live (non-paused)
                     # instance is reused instead of spawning a duplicate. Any
                     # spawn query is delivered to it AFTER the lock (D2).
@@ -6322,9 +6332,18 @@ class Worker(ToolBase):
         from tools.workspace.worker_runtime import (
             attach_thread_frame_sink,
             register_runtime_handle,
+            resolve_runtime_mode,
         )
 
-        _runtime_handle = attach_thread_frame_sink(thread)
+        # The mode a REAL spawn gets comes from the resolver, read once here
+        # (\u00a710, D11: at spawn time, never memoised). The handle's own
+        # ``mode=MODE_THREAD`` default is an explicit-API default -- "the
+        # caller asked for thread" -- not the shipped one, so leaving this
+        # call to default would make ``WORKER_RUNTIME_MODE`` unreadable on
+        # the only production spawn path and the default a lie.
+        _runtime_handle = attach_thread_frame_sink(
+            thread, mode=resolve_runtime_mode()
+        )
 
         # Store initial context for the thread to pick up in run().  This is a
         # COPY, not an alias: the caller may reuse one context dict across
@@ -6377,7 +6396,7 @@ class Worker(ToolBase):
                 # (it may also have a stop already in flight, which is what
                 # routed us here from the early availability check). Say so
                 # instead of the generic "already running".
-                if self.force:
+                if effective_force:
                     _why = (
                         "a stop already in flight"
                         if _stop_already_pending(existing)
