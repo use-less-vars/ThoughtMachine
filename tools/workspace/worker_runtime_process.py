@@ -122,6 +122,9 @@ _OPTIONAL_KWARGS = (
     ("max_container_count", "max_container_count"),
     ("max_token_usage", "max_token_usage"),
     ("max_runtime_s", "max_runtime_s"),
+    # The initial context ("briefing") and the query that rides in it. Without
+    # this line the child interpreter builds a worker with no brief at all.
+    ("initial_context", "_initial_context"),
 )
 
 

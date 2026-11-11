@@ -161,6 +161,8 @@ class WorkerContext:
         The compaction keeps:
           - Leading system prompt messages (role='system' before any
             non-system message)
+          - The worker briefing message (the leading ``'Initial context: '``
+            message, which rides as role='user' -- see the inline note below)
           - The latest summary message (the one with ``'summary': True``)
           - All messages after the latest summary
 
@@ -187,6 +189,16 @@ class WorkerContext:
         leading_system_msgs = []
         for msg in self.user_history:
             if msg.get("role") == "system" and not msg.get("summary"):
+                leading_system_msgs.append(msg)
+            elif str(msg.get("content", "")).startswith("Initial context: "):
+                # The worker briefing. It rides as role='user' because a second
+                # role='system' message is deleted by
+                # LLMClient.ensure_system_prompt(); without this branch it would
+                # end the leading run and be pruned on every compaction.
+                # The producer that owns this prefix is
+                # tools/workspace/worker_thread.py (INITIAL_CONTEXT_PREFIX) --
+                # keep the two in step. Not imported: agent/core must not
+                # depend on tools/workspace.
                 leading_system_msgs.append(msg)
             else:
                 break
