@@ -188,3 +188,5 @@ different file, different name. Never rename one to the other.
 - **C12: `cancellation.interrupt()` sticky-fallback trap.** **Open.** Calling `interrupt()` with no bound token arms a per-thread fallback event. `unbind()` does not clear it, so every subsequent `is_interrupted()` on that thread reads True permanently. This poisons the thread for the rest of the process (found during C11). Fix: clear the fallback on `unbind()`.
 
 - **C14: `visual_tool.py` missing cancellation reporting.** **Open.** An interrupted render drops the `reason` and returns `"visual: the renderer exited with code None."` to the model. This looks like a renderer crash, not an operator cancel, causing the model to hallucinate a failure. Teardown runs correctly (pinned by test). Fix: detect `status == "interrupted"` and return a clear cancellation message. (Discovered during C11').
+
+- **C37: Frontend Scroll Jump.** **Open.** When a new WebSocket event arrives (`conversation_changed`), the UI unconditionally snaps to the bottom. `useStore.js:353-372` does a full array replace. Fix requires a "scroll lock" check if the user is reading history.
