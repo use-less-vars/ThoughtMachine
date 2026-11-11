@@ -305,8 +305,9 @@ chmod +x "{script_path}"
                 duration=duration
             ))
 
-        # Validate workspace path
-        ws_path = self._resolve_registry_workspace()
+        # Validate workspace path (worktree_root narrows this to the worktree
+        # when one is configured; None still refuses rather than mounting cwd)
+        ws_path = self._resolve_workspace_root()
         if ws_path is None:
             # Never fall back to cwd: the current directory may be outside the
             # workspace, and mounting it would leak host files into the container.

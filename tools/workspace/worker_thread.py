@@ -5183,6 +5183,12 @@ class Worker(ToolBase):
         description="Session ID that spawned this worker (injected by ToolExecutor)",
     )
 
+    worktree_root: Optional[str] = Field(
+        default=None,
+        description="Optional narrower workspace root for path-anchored tool "
+        "operations (injected by ToolExecutor when the session is bound to one).",
+    )
+
     instance_id: Optional[int] = Field(
         default=None,
         description="Worker instance ID to address. When omitted, actions that "
@@ -5603,6 +5609,16 @@ class Worker(ToolBase):
             ws_path = parent_ws
         if ws_path:
             result["workspace_path"] = ws_path
+
+        # Inheritance is deliberately ABSENT: worktree_root is forwarded only
+        # when THIS tool instance was itself given one, never copied from the
+        # parent agent's config.  A sub-worker must therefore be opted in
+        # explicitly, so it can never be silently dragged into a worktree
+        # (writing to a checkout its caller is not looking at) merely because
+        # the worker that spawned it happens to be bound there.
+        _wt = getattr(self, 'worktree_root', None)
+        if _wt:
+            result['worktree_root'] = _wt
 
         # Propagate the workspace-lifecycle-manager feature flag so the
         # WorkerThread's _wlm_flag_enabled() sees it at the top level.

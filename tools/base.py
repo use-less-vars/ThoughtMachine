@@ -45,6 +45,15 @@ class ToolBase(BaseModel):
     is_docker: bool = Field(default=False, description="Whether the tool is executing in a Docker container")
     container_workspace_path: Optional[str] = Field(default=None, description="Workspace path as seen from inside the container (e.g., /workspace)")
 
+    # Optional NARROWER root for path-anchored tool operations (e.g. a git
+    # worktree living inside the registered workspace). Injected by
+    # ToolExecutor only when AgentConfig.worktree_root is truthy; None means
+    # "use the registered workspace root". Never inherited by sub-workers.
+    worktree_root: Optional[str] = Field(
+        default=None,
+        description="Optional narrower workspace root (e.g. a git worktree) for path-anchored operations; None = registered workspace root.",
+    )
+
     # Session permissions profile injected by ToolExecutor before execute()
     # Controls container network, filesystem mode, etc.
     session_permissions: Optional[Dict[str, Any]] = Field(
@@ -295,6 +304,69 @@ class ToolBase(BaseModel):
 
         return ws_path
 
+    def _worktree_root(self) -> Optional[str]:
+        """Return the validated ``worktree_root``, or None when unset.
+
+        Fails closed: a configured value that cannot be proven to be a real
+        directory inside the registered workspace root raises ``ValueError``.
+        It NEVER falls back to the wider registered root, because a silent
+        fallback would make a worktree-bound agent write into the main
+        checkout.
+        """
+        raw = getattr(self, 'worktree_root', None)
+        if not raw:
+            return None
+
+        wt = os.path.realpath(raw)
+        if not os.path.isdir(wt):
+            raise ValueError(
+                f"Invalid worktree_root {raw!r}: not an existing directory"
+            )
+
+        registry_root = self._resolve_registry_workspace()
+        if not registry_root:
+            raise ValueError(
+                f"Invalid worktree_root {raw!r}: workspace root could not be resolved"
+            )
+
+        root_real = os.path.realpath(registry_root)
+        if not os.path.isdir(root_real):
+            raise ValueError(
+                f"Invalid worktree_root {raw!r}: workspace root "
+                f"{registry_root!r} is not a directory"
+            )
+
+        # Component-aware containment: a bare prefix test would accept
+        # '/ws-evil' for a root of '/ws'.
+        if wt != root_real and not wt.startswith(root_real + os.sep):
+            raise ValueError(
+                f"worktree_root {raw!r} is outside workspace {registry_root!r}"
+            )
+
+        # Reuse the centralized vault barrier so a worktree that points into the
+        # vault is rejected by exactly the same rules as any other path.
+        if SECURITY_AVAILABLE:
+            try:
+                security_validate_path(wt, mode='read', workspace_path=root_real)
+            except Exception as e:
+                raise ValueError(str(e)) from e
+
+        return wt
+
+    def _resolve_workspace_root(self) -> Optional[str]:
+        """
+        Resolve the effective root for path-anchored tool operations.
+
+        Returns the validated ``worktree_root`` when configured, else the
+        registered workspace root. Path-anchored tools (file-walk bases,
+        container bind-mount sources, git working dirs) should call this
+        instead of :meth:`_resolve_registry_workspace` directly.
+        """
+        wt = self._worktree_root()
+        if wt:
+            return wt
+        return self._resolve_registry_workspace()
+
     def execute(self) -> str:
         raise NotImplementedError
 
@@ -348,8 +420,9 @@ class ToolBase(BaseModel):
         Returns absolute normalized path if valid.
         Raises ValueError if path is outside workspace.
         """
-        # Resolve workspace path from registries first
-        resolved_ws = self._resolve_registry_workspace()
+        # Resolve the effective path root (worktree_root when configured,
+        # else the registered workspace) from registries first
+        resolved_ws = self._resolve_workspace_root()
 
         # Use centralized security validation if available
         if SECURITY_AVAILABLE:

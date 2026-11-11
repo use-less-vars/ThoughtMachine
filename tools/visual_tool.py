@@ -372,8 +372,9 @@ class VisualTool(ToolBase):
         if refusal is not None:
             return self._fail(refusal, started)
 
-        # 2. Workspace, resolved through the registries like every other tool.
-        workspace = self._resolve_registry_workspace()
+        # 2. Workspace, resolved through the registries like every other tool
+        #    (narrowed to worktree_root when one is configured).
+        workspace = self._resolve_workspace_root()
         if not workspace:
             return self._fail(
                 "visual: no workspace path could be resolved for this session, "

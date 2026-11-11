@@ -106,6 +106,11 @@ def config_requires_respawn(old_config, new_config) -> bool:
     # Workspace path changes require a full restart
     if new_config.workspace_path != old_config.workspace_path:
         return True
+    # A worktree_root change re-anchors every path-anchored tool, so it needs
+    # a restart too: hot-swapping it would leave the live ToolExecutor pointed
+    # at the old root (see ToolExecutor.config assignment in Agent._hot_swap).
+    if new_config.worktree_root != old_config.worktree_root:
+        return True
     # Provider config changes (e.g. timeout/max_retries) require a full
     # restart so the LLM provider is re-initialised with the new settings.
     return new_config.provider_config != old_config.provider_config

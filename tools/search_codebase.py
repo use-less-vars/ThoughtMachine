@@ -82,7 +82,7 @@ class SearchCodebaseTool(ToolBase):
             return "RAG dependencies not installed. Run `pip install chromadb sentence-transformers tree-sitter pathspec`."
         
         # Get workspace path from registries or use current directory
-        workspace_path = self._resolve_registry_workspace()
+        workspace_path = self._resolve_workspace_root()
         if not workspace_path:
             # Use current directory if workspace_path not provided
             workspace_path = str(Path.cwd())
