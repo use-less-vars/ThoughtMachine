@@ -617,3 +617,74 @@ def test_neither_catalogue_nor_sweep_constructs_a_worker_thread(
 
     assert [w.identity for w in iter_persisted_workers(workers_dir)] == ["sess-1:w1"]
     assert sweep_stale_worker_containers(client, workers_dir) == ["c1"]
+
+
+# ===========================================================================
+# THE CALL SITE -- the boot path must actually RUN the sweep.
+#
+# Deliberate addition to the committed contract (C44 batch 2, implementation
+# half): the surface above is worthless if nothing calls it, which was the
+# original bug ("``start_stale_check`` had no production caller").  These two
+# tests import the REAL boot hook -- ``web_ui/backend/server.py::
+# _sweep_stale_worker_containers``, invoked exactly once from ``lifespan`` --
+# so a later refactor that deletes the call site fails here instead of
+# silently re-opening the leak.
+# ===========================================================================
+def test_boot_hook_sweeps_and_reaps_exactly_the_crashed_worker(tmp_path, monkeypatch):
+    """The real boot hook reaps the crashed worker and spares the parked one."""
+    from web_ui.backend import server
+
+    workers_dir = tmp_path / "workers"
+    _session_scoped_worker(workers_dir, "sess-1", "parked", "detached")
+    _session_scoped_worker(workers_dir, "sess-1", "crashed", "failed")
+    parked = _worker_container("c-parked", "sess-1:parked")
+    crashed = _worker_container("c-crashed", "sess-1:crashed")
+    client = FakeClient([parked, crashed])
+    _reconcile_spy(monkeypatch)
+
+    summary = server._sweep_stale_worker_containers(
+        docker_client=client, workers_dirs=[workers_dir]
+    )
+
+    assert summary["removed_ids"] == ["c-crashed"]
+    assert summary["removed"] == 1
+    assert crashed.remove_calls == [{"force": True}]
+    assert parked.remove_calls == []
+
+
+def test_boot_hook_never_raises_when_docker_is_unavailable(tmp_path, monkeypatch):
+    """Boot must survive a completely unusable Docker client.
+
+    A process that refuses to start because it could not reap a container is a
+    worse bug than the leak being fixed, so the boot hook is exception-isolated
+    all the way out.
+    """
+    from web_ui.backend import server
+
+    class _ExplodingClient:
+        def __getattr__(self, name):
+            raise RuntimeError(f"docker daemon unavailable: {name}")
+
+    workers_dir = tmp_path / "workers"
+    _session_scoped_worker(workers_dir, "sess-1", "crashed", "failed")
+    fallback = _worker_container("c-crashed", "sess-1:crashed")
+    _reconcile_spy(monkeypatch)
+
+    summary = server._sweep_stale_worker_containers(
+        docker_client=_ExplodingClient(), workers_dirs=[workers_dir]
+    )
+
+    assert summary["removed_ids"] == []
+    assert fallback.remove_calls == []
+
+
+def test_boot_hook_is_a_clean_noop_without_a_workers_directory(tmp_path, monkeypatch):
+    """Fresh install / CI: no workers dir, no docker call, no exception."""
+    from web_ui.backend import server
+
+    summary = server._sweep_stale_worker_containers(
+        docker_client=FakeClient([_worker_container("c1", "sess-1:w1")]),
+        workers_dirs=[tmp_path / "no-such-workers"],
+    )
+
+    assert summary == {"removed": 0, "removed_ids": [], "detail": ""}

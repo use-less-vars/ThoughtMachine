@@ -76,6 +76,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict, namedtuple
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -5368,6 +5369,190 @@ def cleanup_stale_worker_containers(docker_client, owner_identity,
             log("WARNING", "docker.container_manager",
                 f"Failed to remove stale worker container "
                 f"{getattr(container, 'id', getattr(container, 'name', '?'))}: {exc}")
+    return removed
+
+
+# ── Boot-time worker catalogue + status-aware stale sweep (C44) ───────────
+# ``cleanup_stale_worker_containers`` above knows HOW to spare a parked worker.
+# It does not know WHO is parked: after a hard crash the on-disk ``workers/``
+# tree is the only surviving witness of what the previous process was running,
+# and the primitive's only production caller is the per-spawn self-heal in
+# ``ContainerManager.start()``, which must keep reaping BY NAME (threading
+# ``worker_status`` into it would disable the self-heal for the very worker
+# being respawned -- design doc §5.1.1).
+#
+# The boot path therefore needs two things: a read-only catalogue of the
+# on-disk workers, and a sweep whose decision comes from each worker's RECORDED
+# status.  Both live HERE, next to the primitive they feed, because ``infra``
+# must never import ``tools.workspace.worker_thread`` (see the comment above):
+# the worker layer cannot host them without inverting that dependency, and
+# re-implementing the removal logic here would fork the single destroy gate.
+# The OWNER of the sweep is the supervisor/boot path -- exactly one caller,
+# once per process start (``web_ui/backend/server.py::lifespan``).
+
+_PERSISTED_WORKER_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class PersistedWorker:
+    """Read-only record of ONE worker found on disk (a witness, not a worker).
+
+    ``identity`` is the Docker join key: the EXACT value stamped on
+    ``thoughtmachine.worker`` (``tools/workspace/worker_container.py:30-51``).
+    ``status`` is the worker's recorded ``runtime_status``, or ``"unknown"``
+    when the record is missing / unreadable / key-less -- and "unknown" is a
+    REFUSAL to reap, never a guess (design doc §I4).
+    """
+
+    session_id: str
+    worker_name: str
+    status: str
+    worker_dir: Path
+
+    @property
+    def identity(self) -> str:
+        """``"<session_id or 'unknown'>:<worker_name>"`` -- the Docker label."""
+        return f"{self.session_id or _PERSISTED_WORKER_UNKNOWN}:{self.worker_name}"
+
+
+def _read_worker_status_payload(worker_dir):
+    """Parsed ``status.json`` of *worker_dir*, or ``None`` when unreadable.
+
+    ``None`` is the fail-closed value: absent, corrupt, non-UTF8, non-JSON and
+    non-dict payloads are all "cannot tell", never "not detached".
+    """
+    try:
+        raw = (Path(worker_dir) / "status.json").read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _persisted_worker(worker_dir, dir_session_id=None) -> PersistedWorker:
+    """Build the catalogue record for one worker directory (never raises)."""
+    worker_dir = Path(worker_dir)
+    payload = _read_worker_status_payload(worker_dir) or {}
+    session_id = payload.get("session_id") or dir_session_id
+    status = payload.get("runtime_status")
+    if not isinstance(status, str) or not status.strip():
+        status = _PERSISTED_WORKER_UNKNOWN
+    else:
+        status = status.strip()
+    return PersistedWorker(
+        session_id=str(session_id) if session_id else _PERSISTED_WORKER_UNKNOWN,
+        worker_name=worker_dir.name,
+        status=status,
+        worker_dir=worker_dir,
+    )
+
+
+def iter_persisted_workers(workers_dir):
+    """Catalogue every worker recorded under a workspace's ``workers/`` dir.
+
+    Tolerates BOTH shipped layouts (the two ``web_ui/backend/health_routes.py::
+    _collect_workers_from_fs`` already walks):
+
+    - ``workers/<worker_name>/status.json``            (legacy, no session dir)
+    - ``workers/<session_id>/<worker_name>/status.json`` (session-scoped)
+
+    A directory holding its own ``status.json`` is a legacy worker; otherwise
+    its subdirectories are session-scoped workers, joined back to Docker with
+    the payload's ``session_id`` and falling back to the directory name.
+
+    A worker whose ``status.json`` is missing / corrupt is STILL catalogued,
+    with status ``"unknown"``: it is a real directory that a teardown may have
+    half-removed (§I11), and the sweep must be able to name it in order to
+    refuse it.  Not cataloguing it would silently hide the crash.
+
+    Never raises: an absent / unreadable ``workers_dir`` yields ``[]`` (fresh
+    install, CI, or a workspace that never spawned a worker).
+    """
+    workers = []
+    try:
+        root = Path(workers_dir)
+        if not root.is_dir():
+            return workers
+        for entry in sorted(root.iterdir()):
+            try:
+                if not entry.is_dir():
+                    continue
+                if (entry / "status.json").exists():
+                    # Legacy layout: the entry IS the worker.
+                    workers.append(_persisted_worker(entry))
+                    continue
+                subdirs = sorted(p for p in entry.iterdir() if p.is_dir())
+            except OSError as exc:
+                log("WARNING", "docker.container_manager",
+                    f"Worker catalogue skipped {entry}: {exc}")
+                continue
+            if not subdirs or (entry / "context.json").exists():
+                # A worker directory whose status.json is gone (teardown
+                # intermediate) -- or an empty leftover: catalogue it so the
+                # sweep deliberately spares it instead of losing sight of it.
+                workers.append(_persisted_worker(entry))
+                continue
+            for worker_dir in subdirs:
+                workers.append(_persisted_worker(worker_dir, dir_session_id=entry.name))
+    except OSError as exc:
+        log("WARNING", "docker.container_manager",
+            f"Worker catalogue could not read {workers_dir}: {exc}")
+    return workers
+
+
+def sweep_stale_worker_containers(docker_client, workers_dir, *,
+                                  live_identities=()):
+    """BOOT sweep: reap containers left behind by a PREVIOUS process.
+
+    For every worker catalogued by :func:`iter_persisted_workers` this delegates
+    to :func:`cleanup_stale_worker_containers` -- the one and only container
+    removal path -- passing the worker's RECORDED status as ``worker_status``.
+    The result is status-aware for free: ``detached`` is spared by the primitive
+    itself, and every other recorded status is reapable.
+
+    Two identities are never even listed (§I10, cheap gate first):
+
+    - ``live_identities`` -- owner identities the supervisor has ALREADY
+      adopted in this process.  *Deliberate extension of the design doc's
+      surface*: the doc specifies the sweep without it, but the boot sweep must
+      never fight the live supervisor it is booting into.
+    - ``status == "unknown"`` -- fail closed (§I4).  The primitive is NOT
+      called at all: passing ``worker_status="unknown"`` down would trip its
+      ``worker_status is not None => detached = False`` branch and reap on
+      evidence that could not be read.  Removing a parked worker's containers
+      is unrecoverable; deferring a crashed worker's reclaim is not.
+
+    Returns the list of removed container ids (in catalogue order).  Never
+    raises: one unreadable worker, or a failing Docker call for one identity,
+    must not stop the rest of the sweep.
+    """
+    removed = []
+    try:
+        live = {str(identity) for identity in (live_identities or ())}
+    except TypeError:
+        live = set()
+
+    for worker in iter_persisted_workers(workers_dir):
+        if worker.identity in live:
+            log("INFO", "docker.container_manager",
+                f"Skipped stale worker container sweep for {worker.identity}: "
+                f"worker is live in this process")
+            continue
+        if worker.status == _PERSISTED_WORKER_UNKNOWN:
+            log("INFO", "docker.container_manager",
+                f"Skipped stale worker container sweep for {worker.identity}: "
+                f"recorded status unknown in {worker.worker_dir} -- refusing to "
+                f"reap on a guess")
+            continue
+        try:
+            removed.extend(
+                cleanup_stale_worker_containers(
+                    docker_client, worker.identity, worker_status=worker.status
+                ) or []
+            )
+        except Exception as exc:  # defensive: one identity must not stop the rest
+            log("WARNING", "docker.container_manager",
+                f"Stale worker container sweep failed for {worker.identity}: {exc}")
     return removed
 
 
