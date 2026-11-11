@@ -159,11 +159,16 @@ def test_permissive_resolution_reports_the_clamp_instead_of_hiding_it():
     assert budget.effective == 600
     assert budget.clamped is True
     fields = budget.as_envelope_fields()
-    assert set(fields) >= {"requested", "effective", "clamped", "clamped_by"}
-    assert fields["requested"] == 900
-    assert fields["effective"] == 600
-    assert fields["clamped"] is True
-    assert fields["clamped_by"] is not None
+    assert set(fields) >= {
+        "requested_timeout_seconds",
+        "effective_timeout_seconds",
+        "timeout_clamped",
+        "timeout_clamped_by",
+    }
+    assert fields["requested_timeout_seconds"] == 900
+    assert fields["effective_timeout_seconds"] == 600
+    assert fields["timeout_clamped"] is True
+    assert fields["timeout_clamped_by"] is not None
 
 
 # ─────── 6. ACCEPTANCE: the real job-wait helper must not answer 300 ──────────
@@ -197,12 +202,12 @@ def test_one_clock_is_used_by_wait_and_envelope():
     budget = _tb().resolve(420, default=300, cap=600)
     wait_seconds = budget.effective  # what the deadline math would use
     envelope = budget.as_envelope_fields()  # what the tool returns to the agent
-    assert envelope["effective"] == wait_seconds, (
+    assert envelope["effective_timeout_seconds"] == wait_seconds, (
         "two clocks: the deadline math and the result envelope disagree "
-        f"({wait_seconds} vs {envelope['effective']})"
+        f"({wait_seconds} vs {envelope['effective_timeout_seconds']})"
     )
     assert wait_seconds == 420
-    assert envelope["requested"] == 420
+    assert envelope["requested_timeout_seconds"] == 420
 
 
 # ─────────────── 8. exactly one declared ceiling, one symbol ──────────────────

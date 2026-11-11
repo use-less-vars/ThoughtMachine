@@ -6889,7 +6889,8 @@ class Worker(ToolBase):
         )
         if wait != 300.0:
             logger.info(
-                "query wait %.0fs (effective timeout %.0fs + grace) exceeds legacy 300s cap",
+                "query wait %.0fs (effective timeout %.0fs + grace); "
+                "no cap applied -- bounded only by the declared ceiling",
                 wait,
                 wait - QUERY_WAIT_GRACE_SECONDS,
             )
@@ -7113,8 +7114,10 @@ class Worker(ToolBase):
 
         Shared handler for both the ``join`` and ``wait_for_job`` actions.
         ``worker_query`` carries the job_id (same convention as ``job_status``).
-        Polls the job registry in 0.25s slices for a total of ``timeout_seconds``
-        (default 60, hard cap 300). Returns early on: job terminal state
+        Polls the job registry in 0.25s slices for a total of the RESOLVED
+        budget -- the per-call request if given, else the budget pinned on the
+        thread at spawn (default 60, bounded only by DECLARED_CEILING). There
+        is no 300 s cap. Returns early on: job terminal state
         (completed / timeout / error), a partial result (status ``partial_result``
         + preview), the worker thread pausing (``status == 'paused'``) or being
         detached (``status == 'detached'``), a kill signal (stop_event set /

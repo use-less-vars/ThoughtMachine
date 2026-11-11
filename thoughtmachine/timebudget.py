@@ -204,14 +204,16 @@ class TimeBudget:
     def as_envelope_fields(self) -> Dict[str, Any]:
         """Flat dict a result envelope spreads to show the ONE clock it got.
 
-        Canonical keys are ``requested_timeout_seconds`` /
-        ``effective_timeout_seconds`` / ``timeout_clamped`` /
-        ``timeout_clamped_by`` / ``timeout_source``.  The shorter
-        ``requested`` / ``effective`` / ``clamped`` / ``clamped_by`` /
-        ``source`` keys are the same values for envelope consumers that read
-        the contract object directly (``tests/test_time_budget_contract.py``
-        asserts those names); both point at the identical objects, so there is
-        still one clock, just two labels for it.
+        There is exactly ONE spelling per value, and it is the canonical one:
+        ``requested_timeout_seconds`` / ``effective_timeout_seconds`` /
+        ``timeout_clamped`` / ``timeout_clamped_by`` / ``timeout_source``.
+
+        No aliases are emitted.  Two names for one number is the same disease
+        as two clocks for one deadline: it lets a reader pick the spelling that
+        happens to agree with it.  Consumers read these five keys, and a
+        consumer that wants a shorter local name binds the attribute on the
+        :class:`TimeBudget` (``budget.effective`` et al.) instead of asking this
+        dict for a second label.
         """
         return {
             "requested_timeout_seconds": self.requested,
@@ -219,9 +221,4 @@ class TimeBudget:
             "timeout_clamped": self.clamped,
             "timeout_clamped_by": self.clamped_by,
             "timeout_source": self.source,
-            "requested": self.requested,
-            "effective": self.effective,
-            "clamped": self.clamped,
-            "clamped_by": self.clamped_by,
-            "source": self.source,
         }
