@@ -6,3 +6,16 @@
 # class). The windows-smoke CI step is the behavioral guard for this.
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Everything the onboarding router hashes or executes must be LF on EVERY
+# checkout. The `sha256:<64 hex>` digests HANDOFF.md records are over the files'
+# BYTES, so a CRLF checkout (Git for Windows defaults core.autocrlf=true) makes
+# every recorded digest disagree with the file on disk; and a CRLF shell script
+# handed to bash dies on "$'\r': command not found". The stored blobs are
+# already LF, so pinning eol=lf here changes no content -- it only stops the
+# Windows checkout from rewriting it. The behavioral guards are
+# tests/test_onboarding_bundle_contract.py (digest equality, byte-exact
+# regeneration) and tests/test_onboarding_scripts.py (the scripts actually run).
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf

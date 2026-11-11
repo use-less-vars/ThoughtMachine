@@ -833,3 +833,9 @@ Two threads allocating concurrently both read `base = N`, both write `N + 1`, an
 ## 2026-11-03 — Don't start appended content with a heading (Gen 56b)
 
 The KB append tool prefixes its own `## <date> — <first ~60 chars>...` line. If the appended body *also* begins with `## `, the file accumulates `## 2026-11-02 — ## The Heading (Gen 56)` followed by a truncated duplicate. This is **systemic, not new**: ~40 instances across `knowledge/` since 2026-08 (`personal/handoffs.md`, `personal/lessons_learned.md`, `personal/task_tracker.md`, `personal/parking_lot.md`, `project/working_agreements.md`). Cosmetic, so it has never been worth a cleanup pass — but it is why a section can appear to exist twice. **Append prose bodies, not headings.**
+
+## 2026-11-11 — TWO ADDITIONS (Gen 64)
+
+**WA-5 — DESIGN-PASS COMPLETENESS (CI contract).** *A design pass is complete only when its CI contract test exists and passes.* Applies to every design/architecture pass, not only the passes whose output is code: a design that lives only in prose has no holder that fails the day the code drifts from it, which is the `displayed≠enforced` class one layer up. The contract test is the acceptance criterion the pass ships with — if the design says "the gate refuses X", the pass is not finished until something goes red when X is allowed.
+
+**WA-6 — LIVING ONBOARDING BUNDLE.** *The onboarding bundle is living, not a snapshot. When a bug reveals a missing rule, add that rule to `MANDATORY_STOP.md`, `docs/ARCHITECTURE_MACHINE_MODEL.md` or `HANDOFF.md` in the SAME commit as the fix.* Same commit, not a follow-up hygiene pass: the rule and the evidence that it was needed land together, so the bundle's staleness and its content are decided by one diff.
