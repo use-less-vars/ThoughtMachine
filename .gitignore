@@ -409,3 +409,8 @@ web_ui/frontend/.npmrc
 !docs/CONTROL_PLANE.md
 !docs/history-worker-control.md
 
+# Gen-65 agent/worker problem consolidation: report + evidence parts.
+# Both the directory AND its contents need a negation, because the
+# `.thoughtmachine/working_docs/*` re-ignore above would otherwise hide them.
+!.thoughtmachine/working_docs/agent-worker-problems/
+!.thoughtmachine/working_docs/agent-worker-problems/**
