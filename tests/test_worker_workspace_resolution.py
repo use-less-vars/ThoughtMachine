@@ -237,7 +237,17 @@ class TestExecutePassesParentWorkspaceId(unittest.TestCase):
         ):
             payload = json.loads(tool.execute())
 
-        self.assertEqual(payload, {"spawned": True})
+        self.assertEqual(
+            payload,
+            {
+                "spawned": True,
+                "requested_timeout_seconds": None,
+                "effective_timeout_seconds": 300,
+                "timeout_clamped": False,
+                "timeout_clamped_by": None,
+                "timeout_source": "worker_thread.spawn",
+            },
+        )
         # workers.json lookup used the parent id ...
         tool._load_workers.assert_called_once_with(PARENT_WORKSPACE_ID)
         # ... and so did the spawn dispatch.
