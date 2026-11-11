@@ -5157,6 +5157,14 @@ def get_worker_event_buses_for_session(session_id: str) -> Dict[str, Any]:
 # Tool
 # ---------------------------------------------------------------------------
 
+#: The worker an action lands on when the caller omits ``worker_name``.
+#: ``resources/worker_templates/default.json`` ships a template of this name, so
+#: "omitted" always names a worker that exists rather than demanding a name the
+#: agent was never told to supply (the schema said ``worker_name`` was optional
+#: while ``execute()`` rejected None -- that contradiction cost a turn).
+DEFAULT_WORKER_NAME = "default"
+
+
 class Worker(ToolBase):
     """Manage background or child worker processes.
 
@@ -5172,6 +5180,13 @@ class Worker(ToolBase):
     queries are kept); it never terminates anything.  Terminating (``kill``)
     and reviving (``resume``) a worker are operator-only operations exposed in
     the workspace UI, not actions this tool offers the agent.
+
+    ``worker_name`` is genuinely optional: omit it (or leave it blank) and every
+    action that needs a worker uses the ``default`` worker.  A spawn task may be
+    given either as the top-level ``query`` argument or as ``context['query']``
+    — the same task, run on the same blocking dispatch path; passing both is
+    only accepted when they are identical, otherwise the call is rejected as
+    ambiguous rather than silently dropping one of them.
     """
 
     tool: str = "Worker"
@@ -5187,9 +5202,12 @@ class Worker(ToolBase):
         "operator can revive it — a stop is therefore never a termination. "
         "Killing and resuming a worker are operator-only (workspace UI), not "
         "agent actions. "
-        "When action='spawn' and context has a 'query' key, the spawn call "
-        "BLOCKS until the worker finishes the task and returns the full result. "
-        "Without a 'query' key, spawn returns immediately; use action='query' later. "
+        "When action='spawn' and a task is given -- as the top-level 'query' "
+        "argument or as context['query'] -- the spawn call BLOCKS until the "
+        "worker finishes the task and returns the full result. The two "
+        "spellings are the same task: give both and they must agree, or the "
+        "call is rejected as ambiguous. With no task, spawn returns "
+        "immediately; use action='query' later. "
         "action='submit_query' enqueues a query and returns immediately with a job_id "
         "(non-blocking); poll progress with action='job_status' (worker_query = job id, "
         "or empty to list this worker's jobs)."
@@ -5197,7 +5215,12 @@ class Worker(ToolBase):
 
     worker_name: Optional[str] = Field(
         default=None,
-        description="Name of the worker",
+        description=(
+            "Name of the worker, as listed in workers.json. Optional: when "
+            f"omitted (or blank) every action that needs a worker uses the "
+            f"'{DEFAULT_WORKER_NAME}' worker. "
+            "Use action='list' to see the available names."
+        ),
     )
 
     worker_query: Optional[str] = Field(
@@ -5206,6 +5229,16 @@ class Worker(ToolBase):
         "Only valid with action='query' (the call BLOCKS until the worker responds), "
         "action='submit_query' (non-blocking; returns a job handle immediately), "
         "or action='job_status' (job id to look up; empty lists jobs for the worker).",
+    )
+
+    query: Optional[str] = Field(
+        default=None,
+        description="The task for action='spawn' (e.g. query='Review src/'). "
+        "The spawn call BLOCKS until the worker finishes and returns the "
+        "worker's result. This is the same task as context['query'] -- "
+        "passing both is only accepted when they are identical, otherwise the "
+        "call is rejected as ambiguous. Only valid with action='spawn'; for "
+        "an already-spawned worker use worker_query.",
     )
 
     context: Optional[Union[Dict, str]] = Field(
@@ -5273,6 +5306,15 @@ class Worker(ToolBase):
     # agent actions.  The agent's "stop" DETACHES (recoverable park).
     VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "reset"]
 
+    #: Actions that cannot do anything without naming a worker.  Every other
+    #: action keeps ``worker_name=None``: for pause/stop that None is
+    #: MEANINGFUL (session/main scope), not a missing argument -- defaulting
+    #: them to a worker name would silently redirect a main-agent pause onto
+    #: one worker.
+    ACTIONS_REQUIRING_WORKER: ClassVar[tuple[str, ...]] = (
+        "spawn", "check", "query", "submit_query", "join", "wait_for_job", "reset",
+    )
+
     # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
     @field_validator('context', mode='before')
     @classmethod
@@ -5280,6 +5322,14 @@ class Worker(ToolBase):
         """If the LLM passes a plain string as context, wrap it as a query dict."""
         if isinstance(v, str):
             return {"query": v}
+        return v
+
+    @field_validator('worker_name', mode='before')
+    @classmethod
+    def blank_worker_name_means_omitted(cls, v: Any) -> Any:
+        """A blank/whitespace name is OMITTED, never a worker called ``''``."""
+        if isinstance(v, str) and not v.strip():
+            return None
         return v
 
     # ------------------------------------------------------------------
@@ -5307,10 +5357,19 @@ class Worker(ToolBase):
                     "available_actions": self.VALID_ACTIONS,
                 })
 
-            if self.action in ("spawn", "check", "query", "submit_query", "join", "wait_for_job", "reset") and not self.worker_name:
-                return json.dumps({
-                    "error": f"worker_name is required for action '{self.action}'",
-                })
+            # An omitted worker_name is not an error: every action that NEEDS a
+            # worker lands on DEFAULT_WORKER_NAME.  pause/resume/stop (and
+            # 'list', 'job_status') keep None, because there None means
+            # session/main scope rather than a missing argument.
+            if self.action in self.ACTIONS_REQUIRING_WORKER and self.worker_name is None:
+                self.worker_name = DEFAULT_WORKER_NAME
+
+            # A top-level 'query' is the spawn task, folded into the context so
+            # both spellings run the ONE blocking dispatch path below.
+            try:
+                self._fold_query_into_context()
+            except ValueError as exc:
+                return json.dumps({"error": str(exc), "action": self.action})
 
             # === Resolve the workspace id the worker must inherit ===
             # The parent's own workspace_path wins over SessionRegistry; see
@@ -5343,6 +5402,51 @@ class Worker(ToolBase):
             )
 
     # -- helpers -----------------------------------------------------
+
+    def _fold_query_into_context(self) -> None:
+        """Fold the top-level ``query`` argument into ``context['query']``.
+
+        ``context={'query': ...}`` is the long-standing spelling and the only
+        one with a dispatch behind it (``_action_spawn`` copies ``context`` into
+        ``thread._initial_context`` and then BLOCKS on the worker's first reply
+        because that dict has a 'query' key).  ``query=`` exists because it is
+        the shape an agent reaches for, so it is merged INTO the context instead
+        of growing a second dispatch path that could drift from the first.
+
+        Both precedence rules are explicit:
+
+        * top-level ``query`` + a context WITHOUT a 'query' key -> the
+          top-level value becomes the task;
+        * both present and DIFFERENT -> ``ValueError`` naming both, because
+          silently picking one drops work the caller asked for;
+        * both present and equal -> accepted once (the context already carries
+          exactly that task, so nothing is duplicated or dispatched twice).
+        """
+        if self.query is None or not self.query.strip():
+            return
+        task = self.query
+        if self.action != "spawn":
+            raise ValueError(
+                f"'query' is only valid with action='spawn'; for "
+                f"action='{self.action}' the task belongs in 'worker_query'. "
+                "Nothing was dispatched."
+            )
+        if not isinstance(self.context, dict):
+            self.context = {"query": task}
+            return
+        existing = self.context.get("query")
+        if existing is None or (isinstance(existing, str) and not existing.strip()):
+            merged = dict(self.context)
+            merged["query"] = task
+            self.context = merged
+            return
+        if str(existing) != task:
+            raise ValueError(
+                f"Conflicting tasks: query={task!r} but "
+                f"context['query']={existing!r}. They differ, so this call was "
+                "rejected rather than dispatching one of them silently -- pass "
+                "the task once, either as query= or as context={'query': ...}."
+            )
 
     def _load_workers(self, ws_id: Optional[str]) -> list:
         """
