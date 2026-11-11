@@ -173,6 +173,7 @@ docs/*
 # Host port design spec (Gen 49, 2026-10-24): public-tier design doc.
 !docs/host-port.md
 !docs/design-auth-boundary.md
+!docs/design-c44-worker-state-reattachment.md
 # KB policy: the three document tiers (Public docs / Internal KB / Diary).
 # Public tier ships with the repo — every docs/ file needs its own line.
 !docs/KB_POLICY.md
