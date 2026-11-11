@@ -23,6 +23,7 @@ Run:  python3 -m pytest tests/test_worker_timeout_truth.py -v
 """
 
 import json
+import pytest
 import queue
 import sys
 import tempfile
@@ -45,6 +46,14 @@ from tools.workspace.worker import (  # noqa: E402
     _worker_registry,
     _registry_lock,
 )
+
+
+@pytest.fixture(autouse=True)
+def _pin_thread_mode(monkeypatch):
+    # These tests pin the THREAD path: they exercise thread-path timeout logic,
+    # not process spawning. Process mode cannot pickle a mock worker.
+    monkeypatch.setenv("WORKER_RUNTIME_MODE", "thread")
+
 
 SYS_PROMPT = "You are a helpful worker assistant."
 

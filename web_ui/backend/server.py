@@ -606,6 +606,120 @@ def _sweep_orphan_container_records():
         log('WARNING', 'server', f'Startup record sweep skipped: {exc}')
 
 
+def _live_worker_identities():
+    """Owner identities the in-process supervisor has ALREADY adopted.
+
+    Returns the set of ``"<session_id or 'unknown'>:<worker_name>"`` identities
+    currently registered with ``WorkerRegistry``, or ``None`` when that set
+    cannot be determined.  ``None`` is a REFUSAL: the caller must skip the boot
+    sweep rather than assume "nothing is live", because reaping a live worker's
+    containers is unrecoverable while deferring a crashed worker's reclaim only
+    postpones it.  NEVER raises.
+    """
+    try:
+        from tools.workspace.worker_registry import WorkerRegistry
+
+        workers = WorkerRegistry.get_instance().get_all_workers()
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Boot worker sweep: could not enumerate live workers: {exc}')
+        return None
+    live = set()
+    try:
+        for key in list(workers):
+            session_id, worker_name = key[0], key[1]
+            live.add(f"{session_id or 'unknown'}:{worker_name}")
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Boot worker sweep: malformed worker registry key: {exc}')
+        return None
+    return live
+
+
+def _worker_dirs_at_boot():
+    """Every ``<workspace>/workers/`` directory in the vault. NEVER raises.
+
+    Returns ``[]`` on a fresh install / CI host where the vault has no
+    ``workspaces`` directory yet, which makes the boot sweep a clean no-op.
+    """
+    try:
+        from thoughtmachine.vault import vault_root
+
+        base = vault_root() / 'workspaces'
+        if not base.is_dir():
+            return []
+        return [entry / 'workers' for entry in sorted(base.iterdir())
+                if entry.is_dir()]
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Boot worker sweep: could not resolve the workers directory: {exc}')
+        return []
+
+
+def _sweep_stale_worker_containers(docker_client=None, workers_dirs=None):
+    """Startup sweep: reap worker containers a PREVIOUS process left behind.
+
+    A worker that died with its process (crash, ``kill -9``) leaves ephemeral
+    containers behind that can block the next respawn.  The dead process left a
+    ``status.json`` per worker, so the sweep is decided by each worker's
+    RECORDED status: a parked (``detached``) worker keeps its containers, a
+    crashed one is reclaimed, and an unreadable record is refused outright
+    (``infra.container_manager.sweep_stale_worker_containers``).
+
+    Runs EXACTLY ONCE per process start, from ``lifespan`` -- never per spawn
+    (``ContainerManager.start()`` keeps its own by-name self-heal) and never at
+    import time.  ``live_identities`` is everything the supervisor has already
+    adopted at this moment, so the boot sweep can never fight the live process
+    it is booting into.
+
+    Fully guarded: no Docker daemon/SDK, a permission error, a missing workers
+    directory or a corrupt ``status.json`` is logged and startup continues.  A
+    process that refused to start because it could not reap a container would
+    be a worse bug than the leak this fixes.  NEVER raises.
+
+    Returns ``{"removed": int, "removed_ids": [...], "detail": str}``.
+    """
+    summary = {'removed': 0, 'removed_ids': [], 'detail': ''}
+    try:
+        live = _live_worker_identities()
+        if live is None:
+            log('WARNING', 'server',
+                'Startup worker sweep skipped: could not enumerate live '
+                'workers (refusing to reap on a guess)')
+            return summary
+        if workers_dirs is None:
+            workers_dirs = _worker_dirs_at_boot()
+        elif isinstance(workers_dirs, (str, Path)):
+            workers_dirs = [workers_dirs]
+        if docker_client is None:
+            import docker  # noqa: PLC0415 - optional dependency at boot
+            docker_client = docker.from_env()
+
+        from infra.container_manager import sweep_stale_worker_containers
+
+        parts = []
+        for workers_dir in workers_dirs:
+            try:
+                removed = sweep_stale_worker_containers(
+                    docker_client, workers_dir, live_identities=live)
+            except Exception as exc:
+                log('WARNING', 'server',
+                    f'Startup worker sweep failed for {workers_dir}: {exc}')
+                continue
+            if removed:
+                summary['removed'] += len(removed)
+                summary['removed_ids'].extend(removed)
+                parts.append(f'{workers_dir}: {len(removed)}')
+        summary['detail'] = ', '.join(parts)
+        log('INFO', 'server',
+            f"Startup worker sweep: removed {summary['removed']} stale worker "
+            f"container(s)"
+            + (f" -- {summary['detail']}" if summary['detail'] else ''))
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup worker sweep skipped: {exc}')
+    return summary
+
+
 # ── Periodic container sweep (Phase 1.1) ───────────────────────────────
 # Startup runs both sweeps once; a background task then re-runs them on a
 # fixed interval so idle/orphan containers are reclaimed during long-lived
@@ -1030,6 +1144,20 @@ async def lifespan(app: FastAPI):
     # treated as orphans and removed too. Resource containers are excluded.
     # Best-effort: a failing sweep must never break startup.
     _sweep_exited_workspace_containers()
+
+    # ── Startup stale WORKER container sweep (C44) ────────────────────────
+    # Reap worker containers a previous process left behind when it died with
+    # them (crash / kill -9). The decision comes from each worker's RECORDED
+    # status.json, so a parked (detached) worker keeps its containers while a
+    # crashed one is reclaimed -- and an unreadable record is refused, never
+    # guessed at. One pass per process start, before any worker is adopted;
+    # workers adopted later in this session are passed as live_identities.
+    # Best-effort and blocking (docker API), so it runs in a worker thread: a
+    # failing sweep must never break startup.
+    try:
+        await asyncio.to_thread(_sweep_stale_worker_containers)
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup worker sweep skipped: {exc}')
 
     # ── Startup orphan container-RECORD sweep ───────────────────────────
     # Reap container records whose bound Docker container is gone, once past
