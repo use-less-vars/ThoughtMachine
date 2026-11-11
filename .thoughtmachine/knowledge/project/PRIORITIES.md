@@ -235,6 +235,46 @@ different file, different name. Never rename one to the other.
   brief yet, do not start before Batch 1 merges.** The scope line stays deliberately thin
   until then, because the archived entry is a historical note, not a specification.
 
+- **C45: worker briefing is stripped before turn 1.**
+  **Open** — bug, high. `agent/core/llm_client.py:201` `ensure_system_prompt()` deletes, in
+  place on `session.user_history`, every `role="system"` message whose content does not start
+  with `"Summary of previous conversation:"`. It runs at `Agent.__init__` (`agent.py:554`) and
+  every turn (`agent.py:1562`). Worker briefings are appended as exactly such a system message
+  (`worker_thread.py:3747` and `3805`), so the brief is erased from persisted history before the
+  first turn; queries survive only because they arrive as `user` turns via `_input_queue`.
+  **Second, independent hole (process mode only).** `_initial_context` is set after construction
+  (`worker_thread.py:6292`) and is missing from `_OPTIONAL_KWARGS`
+  (`worker_runtime_process.py:112-127`), so the child builds `WorkerThread(**kwargs)` with
+  `_initial_context=None` and the system message is never built at all.
+  **Test gap.** `TestBriefingDeliveredInFull` (`tests/test_worker_timeout_audit.py`) asserts only
+  the append; nothing runs `ensure_system_prompt` over the constructed history.
+  **Fix direction (agreed).** Carry the briefing on the first `user` message instead of adding a
+  new survivor prefix to `ensure_system_prompt` — that rule guards token explosion elsewhere.
+  The regression test must run the real `ensure_system_prompt()` over the history the worker
+  actually builds. Cited at `25be340a`; the fix's first step is to re-verify each line number.
+
+- **C46: host-port kill-switch scan root is the wrong shape (class fix, not a point fix).**
+  **Open.** C42's guard scans `tools/**` only. `thoughtmachine/doctor.py` has `import subprocess`
+  plus `subprocess.run` and is covered by neither C42 nor
+  `tests/test_tool_import_declaration_match.py`.
+  **Ruling: the defect is the scan root, not doctor.** C46 = determine whether `doctor.py` is
+  agent-reachable (via any tool or HTTP route) and audit the scan root itself. If reachable,
+  route it through `thoughtmachine/host_port.host_run()`. If not reachable, allowlist it with a
+  written reason AND a reachability pin (a test that fails the day it becomes reachable).
+  **Separately decide** whether `thoughtmachine/**` enters C42 scope or gets its own named
+  allowlist. Do not widen C42 inside the C42 commit; that scope decision belongs here.
+
+- **C47: onboarding bundle is a stale snapshot, not a living artifact (delivered on this branch).**
+  **Open** — delivered on `feat/gen64-taskB-c47-onboarding`; the entry stays open only until
+  the merge SHA is known (same standing as C33). Acceptance contract: the emitted onboarding
+  bundle must include `HANDOFF.md` verbatim, and its manifest must cover `MANDATORY_STOP.md`,
+  `docs/ARCHITECTURE_MACHINE_MODEL.md` and
+  `.thoughtmachine/knowledge/project/architecture_invariants.md`; staleness must be
+  content-addressed (sha256), not mtime-based; `--check` mode must exist and exit non-zero when
+  the bundle is stale, and it must be wired into CI so staleness fails the build.
+  **Maintenance rule.** When a bug reveals a missing rule, the same commit that fixes the bug
+  updates `MANDATORY_STOP.md` / `ARCHITECTURE_MACHINE_MODEL.md` / `HANDOFF.md`.
+
 ## Numbering (Gen 63 housekeeping)
 
 - **The Archived block reuses two live IDs.** It holds a **C35** ("Prove the Host Port is
