@@ -22,6 +22,16 @@ A successful reply envelope carries ``status`` plus the response payload:
     {"status": "ok", "response": ..., "worker_name": ...,
      "instance_label": ..., "elapsed_seconds": <numeric>}
 
+An INTERRUPTED wait (D16: the caller's pause / turn-cancel ended the wait,
+the query itself was not cancelled) is never nested inside an ``ok``
+envelope. Its interruption fields are carried at the top level so the tool
+boundary reports the interruption as the result's own status:
+
+    {"status": "interrupted", "interrupted": True, "reason": <str>,
+     "query_id": <str>, "worker_name": <str>,
+     "instance_label": <str | None>, "elapsed_seconds": <numeric>,
+     "note": <non-empty str>}
+
 The wait-time math is single-sourced in ``tools.workspace.worker_timeout``
 (``_worker_query_wait_timeout`` = effective timeout + grace); this module
 re-exports the timeout helpers so importers do not need to reach into
@@ -164,6 +174,57 @@ def validate_query_reply(
     return reply
 
 
+def _interrupted_payload(response: Any) -> Optional[Dict[str, Any]]:
+    """The parsed payload when *response* is an interrupted (D16) envelope.
+
+    Detection is on the envelope VOCABULARY -- ``status == "interrupted"`` or
+    ``interrupted is True`` -- never on string matching of the raw reply, so a
+    worker is free to reword the ``note`` without silencing this. Anything
+    else (a normal reply, a non-JSON test double) returns None.
+    """
+    payload = response
+    if isinstance(response, str):
+        try:
+            payload = json.loads(response)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("interrupted") is True or payload.get("status") == "interrupted":
+        return payload
+    return None
+
+
+def _interrupted_envelope(
+    payload: Dict[str, Any],
+    worker_name: str,
+    instance_label: Optional[str],
+    elapsed_seconds: float,
+) -> Dict[str, Any]:
+    """Flatten an interrupted reply into the tool-boundary envelope.
+
+    The interruption fields reach the caller at the TOP level -- never nested
+    under ``status == "ok"`` -- so the result says WHY the wait ended
+    (``reason``), which query it abandoned (``query_id``) and that the query
+    itself was not cancelled (``note``). Values come from the worker's own
+    envelope; *worker_name* / *elapsed_seconds* are only fallbacks for a
+    sender that omitted them.
+    """
+    elapsed = payload.get("elapsed_seconds")
+    return {
+        "status": "interrupted",
+        "interrupted": True,
+        "reason": payload.get("reason"),
+        "query_id": payload.get("query_id"),
+        "worker_name": payload.get("worker_name") or worker_name,
+        "instance_label": instance_label,
+        "elapsed_seconds": (
+            elapsed if _is_numeric(elapsed) else round(elapsed_seconds, 3)
+        ),
+        "note": payload.get("note"),
+    }
+
+
 def strict_wait_for_reply(
     thread: Any,
     query: str,
@@ -186,6 +247,10 @@ def strict_wait_for_reply(
         with the measured ``elapsed_seconds``.
       * A successful reply is wrapped in a ``{"status": "ok", ...}``
         envelope carrying the response, worker identity and elapsed seconds.
+      * An INTERRUPTED reply (the worker's D16 wait-interrupted envelope,
+        ``status == "interrupted"`` / ``interrupted is True``) is NOT wrapped:
+        it is flattened into the top-level interruption envelope whose own
+        ``status`` is ``"interrupted"`` (see ``_interrupted_envelope``).
     """
     effective = _worker_query_wait_timeout(timeout_seconds, fallback=fallback)
     if (
@@ -214,6 +279,9 @@ def strict_wait_for_reply(
             elapsed_seconds=round(elapsed, 3),
         )
     elapsed = time.monotonic() - t0
+    interrupted = _interrupted_payload(response)
+    if interrupted is not None:
+        return _interrupted_envelope(interrupted, name, label, elapsed)
     return {
         "status": "ok",
         "response": response,
@@ -400,6 +468,11 @@ def deliver_query_and_block(
       * On success returns the canonical ok envelope (status/content/
         confidence/meta/telemetry merged from the worker's JSON-string
         envelope) plus worker identity and elapsed seconds.
+      * When the reply is the D16 interrupted envelope the interruption
+        fields are returned at the TOP level (``status="interrupted"``,
+        ``interrupted``, ``reason``, ``query_id``, ``note``,
+        ``elapsed_seconds``) -- never nested under an ok envelope and never
+        normalised down to a hollow status-only result.
       * On timeout returns a TERMINAL envelope: the worker is classified
         (paused/stopped/error/timeout) and — unless *stop_on_timeout* is
         False or the worker already reached a terminal state — cooperatively
@@ -432,6 +505,12 @@ def deliver_query_and_block(
             float(reply.get("elapsed_seconds") or 0.0),
             stop_on_timeout,
         )
+    if reply.get("status") == "interrupted":
+        # D16: the WAIT ended, the query did not. ``strict_wait_for_reply``
+        # already flattened the interruption into its own envelope, so it is
+        # passed through as-is instead of being re-normalised (which would
+        # drop ``reason``/``query_id``/``note``).
+        return reply
     return _normalize_reply(
         reply.get("response"),
         name,

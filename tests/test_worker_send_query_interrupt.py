@@ -9,6 +9,11 @@ returns a structured ``status='interrupted'`` envelope within one slice.  Only
 the WAIT ends: the worker may still be running the query, and with no signal
 bound (tests / direct use) the full-deadline wait is unchanged.
 
+The envelope also has to survive the layers above it: the sync-query tool
+boundary (``worker_query.deliver_query_and_block``) reports the interruption as
+the RESULT's own ``status``, with ``reason`` / ``query_id`` / ``note`` intact --
+never nested under a ``status='ok'`` wrapper that only keeps the status.
+
 Hermetic: no real worker thread, no LLM, no Docker, no network.  The input
 queue's ``put`` is stubbed, so no reply is ever produced.
 
@@ -30,6 +35,7 @@ from tools.sleep_tool import (  # noqa: E402
     bind_turn_cancel,
     unbind,
 )
+from tools.workspace.worker_query import deliver_query_and_block  # noqa: E402
 from tools.workspace.worker_thread import WorkerThread  # noqa: E402
 
 WORKER = "w-send"
@@ -131,6 +137,44 @@ def test_turn_cancel_interrupts_a_blocked_send_query(tmp_path, monkeypatch):
     assert payload["reason"] == "turn_cancelled"
     assert payload["query_id"] == sent[0][0]
     assert elapsed < 5.0, f"cancel took {elapsed:.2f}s to unblock a 30s wait"
+
+
+def test_tool_boundary_reports_the_interrupted_status(tmp_path, monkeypatch):
+    """The interruption must reach the caller as the RESULT's own status.
+
+    ``send_query``'s envelope travels through ``strict_wait_for_reply`` and
+    ``deliver_query_and_block``.  The wait layer used to re-wrap it as
+    ``{"status": "ok", "response": <envelope>}`` and the tool boundary kept
+    only the status, so the result lost ``reason`` / ``query_id`` / ``note``
+    and a caller could not tell WHY its wait ended.  It has to arrive flat.
+    """
+    thread = _thread(tmp_path)
+    reply = json.dumps(
+        {
+            "status": "interrupted",
+            "interrupted": True,
+            "reason": "paused",
+            "query_id": "q-tool",
+            "worker_name": WORKER,
+            "elapsed_seconds": 0.4,
+            "note": (
+                "Wait interrupted; the query was NOT cancelled and the worker "
+                "may still be running it."
+            ),
+        }
+    )
+    monkeypatch.setattr(thread, "send_query", lambda query, timeout=120.0: reply)
+
+    result = deliver_query_and_block(thread, "hi", timeout=30)
+
+    assert result.get("status") == "interrupted", result
+    assert result.get("status") != "ok", result
+    assert result.get("interrupted") is True, result
+    assert result.get("reason") == "paused", result
+    assert result.get("query_id") == "q-tool", result
+    assert result.get("worker_name") == WORKER, result
+    assert result.get("elapsed_seconds") == 0.4, result
+    assert "NOT cancelled" in (result.get("note") or ""), result
 
 
 def test_bound_but_unset_signals_do_not_interrupt(tmp_path, monkeypatch):
