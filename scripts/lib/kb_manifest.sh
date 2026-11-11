@@ -18,6 +18,8 @@
 #   kb_resolve_entry <router> <entry>
 #                                absolute path, or non-zero when unresolvable
 #   kb_rel_path <root> <abs>     path made relative to <root> when possible
+#   kb_entry_hashes <router>     "<sha256><TAB><entry>" per manifest entry
+#   kb_sha256 <file>             lowercase hex sha256 of a file's bytes
 
 # Section heading: "##" + whitespace + "2" + "." (title deliberately ignored).
 KB_SECTION_RE=${KB_SECTION_RE:-'^##[[:space:]]+2[.]'}
@@ -31,16 +33,26 @@ KB_ENTRY_RE=${KB_ENTRY_RE:-'^[[:space:]]*[0-9]+[.]?[[:space:]]+`([^`]+)`'}
 
 KB_DEFAULT_HANDOFF_REL=${KB_DEFAULT_HANDOFF_REL:-.thoughtmachine/knowledge/project/HANDOFF.md}
 
-# kb_entries <router-file>
-#   Prints one manifest entry per line (backticks stripped), in manifest order.
-#   Hard-fails -- message on stderr, non-zero return -- when the router is
-#   missing, when section 2 is absent, or when section 2 holds no numbered
-#   backticked items: a silently empty manifest is exactly the failure mode
-#   that produces a bundle which looks complete while carrying nothing.
-kb_entries() {
-  local router="${1:-}" body status n line
-  local -a entries
+# _kb_section2_body <router-file>
+#   Prints the lines of section 2: everything after the "## 2." heading, up to
+#   the next "## " heading. Returns 3 when no heading matched, so "absent
+#   section" stays distinguishable from "empty section" -- awk's own exit status
+#   would be lost to a plain command substitution.
+_kb_section2_body() {
+  local router="${1:-}"
+  awk -v re="$KB_SECTION_RE" '
+    !in_section && $0 ~ re { in_section = 1; found = 1; next }
+    in_section && /^## /   { exit }
+    in_section             { print }
+    END                    { if (!found) exit 3 }
+  ' "$router"
+}
 
+# _kb_section2_body_or_fail <router-file>
+#   _kb_section2_body plus the diagnostics every caller needs, so the parsing
+#   entry points below cannot drift apart in what they say about a bad router.
+_kb_section2_body_or_fail() {
+  local router="${1:-}" body status
   if [ -z "$router" ]; then
     printf 'ERROR: no router file given.\n' >&2
     return 1
@@ -50,17 +62,8 @@ kb_entries() {
     return 1
   fi
 
-  # Body of section 2: the lines after the heading, up to the next "## ".
-  # awk exits 3 when no heading matched, so "absent section" is distinguishable
-  # from "empty section" (a plain command substitution would lose the status).
   status=0
-  body="$(awk -v re="$KB_SECTION_RE" '
-    !in_section && $0 ~ re { in_section = 1; found = 1; next }
-    in_section && /^## /   { exit }
-    in_section             { print }
-    END                    { if (!found) exit 3 }
-  ' "$router")" || status=$?
-
+  body="$(_kb_section2_body "$router")" || status=$?
   if [ "$status" -eq 3 ]; then
     printf 'ERROR: %s: no section heading matching %s (expected a "## 2. <title>" section).\n' \
       "$router" "'^##[[:space:]]+2\[.]'" >&2
@@ -70,6 +73,22 @@ kb_entries() {
     printf 'ERROR: %s: could not read the router (awk exit %d).\n' "$router" "$status" >&2
     return 1
   fi
+  printf '%s\n' "$body"
+}
+
+# kb_entries <router-file>
+#   Prints one manifest entry per line (backticks stripped), in manifest order.
+#   Hard-fails -- message on stderr, non-zero return -- when the router is
+#   missing, when section 2 is absent, or when section 2 holds no numbered
+#   backticked items: a silently empty manifest is exactly the failure mode
+#   that produces a bundle which looks complete while carrying nothing.
+kb_entries() {
+  local router="${1:-}" body n line
+  local -a entries
+
+  # Section 2's body, with the shared "absent/unreadable router" diagnostics
+  # already printed on failure.
+  body="$(_kb_section2_body_or_fail "$router")" || return 1
 
   n=0
   while IFS= read -r line; do
@@ -85,6 +104,36 @@ kb_entries() {
   fi
 
   printf '%s\n' "${entries[@]}"
+}
+
+# kb_entry_hashes <router-file>
+#   Prints "<recorded-sha256><TAB><entry>" per manifest entry, manifest order.
+#   The recorded digest is the `sha256:<64 lowercase hex>` token the entry line
+#   carries; it is EMPTY when the line carries none (or carries a malformed
+#   one). Callers must treat empty as STALE, never as "nothing to compare": an
+#   entry that quietly lost its hash would otherwise pass the gate forever,
+#   which is precisely the silent drift the digest exists to catch.
+kb_entry_hashes() {
+  local router="${1:-}" body n line entry hash
+  body="$(_kb_section2_body_or_fail "$router")" || return 1
+
+  n=0
+  while IFS= read -r line; do
+    if [[ "$line" =~ $KB_ENTRY_RE ]]; then
+      entry="${BASH_REMATCH[1]}"
+      hash=""
+      if [[ "$line" =~ sha256:([0-9a-f]{64}) ]]; then
+        hash="${BASH_REMATCH[1]}"
+      fi
+      printf '%s\t%s\n' "$hash" "$entry"
+      n=$((n + 1))
+    fi
+  done <<< "$body"
+
+  if [ "$n" -eq 0 ]; then
+    printf 'ERROR: %s: section 2 lists no "N. `path`" manifest entries.\n' "$router" >&2
+    return 1
+  fi
 }
 
 # kb_repo_root <router-file>
@@ -172,4 +221,48 @@ kb_rel_path() {
     "$root"/*) printf '%s\n' "${path#"$root"/}" ;;
     *)         printf '%s\n' "$path" ;;
   esac
+}
+
+# kb_sha256 <file>
+#   Prints the lowercase hex sha256 digest of <file>'s bytes.
+#   The tool is DISCOVERED, never assumed: `shasum -a 256` ships with stock
+#   macOS, `sha256sum` with GNU coreutils, `openssl dgst -sha256` with Git for
+#   Windows (which has neither of the other two). Probing all three is what lets
+#   one script serve every supported host without reaching for `stat`. When none
+#   is present we HARD-FAIL: silently skipping the comparison would turn a
+#   fail-closed gate into a no-op, which is worse than a loud refusal.
+kb_sha256() {
+  local file="${1:-}" digest
+  if [ -z "$file" ]; then
+    printf 'ERROR: kb_sha256: no file given.\n' >&2
+    return 1
+  fi
+  if [ ! -f "$file" ]; then
+    printf 'ERROR: kb_sha256: not a regular file: %s\n' "$file" >&2
+    return 1
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    digest=$(shasum -a 256 "$file" | awk '{ print $1 }')
+  elif command -v sha256sum >/dev/null 2>&1; then
+    digest=$(sha256sum "$file" | awk '{ print $1 }')
+  elif command -v openssl >/dev/null 2>&1; then
+    # Third probe: Git Bash on Windows ships openssl but neither shasum nor
+    # sha256sum. Both OpenSSL 1.1 ("SHA256(f)= <hex>") and 3.x
+    # ("SHA2-256(f)= <hex>") put the digest LAST, so $NF is the hex field.
+    digest=$(openssl dgst -sha256 "$file" | awk '{ print $NF }')
+  else
+    printf 'ERROR: kb_sha256: none of "shasum -a 256", "sha256sum" or "openssl dgst -sha256" is on PATH; cannot compute a checksum. Install one of them (shasum ships with macOS, sha256sum comes with GNU coreutils, openssl with Git for Windows).\n' >&2
+    return 1
+  fi
+
+  # A tool that exits 0 but emits something short of a full digest is broken,
+  # and a short string would compare unequal to every recorded value -- i.e. a
+  # permanent, unexplained STALE. Fail loudly here instead.
+  if [ "${#digest}" -ne 64 ]; then
+    printf 'ERROR: kb_sha256: could not compute a 64-char digest for %s (got %d chars).\n' \
+      "$file" "${#digest}" >&2
+    return 1
+  fi
+  printf '%s\n' "$digest"
 }

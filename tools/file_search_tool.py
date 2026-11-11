@@ -107,7 +107,7 @@ class FileSearchTool(ToolBase):
             elif self.file_pattern:
                 # Walk directory tree with exclusion pruning (unlike Path.glob which traverses everything)
                 files_to_search = []
-                ws_path = self._resolve_registry_workspace()
+                ws_path = self._resolve_workspace_root()
                 base_path = Path(ws_path or '.')
                 pattern = self.file_pattern
                 for root, dirs, files in os.walk(str(base_path)):

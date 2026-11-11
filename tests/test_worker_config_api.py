@@ -8,7 +8,7 @@ through without upgrading it. The tests are grouped the same way:
   modes: thread mode reuses the child-side handler, process mode reports a
   capability gap as ``ok=False`` instead of raising.
 * ``TestConfigFieldTiers`` -- ``config_field_tiers`` must agree field-for-field
-  with the authority, and must mark exactly the seven compared fields
+  with the authority, and must mark exactly the eight compared fields
   ``requires_respawn``.
 * ``TestConfigRoute`` -- ``POST .../workers/{name}/config`` never turns "no
   runtime" / "stale fence" into a success, and reports ``applied_live`` only
@@ -44,6 +44,7 @@ def _config(**overrides: Any) -> SimpleNamespace:
         base_url="https://api.example.com/v1",
         system_prompt="be helpful",
         workspace_path="/workspace",
+        worktree_root=None,
         provider_config={},
     )
     values.update(overrides)
@@ -169,6 +170,7 @@ class TestConfigFieldTiers:
         "base_url",
         "system_prompt",
         "workspace_path",
+        "worktree_root",
         "provider_config",
     }
 

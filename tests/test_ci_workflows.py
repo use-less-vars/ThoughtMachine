@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 SMOKE_WORKFLOW = WORKFLOWS_DIR / "cross-platform-smoke.yml"
 FIRST_START_WORKFLOW = WORKFLOWS_DIR / "first_start_ci.yml"
+PYTHON_MATRIX_WORKFLOW = WORKFLOWS_DIR / "python-version-matrix.yml"
 SMOKE_SCRIPT = REPO_ROOT / "scripts" / "smoke_windows.ps1"
 ASSERT_SCRIPT = REPO_ROOT / "scripts" / "assert_check_only_not_vacuous.sh"
 
@@ -144,6 +145,18 @@ def _run_assert(tmp_path, log_text, *extra):
         capture_output=True,
         text=True,
     )
+
+
+def test_installer_contract_job_runs_the_kb_staleness_gate():
+    """The onboarding router's recorded digests must gate CI, not just log."""
+    assert PYTHON_MATRIX_WORKFLOW.is_file(), PYTHON_MATRIX_WORKFLOW
+    text = PYTHON_MATRIX_WORKFLOW.read_text(encoding="utf-8")
+
+    job = _job_text(text, "installer-contract")
+
+    assert "check_kb_staleness.sh --check" in job
+    # It rides with the repo's other shell/script checks, not in its own job.
+    assert "bash -n" in job
 
 
 def test_assert_script_exists():

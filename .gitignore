@@ -173,6 +173,7 @@ docs/*
 # Host port design spec (Gen 49, 2026-10-24): public-tier design doc.
 !docs/host-port.md
 !docs/design-auth-boundary.md
+!docs/design-c44-worker-state-reattachment.md
 # KB policy: the three document tiers (Public docs / Internal KB / Diary).
 # Public tier ships with the repo — every docs/ file needs its own line.
 !docs/KB_POLICY.md
@@ -409,3 +410,8 @@ web_ui/frontend/.npmrc
 !docs/CONTROL_PLANE.md
 !docs/history-worker-control.md
 
+# Gen 62 C13 design pass (2026-11): the persistent-container timeout
+# self-healing design proposal, public tier, ships with the repo. `docs/*`
+# above is a catch-all, so the negation is required or the file is never
+# versioned and vanishes on the next clone.
+!docs/design_c13_timeout_self_healing.md

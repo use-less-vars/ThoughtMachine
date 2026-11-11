@@ -12,7 +12,9 @@ Audits worker timeout & force-respawn behaviour in tools/workspace/worker.py:
   3. Query action timeout: send_query raising TimeoutError returns an error
      dict with "Worker did not respond in time" + "still alive" note (no raise).
   4. Force-respawn reload: a worker with persisted context.json gets the NEW
-     _initial_context appended as a system message and the NEW query
+     _initial_context appended as the first role='user' message (prefix
+     "Initial context: ") — NOT as a second role='system' message, which
+     LLMClient.ensure_system_prompt() deletes — and the NEW query
      auto-queued — NOT the old attempt query. If the previous attempt never
      completed (last_query != last_completed_query) and belongs to a different
      query, it is pruned before the merge (F1) so the conversation does not
@@ -42,6 +44,7 @@ Run:  python3 -m pytest tests/test_worker_timeout_audit.py -v
 
 import json
 import os
+import pytest
 import queue
 import sys
 import tempfile
@@ -62,6 +65,14 @@ from tools.workspace.worker import (  # noqa: E402
     _registry_lock,
 )
 from agent.core.worker_context import WorkerContext  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pin_thread_mode(monkeypatch):
+    # These tests pin the THREAD path: they exercise thread-path timeout logic,
+    # not process spawning. Process mode cannot pickle a mock worker.
+    monkeypatch.setenv("WORKER_RUNTIME_MODE", "thread")
+
 
 SYS_PROMPT = "You are a helpful worker assistant."
 
@@ -95,7 +106,10 @@ def make_thread(workspace_dir, name="w-test", timeout=60, session_id="s1"):
 
 def initial_ctx_msg(initial_context):
     return {
-        "role": "system",
+        # The brief must NOT be role='system': LLMClient.ensure_system_prompt()
+        # deletes every non-``Summary of previous conversation:`` system message,
+        # which silently dropped it before the model ever saw it.
+        "role": "user",
         "content": f"Initial context: {json.dumps(initial_context, default=str, ensure_ascii=True)}",
     }
 
@@ -973,14 +987,14 @@ class TestPlainStringContextBecomesQuery(_InitialContextHelpers):
         self.assertEqual(list(thread._input_queue.queue), [string_ctx])
         history = thread._worker_ctx.user_history
         self.assertEqual(history[0], {"role": "system", "content": SYS_PROMPT})
-        self.assertEqual(history[1]["role"], "system")
+        self.assertEqual(history[1]["role"], "user")
         self.assertTrue(history[1]["content"].startswith("Initial context: "))
         self.assertIn("BRIEF-STR-7F3A", history[1]["content"])
 
 
 class TestBriefingDeliveredInFull(_InitialContextHelpers):
     """A long briefing arrives whole, after the system prompt, in its own
-    separate role='system' message."""
+    separate role='user' message (see initial_ctx_msg for why not 'system')."""
 
     def test_long_briefing_survives_delivery_whole(self):
         head = "BRIEF-HEAD-7F3A"
@@ -993,11 +1007,12 @@ class TestBriefingDeliveredInFull(_InitialContextHelpers):
             thread = self._run_fresh_thread(Path(tmp), dict(initial_context))
 
         history = thread._worker_ctx.user_history
-        # Ordering property: prompt first, briefing second, both role='system'.
+        # Ordering property: prompt first, briefing second (prompt is the only
+        # role='system' message; the brief rides as role='user').
         self.assertEqual(len(history), 2)
         self.assertEqual(history[0], {"role": "system", "content": SYS_PROMPT})
         ic = history[1]
-        self.assertEqual(ic["role"], "system")
+        self.assertEqual(ic["role"], "user")
         self.assertNotEqual(ic["content"], SYS_PROMPT)
 
         # Full-content assertion (not just the first sentence).
@@ -1026,7 +1041,7 @@ class TestBriefingDeliveredInFull(_InitialContextHelpers):
 
 
 class TestBriefingSurvivesCompaction(unittest.TestCase):
-    """The brief is a leading system message, so summarisation must not eat it."""
+    """The brief is a leading role='user' message, so summarisation must not eat it."""
 
     def test_briefing_survives_compact_after_summary(self):
         sentinel = "BRIEF-COMPACT-7F3A"
@@ -1058,9 +1073,48 @@ class TestBriefingSurvivesCompaction(unittest.TestCase):
         # ... system prompt and the brief are not.
         self.assertEqual(contents[0], SYS_PROMPT)
         self.assertEqual(contents[1], ic["content"])
-        self.assertEqual(ctx.user_history[1]["role"], "system")
+        self.assertEqual(ctx.user_history[1]["role"], "user")
         self.assertIn(sentinel, ctx.user_history[1]["content"])
         self.assertEqual(contents[-1], "new question after summary")
+
+
+class TestBriefingSurvivesRealSystemPromptSanitizer(_InitialContextHelpers):
+    """THE regression: the brief must survive the REAL
+    ``LLMClient.ensure_system_prompt()`` pass, which deletes every
+    ``role='system'`` message that is not a compaction summary. When the brief
+    was emitted as a second ``role='system'`` message it was silently dropped
+    before the model ever saw it."""
+
+    def test_briefing_survives_real_ensure_system_prompt(self):
+        sentinel = "BRIEF-SURVIVES-7F3A"
+        initial_context = {"query": "read the brief", "briefing": f"rule {sentinel}"}
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = self._run_fresh_thread(Path(tmp), dict(initial_context))
+
+        ctx = thread._worker_ctx
+        history = ctx.user_history
+        self.assertIn(sentinel, json.dumps(history, default=str))
+
+        # Run the production sanitizer for real (no mock): this is the exact
+        # call Agent.__init__ / process_query make on every turn.
+        from agent.core.llm_client import LLMClient
+
+        class _FakeClient:
+            config = type("C", (), {"system_prompt": SYS_PROMPT})()
+            session = None
+
+        LLMClient.ensure_system_prompt(_FakeClient(), history)
+
+        self.assertIn(sentinel, json.dumps(history, default=str))
+        self.assertTrue(
+            any(sentinel in (msg.get("content") or "") for msg in history),
+            "the briefing was dropped by LLMClient.ensure_system_prompt()",
+        )
+        # Only the real system prompt may keep role='system'.
+        self.assertEqual(
+            [msg for msg in history if msg.get("role") == "system"],
+            [{"role": "system", "content": SYS_PROMPT}],
+        )
 
 
 if __name__ == "__main__":

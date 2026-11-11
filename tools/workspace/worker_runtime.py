@@ -1162,9 +1162,20 @@ class WorkerRuntimeHandle:
 
 
 def attach_thread_frame_sink(
-    worker: Any, *, mode: str = MODE_THREAD
+    worker: Any, *, mode: Optional[str] = None
 ) -> "WorkerRuntimeHandle":
     """Build a handle around *worker* and install its ``on_frame`` as the sink.
+
+    *mode* is resolved HERE when the caller does not name one: a call site that
+    omits ``mode=`` is asking for "the mode in force now", and that is
+    ``WORKER_RUNTIME_MODE`` -- not ``thread``. Resolving it on every call (never
+    memoised) is what makes §10's "read at spawn time" true for the production
+    spawn site (``worker_thread._action_spawn``) as well as for
+    :meth:`WorkerRuntimeHandle.spawn`, and it is fail closed for the same
+    reason: an unrecognised value raises :class:`InvalidRuntimeModeError` here,
+    before any worker starts, instead of silently running in-process. An
+    explicit ``mode=`` still wins, and with the flag unset the resolution is
+    ``thread`` -- byte-identical to this function's previous default.
 
     This is the S5 production construction site: the one place a real
     ``WorkerThread`` gets a :class:`WorkerRuntimeHandle` and the runtime ->
@@ -1192,7 +1203,8 @@ def attach_thread_frame_sink(
     needs, and nothing else has to remember to close a handle that owns no
     resource of its own in thread mode (``close`` is a no-op there).
     """
-    handle = WorkerRuntimeHandle(worker, mode=mode)
+    resolved_mode = resolve_runtime_mode() if mode is None else mode
+    handle = WorkerRuntimeHandle(worker, mode=resolved_mode)
     worker._frame_sink = handle.on_frame
     worker._runtime_handle = handle
     return handle

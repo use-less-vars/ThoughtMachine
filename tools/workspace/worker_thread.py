@@ -1348,6 +1348,50 @@ def _adopt_predecessor_journal(
 
 
 # ---------------------------------------------------------------------------
+# Initial-context ("briefing") delivery
+# ---------------------------------------------------------------------------
+
+#: Prefix of every initial-context payload. It is the marker the F1/WLM prune
+#: boundaries look for, so it must stay stable across the role change below.
+INITIAL_CONTEXT_PREFIX = "Initial context: "
+
+
+def initial_context_message(initial_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the history message that carries a worker's initial context.
+
+    The payload is exactly what workers have always been given; only the ROLE
+    changed, from ``system`` to ``user``. It rides on the conversation's first
+    ``role='user'`` message so it is ordinary conversational history, because
+    ``LLMClient.ensure_system_prompt`` deletes every system message that is not
+    a conversation summary (agent/core/llm_client.py:229-234). That is what
+    used to happen to a briefing delivered as ``role='system'``: it was
+    stripped before the first LLM call, once by ``Agent.__init__``
+    (agent/core/agent.py:554) and again at the start of every turn
+    (agent/core/agent.py:1562), so the worker never saw its brief.
+    """
+    return {
+        "role": "user",
+        "content": (
+            f"{INITIAL_CONTEXT_PREFIX}"
+            f"{json.dumps(initial_context, default=str, ensure_ascii=True)}"
+        ),
+    }
+
+
+def is_initial_context_message(message: Any) -> bool:
+    """True when *message* carries an initial-context payload.
+
+    Role-agnostic on purpose: a ``context.json`` written before the delivery
+    role changed holds ``role='system'``, a current one holds ``role='user'``,
+    and the F1/WLM prune boundaries have to keep finding both.
+    """
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and content.startswith(INITIAL_CONTEXT_PREFIX)
+
+
+# ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
 
@@ -1386,6 +1430,7 @@ class WorkerThread(threading.Thread):
         max_token_usage: Optional[int] = None,
         max_runtime_s: Optional[float] = None,
         frame_sink: Optional[Callable[[Any], None]] = None,
+        initial_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         # S4a: assigned before anything else -- every other attribute below can
         # reach a helper that calls _write_status_file, so the sink is set
@@ -1585,7 +1630,16 @@ class WorkerThread(threading.Thread):
         # Agent instance + WorkerContext (created lazily in run())
         self._agent: Optional[Any] = None
         self._worker_ctx: Optional[Any] = None
-        self._initial_context: Optional[Dict[str, Any]] = None
+        # The initial context ("briefing") can arrive either here, at
+        # construction, or be assigned by the spawn action after construction
+        # (tools/workspace/worker_thread.py:_action_spawn). Both end up
+        # identical; the constructor argument exists because process mode
+        # rebuilds this thread in a child interpreter from a picklable spec
+        # (worker_runtime_process.spec_from_worker) and cannot assign attributes
+        # to an object it has not built yet.
+        self._initial_context: Optional[Dict[str, Any]] = (
+            dict(initial_context) if initial_context else None
+        )
 
         # Per-worker EventBus (created lazily in run() before Agent)
         self._event_bus: Optional[Any] = None
@@ -3753,7 +3807,8 @@ class WorkerThread(threading.Thread):
                     {"role": "system", "content": system_prompt}
                 ]
                 if self._initial_context:
-                    ic_payload = f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}"
+                    ic_message = initial_context_message(self._initial_context)
+                    ic_payload = ic_message["content"]
                     # Auditability without leaking the brief: record only the
                     # payload length and a short digest of the exact string
                     # appended. Briefings can carry secrets, so no preview.
@@ -3763,10 +3818,7 @@ class WorkerThread(threading.Thread):
                         len(ic_payload),
                         hashlib.sha256(ic_payload.encode("utf-8")).hexdigest()[:12],
                     )
-                    user_history.append({
-                        "role": "system",
-                        "content": ic_payload,
-                    })
+                    user_history.append(ic_message)
                 # Reset cached token count for a fresh run
                 self._cached_context_tokens = None
                 self._worker_ctx = WorkerContext(
@@ -3809,11 +3861,11 @@ class WorkerThread(threading.Thread):
                             self._prune_abandoned_attempt_via_wlm(initial_query)
                         else:
                             self._prune_stale_attempt_before_merge(initial_query)
-                    # Add initial context as a system message for continuity
-                    ctx_msg = {
-                        "role": "system",
-                        "content": f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}",
-                    }
+                    # Add the initial context as the conversation's first user
+                    # message for continuity -- NOT as a system message, which
+                    # ensure_system_prompt would delete (see
+                    # initial_context_message).
+                    ctx_msg = initial_context_message(self._initial_context)
                     # Check if this initial_context was already injected (avoid duplicates
                     # on repeated spawn calls)
                     already_present = any(
@@ -4671,10 +4723,7 @@ class WorkerThread(threading.Thread):
             return  # last attempt completed — completed work is kept
         history = self._worker_ctx.user_history
         ic_indices = [
-            i for i, msg in enumerate(history)
-            if msg.get("role") == "system"
-            and isinstance(msg.get("content"), str)
-            and msg["content"].startswith("Initial context: ")
+            i for i, msg in enumerate(history) if is_initial_context_message(msg)
         ]
         if not ic_indices:
             return
@@ -4722,10 +4771,7 @@ class WorkerThread(threading.Thread):
             return
         history = self._worker_ctx.user_history
         ic_indices = [
-            i for i, msg in enumerate(history)
-            if msg.get("role") == "system"
-            and isinstance(msg.get("content"), str)
-            and msg["content"].startswith("Initial context: ")
+            i for i, msg in enumerate(history) if is_initial_context_message(msg)
         ]
         if not ic_indices:
             return
@@ -5193,6 +5239,12 @@ class Worker(ToolBase):
         description="Session ID that spawned this worker (injected by ToolExecutor)",
     )
 
+    worktree_root: Optional[str] = Field(
+        default=None,
+        description="Optional narrower workspace root for path-anchored tool "
+        "operations (injected by ToolExecutor when the session is bound to one).",
+    )
+
     instance_id: Optional[int] = Field(
         default=None,
         description="Worker instance ID to address. When omitted, actions that "
@@ -5652,6 +5704,16 @@ class Worker(ToolBase):
             ws_path = parent_ws
         if ws_path:
             result["workspace_path"] = ws_path
+
+        # Inheritance is deliberately ABSENT: worktree_root is forwarded only
+        # when THIS tool instance was itself given one, never copied from the
+        # parent agent's config.  A sub-worker must therefore be opted in
+        # explicitly, so it can never be silently dragged into a worktree
+        # (writing to a checkout its caller is not looking at) merely because
+        # the worker that spawned it happens to be bound there.
+        _wt = getattr(self, 'worktree_root', None)
+        if _wt:
+            result['worktree_root'] = _wt
 
         # Propagate the workspace-lifecycle-manager feature flag so the
         # WorkerThread's _wlm_flag_enabled() sees it at the top level.
