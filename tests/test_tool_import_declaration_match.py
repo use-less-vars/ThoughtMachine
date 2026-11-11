@@ -83,6 +83,13 @@ ALLOWED_EXCEPTIONS = (
     # python3/docker to report host health.  A dev/ops diagnostic, never
     # reachable from an agent tool call, so the tool-execution chokepoint does
     # not govern it.
+    #   Reachability audited (C46): imported by NOTHING outside tests/ (only
+    #   tests/test_install_self_heal.py, which is not a tool path), no entry
+    #   point in [project.scripts], and the single invocation in the tree is
+    #   `python3 -m thoughtmachine.doctor` in start_thoughtmachine.sh:218 -- the
+    #   human launcher path.  Pinned by
+    #   test_doctor_exception_stays_off_the_tool_path below: if doctor.py ever
+    #   becomes reachable, migrate it onto host_run() and prune this entry.
     "thoughtmachine/doctor.py",
     # CI monitoring: shells out to the `gh` CLI (subprocess.run) to read
     # workflow runs.  Own grain (ci:read) and own gate; unrelated to host
@@ -123,6 +130,21 @@ MIGRATED_MODULES = (
     "tools/host_bash_tool.py",
     "tools/workspace/check_system.py",
 )
+
+#: Directories that make up the TOOL EXECUTION PATH: the code an agent tool
+#: call can actually reach (tool implementations, the agent runtime, the web
+#: backend that dispatches for them, and the thoughtmachine support package the
+#: tools import).  ``scripts/``, ``infra/``, ``docs/`` and ``tests/`` are NOT
+#: here: a launcher or a test invoking a module is a human/CI path, not a tool
+#: path.
+TOOL_PATH_ROOTS = ("agent", "thoughtmachine", "tools", "web_ui")
+
+#: The allowlisted module whose reason is "not on a tool path", plus the two
+#: spellings a reach would use: the dotted module name (imports and
+#: ``python3 -m ...`` command lines) and the file path.
+DOCTOR_MODULE = "thoughtmachine/doctor.py"
+DOCTOR_DOTTED = "thoughtmachine.doctor"
+DOCTOR_TOKENS = (DOCTOR_DOTTED, "thoughtmachine/doctor")
 
 #: The exact set of modules in SCAN_ROOTS that import subprocess, sorted.  This
 #: is the anti-growth pin: it is written out literally (never derived from
@@ -234,6 +256,42 @@ def _describe(sites: list[tuple[int, str, str]]) -> str:
 
 def _source_for(rel_path: str) -> str:
     return (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+
+
+def _doctor_references(source: str) -> list[tuple[int, str]]:
+    """Every reach to :data:`DOCTOR_MODULE` in *source* as ``(lineno, form)``.
+
+    Three forms are reaches: ``import thoughtmachine.doctor``,
+    ``from thoughtmachine.doctor import ...`` (and ``from thoughtmachine import
+    doctor``), and a string literal naming the module -- which is how a
+    ``subprocess``/``host_run`` command line would spell it.  Comments are not
+    in the AST, so prose *about* the doctor module is never a reach.
+    """
+    tree = ast.parse(source)
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == DOCTOR_DOTTED or alias.name.startswith(
+                    DOCTOR_DOTTED + "."
+                ):
+                    found.append((node.lineno, f"import {alias.name}"))
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            names = ", ".join(
+                alias.name + (f" as {alias.asname}" if alias.asname else "")
+                for alias in node.names
+            )
+            if module == DOCTOR_DOTTED or module.startswith(DOCTOR_DOTTED + "."):
+                found.append((node.lineno, f"from {module} import {names}"))
+            elif module == "thoughtmachine" and any(
+                alias.name == "doctor" for alias in node.names
+            ):
+                found.append((node.lineno, f"from {module} import {names}"))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if any(token in node.value for token in DOCTOR_TOKENS):
+                found.append((node.lineno, f"string {node.value[:70]!r}"))
+    return found
 
 
 def _missing_entries(discovered: list[str], expected: tuple[str, ...]) -> str:
@@ -448,4 +506,72 @@ def test_allowlist_has_no_duplicates_and_no_stale_entries():
         "ALLOWED_EXCEPTIONS: " + ", ".join(undeclared) + ".\n"
         "  Fix: add them to ALLOWED_EXCEPTIONS with their reason, or drop them "
         "from DEFERRED_EXCEPTIONS."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. the doctor exception stays off the tool path
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_exception_stays_off_the_tool_path():
+    """The doctor exception is lawful only while no tool path reaches the module.
+
+    ``thoughtmachine/doctor.py`` is allowlisted BECAUSE of the claim "a dev/ops
+    diagnostic, never reachable from an agent tool call" -- that claim is the
+    entire reason the module may keep its own ``import subprocess``.  Pinned
+    here: if a tool, a route or the agent runtime ever imports it, or shells out
+    to ``python3 -m thoughtmachine.doctor``, the module HAS become a tool path.
+    Migrate it onto host_run()/host_run_async() and prune the entry -- do not
+    re-word the comment.
+    """
+    assert DOCTOR_MODULE in ALLOWED_EXCEPTIONS, (
+        f"{DOCTOR_MODULE} lost its allowlist entry while it still imports "
+        "subprocess; restore it in ALLOWED_EXCEPTIONS of "
+        "tests/test_tool_import_declaration_match.py, or migrate the module."
+    )
+
+    sites = _import_sites_for(DOCTOR_MODULE)
+    assert sites, (
+        f"{DOCTOR_MODULE} no longer imports subprocess.\n"
+        "  Fix: this is the happy ending -- delete the exception comment, prune "
+        "the ALLOWED_EXCEPTIONS and PINNED_IMPORTERS entries, and drop this "
+        "test together with the constants it uses."
+    )
+
+    offenders: list[str] = []
+    scanned: list[str] = []
+    for root in TOOL_PATH_ROOTS:
+        for path in sorted((REPO_ROOT / root).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            rel = _rel(path)
+            if rel == DOCTOR_MODULE:
+                # The module names itself in its own docstring/argv handling.
+                continue
+            scanned.append(rel)
+            refs = _doctor_references(path.read_text(encoding="utf-8"))
+            if refs:
+                offenders.append(
+                    f"  {rel}\n"
+                    + "\n".join(f"    {lineno}: {form}" for lineno, form in refs)
+                )
+
+    # Positive control: the walk really covered the tool path, so an empty
+    # offender list cannot be the result of a scan that saw nothing at all.
+    assert "tools/host_bash_tool.py" in scanned, (
+        "the tool-path walk in tests/test_tool_import_declaration_match.py did "
+        "not even see tools/host_bash_tool.py -- the scan over "
+        f"{', '.join(TOOL_PATH_ROOTS)} is broken, so this guard would pass "
+        "vacuously. Fix the scan, not the allowlist."
+    )
+
+    assert not offenders, (
+        f"{DOCTOR_MODULE} is now reachable from the tool path:\n"
+        + "\n".join(offenders)
+        + "\n  Its allowlist entry exists ONLY because nothing on the tool path "
+        "reaches it. Fix: migrate thoughtmachine/doctor.py onto host_run() / "
+        "host_run_async() from thoughtmachine/host_port.py, then prune its "
+        "ALLOWED_EXCEPTIONS and PINNED_IMPORTERS entries -- do NOT re-word the "
+        "exception comment so the import can stay."
     )
