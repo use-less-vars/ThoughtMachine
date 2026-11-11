@@ -30,7 +30,7 @@ import tools.workspace.worker as worker_module
 import tools.workspace.worker_thread as worker_thread_module
 from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_runtime import (
-    MODE_THREAD,
+    MODE_PROCESS,
     WorkerRuntimeHandle,
     attach_thread_frame_sink,
 )
@@ -90,7 +90,8 @@ def test_attach_installs_the_handle_sink_on_the_worker():
     handle = attach_thread_frame_sink(worker)
 
     assert isinstance(handle, WorkerRuntimeHandle)
-    assert handle.mode == MODE_THREAD
+    # Bare attach = "the mode in force now", which is the isolation default.
+    assert handle.mode == MODE_PROCESS
     assert callable(worker._frame_sink)
     # The SAME callable, not a copy: what the worker emits is what the handle
     # caches, which is the whole point of a single seam.
