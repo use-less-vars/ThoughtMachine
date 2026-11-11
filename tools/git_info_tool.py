@@ -602,7 +602,7 @@ class GitReadTool(ToolBase):
         session, no ``workspace_path``), no restriction is applied.
         """
         repo_root = Path(repo_root).expanduser().resolve()
-        ws_path = self._resolve_registry_workspace()
+        ws_path = self._resolve_workspace_root()
         if not ws_path:
             return repo_root
 
@@ -646,7 +646,7 @@ class GitReadTool(ToolBase):
         norm = "/" + "/".join(segs)
         if norm != mount and not norm.startswith(mount + "/"):
             return working_dir
-        ws_path = self._resolved_workspace_path or self._resolve_registry_workspace()
+        ws_path = self._resolved_workspace_path or self._resolve_workspace_root()
         if not ws_path:
             return working_dir
         self._resolved_workspace_path = ws_path

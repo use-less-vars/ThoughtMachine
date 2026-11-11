@@ -137,18 +137,23 @@ class _ContainerControlBase(ToolBase):
                 "Could not import ContainerManager. Make sure docker package is "
                 "installed and infra.container_manager.py exists."
             )
-        ws = self._resolve_registry_workspace()
+        # Bind-mount source: narrowed to the worktree when one is configured.
+        ws = self._resolve_workspace_root()
         if ws is None:
             # Never fall back to cwd: the current directory may be outside the
             # workspace, and mounting it would leak host files into the container.
             raise RuntimeError(
                 "workspace path could not be resolved; refusing to fall back to cwd"
             )
+        # The workspace ID is a property of the REGISTERED workspace, not of the
+        # (possibly narrower) mount source: resolve_workspace_id() matches the
+        # registered root by exact path, so a worktree path never resolves.
+        registered_ws = self._resolve_registry_workspace() or ws
         resolved_workspace_id = workspace_id
         if not resolved_workspace_id:
             try:
                 from thoughtmachine.workspace_capabilities import resolve_workspace_id
-                resolved_workspace_id = resolve_workspace_id(ws)
+                resolved_workspace_id = resolve_workspace_id(registered_ws)
             except Exception:
                 pass
         return ContainerManager(

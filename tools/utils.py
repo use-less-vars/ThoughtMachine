@@ -99,7 +99,7 @@ def model_to_openai_tool(model: Type[BaseModel]) -> Dict[str, Any]:
     """
     schema = model.model_json_schema()
     # Exclude internal infrastructure fields from tool schema (set by agent)
-    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool"}
+    infra_fields = {"workspace_path", "worktree_root", "token_limit", "is_docker", "container_workspace_path", "tool"}
     if "properties" in schema:
         for field in infra_fields:
             if field in schema["properties"]:

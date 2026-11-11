@@ -477,7 +477,7 @@ class ToolExecutor:
             except ValidationError as e:
                 # Provide LLM-friendly error with valid field names
                 try:
-                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions", "session_id", "is_worker_context"}
+                    infra_fields = {"workspace_path", "worktree_root", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions", "session_id", "is_worker_context"}
                     valid_fields = [f for f in valid_field_names if f not in infra_fields]
                     valid_fields_str = ', '.join(valid_fields)
                     return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal', 'success': False}
@@ -487,6 +487,12 @@ class ToolExecutor:
             # workspace_path is ALWAYS taken from the executor config: it is an
             # infrastructure field, so a caller-supplied value must never win.
             tool_args['workspace_path'] = self.config.workspace_path
+            # worktree_root is an infrastructure field too, but it is injected
+            # ONLY when the config carries one: a None config must leave
+            # tool_args byte-identical to the pre-worktree behaviour, so
+            # existing tool instances keep seeing no key at all.
+            if getattr(self.config, 'worktree_root', None):
+                tool_args['worktree_root'] = self.config.worktree_root
             if self.config.tool_output_token_limit is not None:
                 tool_args['token_limit'] = self.config.tool_output_token_limit
             # Check permission categories using the unified security gate

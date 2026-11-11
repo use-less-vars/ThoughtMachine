@@ -89,6 +89,7 @@ class AgentConfig(BaseModel):
         'max_file_size_mb': GLOBAL_STATIC,
         'max_backup_files': GLOBAL_STATIC,
         'workspace_path': RESTART_REQUIRED,  # DEPRECATED: tools should resolve via SessionRegistry → WorkspaceRegistry instead
+        'worktree_root': RESTART_REQUIRED,
         'detail': HOT_SWAPPABLE,
         'rag_enabled': RESTART_REQUIRED,
         'rag_embedding_model': RESTART_REQUIRED,
@@ -177,6 +178,7 @@ class AgentConfig(BaseModel):
     max_file_size_mb: int = Field(default=10, description='Maximum log file size in MB before rotation')
     max_backup_files: int = Field(default=5, description='Maximum number of backup log files to keep')
     workspace_path: Optional[str] = Field(default=None, description='[DEPRECATED] Root directory for file operations (None = unrestricted). Tools should resolve workspace path via SessionRegistry → WorkspaceRegistry instead of relying on this field.')
+    worktree_root: Optional[str] = Field(default=None, description='Optional narrower root for path-anchored tool operations (e.g. a git worktree inside the registered workspace). None = use the registered workspace root. Must be an existing directory inside the registered workspace; invalid values fail closed with ValueError.')
     rag_enabled: bool = Field(default=False, description='Enable RAG functionality')
     rag_embedding_model: str = Field(default='BAAI/bge-small-en-v1.5', description='Model name for sentence-transformers embeddings')
     rag_vector_store_path: Optional[str] = Field(default=None, description='Path to vector store database (None = default .thoughtmachine/rag/)')

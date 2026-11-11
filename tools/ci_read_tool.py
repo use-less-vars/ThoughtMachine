@@ -220,7 +220,7 @@ class CiReadTool(ToolBase):
         registry workspace); otherwise the registry workspace; otherwise the
         process working directory.
         """
-        ws_path = self._resolve_registry_workspace()
+        ws_path = self._resolve_workspace_root()
         if self.working_dir:
             candidate = Path(self.working_dir).expanduser()
             if not candidate.is_absolute() and ws_path:
