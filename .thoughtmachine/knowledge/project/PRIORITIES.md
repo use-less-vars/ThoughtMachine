@@ -173,6 +173,104 @@ different file, different name. Never rename one to the other.
 - **Correction (Gen 62):** the pre-Gen-62 `HANDOFF.md` referenced "Phase 10 (EM-Solver / Resources) OPEN" and "C25 (Worker State Reattachment) open". **Neither exists in this queue — no C25, no Phase 10 section. The prior handoff hallucinated them.** Do not search the queue for either; if either is real work, it needs a fresh ID and a real scope, not an inheritance.
 
 
+## Filed by the seat, Gen 63 — MODE_PROCESS follow-ups (scope only; do not fix here)
+
+- **C38: `WorkerRuntimeHandle` still defaults to in-process when built by hand.**
+  **Open.** `WorkerRuntimeHandle.__init__` keeps `mode: str = MODE_THREAD` as its default
+  (`tools/workspace/worker_runtime.py`), so any caller that constructs a handle directly
+  instead of going through spawn silently stays in-process. The Gen 62 flip gated the
+  **spawn site** on `resolve_runtime_mode()`; it did not move the constructor's default.
+  **Verified at HEAD `c1771222`.** Scope: decide whether the constructor default flips to
+  process or direct construction is fenced and refused. Do not change the default here.
+
+- **C39: the "em dash reaches users as a raw u-escape" claim is DISPROVED.**
+  **Disproved** — do not re-chase without new evidence. Carried into Gen 63 as a known
+  defect with a line citation in `tools/workspace/worker_thread.py`; both halves were
+  checked and neither holds. The cited line is, at HEAD `c1771222`,
+  `project_root = config_data.get("root")` — unrelated code, so that citation had drifted
+  rather than pointing at a bug. A full scan of `tools/**/*.py` and `agent/**/*.py` for
+  four-hex-digit `u`-escapes returns **11 hits, every one a single backslash inside a
+  non-raw string literal or a comment, and zero doubled-backslash occurrences**. A single
+  backslash escape in a non-raw literal is interpreted by Python at parse time, so nothing
+  renders to model or operator as a literal escape. **Most likely origin of the report:**
+  the em dash arriving in escaped form inside JSON-serialised tool envelopes
+  (`ensure_ascii`), which is a display artefact of the envelope, not of the source.
+
+- **C40: no end-to-end test spawns a real child process through the tool spawn path.**
+  **Open** — coverage gap, not a bug claim, same standing as C23. The process-mode suite
+  exercises `WorkerRuntimeHandle` and the supervisor protocol in isolation; nothing drives
+  `Worker(action="spawn")` itself in process mode and asserts the envelope came back from
+  the child. Scope: one hermetic test, spawn then dispatch then envelope, red if the
+  runtime falls back to in-process. **The claim is filed unverified** — first task is to
+  confirm the gap by reading the fixtures.
+
+- **C41: `docs/` is a catch-all ignore, so every design deliverable needs its own negation line.**
+  **Open.** `.gitignore` carries `docs/*` plus roughly sixty `!docs/<file>` negations, one
+  per session that needed a doc published; a doc written without one is never staged and
+  dies on the next clone, and `git clean -xdf` destroys it first. Verified at HEAD
+  `c1771222`. Scope: decide the tier policy — negation for an approved directory, or keep
+  the per-file tax and say so in KB_POLICY. Housekeeping; no code.
+
+- **C42: Host Port seal / kill-switch CI contract (fail-closed).**
+  **Open.** Resurrects the archived "Prove the Host Port is sealed" scope. A CI test must
+  walk `tools/**` by **AST, not grep**, so docstrings and comments cannot false-positive,
+  and fail if any module references `subprocess.`, `Popen`, `os.system`, `os.exec*` or
+  `os.spawn*` outside the two sanctioned modules `tools/host_resource_policy.py` and
+  `tools/host_bash_tool.py`. The default is **fail-closed**: an unlisted hit fails and the
+  scan is never widened to make it pass. Legitimate pre-existing hits get an explicit
+  allowlist entry with a comment naming why. Proof obligation: the test must be shown to
+  **bite** (deliberate violating fixture, or an injected fake module), not merely to pass.
+  Scope only — Batch 1a, one commit.
+
+- **C43: Frontend scroll jump on new messages.**
+  **Open.** Resurrects the phantom "C37". New WebSocket events currently snap the message
+  list to the bottom unconditionally (`useStore.js`, message-array region near the 350s).
+  Fix: track `isAtBottom` with a few-pixel threshold; auto-scroll only while pinned; when
+  not pinned, surface a "New messages below" affordance that scrolls on click. Frontend
+  only, no backend change, no new dependency without a flag. Scope only — Batch 1b, one
+  commit.
+
+- **C44: Worker trust boundary under borrowed context.**
+  **Open.** Resurrects the archived "Verify Worker Trust Boundary" scope. **Batch 2 — no
+  brief yet, do not start before Batch 1 merges.** The scope line stays deliberately thin
+  until then, because the archived entry is a historical note, not a specification.
+
+## Numbering (Gen 63 housekeeping)
+
+- **The Archived block reuses two live IDs.** It holds a **C35** ("Prove the Host Port is
+  sealed") and a **C36** ("Verify Worker Trust Boundary"), each printed **twice**, while
+  the Active list's C35 is worker force-summarisation and its C36 is the
+  `bugs_and_fixes.md` size. An ID is not a key in this file any more: quote the title when
+  briefing work. Not renumbered here, because archived entries are a historical record.
+
+- **C37 is unassigned and reserved.** The Gen 63 handover names C37 as the message-list
+  scroll-jump item ("track at-bottom; auto-scroll only when pinned, else 'New messages
+  below'", in the `useStore` message-array region), but no C37 entry exists in this file.
+  The seat did not invent one: the scope above is the engineer's wording, not a reading of
+  the code, and this file's rule is that a line number is a dated snapshot of something
+  read. It is filed when someone reads it.
+
+- **The Gen 62 Correction block contradicts this file.** It states that neither C25 nor a
+  Phase 10 section exists, but an active **C25: Worker State Reattachment** entry does sit
+  in the Active list (its scope: "the first task is to write the scope"). One of the two
+  must go. Not edited here — a ruling decides that, not housekeeping.
+
+- **C42/C43/C44 are fresh scoped items resurrecting archived and phantom scopes, per the
+  Infra 63 ruling; active C35/C36 are untouched.** Each new entry quotes the scope it
+  resurrects, so the archive collisions stop biting. Do not un-archive or renumber the
+  duplicate historical entries.
+
+- **The Gen 62 "Correction" block is stale with respect to C25.** It asserts that no C25
+  exists, but an active C25 does, and **the Active list wins.** The block stays as
+  historical text; do not delete it.
+
+- **Tool defects noted (C32 class, not scheduled).** `git_read show_file` ignores its `ref`
+  argument and silently returns HEAD; `git_read ls_tree` ignores `prefix` and dumps the
+  whole tree; `Worker(action="spawn")` rejects a call that omits `worker_name` although
+  its documentation says it defaults. The first two are the dangerous ones: reads of
+  authority files that quietly answer a different question than the one asked. A fourth
+  report — worker briefings arriving stripped — is under probe and is not filed here.
+
 ## Archived (pre-Gen 42 brain dump — do not read as current work)
 
 - **W11 (Resource Composition):** Bins (granular permissions), Dynamic Imports,
@@ -188,3 +286,9 @@ different file, different name. Never rename one to the other.
 - **C12: `cancellation.interrupt()` sticky-fallback trap.** **Open.** Calling `interrupt()` with no bound token arms a per-thread fallback event. `unbind()` does not clear it, so every subsequent `is_interrupted()` on that thread reads True permanently. This poisons the thread for the rest of the process (found during C11). Fix: clear the fallback on `unbind()`.
 
 - **C14: `visual_tool.py` missing cancellation reporting.** **Open.** An interrupted render drops the `reason` and returns `"visual: the renderer exited with code None."` to the model. This looks like a renderer crash, not an operator cancel, causing the model to hallucinate a failure. Teardown runs correctly (pinned by test). Fix: detect `status == "interrupted"` and return a clear cancellation message. (Discovered during C11').
+
+- **C35: Prove the Host Port is sealed.** **Open.** Create a CI test (AST scan or grep) that proves subprocess and docker invocations only occur inside the approved wrappers. No tool may bypass the kill switch.
+- **C36: Verify Worker Trust Boundary.** **Open.** Write a test proving that a worker is bound to its session workspace_id and cannot execute tools using permissions of a different session if borrowed.
+
+- **C35: Prove the Host Port is sealed.** **Open.** Create a CI test (AST scan or grep) that proves subprocess and docker invocations only occur inside the approved wrappers. No tool may bypass the kill switch.
+- **C36: Verify Worker Trust Boundary.** **Open.** Write a test proving that a worker is bound to its session workspace_id and cannot execute tools using permissions of a different session if borrowed.
