@@ -57,6 +57,7 @@ with its I/O edges patched for cases 5-6.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shutil
 import tempfile
@@ -67,6 +68,7 @@ from unittest import mock
 from unittest.mock import MagicMock
 
 from tools.workspace.worker import Worker
+from tools.workspace.worker_runtime import MODE_THREAD, WORKER_RUNTIME_MODE_ENV
 
 SESSION = "sess-force-res"
 OTHER_SESSION = "sess-force-res-other"
@@ -114,6 +116,17 @@ class TestForceSpawnResurrection(unittest.TestCase):
         self.addCleanup(self._p_resolve.stop)
         self.addCleanup(self._p_ws_dir.stop)
         self.addCleanup(self._p_thread_cls.stop)
+
+        # ── Pin thread mode for this class ──
+        # The absent-flag default is ``process``, and these fixtures stub
+        # ``WorkerThread`` and preload ``_output_queue``, which is the
+        # thread-mode model of the spawn path -- so the mode is configured
+        # explicitly here instead of inherited from the environment.
+        self._p_runtime_mode = mock.patch.dict(
+            os.environ, {WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
+        )
+        self._p_runtime_mode.start()
+        self.addCleanup(self._p_runtime_mode.stop)
 
         self._created_threads: list[MagicMock] = []
         self._mock_thread_cls.side_effect = self._thread_factory
