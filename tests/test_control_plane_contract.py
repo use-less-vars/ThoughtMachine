@@ -390,6 +390,51 @@ class TestImplicitUnpauseOnNewQuery:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# 11b. timeout restriction: read-only tools survive
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestTimeoutRestrictionKeepsReadOnlyTools:
+    def test_timeout_restriction_keeps_read_only_tools(self):
+        """A 'timeout' restriction must not blind the agent.
+
+        The soft budget is spent, so no new WORK may start -- but the agent
+        still has to write up a response about code it may never have read in
+        this turn, so the read-only set stays available (Rationale:
+        thoughtmachine/timeout_constants.py). SummarizeTool stays too, so
+        compaction still works. Enforcement and display must agree, because
+        the rejection prose (``Available tools:``) is rendered from
+        ``get_allowed_tools()``.
+        """
+        agent = _make_agent()
+        agent.state.restrict("timeout")
+
+        allowed = agent.state.get_allowed_tools()
+        assert "Respond" in allowed
+        assert "SummarizeTool" in allowed
+        assert "ReadFile" in allowed
+        assert "git_read" in allowed
+        # No work tools on this axis.
+        for work_tool in ("ApplyEdits", "FileEditor", "ContainerExecTool",
+                          "DockerCodeRunner", "Worker"):
+            assert work_tool not in allowed, f"{work_tool} leaked into {allowed}"
+
+        assert agent.state.is_tool_allowed("ReadFile") is True
+        assert agent.state.is_tool_allowed("ApplyEdits") is False
+        assert agent.state.is_tool_allowed("ContainerExecTool") is False
+
+    def test_timeout_restriction_still_blocks_before_finishing(self):
+        """The restriction is a wind-down, not a licence: writes stay refused.
+
+        Guards the fail-closed direction -- adding the read-only set must not
+        have widened any other axis.
+        """
+        agent = _make_agent()
+        agent.state.restrict("turn")
+        assert agent.state.get_allowed_tools() == ["Respond"]
+        assert agent.state.is_tool_allowed("ReadFile") is False
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # 12. tool return contract: DockerCodeRunner passthrough
 # ────────────────────────────────────────────────────────────────────────────
 
