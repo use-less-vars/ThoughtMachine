@@ -562,6 +562,24 @@ a shell probe for a binary. Concretely, with `container:true` absent from the fo
 from the subset, it must be unavailable regardless of footprint. A worker-side `docker ps` returning
 command-not-found is the expected output of a correct design and must never be written into a test as a failure.
 
+### 7.4 Implementation status: Phase 1 shipped
+
+Shipped on `feat/gen67-capability-registry-phase1` (commit `ad9f47de`): `tools/capability_registry.py` adds `CapabilityRegistry.resolve(...)`, a factory returning an immutable dataclass with the buckets `resolved`, `excluded`, `parent_denied` and `permission_denied` -- no module state, no fallback to `_get_tool_registry()`, no permission evaluation (§7.2 respected). Wiring in `tools/workspace/worker_thread.py` makes `_build_agent_config` (`:3119-3147`) and `Worker._action_spawn` (`:6459-6541`) derive `enabled_tools` from one frozen registry.
+
+**Section 4.2's two-universe hazard is closed, and it was real.** `enabled_tools` used to derive from `SIMPLIFIED_TOOL_CLASSES` while spawn-time class resolution walked `iter_tool_classes()`. `_worker_tool_universe()` (`:754-783`) is now the single universe -- the simplified classes, addressable by class `__name__` and by the stable `tool_name()` alias, so `GitReadTool` and `git_read` resolve to the same class.
+
+**Section 4.2's loud failure shipped as specified.** `Worker._action_spawn` returns `{"error": ..., "worker_name": ..., "missing_tools": [...]}` before any `WorkerThread` is constructed. Evidence for the implementers: `TOOL_CLASSES - SIMPLIFIED_TOOL_CLASSES` is currently **empty** (measured: 0 classes, 0 aliases) and neither definition in the tree (`resources/worker_templates/default.json`, `.thoughtmachine/workers.json`) names a tool outside the simplified universe, so today the guard fires only on typos, renamed or removed tool names -- it protects against template rot, not against a registered-but-non-simplified tool. Know that before calling it load-bearing.
+
+**Section 4.2's migration step shipped.** An empty `tools` list still means "all simplified tools minus the blocklist", and the spawn now emits a WARNING containing `implicit` and the resolved size (measured: 36 tools -- 39 simplified classes minus the 3 blocklisted -- for the shipped default template, whose `tools` is `[]`).
+
+**What is not yet true.** The resolved class map is handed to `WorkerThread` (`tool_classes=`, `:6600`), where it was previously dead data -- `self._tool_classes` is still unread -- but nothing intersects `config.get_filtered_tool_classes()` (`agent/config/models.py:369-402`) against it. The set is frozen and single-sourced; injection has no second wall yet, so a bug that widens `enabled_tools` still widens availability. That intersection is the next increment, not a property we have. Follow-ups found while wiring:
+
+- the injection consumer above: intersecting `get_filtered_tool_classes()` with the frozen registry is where the second wall goes;
+- `_capability_registry` is not in `worker_runtime_process._OPTIONAL_KWARGS`, so a process-mode child re-derives the registry from the definition instead of inheriting the frozen one -- correct semantics, one extra resolve per child, and the place a future "transfer the snapshot" change would go;
+- `Worker._resolve_tool_class` (`:5913`) and `_TOOL_REGISTRY` (`:5248`) no longer have a spawn-path consumer -- delete or keep deliberately, but they are a second authority with no reader.
+
+Tests: `tests/test_capability_registry.py` (11 unit tests) and `tests/test_capability_registry_spawn.py` (7 spawn-level tests) implement §8.2 items 1-4, including the alias case; items 5-10 belong to the persistence and override phases.
+
 ---
 
 ## 8. Open questions, tickets, test strategy
