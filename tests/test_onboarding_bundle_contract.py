@@ -53,9 +53,12 @@ NEW_MEMBERS = [
 # reason.
 ADVISORY_MEMBER = ".thoughtmachine/knowledge/project/PRIORITIES.md"
 
-# Exactly the manifest entries that DO record a digest: the seven members whose
-# bytes are stable across branches, and therefore the seven the digest is a real
-# tripwire for. Kept next to ADVISORY_MEMBER so the two cannot drift apart.
+# Exactly the manifest entries that DO record a digest, in manifest order: the
+# members whose bytes are stable across branches, and therefore the ones the
+# digest is a real tripwire for. The list itself is the count -- prose here once
+# said "seven" over a list that had grown, which is how a count in a comment
+# goes stale -- so no number is repeated in this file. Kept next to
+# ADVISORY_MEMBER so the two cannot drift apart.
 HASHED_MEMBERS = [
     "docs/CONTROL_PLANE.md",
     ".thoughtmachine/knowledge/project/MANDATORY_STOP.md",
@@ -63,6 +66,8 @@ HASHED_MEMBERS = [
     "docs/ARCHITECTURE_MACHINE_MODEL.md",
     ".thoughtmachine/knowledge/project/machine_history_and_vision.md",
     ".thoughtmachine/knowledge/project/vision_ledger.md",
+    ".thoughtmachine/knowledge/project/ORCHESTRATOR_GUIDE.md",
+    ".thoughtmachine/knowledge/project/CI_PROCESS.md",
     ".thoughtmachine/knowledge/project/INFRA_ONBOARDING.md",
 ]
 
@@ -162,8 +167,8 @@ def _without_queue_block(text):
     perfectly correct for its own tree (it is regenerated, so it would also
     demand a regeneration on every unrelated merge). Collapsing it to a
     sentinel on both sides keeps every OTHER byte pinned -- the header, the
-    pinned git facts, the five-commit block, the manifest prose and its six
-    stable digests, the rules of engagement, the carried traps, the
+    pinned git facts, the five-commit block, the manifest prose and its stable
+    digests, the rules of engagement, the carried traps, the
     'do not re-litigate' block and the footer -- which is what this test is
     for. The queue body still has its own, weaker contract:
     test_queue_block_names_only_items_that_are_still_open.
@@ -226,9 +231,9 @@ def test_checked_in_handoff_matches_fresh_generation(tmp_path):
 
     Still BYTE-PINNED (the queue body is the only thing collapsed first): the
     title and generation banner, the pinned `dev` line, the five-commit block,
-    all eight manifest entries with their prose, the seven stable sha256 digests,
-    the rules of engagement, the carried traps, the 'do not re-litigate' block
-    and the footer.
+    every manifest entry with its prose, every recorded sha256 digest (the
+    stable members' -- see HASHED_MEMBERS for which those are), the rules of
+    engagement, the carried traps, the 'do not re-litigate' block and the footer.
 
     Intentionally NOT pinned: the body of '## First task (from the live
     queue)'. It lists the C-items OPEN in this tree, which is branch-local --
@@ -315,7 +320,7 @@ def test_queue_block_names_only_items_that_are_still_open():
     )
 
 
-def test_manifest_carries_the_three_new_members():
+def test_manifest_carries_the_c47_members():
     entries = _manifest_entries()
 
     for member in NEW_MEMBERS:
@@ -323,8 +328,9 @@ def test_manifest_carries_the_three_new_members():
 
 
 def test_every_recorded_hash_matches_the_file_on_disk():
-    """Every entry that carries a digest must match its bytes -- and only the
-    six stable members carry one (the queue is ADVISORY, see ADVISORY_MEMBER).
+    """Every entry that carries a digest must match its bytes -- and exactly the
+    stable members carry one (HASHED_MEMBERS is the list; the queue is ADVISORY,
+    see ADVISORY_MEMBER).
     """
     recorded = []
     for line in _section2_lines():

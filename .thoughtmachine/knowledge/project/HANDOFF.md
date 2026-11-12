@@ -23,7 +23,9 @@ b43163dc docs: log security boundary C-items
 5. `docs/ARCHITECTURE_MACHINE_MODEL.md` -- what runs where, and what stops it. - sha256:ed240aba0bc0e0ac757d5ce10e6306317380529d691b81d8a9fd88d5a3c9544c
 6. `.thoughtmachine/knowledge/project/machine_history_and_vision.md` -- the incidents behind the rules, and what they are for. - sha256:b444c581ca3648f9b6ddd985c6aa5e486e767abd07651edb07953b5df2bd6032
 7. `.thoughtmachine/knowledge/project/vision_ledger.md` -- the five standing commitments (V1-V5). - sha256:5a01a13c684e94f5bc0e762807b8183d9e06f283b20caf3389aec662149ff930
-8. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:aa6670275083f6a38f9943843bb0efc759ec8dce2e7986605f2dfeea0122bd38
+8. `.thoughtmachine/knowledge/project/ORCHESTRATOR_GUIDE.md` -- how to run workers without believing the brief. - sha256:36dfb786917609a2157ca3dc58d8069244fb3d49c0db295e6a6d08af1a160fa9
+9. `.thoughtmachine/knowledge/project/CI_PROCESS.md` -- what CI actually runs, and what this repo cannot see. - sha256:85a02df0358a432461bf3041c863786e40c745d37ab600d264da0c2798a3120c
+10. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:aa6670275083f6a38f9943843bb0efc759ec8dce2e7986605f2dfeea0122bd38
 
 ## First task (from the live queue)
 
