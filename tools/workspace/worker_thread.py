@@ -3127,10 +3127,16 @@ class WorkerThread(threading.Thread):
         # registry owns the blocklist, the parent clamp (narrowing recorded in
         # ``.parent_denied``) and the implicit "all simplified tools" default,
         # so ``enabled_tools`` can never be a silently narrowed subset.
+        resolved_tool_names: Optional[frozenset] = None
         try:
-            enabled_tools = _worker_granted_tool_names(
-                self._resolve_capability_registry()
-            )
+            _registry = self._resolve_capability_registry()
+            enabled_tools = _worker_granted_tool_names(_registry)
+            # The SAME frozen registry object that fed enabled_tools -- never a
+            # re-resolution and never a set rebuilt from enabled_tools, so the
+            # two cannot drift.  AgentConfig intersects this with enabled_tools
+            # at run time (defence in depth: widening enabled_tools cannot
+            # widen real tool availability).
+            resolved_tool_names = frozenset(_registry.names)
         except Exception as exc:
             # Never raise from here: the spawn boundary (Worker._action_spawn)
             # is what fails loudly.  Fall back to the legacy derivation
@@ -3152,6 +3158,8 @@ class WorkerThread(threading.Thread):
             if parent_enabled_tools is not None:
                 enabled_tools = [t for t in enabled_tools if t in parent_enabled_tools]
         worker_cfg["enabled_tools"] = enabled_tools
+        # None when the registry could not be resolved (legacy behaviour).
+        worker_cfg["resolved_tool_names"] = resolved_tool_names
         # Resolve max_turns: prefer definition, then parent config (treating
         # None as absent), then default 100.
         _inherit_max_turns = cfg.get("max_turns")
@@ -3221,7 +3229,25 @@ class WorkerThread(threading.Thread):
 
         log('DEBUG', 'core.token', f"Worker agent config: token_monitor_warning_threshold={worker_cfg.get('token_monitor_warning_threshold', 'NOT SET')} token_monitor_critical_threshold={worker_cfg.get('token_monitor_critical_threshold', 'NOT SET')} max_turns={worker_cfg.get('max_turns', 'NOT SET')} timeout_seconds={worker_cfg.get('timeout_seconds', 'NOT SET')}")
 
-        return AgentConfig(**worker_cfg)
+        _config = AgentConfig(**worker_cfg)
+        # ``_tool_classes`` used to be spawn-time data nothing ever read.  Feed it
+        # from the runtime authority instead: exactly the list the agent will
+        # hand to its ToolExecutor (enabled_tools intersected with
+        # resolved_tool_names).  The dict-keyed-by-class-name shape is kept for
+        # the process-mode kwarg map (worker_runtime_process._OPTIONAL_KWARGS).
+        try:
+            self._tool_classes = {
+                cls.__name__: cls
+                for cls in _config.get_filtered_tool_classes(
+                    allowed_names=resolved_tool_names
+                )
+            }
+        except Exception as exc:
+            logger.debug(
+                "Worker '%s' could not mirror the runtime tool classes (%s)",
+                self.worker_name, exc,
+            )
+        return _config
 
     def _run_tool_loop(
         self,
