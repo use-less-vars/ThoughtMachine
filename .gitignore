@@ -267,14 +267,23 @@ web_ui/frontend/.npmrc
 # have. Everything else under project/ stays ignored, as KB_POLICY intends.
 !.thoughtmachine/knowledge/project/architecture_invariants.md
 
-# Gen 61 housekeeping (2026-11) — three read-on-entry KB files added to the
-# onboarding-contract set. `.thoughtmachine/knowledge/project/**/*.md` is ignored
-# wholesale above, so a file created without its own negation line is never
-# staged, never committed, and gone on the next clone while the tracked documents
-# that point at it survive. Each line below is therefore load-bearing:
+# Gen 61 housekeeping (2026-11; extended since) — the onboarding-contract set:
+# one negation line per KB file that a read-on-entry document names.
+# `.thoughtmachine/knowledge/project/**/*.md` is ignored wholesale above, so a
+# file created without its own negation line is never staged, never committed,
+# and gone on the next clone while the tracked documents that point at it
+# survive. Each line below is therefore load-bearing, and this comment states the
+# RULE rather than a count: it used to say "three read-on-entry KB files" over a
+# list that had already outgrown it, which is the drift a number here invites.
+# The list below is the invariant. A file added to `scripts/gen_handoff.py`'s
+# MANIFEST (the router's "read in this order" section) is added HERE in the same
+# change, or the bundle tells a fresh clone to read a file it does not have:
 #   vision_ledger.md   — the Vision Ledger (V1–V5); named by MAIN_ONBOARDING tier 1
 #   MAIN_ONBOARDING.md — the default seat's entry point
 #   lessons_learned.md — "Gen 60 — The Heat of the Moment"; named by the status handoff
+#   machine_history_and_vision.md — the incidents behind the rules; HANDOFF §2 member
+#   ORCHESTRATOR_GUIDE.md — how to run workers without believing the brief; HANDOFF §2 member
+#   CI_PROCESS.md — what CI actually runs, and what this repo cannot see; HANDOFF §2 member
 #
 # Deliberately NOT re-included: project/core.md (pending core work, 39.6 kB).
 # It is untracked and gitignored today and this commit does not change that —
@@ -283,6 +292,8 @@ web_ui/frontend/.npmrc
 !.thoughtmachine/knowledge/project/MAIN_ONBOARDING.md
 !.thoughtmachine/knowledge/project/lessons_learned.md
 !.thoughtmachine/knowledge/project/machine_history_and_vision.md
+!.thoughtmachine/knowledge/project/ORCHESTRATOR_GUIDE.md
+!.thoughtmachine/knowledge/project/CI_PROCESS.md
 
 # Gen 50 design pass: auth layer — re-included because docs/* is a catch-all.
 !docs/design-auth-layer.md

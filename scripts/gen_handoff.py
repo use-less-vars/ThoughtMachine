@@ -54,6 +54,8 @@ MANIFEST = [
     ("docs/ARCHITECTURE_MACHINE_MODEL.md", "what runs where, and what stops it."),
     (f"{KB}/machine_history_and_vision.md", "the incidents behind the rules, and what they are for."),
     (f"{KB}/vision_ledger.md", "the five standing commitments (V1-V5)."),
+    (f"{KB}/ORCHESTRATOR_GUIDE.md", "how to run workers without believing the brief."),
+    (f"{KB}/CI_PROCESS.md", "what CI actually runs, and what this repo cannot see."),
     (f"{KB}/INFRA_ONBOARDING.md", "the environment you are working in."),
 ]
 
