@@ -740,6 +740,76 @@ _WORKER_BLOCKLIST: frozenset[str] = frozenset({
     "KnowledgeBaseTool", # persistent cross-session knowledge store
 })
 
+# ── Worker tool universe (single source of truth) ─────────────────────────────
+# Two universes exist in this build: ``SIMPLIFIED_TOOL_CLASSES`` (what
+# ``enabled_tools`` is filtered against, agent/config/models.py:379-401) and
+# ``iter_tool_classes()`` (what spawn-time class resolution used to walk).  A
+# tool present in the latter but not the former resolved at spawn and was then
+# silently filtered out at run time — silent narrowing, forbidden by design doc
+# §4.2.  ``_worker_tool_universe()`` is therefore the ONE universe: the classes
+# the runtime can actually instantiate, addressable by class name AND by the
+# stable ``tool_name()`` alias (``GitReadTool`` <-> ``git_read``).
+
+
+def _worker_tool_universe() -> Dict[str, type]:
+    """Return the authoritative worker tool universe: name -> class.
+
+    Keys are the class ``__name__`` (canonical) plus, for every class whose
+    stable ``tool_name()`` differs, that alias.  Canonical names win: aliases
+    are added with ``setdefault``, so a class can never shadow another class'
+    name.  Aliases of blocklisted classes are not added at all, so the
+    blocklist cannot be bypassed through a stable name.
+    """
+    from tools import simplified_tool_classes
+
+    universe: Dict[str, type] = {}
+    aliases: Dict[str, type] = {}
+    for cls in simplified_tool_classes():
+        name = getattr(cls, "__name__", "")
+        if not name:
+            continue
+        universe[name] = cls
+        if name in _WORKER_BLOCKLIST:
+            continue
+        try:
+            alias = cls.tool_name()
+        except Exception:
+            # ``tool_name()`` is optional for third-party tool classes.
+            continue
+        if alias and alias != name:
+            aliases.setdefault(alias, cls)
+    for alias, cls in aliases.items():
+        universe.setdefault(alias, cls)
+    return universe
+
+
+def _canonical_worker_tool_name(name: str) -> str:
+    """Map *name* to its canonical class ``__name__`` (identity when unknown)."""
+    cls = _worker_tool_universe().get(name)
+    if cls is None:
+        return name
+    return getattr(cls, "__name__", name)
+
+
+def _worker_granted_tool_names(registry: Any) -> List[str]:
+    """Granted tool names for *registry*, in ``simplified_tool_classes()`` order.
+
+    Deliberately NOT ``registry.names`` (which is sorted): the historical
+    ``tools: []`` derivation order is registration order and
+    tests/test_ci_read_tool.py mirrors it verbatim.  Values are de-duplicated by
+    class, so a tool's alias spelling can never add a second entry.
+    """
+    from tools import simplified_tool_classes
+
+    granted = set(registry.resolved.values())
+    names: List[str] = []
+    for cls in simplified_tool_classes():
+        name = getattr(cls, "__name__", "")
+        if name and name not in _WORKER_BLOCKLIST and cls in granted:
+            names.append(name)
+    return names
+
+
 # Default system prompt for worker sub-agents.
 # This is a fixed instruction rather than inheriting the main agent's prompt,
 # preventing delegation loops in Engineer mode.
@@ -1452,6 +1522,12 @@ class WorkerThread(threading.Thread):
 
         # Tool classes available to this worker (name -> class)
         self._tool_classes: Dict[str, type[ToolBase]] = tool_classes or {}
+
+        # Frozen capability set: resolved lazily from ``definition["tools"]``
+        # on first use and cached for the life of this worker (§4.2 / §7.2).
+        # Annotated as a string because the registry import is deliberately
+        # lazy (it pulls in ``tools``, which imports this module's package).
+        self._capability_registry: Optional["CapabilityRegistry"] = None
 
         # Session permissions for gate-checking tool calls
         self._session_permissions: Dict[str, Any] = session_permissions or {}
@@ -2946,6 +3022,40 @@ class WorkerThread(threading.Thread):
         """Return elapsed seconds from the most recent query execution."""
         return getattr(self, '_last_elapsed_val', None)
 
+    def _resolve_capability_registry(self) -> "CapabilityRegistry":
+        """Resolve this worker's declared tool set once; cache the frozen result.
+
+        One resolution per worker: the registry is built from the definition,
+        so a later edit to the template affects only the next spawn.  Declared
+        names are canonicalised first, so a template that uses a tool's stable
+        name (``git_read``) resolves to the class instead of being reported as
+        "not shippable by this build".
+
+        ``permission_veto=None`` is deliberate: the registry says which tools
+        EXIST, the footprint gate in ``Worker._action_spawn`` says which of them
+        may RUN (design doc §7.2).
+        """
+        if self._capability_registry is not None:
+            return self._capability_registry
+        from tools.capability_registry import CapabilityRegistry
+
+        universe = _worker_tool_universe()
+        declared = [
+            _canonical_worker_tool_name(name)
+            for name in (self.definition.get("tools") or [])
+        ]
+        self._capability_registry = CapabilityRegistry.resolve(
+            declared,
+            available_names=tuple(universe),
+            lookup=universe,
+            blocklist=_WORKER_BLOCKLIST,
+            parent_enabled_tools=(self._agent_config_dict or {}).get(
+                "enabled_tools"
+            ),
+            permission_veto=None,
+        )
+        return self._capability_registry
+
     def _build_agent_config(self) -> Any:
         """
         Build an AgentConfig from the worker definition and parent agent config.
@@ -3006,17 +3116,34 @@ class WorkerThread(threading.Thread):
             if self.definition.get("temperature") is not None
             else WORKER_DEFAULT_TEMPERATURE
         )
-        worker_tools = self.definition.get("tools", [])
-        parent_enabled_tools = cfg.get("enabled_tools")
-        if worker_tools:
-            enabled_tools = [t for t in worker_tools if t not in _WORKER_BLOCKLIST]
-        else:
-            from tools import simplified_tool_classes
-            enabled_tools = [cls.__name__ for cls in simplified_tool_classes()
-                             if cls.__name__ not in _WORKER_BLOCKLIST]
-        # Intersect with parent's enabled_tools — worker cannot exceed parent
-        if parent_enabled_tools is not None:
-            enabled_tools = [t for t in enabled_tools if t in parent_enabled_tools]
+        # Tool set: resolved once through the capability registry.  The
+        # registry owns the blocklist, the parent clamp (narrowing recorded in
+        # ``.parent_denied``) and the implicit "all simplified tools" default,
+        # so ``enabled_tools`` can never be a silently narrowed subset.
+        try:
+            enabled_tools = _worker_granted_tool_names(
+                self._resolve_capability_registry()
+            )
+        except Exception as exc:
+            # Never raise from here: the spawn boundary (Worker._action_spawn)
+            # is what fails loudly.  Fall back to the legacy derivation
+            # verbatim so config building stays total.
+            logger.debug(
+                "Worker '%s' could not resolve a capability registry (%s); "
+                "using the legacy enabled_tools derivation",
+                self.worker_name, exc,
+            )
+            worker_tools = self.definition.get("tools", [])
+            parent_enabled_tools = cfg.get("enabled_tools")
+            if worker_tools:
+                enabled_tools = [t for t in worker_tools if t not in _WORKER_BLOCKLIST]
+            else:
+                from tools import simplified_tool_classes
+                enabled_tools = [cls.__name__ for cls in simplified_tool_classes()
+                                 if cls.__name__ not in _WORKER_BLOCKLIST]
+            # Intersect with parent's enabled_tools — worker cannot exceed parent
+            if parent_enabled_tools is not None:
+                enabled_tools = [t for t in enabled_tools if t in parent_enabled_tools]
         worker_cfg["enabled_tools"] = enabled_tools
         # Resolve max_turns: prefer definition, then parent config (treating
         # None as absent), then default 100.
@@ -6305,10 +6432,9 @@ class Worker(ToolBase):
                 "worker_name": self.worker_name,
             }
 
-        # Resolve tool classes from definition
-        tool_classes: Dict[str, type[ToolBase]] = {}
-        missing_tools: list[str] = []
-        tool_names = definition.get("tools", [])
+        # Declared tool names.  An empty list is the implicit "all simplified
+        # tools" default; the capability registry below owns that meaning.
+        tool_names = list(definition.get("tools") or [])
         worker_perms = definition.get("permission_footprint") or definition.get("worker_permissions", {})
         # ── Fail-closed spawn guard ────────────────────────────────────
         # The worker footprint may only RESTRICT categories the session
@@ -6330,15 +6456,65 @@ class Worker(ToolBase):
         # Effective worker profile: session (ceiling) intersected with the
         # worker footprint.  Used for spawn-time tool validation below.
         spawn_effective = _restrictive_merge(session_perms, worker_perms)
+        # ── Capability resolution (fail loud, before the thread is built) ──
+        # The registry says which tools EXIST for this build; the footprint gate
+        # below says which of them may RUN (§7.2).  A name this build cannot
+        # ship aborts the spawn here, before any worker object is constructed,
+        # so no half-capable worker can ever start.
+        from tools.capability_registry import (
+            CapabilityRegistry,
+            CapabilityResolveError,
+        )
+
+        universe = _worker_tool_universe()
+        try:
+            capability_registry = CapabilityRegistry.resolve(
+                [_canonical_worker_tool_name(name) for name in tool_names],
+                available_names=tuple(universe),
+                lookup=universe,
+                blocklist=_WORKER_BLOCKLIST,
+                parent_enabled_tools=(self.agent_config or {}).get("enabled_tools"),
+                permission_veto=None,
+            )
+        except CapabilityResolveError as err:
+            return {
+                "error": (
+                    f"Worker '{self.worker_name}' requires tool(s) not "
+                    "shippable by this build: "
+                    f"{', '.join(err.missing_names)}"
+                ),
+                "worker_name": self.worker_name,
+                "missing_tools": list(err.missing_names),
+            }
+
+        # Canonical class map: keyed by class name, so a tool's alias spelling
+        # cannot create a second entry for the same class.
+        tool_classes: Dict[str, type[ToolBase]] = {
+            cls.__name__: cls for cls in capability_registry.resolved.values()
+        }
+        missing_tools: list[str] = []
+
+        if not tool_names:
+            # Implicit "all simplified tools" default: report the privilege,
+            # never grant it silently (§4.2).  The spawn envelope is unchanged.
+            implicit_granted = _worker_granted_tool_names(capability_registry)
+            if implicit_granted:
+                logger.warning(
+                    "Worker '%s' has an empty tool list (implicit / "
+                    "unrestricted): resolved to %d tool(s) from the default "
+                    "universe",
+                    self.worker_name, len(implicit_granted),
+                )
+
         if tool_names:
-            for tool_name in tool_names:
-                if tool_name in _WORKER_BLOCKLIST:
-                    missing_tools.append(f"{tool_name} (excluded for worker safety)")
-                    continue
-                cls = self._resolve_tool_class(tool_name)
-                if cls is None:
-                    missing_tools.append(tool_name)
-                    continue
+            # Blocklist exclusions stay SOFT (the worker spawns without them)
+            # and are reported to the operator, never silently dropped.
+            for excluded_name in capability_registry.excluded:
+                logger.warning(
+                    "Worker '%s': tool %s (excluded for worker safety)",
+                    self.worker_name, excluded_name,
+                )
+            for tool_name, cls in capability_registry.resolved.items():
                 # Spawn-time footprint validation: check tool categories against
                 # the worker's declared permission footprint.
                 tool_cats = cls.get_required_categories({})
@@ -6353,7 +6529,7 @@ class Worker(ToolBase):
                             f" for {tool_name}"
                         ),
                         # Footprint already intersected into spawn_effective
-                        # via _restrictive_merge \u2014 pass None so the gate does
+                        # via _restrictive_merge — pass None so the gate does
                         # not re-apply the raw footprint on top.
                         permission_footprint=None,
                         is_worker_context=True,
@@ -6362,8 +6538,7 @@ class Worker(ToolBase):
                         missing_tools.append(
                             f"{tool_name} (permission denied by worker footprint)"
                         )
-                        continue
-                tool_classes[tool_name] = cls
+                        tool_classes.pop(tool_name, None)
 
         # Resolve project root from workspace config so tools get the right
         # workspace_path (the project root, not the worker's internal dir).
