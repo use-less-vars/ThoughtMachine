@@ -16,9 +16,13 @@
  *     WHETHER a scroll is warranted, from the shape of the `messages` array
  *     (an append, or a streaming delta that grew the last message in place).
  *     That decision is then executed through `stick.scrollToBottom()`.
+ *   - While the reader is scrolled UP that decision is "do not move them": an
+ *     append instead raises the "New messages below" offer, which jumps to the
+ *     bottom and re-pins on click, and clears itself as soon as the view is
+ *     pinned again (the click, ↓, or scrolling back down).
  */
 
-import React, { useEffect, useLayoutEffect, useRef } from 'react'
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { MessageBubble } from './chat/MessageBubble'
 import { useStickToBottom } from '../hooks/useStickToBottom'
 
@@ -34,12 +38,24 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
   // Streaming deltas grow the LAST message in place (count unchanged), so the
   // last rendered content is tracked to detect "appended below the fold".
   const prevLastContentRef = useRef(null)
+  // Last message OBJECT from the previous commit, used to tell an append (the
+  // tail is replaced) from a prepend (older history loaded above the fold: the
+  // tail is untouched).
+  const prevLastMsgRef = useRef(null)
+
+  // "New messages below" offer.  Raised only when content was appended while
+  // the reader was scrolled up; cleared by the hook's `onPinnedChange` the
+  // moment the view is pinned again.
+  const [hasNewMessages, setHasNewMessages] = useState(false)
 
   // `threshold` keeps this panel's historical 50px "near the bottom" window;
   // the hook's own default is narrower.
   const stick = useStickToBottom({
     containerRef: chatRef,
     threshold: AT_BOTTOM_THRESHOLD,
+    // Re-sourced badge clearing (the same convention WorkerOutputPanel uses):
+    // while the view is pinned there is nothing "below" left to offer.
+    onPinnedChange: (isPinned) => { if (isPinned) setHasNewMessages(false) },
   })
 
   // ── Auto-scroll on message append ──
@@ -66,15 +82,29 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
     const grewInPlace = currentCount === prevCount && currentCount > 0 &&
       currentLastContent !== prevLastContent
 
+    // Append detection for the offer, stricter than the scroll decision below:
+    // `currentCount > prevCount` is ALSO true for a PREPEND (load-more pulling
+    // older history in above the fold), which must never be advertised as "new
+    // messages below".  An append replaces the tail, a prepend leaves it alone.
+    const prevLastMsg = prevLastMsgRef.current
+    prevLastMsgRef.current = lastMsg
+    const appendedBelow = grewInPlace ||
+      (currentCount > prevCount && prevLastMsg != null && lastMsg !== prevLastMsg)
+
     // No container — nothing to do.
     if (!chatRef.current || currentCount === 0) return
 
-    // Not warranted: the reader is scrolled up, or the list was REPLACED rather
-    // than appended to.  Nothing to do here — while unpinned the hook restores the
-    // reading anchor itself, and two writers of scrollTop would fight.
-    if (!stick.isAtBottomRef.current || (currentCount <= prevCount && !grewInPlace)) {
+    // The reader is scrolled up: NEVER move them.  While unpinned the hook
+    // restores the reading anchor itself and two writers of scrollTop would
+    // fight; all this panel owes them is the offer to jump.
+    if (!stick.isAtBottomRef.current) {
+      if (appendedBelow) setHasNewMessages(true)
       return
     }
+
+    // Pinned, but the list was REPLACED rather than appended to — nothing to
+    // follow.
+    if (currentCount <= prevCount && !grewInPlace) return
 
     // Content was APPENDED and user is at bottom — follow it.  The hook performs
     // the write (it also arms the programmatic guard, which is what stops this
@@ -106,6 +136,15 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
       })
     })
   }, [scrollToBottomKey])
+
+  // ── Jump to the newest message (the "New messages below" offer) ──
+  // force=true so it wins while the reader is scrolled up; it re-pins the view,
+  // which is what clears the offer (plus the explicit reset in case the write
+  // lands while the hook still believes the view is pinned).
+  const jumpToLatest = () => {
+    setHasNewMessages(false)
+    stick.scrollToBottom(true)
+  }
 
   // ── Scroll to previous user query (jump up) ──
   const jumpToPrevQuery = () => {
@@ -145,6 +184,21 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
         {messages && messages.map((msg, i) => (
           <MessageBubble key={i} msg={msg} index={i} />
         ))}
+        {/* "New messages below" offer.  A real <button>, so it is keyboard
+            reachable in DOM order; it reuses the floating-pill styling the
+            worker panel already uses for its "New events" badge. */}
+        {hasNewMessages && (
+          <div className="new-events-container">
+            <button
+              type="button"
+              className="new-events-btn"
+              onClick={jumpToLatest}
+              title="Scroll to the newest messages"
+            >
+              ↓ New messages below
+            </button>
+          </div>
+        )}
       </div>
       <div className="scroll-nav-group">
         <button className="scroll-prev-btn" onClick={jumpToPrevQuery} title="Jump to previous query">

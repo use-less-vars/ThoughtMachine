@@ -56,6 +56,13 @@ MANIFEST = [
     ("status.md", "STATUS BODY\n"),
 ]
 
+# The BASENAME of the advisory entry: listed in the manifest, but no digest is
+# ever recorded for it (``KB_ADVISORY_ENTRIES`` in lib/kb_manifest.sh, twin of
+# ``ADVISORY`` in scripts/gen_handoff.py), because its bytes are branch-local.
+# The synthetic manifest above keeps it deliberately, so the advisory branches
+# of the gate are exercised against a realistic router shape.
+ADVISORY_REL = "PRIORITIES.md"
+
 
 def _make_project(
     tmp_path,
@@ -314,7 +321,15 @@ def test_check_fails_closed_when_no_hash_is_recorded(tmp_path):
 
 
 def test_update_records_hashes_and_then_check_passes(tmp_path):
+    """--update fills in the missing digests, and every later --check passes.
+
+    The advisory entry is the exception on both sides: --update does NOT invent
+    a token for it (that is what the generator would refuse to write either),
+    and the later --check reports it as a NOTE rather than a warning, so the
+    run is still green.
+    """
     _repo, kb_dir, handoff = _make_project(tmp_path, record_hashes=False)
+    hashed = [rel for rel, _body in MANIFEST if rel != ADVISORY_REL]
 
     stale = _run(STALENESS_SCRIPT, handoff, args=("--check",))
     assert stale.returncode == 1
@@ -323,21 +338,31 @@ def test_update_records_hashes_and_then_check_passes(tmp_path):
 
     assert update.returncode == 0, update.stderr
     assert update.stdout == (
-        f"Updated {len(MANIFEST)} recorded sha256 values in {handoff}.\n"
+        f"Updated {len(hashed)} recorded sha256 values in {handoff}.\n"
     )
 
     text = handoff.read_text(encoding="utf-8")
     # Only the digest tokens change; the rest of the router survives verbatim.
     assert "## 1. State" in text
     assert "- `NOT_A_MANIFEST_ENTRY.md` - prose, not a numbered item." in text
-    for rel, _body in MANIFEST:
+    for rel in hashed:
         digest = hashlib.sha256((kb_dir / rel).read_bytes()).hexdigest()
         assert f"`{rel}`" in text
         assert f"- sha256:{digest}\n" in text
 
+    # The advisory entry is emitted untouched: still listed, still token-less.
+    advisory_lines = [line for line in text.splitlines() if f"`{ADVISORY_REL}`" in line]
+    assert len(advisory_lines) == 1, advisory_lines
+    assert "sha256" not in advisory_lines[0], advisory_lines[0]
+
     fresh = _run(STALENESS_SCRIPT, handoff, args=("--check",))
     assert fresh.returncode == 0
-    assert fresh.stdout == "PASS: HANDOFF.md is up to date.\n"
+    assert fresh.stdout == (
+        f"NOTE: {KB_DIR_REL}/{ADVISORY_REL} carries no recorded sha256 because it "
+        "is an advisory entry that changes on every branch; not a staleness "
+        "failure.\n"
+        "PASS: HANDOFF.md is up to date.\n"
+    )
 
 
 def test_update_refuses_to_rewrite_a_partial_router(tmp_path):
