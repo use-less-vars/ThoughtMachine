@@ -100,6 +100,14 @@ merge helper stays, as the spawn-time mirror it is and not the runtime authority
 formula is now `effective = min(declared_footprint, live_session − workspace_ceiling)` — commit
 `4e96c32c` (#137), *"Wave: worker obeys session grants (fourth gate removed)"*.
 
+**A second authority can also be a second *entry point*.** The removed fourth gate was a copy of the
+chain's output. The paginate tool (§9a) was a second *place the chain gets consulted* — and it was
+consulted correctly, with the same helper, on the wrong subject: the categories of the top-level
+tool, which then constructed and ran a more privileged one. Both are the same bug — the answer was
+never stale, the *question* was — and both fixes are shaped the same: the gate must be evaluated on
+the tool the call actually names, and the callee's authority must never be selectable by the caller's
+payload.
+
 Assume there are more. When you find one, remove it; do not "sync" it.
 
 ### Where the gates live
@@ -242,10 +250,88 @@ Three habits that pay for themselves:
 - **Found a second authority? Remove it** — don't synchronise it (§2).
 - **Does a tool shell out? Ask what enforces the grain.** If the answer is "the tool checks", verify
   that it does.
+- **Name the path before you believe a behaviour claim.** Git in this system has three commit
+  paths with three behaviours — container (workspace `.githooks` fires), host (hooks neutralized by
+  construction), bare shell (the worktree gitdir's hook resolves; `/workspace/.git` is a gitfile into
+  the host worktree). "The hook runs" and "the hook is dormant" are both true statements about this
+  repo, about different paths (§9b).
 - **Never infer execution class from failure.** There is no *silent* container→host fallback: a
   container-path failure raises a loud error (`docs/container_p0_bug4_git_fallback.md`). Host mode
   exists, but it is chosen deliberately by config (`host_fallback` in
   `resolve_git_execution_mode()`) and still sits behind Gate 1. Turning a container failure into a
   quiet host run is a safety regression sold as resilience.
+
+## §9 — History: two bypasses that changed the design
+
+Two incidents, kept because the *shape* of each fix is reusable. Neither was solved by tightening a
+check; both ended as a rule about where authority may live. Both were found by asking one question,
+the second habit in §8: **what actually enforces this?**
+
+### a) The paginate laundering hop (removed Gen 48)
+
+The gate is evaluated on the **top-level tool's declared categories**
+(`agent/core/tool_executor.py:419` → `:468-469`). A helper tool existed to paginate large results
+and declared only `filesystem: read`. It also accepted a tool *name* and instantiated that class
+from `tools.TOOL_CLASSES`, then ran it. So a stock filesystem-only profile could execute
+`ContainerRemoveTool` and `HostBashTool`: the gate asked about the tool the model named, and a
+different tool did the work. Because it forwarded a context dict that omitted `workspace_id`, the
+inner call could also run under a caller-chosen workspace identity — a containment defect *and* an
+attribution defect, and reachable from workers.
+
+Filed 2026-10-23 as
+`ticket-bug-paginate-tool-bypasses-required-categories.md`. Three attempts, in order:
+
+1. `8aa17e0d` — contain the context fields (`_CONTEXT_FIELDS`). Failed as a *class* of fix, not as
+   code: the list was written as a list of **paths**, so an identity field that is not a path
+   (`workspace_id`) was never in it. A containment list is not an identity list.
+2. `0c125856` — re-gate inside `execute()`: call `get_required_categories(params)` on the target
+   class and run it back through the same `check_required_categories` the executor uses, before
+   instantiation, fail-closed if the gate cannot be imported. Plus `_NEVER_FORWARD =
+   ('workspace_id',)` and `_NEVER_PAGINATE`, a structural blocklist — needed because several of the
+   blocked tools declare *no* categories at all, so no categories gate can see them. Residuals were
+   recorded honestly: the re-gate validated the already-capped `effective` dict and so applied no
+   ceiling of its own ("Defect 1 with a seatbelt"), and dropping `workspace_id` gives the inner tool
+   `None` — which fails closed in some tools, fabricates `"default"` in others, and is silently
+   unattributed in one.
+3. `4a4bd692` — delete it. 223 lines gone; 18 tests retired with it, not silently. Verbatim
+   rationale: *"a safe wrapper is still a wrapper and the class survives wherever the pattern is
+   copied."* The registry entry is now a pointer comment naming the class rule
+   (`hygiene/no-tool-wrapping`).
+
+**What the design now says.** Authority is evaluated on the tool the call names, and a tool's
+declared categories must describe the maximum reach of that call. A wrapper is therefore not a tool
+with narrow permissions — it is a permission *laundering* device, and the safe version of it does not
+exist. The residual defects in step 2 are the argument for step 3: every one of them is a case where
+the wrapper had to *guess* an identity or a ceiling it had no standing to know.
+
+### b) Git hooks: three commit paths, three behaviours
+
+Same code, same repository, three answers to "do hooks run?" — because the answer is a property of
+the path, not of the repo:
+
+| Path | What happens | Where |
+|---|---|---|
+| Container | `-c core.hooksPath=/workspace/.githooks` (absolute, container-mapped); **no** `--no-verify`. The container is the boundary, so hooks are confined to the workspace dir and allowed to run. | `tools/git_info_tool.py` (container commit path) |
+| Host | Hooks neutralized by construction on *every* invocation: `core.hooksPath=/dev/null`, `core.attributesFile=/dev/null`, `diff.external=`, `core.fsmonitor=`, `filter.clean=`, `filter.smudge=`; `--no-verify` on commit. | `tools/git_info_tool.py` (host argv builder) |
+| Bare shell | Whatever `core.hooksPath` resolves to where you stand. `/workspace/.git` is an ~84-byte gitfile pointing into the host worktree gitdir, so the hook that fires is the host's. | not a tool path — a human or a stray subprocess |
+
+That third row is what makes the table load-bearing: `.githooks/pre-commit` was **deleted** in
+`85035605` because `core.hooksPath` read as *unset* from a bare shell — judged dormant — while the
+container path sets it explicitly and the hook was live. The lesson is one sentence and it is the
+reason this section exists: **one shell's default is not a fact about the machine.**
+
+The design change that came out of it: host mode no longer *silently* bypasses. When
+`<workspace>/.githooks/pre-commit` exists and the execution mode is host, the commit is **refused** —
+"refusing commit: repository hooks are configured (.githooks/pre-commit) but host execution mode
+neutralizes them … Use container mode, or remove the configured hooks to accept the bypass." The rule
+behind it (design §E3): *fail closed only when hooks are configured-but-unenforceable*; silence in the
+face of unknowability is the bug, not the fix. The vault-hook mechanism is gone with it — hooks are
+now either the workspace-local `.githooks` dir (container) or fully neutralized (host), nothing else
+(`tests/security/test_git_hardening.py`, which also asserts the container argv exactly and that
+`--no-verify` is absent from it).
+
+One operational corollary, because it is the trap: a tool commit can **time out while the hook is
+still running** — paths staged, HEAD not advanced, hook killed. A timed-out commit is therefore weak
+evidence that the suite passed, and never a reason to reach for `--no-verify`.
 
 The machine gets more honest one wave at a time. That is the whole method.

@@ -16,11 +16,11 @@ b43163dc docs: log security boundary C-items
 
 ## 2. Read in this order
 
-1. `.thoughtmachine/knowledge/project/PRIORITIES.md` -- the live work queue. **Read first.** - sha256:6abc23e6fa6ddec53e6696170ea4f470de61f184ddb3c95c16ea5b2c17b2ad01
+1. `.thoughtmachine/knowledge/project/PRIORITIES.md` -- the live work queue. **Read first.** - sha256:094d6727551fb6c94a1393bb68aae0ce0f79b82dd8e203e835af8dc6b198e934
 2. `docs/CONTROL_PLANE.md` -- the pause/stop/timeout contract. Doctrine. - sha256:3ecd6a73af659c1daf21c541ec0a5f1edd3dd2c1187028bbe2e7f6ae5402d0e1
-3. `.thoughtmachine/knowledge/project/MANDATORY_STOP.md` -- the read-on-entry rules; none of them are optional. - sha256:6a2f27112c03c00c16a8444909c73bc0ae79f97aeebd4c9021b9cf83da454065
+3. `.thoughtmachine/knowledge/project/MANDATORY_STOP.md` -- the read-on-entry rules; none of them are optional. - sha256:ca47ffe5df0e3b242bfd22543794ef4e8b03ec78b169fc9fb24851c08b76e9d1
 4. `.thoughtmachine/knowledge/project/architecture_invariants.md` -- the invariants a design must not re-derive. - sha256:d7364ff4686a59dc118d3cb9dbde7a516d64c3e3bf80853756e9e2b713da9645
-5. `docs/ARCHITECTURE_MACHINE_MODEL.md` -- what runs where, and what stops it. - sha256:97ebec654e46f836f4120960a86b859c44736fd8757a75757a9205963cb58bb9
+5. `docs/ARCHITECTURE_MACHINE_MODEL.md` -- what runs where, and what stops it. - sha256:ed240aba0bc0e0ac757d5ce10e6306317380529d691b81d8a9fd88d5a3c9544c
 6. `.thoughtmachine/knowledge/project/vision_ledger.md` -- the five standing commitments (V1-V5). - sha256:5a01a13c684e94f5bc0e762807b8183d9e06f283b20caf3389aec662149ff930
 7. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:aa6670275083f6a38f9943843bb0efc759ec8dce2e7986605f2dfeea0122bd38
 
