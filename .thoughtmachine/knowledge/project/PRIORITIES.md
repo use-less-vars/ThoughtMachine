@@ -279,7 +279,17 @@ different file, different name. Never rename one to the other.
   **Maintenance rule.** When a bug reveals a missing rule, the same commit that fixes the bug
   updates `MANDATORY_STOP.md` / `ARCHITECTURE_MACHINE_MODEL.md` / `HANDOFF.md`.
 
-- **C60: Test Isolation Failures.** **Open.** The suite is not order-independent, and
+- **C60: Test Isolation Failures.** **FIXED** in `35c11fbc` ("fix(test): restore the
+  provider registry between tests"). Four pytest fixtures in
+  `tests/test_worker_loop_spike.py` and `tests/test_worker_tool_call_start.py` wrote the
+  CLASS attribute `ProviderFactory._providers` by bare assignment with no teardown, which
+  permanently disabled the factory's lazy population for the rest of the process; they are
+  now `monkeypatch.setattr`-based and self-restoring, plus an autouse
+  `_restore_provider_registry` guard in `tests/conftest.py`. The reproducing pair
+  (`tests/test_worker_loop_spike.py tests/test_worker_pause_reading_mode.py`) went
+  **8 failed / 35 passed -> 43 passed**, and the failure signature
+  `ProviderNotFoundError: Provider 'openai_compatible' not found. Available: ['echotool']`
+  is gone. Original description kept below. The suite is not order-independent, and
   it does not fit in one process. Evidence, measured on this branch: `pytest tests/`
   collects **6771** tests; a single-process full run is **OOM-killed (exit 137) at ~79%**
   (~5,300 tests, zero failures to that point), so the suite can only be run today by
@@ -302,6 +312,56 @@ different file, different name. Never rename one to the other.
   committed entry point that partitions the suite into fixed, documented chunks in
   separate processes, aggregates a single pass/fail summary, and is what CI runs.
   The suite must not be "green only if you know which files to keep apart".
+
+- **C61: In-flight Tool Cancellation & Dispatch Window.** **Open** — proposal /
+  hypothesis, not a confirmed mechanism. Two measured defects in the same seam, both
+  observed with the TimeBudget live (`thoughtmachine/timebudget.py`, envelope keys
+  `requested_timeout_seconds` / `effective_timeout_seconds` / `timeout_clamped` /
+  `timeout_clamped_by` / `timeout_source`).
+  **Defect 1 — the budget stops NEW tool calls and never an in-flight one.** Measured with
+  `effective_timeout_seconds=60`: the worker issued `python3 -c 'time.sleep(200)'`, the call
+  completed in **205.63 s** (`timed_out: false`, exit 0) and the worker survived ~210 s.
+  The worker's own words: "every other tool was restricted at the 60 s tick, yet the
+  already-dispatched sleep ran to 200.0 s undisturbed." The timeout is enforced at
+  *admission* time only, so anything already dispatched outlives the deadline by an
+  unbounded factor.
+  **Defect 2 — the caller's dispatch window is ~2x the effective budget.** Measured:
+  effective 60 -> `dispatch_duration_wall` **120.0 s**; effective 240 -> blocked **300 s**;
+  effective 300 -> returned **277 s**. `timeout_seconds` therefore bounds the *worker's*
+  new-work deadline, not the *caller's* block: the caller can wait twice as long as the
+  number it passed in.
+  **Fix direction (proposal).** Worker/command execution already runs as a real OS process
+  inside the container, so cancel at the process level instead of in the loop: keep a
+  handle for the currently-running command (the `Popen` and the `docker exec` session id)
+  in the supervisor; on budget expiry send **SIGTERM**, wait a short grace (~2 s), then
+  **SIGKILL**; **reap** the child so nothing is orphaned; then return an envelope with
+  `status: "timeout"`, the **partial stdout captured so far**, and the five budget keys
+  extended with an explicit `timeout_enforced` / `cancelled_in_flight` flag so a caller can
+  distinguish "answered in time" from "killed at the deadline". Separately, clamp the
+  dispatch window to `effective_timeout_seconds` instead of a multiple of it.
+  **Constraints the fix must respect.** No orphaned or leaked processes; the container must
+  remain reusable after a cancellation (no wedged exec session); cancellation must be
+  **idempotent** (a second expiry/cancel is a no-op, never a second signal to a recycled
+  pid); a cancelled command must **not corrupt an in-progress KB/file write**; and the
+  mechanism must not be confused with the C12 `interrupt()` sticky-fallback trap.
+  **Acceptance criteria.** (1) With `effective_timeout_seconds=60`, a tool that sleeps 200 s
+  returns in **<= ~62 s** with `status: "timeout"`, `cancelled_in_flight: true`, a
+  non-success exit, and the partial stdout produced so far. (2) Caller wall time for that
+  call is `<= effective_timeout_seconds + grace`, never ~2x. (3) After the cancellation the
+  container is still usable (a following `echo` succeeds) and no surviving sleep process
+  remains in it. (4) A second cancel of the same execution neither raises nor kills an
+  unrelated pid. (5) Every timeout envelope carries `timeout_enforced` /
+  `cancelled_in_flight`, so "no timeout" and "timeout not enforced" are distinguishable.
+  (6) A short command that finishes inside the budget is unchanged (same envelope, no new
+  key flipping true).
+  **Test sketch.** Seed a worker with `effective_timeout_seconds=60`; dispatch
+  `python3 -c 'time.sleep(200)'`; assert the round-trip wall time is `<= 65 s`, the
+  envelope says `status: "timeout"` + `cancelled_in_flight: true`, and elapsed time is
+  nowhere near 200 s; then run a follow-up `python3 -c 'print(1)'` through the same
+  container, asserting it returns 1 (container reusable) and that no `sleep 200` process
+  survived; finally invoke the cancel path a second time and assert it is a silent no-op.
+  The numbers above are a dated snapshot measured on this branch — re-measure before
+  fixing.
 
 ## Numbering (Gen 63 housekeeping)
 

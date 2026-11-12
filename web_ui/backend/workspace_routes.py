@@ -1935,8 +1935,20 @@ async def resume_worker(
     ``ready``/``busy`` asynchronously.
 
     Returns:
-        200 with ``{"status": "resumed", "name": name}`` on success.
-        404 if the worker directory does not exist.
+        200 with ``{"status": "resumed", "name": name}`` when an in-memory
+            thread for this worker was genuinely revived (the fast path).
+        200 with ``{"status": "queued", "resumed_command_written": true,
+            "in_process": false}`` when no in-memory thread matched: the
+            resume travels over the fenced command channel
+            (``tools/workspace/command_channel.py``, "for cross-process worker
+            control"), which a worker running in a separate OS process polls
+            within ~2 seconds.  That is delivery, not a confirmed revive, so
+            the body does not claim "resumed".
+        404 only if the worker directory does not exist -- the body is
+            ``{"status": "not_found", "name": name}`` under ``detail``.
+        200 with ``{"status": "refused", "workers_refused": [...]}`` when the
+            matching live instance refused because a stop is already in
+            flight.
     """
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
@@ -2038,6 +2050,24 @@ async def resume_worker(
                     "worker_name": wname,
                     "instance_id": tid,
                 })
+
+    if not resumed_threads and not refused_threads:
+        # Zero in-memory matches.  That is EXPECTED for a worker running in
+        # another process: the resume command travels over the fenced
+        # command.json channel (tools/workspace/command_channel.py), which the
+        # worker polls within ~2s, and the in-memory revive above is only a
+        # fast path.  So this is not a failure -- but it is also not a
+        # confirmed revive, so do not claim "resumed".
+        resp: Dict[str, Any] = {
+            "status": "queued",
+            "name": name,
+            "resumed_command_written": True,
+            "in_process": False,
+        }
+        if target_label is not None:
+            resp["instance_id"] = instance_id
+            resp["instance_label"] = target_label
+        return resp
 
     if refused_threads and not resumed_threads:
         # Every in-memory thread we found refused: the resume command file was
