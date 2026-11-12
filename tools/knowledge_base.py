@@ -8,8 +8,9 @@ learned, and task management.
 
 import json
 import logging
+import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, ClassVar, List, Dict, Optional, Tuple
 
@@ -45,6 +46,44 @@ def _get_global_kb_root():
     return get_global_kb_root()
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Entry-block parsing for `mode=archive`
+# ---------------------------------------------------------------------------
+# `mode=append` writes entries shaped `## YYYY-MM-DD — <summary>` followed by
+# the body. Archive treats every `## ` heading line as a block boundary and only
+# moves blocks whose heading starts with a parseable ISO date; anything else
+# (structural sections, prose headings, unparseable dates) stays in place.
+_KB_HEADING_RE = _re.compile(r"^##[ \t]+(.*)$", _re.MULTILINE)
+_KB_ENTRY_DATE_RE = _re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?![0-9])")
+_KB_ARCHIVE_DEFAULT_DAYS = 30
+
+
+def _kb_split_blocks(content: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Split *content* into ``(preamble, [(heading_text, block_text), ...])``.
+
+    ``block_text`` runs from a ``## `` heading line up to the next ``## ``
+    heading (or EOF), so ``preamble + "".join(block_text ...)`` reproduces
+    *content* byte-for-byte.
+    """
+    matches = list(_KB_HEADING_RE.finditer(content))
+    if not matches:
+        return content, []
+    preamble = content[: matches[0].start()]
+    blocks: List[Tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+        blocks.append((match.group(1).strip(), content[match.start():end]))
+    return preamble, blocks
+
+
+def _kb_atomic_write(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically (temp file in the same dir + rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 # Hardcoded domain registry mapping domain names to relative file paths
@@ -151,6 +190,7 @@ class KnowledgeBaseTool(ToolBase):
       - **status**: Show current status from task_tracker + recent entries across all files
       - **search**: Search all KB files for a query (substring, case-insensitive)
       - **create_domain**: Create a new domain file
+      - **archive**: Move dated entries older than ``older_than_days`` (default 30) out of a domain file into ``_archive/``
       - **summary**: Return a lightweight section index of a domain file
     """
 
@@ -159,14 +199,15 @@ class KnowledgeBaseTool(ToolBase):
         """Return the permission categories required for each KB operation.
 
         Read-only operations (read, search, list) require ``filesystem:read``;
-        write operations (append, update, create_domain) require ``filesystem:write``.
+        write operations (append, update, create_domain, archive) require
+        ``filesystem:write``.
         Other modes (status, summary) require no special permissions.
         """
         if params:
             mode = params.get("mode", "")
             if mode in ("read", "search", "list"):
                 return ["filesystem:read"]
-            if mode in ("append", "update", "create_domain"):
+            if mode in ("append", "update", "create_domain", "archive"):
                 return ["filesystem:write"]
         return []
 
@@ -175,8 +216,8 @@ class KnowledgeBaseTool(ToolBase):
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = ["read_files", "write_files"]
 
-    mode: Literal["list", "read", "append", "update", "status", "search", "create_domain", "summary"] = Field(
-        ..., description="Operation mode: list, read (with optional max_tokens and section), append (with optional append_section for section-targeted appends), update, status, search, create_domain, or summary"
+    mode: Literal["list", "read", "append", "update", "status", "search", "create_domain", "summary", "archive"] = Field(
+        ..., description="Operation mode: list, read (with optional max_tokens and section), append (with optional append_section for section-targeted appends), update, status, search, create_domain, summary, or archive (with optional older_than_days, default 30)"
     )
     domain: Optional[str] = Field(
         None,
@@ -231,6 +272,13 @@ class KnowledgeBaseTool(ToolBase):
             "Ignored unless mode=append."
         ),
     )
+    older_than_days: Optional[int] = Field(
+        None,
+        description=(
+            "Archive mode: move dated entries older than this many days out of the "
+            "domain file. Defaults to 30 when omitted."
+        ),
+    )
     scope: Literal["workspace", "global"] = Field(
         "workspace",
         description=(
@@ -247,7 +295,7 @@ class KnowledgeBaseTool(ToolBase):
         """
         self._log_debug(f"KnowledgeBaseTool.execute called with mode='{self.mode}', domain='{self.domain}'")
 
-        write_modes = ("append", "update", "create_domain")
+        write_modes = ("append", "update", "create_domain", "archive")
 
         # Resolve the knowledge base root directory
         kb_root: Optional[Path] = None
@@ -304,7 +352,8 @@ class KnowledgeBaseTool(ToolBase):
         # _filesystem_read_gate_error): a missing `filesystem` key defers to
         # the out-of-band session mirror (legacy/direct callers), preserving
         # historical behaviour; read/search/list/summary/status need
-        # filesystem:read and append/update/create_domain need filesystem:write.
+        # filesystem:read and append/update/create_domain/archive need
+        # filesystem:write.
         if self.scope == "workspace":
             from security.gate_helpers import _value_satisfies
             _kb_fs = (self.effective_permissions or {}).get("filesystem")
@@ -368,8 +417,10 @@ class KnowledgeBaseTool(ToolBase):
                 return self._mode_create_domain(kb_root)
             elif self.mode == "summary":
                 return self._mode_summary(kb_root)
+            elif self.mode == "archive":
+                return self._mode_archive(kb_root)
             else:
-                return f"Unknown mode: {self.mode}. Supported modes: list, read, append, update, status, search, create_domain, summary."
+                return f"Unknown mode: {self.mode}. Supported modes: list, read, append, update, status, search, create_domain, summary, archive."
         except Exception as e:
             self._log_tool_error(f"Unexpected error in {self.mode} mode: {e}")
             return f"An unexpected error occurred: {e}. Please try again or check the knowledge base files."
@@ -619,6 +670,7 @@ class KnowledgeBaseTool(ToolBase):
         lines.append("- `mode=search query=<term>` — Search across all KB files")
         lines.append("- `mode=status` — Show current status and recent activity")
         lines.append("- `mode=create_domain domain=<name> category=<project|personal>` — Add a new domain")
+        lines.append("- `mode=archive domain=<name> older_than_days=<n>` — Move dated entries older than n days (default 30) into `_archive/`")
         return "\n".join(lines)
 
     def _mode_list_global(self, kb_root: Path) -> str:
@@ -668,7 +720,7 @@ class KnowledgeBaseTool(ToolBase):
         lines.append("- `mode=read domain=<name> scope=global` — View a global domain")
         lines.append("- `mode=search query=<term> scope=global` — Search across all global KB files")
         lines.append("- `mode=status scope=global` — Show current status and recent activity")
-        lines.append("- Writes (`append`, `update`, `create_domain`) are not available for `scope=global`; use `scope=workspace` instead")
+        lines.append("- Writes (`append`, `update`, `create_domain`, `archive`) are not available for `scope=global`; use `scope=workspace` instead")
         return "\n".join(lines)
 
     def _mode_search(self, kb_root: Path) -> str:
@@ -1181,6 +1233,126 @@ class KnowledgeBaseTool(ToolBase):
 
         self._log_debug(f"Appended entry to {rel_path}: {entry_summary}")
         return result
+
+    def _mode_archive(self, kb_root: Path) -> str:
+        """Move dated entries older than ``older_than_days`` into ``_archive/``.
+
+        Only ``## `` blocks whose heading starts with an ISO date (the shape
+        ``mode=append`` writes: ``## YYYY-MM-DD — <summary>``) are candidates.
+        Structural headings and headings with an unparseable date are never
+        moved: they stay in the live file and are counted as skipped. Both the
+        archive and the live file are written atomically, and a run with nothing
+        old enough writes nothing at all (idempotent, byte-identical file).
+        """
+        if not self.domain:
+            return "Error: `domain` parameter is required for archive mode."
+
+        days = _KB_ARCHIVE_DEFAULT_DAYS if self.older_than_days is None else self.older_than_days
+        if days < 0:
+            return "Error: `older_than_days` must be 0 or greater for archive mode."
+
+        domain_name = self.domain.lower().replace(" ", "_")
+        try:
+            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name, for_write=True)
+        except ValueError as e:
+            return str(e)
+
+        if not file_path.exists():
+            return f"Error: `{rel_path}` does not exist; nothing to archive."
+
+        cutoff = (datetime.now() - timedelta(days=days)).date()
+        cutoff_str = cutoff.isoformat()
+
+        lock = _get_file_lock(str(file_path))
+        with lock:
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except OSError as e:
+                self._log_tool_error(f"Could not read {file_path} for archive: {e}")
+                return f"Error reading '{rel_path}': {e}"
+
+            preamble, blocks = _kb_split_blocks(content)
+
+            archived_blocks: List[str] = []
+            kept_blocks: List[str] = []
+            skipped_undated = 0
+            for heading, block in blocks:
+                match = _KB_ENTRY_DATE_RE.match(heading)
+                entry_date = None
+                if match:
+                    try:
+                        entry_date = datetime.strptime(match.group(0), "%Y-%m-%d").date()
+                    except ValueError:
+                        entry_date = None
+                if entry_date is None:
+                    skipped_undated += 1
+                    kept_blocks.append(block)
+                elif entry_date < cutoff:
+                    archived_blocks.append(block)
+                else:
+                    kept_blocks.append(block)
+
+            entries_kept = len(kept_blocks) - skipped_undated
+
+            if not archived_blocks:
+                return "\n".join([
+                    f"Nothing to archive in **{domain_name}** (`{rel_path}`): "
+                    f"no dated entry is older than {days} days (cutoff {cutoff_str}).",
+                    "",
+                    f"- Dated entries kept: {entries_kept}",
+                    f"- Headings without a parseable ISO date kept in place: {skipped_undated}",
+                    "- File left unchanged.",
+                ])
+
+            archived_text = "".join(archived_blocks)
+            new_live = preamble + "".join(kept_blocks)
+
+            # Safety net: the split must be lossless — every byte of the original
+            # is either still in the live file or preserved verbatim in the archive.
+            if len(new_live) + len(archived_text) != len(content):
+                self._log_tool_error(
+                    f"Archive split mismatch for {rel_path}: "
+                    f"{len(new_live)} + {len(archived_text)} != {len(content)}"
+                )
+                return f"Error: internal archive split mismatch for '{rel_path}'; nothing was written."
+
+            archive_rel = f"_archive/{rel_path}"
+            archive_path = kb_root / "_archive" / rel_path
+            try:
+                if archive_path.exists():
+                    existing = archive_path.read_text(encoding="utf-8").rstrip("\n")
+                    archive_text = f"{existing}\n\n{archived_text}"
+                else:
+                    archive_text = (
+                        f"# Archive — {rel_path}\n\n"
+                        f"> Entries moved out of `{rel_path}` by `mode=archive` "
+                        f"(older than {days} days as of {cutoff_str}). Oldest first.\n\n"
+                        f"{archived_text}"
+                    )
+                # Archive first: a failure after this point can duplicate entries
+                # on a retry, but can never lose them.
+                _kb_atomic_write(archive_path, archive_text)
+                _kb_atomic_write(file_path, new_live)
+            except OSError as e:
+                self._log_tool_error(f"Archive write failed for {rel_path}: {e}")
+                return f"Error archiving entries from '{rel_path}': {e}"
+
+        freed = len(content) - len(new_live)
+        self._log_debug(
+            f"Archived {len(archived_blocks)} entries from {rel_path} into {archive_rel}"
+        )
+        return "\n".join([
+            f"✅ Archived {len(archived_blocks)} entr"
+            f"{'y' if len(archived_blocks) == 1 else 'ies'} from **{domain_name}** (`{rel_path}`).",
+            "",
+            f"- Cutoff: dated entries older than {days} days (before {cutoff_str})",
+            f"- Entries archived: {len(archived_blocks)}",
+            f"- Dated entries kept: {entries_kept}",
+            f"- Headings without a parseable ISO date kept in place: {skipped_undated}",
+            f"- Bytes freed from the live file: {freed}",
+            f"- Archive: `{archive_rel}` (outside `project/` and `personal/`, so "
+            f"`mode=list` omits it; read it with a filesystem read)",
+        ])
 
     def _mode_update(self, kb_root: Path) -> str:
         """Replace a section's content in a domain file.

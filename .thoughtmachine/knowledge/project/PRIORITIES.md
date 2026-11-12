@@ -279,6 +279,30 @@ different file, different name. Never rename one to the other.
   **Maintenance rule.** When a bug reveals a missing rule, the same commit that fixes the bug
   updates `MANDATORY_STOP.md` / `ARCHITECTURE_MACHINE_MODEL.md` / `HANDOFF.md`.
 
+- **C60: Test Isolation Failures.** **Open.** The suite is not order-independent, and
+  it does not fit in one process. Evidence, measured on this branch: `pytest tests/`
+  collects **6771** tests; a single-process full run is **OOM-killed (exit 137) at ~79%**
+  (~5,300 tests, zero failures to that point), so the suite can only be run today by
+  chunking into separate processes. The chunked run gives **6697 passed / 10 failed /
+  67 skipped**. All 10 failures are order/isolation artifacts and **every one passes in
+  isolation**: 8 in `tests/test_worker_pause_reading_mode.py` (they pass in their own
+  10-file chunk and standalone), 2 in `tests/test_worker_operation_semantics.py`
+  (`TestWorkerPauseResumeSemantics::test_next_operator_turn_clears_stranded_main_pause`
+  and `::test_worker_turn_does_not_clear_main_pause`), plus
+  `tests/test_worker_stale_watchdog.py::test_stale_check_disabled_by_default` (flaky).
+  **Root-cause hypothesis:** a global LLM provider registry polluted by an earlier test
+  file in the same process; the symptom is
+  `ProviderNotFoundError: Provider 'openai_compatible' not found. Available: ['echotool']`
+  raised from `ProviderFactory.create_provider` during `Agent()` construction. File it as
+  a hypothesis, not a diagnosis — the polluting file is not yet identified.
+  **Acceptance criteria (desired state, not a proposed fix):** the full suite must pass
+  in a **single process with no order-dependent failures**, run in either order
+  (collection order and reverse), and the run must not exceed the container's memory
+  envelope; failing that, a **deterministic chunking harness** must exist — one
+  committed entry point that partitions the suite into fixed, documented chunks in
+  separate processes, aggregates a single pass/fail summary, and is what CI runs.
+  The suite must not be "green only if you know which files to keep apart".
+
 ## Numbering (Gen 63 housekeeping)
 
 - **The Archived block reuses two live IDs.** It holds a **C35** ("Prove the Host Port is

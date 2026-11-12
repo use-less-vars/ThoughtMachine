@@ -48,7 +48,12 @@ import pytest
 from agent.config.models import AgentConfig
 from agent.controller import AgentController
 from agent.core.agent import Agent
-from agent.core.state import AgentState, ExecutionState, SessionState
+from agent.core.state import (
+    AgentState,
+    ExecutionState,
+    SessionState,
+    describe_allowed_tools,
+)
 from tools.docker_code_runner import DockerCodeRunner
 from tools.sleep_tool import Sleep
 from tools.workspace.worker_thread import WorkerThread
@@ -390,48 +395,86 @@ class TestImplicitUnpauseOnNewQuery:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 11b. timeout restriction: read-only tools survive
+# 11b. timeout restriction: the ONLY grant is the write-only escape hatch
 # ────────────────────────────────────────────────────────────────────────────
 
-class TestTimeoutRestrictionKeepsReadOnlyTools:
-    def test_timeout_restriction_keeps_read_only_tools(self):
-        """A 'timeout' restriction must not blind the agent.
+class TestTimeoutRestrictionGrantsOnlyWriteEscape:
+    def test_timeout_restriction_advertises_the_write_escape_hatch(self):
+        """A 'timeout' restriction grants nothing that can READ.
 
-        The soft budget is spent, so no new WORK may start -- but the agent
-        still has to write up a response about code it may never have read in
-        this turn, so the read-only set stays available (Rationale:
-        thoughtmachine/timeout_constants.py). SummarizeTool stays too, so
-        compaction still works. Enforcement and display must agree, because
-        the rejection prose (``Available tools:``) is rendered from
-        ``get_allowed_tools()``.
+        The soft budget being spent is RESOURCE MANAGEMENT, not salvage: the
+        agent must yield and compact, so read tools are refused -- a read grant
+        lets it keep investigating, which defeats the restriction. The single
+        escape hatch is write-only, so verbatim working memory survives the
+        summary it is about to write (rationale:
+        thoughtmachine/timeout_constants.py). SummarizeTool stays so compaction
+        still works. Enforcement and display must agree, because the rejection
+        prose (``Available tools:``) is rendered from ``get_allowed_tools()``.
         """
         agent = _make_agent()
         agent.state.restrict("timeout")
 
         allowed = agent.state.get_allowed_tools()
-        assert "Respond" in allowed
-        assert "SummarizeTool" in allowed
-        assert "ReadFile" in allowed
-        assert "git_read" in allowed
-        # No work tools on this axis.
-        for work_tool in ("ApplyEdits", "FileEditor", "ContainerExecTool",
-                          "DockerCodeRunner", "Worker"):
-            assert work_tool not in allowed, f"{work_tool} leaked into {allowed}"
+        assert allowed == ["Respond", "SummarizeTool", "WorkingDocument"], (
+            f"unexpected timeout allow-list: {allowed}"
+        )
 
-        assert agent.state.is_tool_allowed("ReadFile") is True
-        assert agent.state.is_tool_allowed("ApplyEdits") is False
-        assert agent.state.is_tool_allowed("ContainerExecTool") is False
+        # The hatch is advertised AND enforceable.
+        assert agent.state.is_tool_allowed("WorkingDocument") is True
+        # Neither read tools nor work tools survive this axis.
+        for refused in ("ReadFile", "FileSearchTool", "FileSummaryTool",
+                        "GlobTool", "DirectoryTreeTool", "CheckSystem",
+                        "git_read", "ApplyEdits", "FileEditor",
+                        "ContainerExecTool", "DockerCodeRunner", "Worker"):
+            assert agent.state.is_tool_allowed(refused) is False, refused
 
-    def test_timeout_restriction_still_blocks_before_finishing(self):
-        """The restriction is a wind-down, not a licence: writes stay refused.
+    def test_timeout_restriction_sentence_is_derived_from_the_gate(self):
+        """The warning prose is a rendering of ``get_allowed_tools()``.
 
-        Guards the fail-closed direction -- adding the read-only set must not
+        Pinned verbatim: a hardcoded sentence is what let the message drift
+        from the gate it describes (it kept advertising read tools after the
+        allow-list stopped granting them).
+        """
+        agent = Agent(
+            config=AgentConfig(
+                api_key="test-key",
+                enable_logging=False,
+                time_monitor_enabled=True,
+                timeout_seconds=300,
+                time_warning_threshold=240,
+            ),
+            session_id="test-timeout-prose",
+        )
+        agent.state.last_time_warning_state = None
+        events = agent.state.update_time_state(301.0)
+
+        warnings = [e for e in events if e.get("type") == "time_warning"]
+        assert warnings, "expected a time_warning event at CRITICAL"
+        msg = warnings[-1].get("warning_message", "")
+
+        # Same decision, rendered: the sentence IS the gate's allow-list.
+        rendered = describe_allowed_tools(agent.state.get_allowed_tools())
+        assert rendered in msg, f"warning must render the gate verbatim: {msg}"
+        assert (
+            "Only the following tools are available: "
+            "Respond, SummarizeTool, WorkingDocument."
+        ) in msg, f"pinned wording changed: {msg}"
+        for read_tool in ("ReadFile", "git_read", "FileSearchTool"):
+            assert read_tool not in msg, (
+                f"{read_tool} must not be advertised under a timeout: {msg}"
+            )
+
+    def test_other_axes_stay_respond_only(self):
+        """The restriction is a wind-down, not a licence.
+
+        Guards the fail-closed direction -- adding the write hatch must not
         have widened any other axis.
         """
         agent = _make_agent()
         agent.state.restrict("turn")
         assert agent.state.get_allowed_tools() == ["Respond"]
         assert agent.state.is_tool_allowed("ReadFile") is False
+        assert agent.state.is_tool_allowed("WorkingDocument") is False
 
 
 # ────────────────────────────────────────────────────────────────────────────

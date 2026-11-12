@@ -613,7 +613,7 @@ def _run_gated_tool(agent):
 
 _Q1_DENIAL = (
     "Permission denied: Tool requires filesystem:write, "
-    "but session allows filesystem:banned"
+    "but the effective grant is filesystem:banned (denied by: session grant)"
 )
 
 

@@ -676,7 +676,13 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     // save is never deferred behind the busy-queue ('Queued — applying…').
     const permissionsOnlyApply = Boolean(sessionPerms) && permsDirty && !isDirty && providerVersion === 0;
 
-    if (sessionId && sessionPerms) {
+    // Only a PENDING permission edit may write the session sidecar. A
+    // config-only Apply (temperature, max_turns, model, provider, ...) must
+    // never touch PUT /api/session/{id}/permissions: that write is what tells
+    // the live agent "Your permissions have been updated" (backend
+    // _notify_permissions_changed), so firing it on a config change reports a
+    // permission change that never happened.
+    if (sessionId && sessionPerms && permsDirty) {
       try {
         await putSessionPermissions(sessionPerms.raw ?? {})
       } catch (err) {

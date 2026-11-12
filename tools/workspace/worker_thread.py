@@ -208,10 +208,20 @@ from tools.workspace.worker_container import (
     worker_owner_label,
 )
 from tools.workspace.worker_timeout import (
+    JOIN_DEFAULT_WAIT_SECONDS,
     _worker_timeout_detected,
     _worker_query_wait_timeout,
+    budget_for_thread,
     clamped_wait_for_job_timeout,
+    store_budget_on_thread,
     wait_for_worker_exit,
+)
+from thoughtmachine.timebudget import (
+    CEILING_OWNER,
+    DECLARED_CEILING,
+    DEFAULT_REQUEST_SECONDS,
+    TimeBudget,
+    TimeBudgetExceeded,
 )
 from tools.workspace.worker_execution import ExecutionTracker
 
@@ -5570,6 +5580,40 @@ class Worker(ToolBase):
 
             workers = self._load_workers(ws_id)
 
+            # ── ONE CLOCK (defect #5): resolve the caller's budget here ──
+            # This is the earliest dispatch point.  ``strict=True`` means a
+            # request above DECLARED_CEILING FAILS AT DISPATCH: no spawn, no
+            # queue, no sleep -- a refusal envelope naming the request, the
+            # ceiling and the layer that owns it.  Nothing on this path is
+            # silently clamped any more.
+            self._dispatch_budget = None
+            if self.action in ("spawn", "query", "join", "wait_for_job"):
+                try:
+                    self._dispatch_budget = TimeBudget.resolve(
+                        self.timeout_seconds,
+                        default=DEFAULT_REQUEST_SECONDS,
+                        cap=DECLARED_CEILING,
+                        strict=True,
+                        source=f"worker_thread.{self.action}",
+                    )
+                except TimeBudgetExceeded as exc:
+                    return json.dumps(
+                        {
+                            "error": str(exc),
+                            "message": str(exc),
+                            "status": "rejected",
+                            "action": self.action,
+                            "worker_name": self.worker_name,
+                            "requested_timeout_seconds": exc.requested,
+                            "declared_ceiling_seconds": exc.ceiling,
+                            "timeout_ceiling_owner": exc.owner,
+                            "timeout_clamped": False,
+                            "timeout_source": exc.source,
+                        },
+                        indent=2,
+                        default=str,
+                    )
+
             handler = {
                 "list": lambda: self._action_list(workers),
                 "spawn": lambda: self._action_spawn(workers, ws_id),
@@ -5585,6 +5629,11 @@ class Worker(ToolBase):
             }[self.action]
 
             result = handler()
+            # Every envelope a timed action returns carries the ONE clock it
+            # was given (requested / effective / clamped / clamped_by /
+            # source) as flat keys -- never buried in a string.
+            if isinstance(result, dict) and self._dispatch_budget is not None:
+                result = {**result, **self._dispatch_budget.as_envelope_fields()}
             if self.action not in self.CONTEXT_ACTIONS and self.context is not None:
                 # A context this action cannot carry must be dropped VISIBLY.
                 result["context_ignored"] = (
@@ -6693,11 +6742,34 @@ class Worker(ToolBase):
         # Compute effective timeout: explicit tool override, otherwise None so
         # WorkerThread.__init__ applies its SESSION-owned resolution chain
         # (definition > agent_config > session_config > WORKER_TIMEOUT_SECONDS).
-        effective_timeout = (
+        # ── ONE CLOCK (defect #5) ──────────────────────────────────────
+        # The SESSION-owned chain the thread would apply (definition >
+        # agent_config > session_config > WORKER_TIMEOUT_SECONDS) is evaluated
+        # here, exactly once, through the declared ceiling -- and the resolved
+        # ``effective`` is what the thread is given, so the worker's own agent
+        # loop (worker_thread.py:2985 -> AgentConfig.timeout_seconds) times out
+        # on the same number the caller waits for.
+        _chain_timeout = definition.get("timeout_seconds")
+        if _chain_timeout is None:
+            _chain_timeout = (agent_config or {}).get("worker_timeout_seconds")
+        if _chain_timeout is None:
+            _chain_timeout = (
+                (agent_config or {}).get("session_config") or {}
+            ).get("worker_timeout_seconds")
+        _requested_timeout = (
             self.timeout_seconds
             if self.timeout_seconds is not None
-            else definition.get("timeout_seconds")
+            else _chain_timeout
         )
+        budget = TimeBudget.resolve(
+            _requested_timeout,
+            default=WORKER_TIMEOUT_SECONDS,
+            cap=DECLARED_CEILING,
+            strict=True,
+            source="worker_thread.spawn",
+        )
+        self._dispatch_budget = budget
+        effective_timeout = budget.effective
 
         # Build a ContainerManager bound to this session/workspace so the
         # worker can stop/remove the containers it owns at teardown. Falls
@@ -6744,6 +6816,9 @@ class Worker(ToolBase):
             instance_id=spawn_iid,
             container_manager=container_manager,
         )
+        # Pin the dispatch-time budget on the thread so later hops (query /
+        # join) reuse THIS number instead of re-resolving a different one.
+        store_budget_on_thread(thread, budget)
 
         # S5: close the runtime -> supervisor frame seam for this worker. The
         # handle is built here and never started, so nothing about the thread's
@@ -7296,13 +7371,22 @@ class Worker(ToolBase):
                     "instance_id": iid,
                 }
 
+        # ONE CLOCK: record the budget this hop actually uses (the thread's
+        # dispatch-time budget, or a per-call request) for the envelope.
+        self._dispatch_budget = budget_for_thread(
+            thread,
+            requested=self.timeout_seconds,
+            default=DEFAULT_REQUEST_SECONDS,
+            source="worker_thread.query",
+        )
         wait = _worker_query_wait_timeout(
             getattr(thread, "_timeout_seconds", None),
-            fallback=300.0,
+            fallback=DEFAULT_REQUEST_SECONDS,
         )
-        if wait != 300.0:
+        if wait != DEFAULT_REQUEST_SECONDS:
             logger.info(
-                "query wait %.0fs (effective timeout %.0fs + grace) exceeds legacy 300s cap",
+                "query wait %.0fs (effective timeout %.0fs + grace); "
+                "no cap applied -- bounded only by the declared ceiling",
                 wait,
                 wait - QUERY_WAIT_GRACE_SECONDS,
             )
@@ -7534,8 +7618,10 @@ class Worker(ToolBase):
 
         Shared handler for both the ``join`` and ``wait_for_job`` actions.
         ``worker_query`` carries the job_id (same convention as ``job_status``).
-        Polls the job registry in 0.25s slices for a total of ``timeout_seconds``
-        (default 60, hard cap 300). Returns early on: job terminal state
+        Polls the job registry in 0.25s slices for a total of the RESOLVED
+        budget -- the per-call request if given, else the budget pinned on the
+        thread at spawn (default 60, bounded only by DECLARED_CEILING). There
+        is no 300 s cap. Returns early on: job terminal state
         (completed / timeout / error), a partial result (status ``partial_result``
         + preview), the worker thread pausing (``status == 'paused'``) or being
         detached (``status == 'detached'``), a kill signal (stop_event set /
@@ -7569,13 +7655,20 @@ class Worker(ToolBase):
                 "job_id": job_id,
                 "worker_name": self.worker_name,
             }
-        requested_timeout = int(self.timeout_seconds or 60)
-        if requested_timeout > 300:
-            logger.info(
-                "wait_for_job: requested timeout %ds exceeds 300s cap; clamped to 300s",
-                requested_timeout,
-            )
-        total = min(requested_timeout, 300)
+        # ── ONE CLOCK (defect #5): no more hardcoded 300 ───────────────
+        # The wait is the RESOLVED budget for this worker (the per-call request
+        # if given, else the budget resolved at dispatch), and the return value
+        # below is the effective number -- a 420 s request waits 420 s.
+        budget = budget_for_thread(
+            thread,
+            requested=self.timeout_seconds,
+            default=JOIN_DEFAULT_WAIT_SECONDS,
+            source="worker_thread.join",
+        )
+        self._dispatch_budget = budget
+        if budget.clamped:
+            logger.warning("wait_for_job: %s", budget.clamp_reason())
+        total = int(budget.effective)
         deadline = time.monotonic() + total
         last_status = rec.get("status")
         while True:

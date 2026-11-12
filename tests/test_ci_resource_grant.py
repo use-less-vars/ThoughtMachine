@@ -73,8 +73,11 @@ def test_ci_read_requirement_denied_without_grant():
         ["ci:read"], eff, "DummyCiTool", {}, "read ci", event_bus=None
     )
     assert ok is False
+    # The refusal grant ("banned") is never described as "session allows":
+    # the denial names the layer that actually denies the call.
     assert msg == (
-        "Permission denied: Tool requires ci:read, but session allows ci:banned"
+        "Permission denied: Tool requires ci:read, "
+        "but the effective grant is ci:banned (denied by: session grant)"
     )
 
 
