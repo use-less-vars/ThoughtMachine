@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.core.state import AgentState
-from thoughtmachine.timeout_constants import TIMEOUT_READ_ONLY_TOOLS
+from thoughtmachine.timeout_constants import TIMEOUT_WRITE_ESCAPE_TOOLS
 
 
 def _state() -> AgentState:
@@ -97,25 +97,28 @@ def test_allowed_tools_respond_only_for_non_token_reasons(reason):
     assert state.get_allowed_tools() == ['Respond']
 
 
-# f2) 'timeout' stops new WORK, not reading: Respond + SummarizeTool + the
-# explicit read-only set, taken from the single source of truth.
-def test_allowed_tools_timeout_reason_allows_respond_summarize_and_read_only():
-    """Display and gate must agree on the widened timeout allow-list."""
+# f2) 'timeout' stops new WORK *and* further reading: Respond + SummarizeTool
+# + the single write-only escape hatch, from the single source of truth.
+def test_allowed_tools_timeout_reason_allows_respond_summarize_and_write_escape():
+    """Display and gate must agree on the timeout allow-list."""
     state = _state()
     state.restrictions_active = True
     state.restriction_reason = 'timeout'
 
-    expected = ['Respond', 'SummarizeTool'] + sorted(TIMEOUT_READ_ONLY_TOOLS)
+    expected = ['Respond', 'SummarizeTool'] + sorted(TIMEOUT_WRITE_ESCAPE_TOOLS)
     assert state.get_allowed_tools() == expected
     # Every advertised tool must actually pass the gate, and vice versa.
     for name in expected:
         assert state.is_tool_allowed(name) is True, name
 
-    # Read-only members are allowed...
-    assert state.is_tool_allowed('ReadFile') is True
-    # ...write/execute tools are refused under a spent budget.
-    assert state.is_tool_allowed('ApplyEdits') is False
-    assert state.is_tool_allowed('ContainerExecTool') is False
+    # The write-only hatch is the ONE thing this axis adds: it can dump working
+    # memory to disk, then the agent yields and compacts.
+    assert state.is_tool_allowed('WorkingDocument') is True
+    # Nothing that would let the agent keep INVESTIGATING is allowed -- the
+    # restriction is resource management, not salvage.
+    for refused in ('ReadFile', 'FileSearchTool', 'git_read',
+                    'ApplyEdits', 'ContainerExecTool'):
+        assert state.is_tool_allowed(refused) is False, refused
 
 
 def test_allowed_tools_token_reason_allows_summarize():
