@@ -21,8 +21,9 @@ b43163dc docs: log security boundary C-items
 3. `.thoughtmachine/knowledge/project/MANDATORY_STOP.md` -- the read-on-entry rules; none of them are optional. - sha256:ca47ffe5df0e3b242bfd22543794ef4e8b03ec78b169fc9fb24851c08b76e9d1
 4. `.thoughtmachine/knowledge/project/architecture_invariants.md` -- the invariants a design must not re-derive. - sha256:d7364ff4686a59dc118d3cb9dbde7a516d64c3e3bf80853756e9e2b713da9645
 5. `docs/ARCHITECTURE_MACHINE_MODEL.md` -- what runs where, and what stops it. - sha256:ed240aba0bc0e0ac757d5ce10e6306317380529d691b81d8a9fd88d5a3c9544c
-6. `.thoughtmachine/knowledge/project/vision_ledger.md` -- the five standing commitments (V1-V5). - sha256:5a01a13c684e94f5bc0e762807b8183d9e06f283b20caf3389aec662149ff930
-7. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:aa6670275083f6a38f9943843bb0efc759ec8dce2e7986605f2dfeea0122bd38
+6. `.thoughtmachine/knowledge/project/machine_history_and_vision.md` -- the incidents behind the rules, and what they are for. - sha256:b444c581ca3648f9b6ddd985c6aa5e486e767abd07651edb07953b5df2bd6032
+7. `.thoughtmachine/knowledge/project/vision_ledger.md` -- the five standing commitments (V1-V5). - sha256:5a01a13c684e94f5bc0e762807b8183d9e06f283b20caf3389aec662149ff930
+8. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:aa6670275083f6a38f9943843bb0efc759ec8dce2e7986605f2dfeea0122bd38
 
 ## First task (from the live queue)
 
@@ -53,6 +54,8 @@ b43163dc docs: log security boundary C-items
 - **C45** -- worker briefing is stripped before turn 1.
 - **C46** -- host-port kill-switch scan root is the wrong shape (class fix, not a point fix).
 - **C47** -- onboarding bundle is a stale snapshot, not a living artifact (delivered on this branch).
+- **C60** -- Test Isolation Failures.
+- **C61** -- In-flight Tool Cancellation & Dispatch Window.
 
 ## Rules of Engagement (Gen 62 Protocol)
 

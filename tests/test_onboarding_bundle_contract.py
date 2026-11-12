@@ -53,14 +53,15 @@ NEW_MEMBERS = [
 # reason.
 ADVISORY_MEMBER = ".thoughtmachine/knowledge/project/PRIORITIES.md"
 
-# Exactly the manifest entries that DO record a digest: the six members whose
-# bytes are stable across branches, and therefore the six the digest is a real
+# Exactly the manifest entries that DO record a digest: the seven members whose
+# bytes are stable across branches, and therefore the seven the digest is a real
 # tripwire for. Kept next to ADVISORY_MEMBER so the two cannot drift apart.
 HASHED_MEMBERS = [
     "docs/CONTROL_PLANE.md",
     ".thoughtmachine/knowledge/project/MANDATORY_STOP.md",
     ".thoughtmachine/knowledge/project/architecture_invariants.md",
     "docs/ARCHITECTURE_MACHINE_MODEL.md",
+    ".thoughtmachine/knowledge/project/machine_history_and_vision.md",
     ".thoughtmachine/knowledge/project/vision_ledger.md",
     ".thoughtmachine/knowledge/project/INFRA_ONBOARDING.md",
 ]
@@ -225,7 +226,7 @@ def test_checked_in_handoff_matches_fresh_generation(tmp_path):
 
     Still BYTE-PINNED (the queue body is the only thing collapsed first): the
     title and generation banner, the pinned `dev` line, the five-commit block,
-    all seven manifest entries with their prose, the six stable sha256 digests,
+    all eight manifest entries with their prose, the seven stable sha256 digests,
     the rules of engagement, the carried traps, the 'do not re-litigate' block
     and the footer.
 
