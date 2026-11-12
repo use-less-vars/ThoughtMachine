@@ -13,4 +13,35 @@ Items promoted from observations → design decisions → migration strands → 
 5. Read the recon map.
 6. Verify live state: dev HEAD, branch protection, open branches, open strands.
 7. Report to operator: what is current, what is blocked, what is next.
+
+## Stop rules
+
+Not reading items. Each is a place where the obvious local fix *is* the bug. Provenance is given so
+the rule can be checked rather than believed; the full narrative is `docs/ARCHITECTURE_MACHINE_MODEL.md`
+§9.
+
+- **Never add a tool that forwards to another tool class.** No "safe wrapper". The gate evaluates
+the categories of the tool the *call* names; a wrapper names one tool and runs another, so its
+declared categories describe nothing that happens. Tried in three steps and abandoned: `8aa17e0d`
+(contain the context fields), `0c125856` (re-gate inside `execute()`), `4a4bd692` (delete
+`PaginateTool` — 223 lines, 18 tests retired with it). Class rule: `hygiene/no-tool-wrapping`.
+If your fix is a wrapper, stop.
+- **Never re-declare authority below a gate.** Gate inputs come from the chain
+(`docs/ARCHITECTURE_MACHINE_MODEL.md` §2), never from the caller's payload. Identity is not
+context: `_CONTEXT_FIELDS` was written as a list of *paths* and omitted `workspace_id`, which is how
+a containment list became an attribution defect. `_NEVER_FORWARD = ('workspace_id',)` records the
+correction.
+- **A structural blocklist is not a call-time gate.** `_NEVER_PAGINATE` was necessary because
+several blocklisted tools declare no categories at all, so no categories gate can see them. If your
+safety argument is "X is not in the list", name what enforces the list and when.
+- **Never `--no-verify`; never disable, edit or "temporarily" move the host hook.** Not a style
+rule. The host git path neutralizes hooks by construction (`core.hooksPath=/dev/null` plus
+`--no-verify`) and *refuses* a commit when `.githooks/pre-commit` exists but cannot be enforced.
+A commit timeout is not a pass: the hook ran and was killed with paths staged and HEAD unmoved.
+Use container mode or fix the hook. Pinned by `tests/security/test_git_hardening.py`.
+- **"Dormant" is a claim about one shell, not about the machine.** `.githooks/pre-commit` was
+deleted in `85035605` because `core.hooksPath` read as unset from a bare shell while the container
+path sets it explicitly. Before removing anything on the strength of a default value, establish
+which of the three commit paths you are standing on.
+
 <!-- Housekeeping note (Gen 48): the header above advertises an archive section that does not exist. Not added this pass; tracked for a later turn. -->

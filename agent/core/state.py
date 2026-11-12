@@ -7,8 +7,25 @@ from agent import events as ev
 from agent.logging import log
 from thoughtmachine.timeout_constants import (
     SOFT_BUDGET_FALLBACK_SECONDS,
-    TIMEOUT_READ_ONLY_TOOLS,
+    TIMEOUT_WRITE_ESCAPE_TOOLS,
 )
+
+
+def describe_allowed_tools(allowed: List[str]) -> str:
+    """Render an allow-list as the sentence shown to the model.
+
+    The ONE place tool names are turned into prose. Every restriction warning
+    must go through here (and hand it ``get_allowed_tools()``), so the message
+    can never contradict the gate that actually refuses the call -- the
+    divergence bug this replaced hardcoded "Only the Respond tool is
+    available" and kept saying it long after the allow-list had changed.
+    """
+    if not allowed:
+        return 'No tools are available.'
+    if len(allowed) == 1:
+        return f'Only the {allowed[0]} tool is available.'
+    return f'Only the following tools are available: {", ".join(allowed)}.'
+
 
 class TokenState(enum.Enum):
     """Token usage state based on conversation token count."""
@@ -220,21 +237,25 @@ class AgentState:
                     f'Tool restrictions will be applied when the timeout is reached.'
                 )
             else:
+                # Set the restriction BEFORE composing the sentence, then
+                # DERIVE the sentence from get_allowed_tools(): the prose and
+                # the gate that refuses the call are then the same decision,
+                # so they cannot drift apart (no second hardcoded tool list).
+                self.restrictions_active = True
+                self.restrictions_pending = False
+                self.restriction_reason = 'timeout'
                 warning = (
                     f'**Time critical**: Agent has exceeded the timeout '
                     f'({timeout}s). Tool restrictions are now active. '
-                    f'Only Respond, SummarizeTool and the read-only tools '
-                    f'are available. Please finish your work and respond '
-                    f'immediately.'
+                    f'{describe_allowed_tools(self.get_allowed_tools())} '
+                    f'Please finish your work and respond immediately.'
                 )
             self.last_time_warning = warning
             self.last_time_warning_count = int(elapsed_seconds)
             self.last_time_warning_state = new_state
 
-            if new_state == TimeState.CRITICAL:
-                self.restrictions_active = True
-                self.restrictions_pending = False
-                self.restriction_reason = 'timeout'
+            # The 'timeout' restriction itself was set just above, before the
+            # warning sentence was derived from it (single mutation site).
 
             if self.logger:
                 self.logger.log_time_warning(old_state.value, new_state.value, elapsed_seconds, warning)
@@ -469,12 +490,12 @@ class AgentState:
         is True the allow-list is chosen strictly by restriction_reason:
 
         - 'turn': Only Respond is allowed (agent must finish immediately).
-        - 'timeout': Respond + SummarizeTool + the explicit read-only set
-          ``TIMEOUT_READ_ONLY_TOOLS`` (see thoughtmachine.timeout_constants).
-          The runtime budget is spent, so no new WORK may start, but the agent
-          must still be able to read code/tests/logs while writing up its
-          response -- a Respond-only allow-list forced it to narrate from
-          memory or guess. SummarizeTool is included so compaction still works.
+        - 'timeout': Respond + SummarizeTool + TIMEOUT_WRITE_ESCAPE_TOOLS.
+          The timeout restriction is RESOURCE MANAGEMENT, not salvage: the
+          agent must yield and compact, so no read tool is granted (read
+          access would let it keep investigating). The single WRITE-only
+          escape hatch lets it dump verbatim working memory to disk first, so
+          the detail survives the summary.
         - 'pause': Only Respond is allowed (externally paused; wait it out).
         - 'token': Respond + SummarizeTool allowed (SummarizeTool needed to
           reduce context).
@@ -496,8 +517,9 @@ class AgentState:
         if reason == 'token':
             return ['Respond', 'SummarizeTool']
         if reason == 'timeout':
-            # Sorted for a stable, diffable allow-list in logs and error prose.
-            return ['Respond', 'SummarizeTool'] + sorted(TIMEOUT_READ_ONLY_TOOLS)
+            # Write-only escape hatch: dump the detail, then yield. Nothing
+            # here can be used to continue the investigation.
+            return ['Respond', 'SummarizeTool'] + sorted(TIMEOUT_WRITE_ESCAPE_TOOLS)
         # 'turn', 'pause' and every unrecognised reason: fail safe to
         # Respond-only rather than assuming the token allow-list.
         return ['Respond']
@@ -523,11 +545,11 @@ class AgentState:
         if reason == 'token':
             return tool_name in ('Respond', 'SummarizeTool')
         if reason == 'timeout':
-            # Budget spent: no new work, but read-only tools stay usable so the
-            # agent can still inspect the code/logs it is reporting on.
-            return (
-                tool_name in TIMEOUT_READ_ONLY_TOOLS
-                or tool_name in ('Respond', 'SummarizeTool')
+            # Must agree EXACTLY with get_allowed_tools() for 'timeout' --
+            # same literal, same escape-hatch constant, same order.
+            return tool_name in (
+                ('Respond', 'SummarizeTool')
+                + tuple(sorted(TIMEOUT_WRITE_ESCAPE_TOOLS))
             )
         # 'turn', 'pause' and every unrecognised reason (including a missing
         # `restriction_reason`): fail safe to Respond-only rather than assuming
