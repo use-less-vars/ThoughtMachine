@@ -118,6 +118,12 @@ except ImportError as e:
     _record_import_failure("ReadFile", e)
 
 try:
+    from .read_file_confined_tool import ReadFileTool
+    TOOL_CLASSES.append(ReadFileTool)
+except ImportError as e:
+    _record_import_failure("ReadFileTool", e)
+
+try:
     from .file_preview_tool import FilePreviewTool
     TOOL_CLASSES.append(FilePreviewTool)
 except ImportError as e:

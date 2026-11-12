@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 import typing
 from agent import events as ev
 from agent.logging import log
-from thoughtmachine.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
+from thoughtmachine.timeout_constants import (
+    SOFT_BUDGET_FALLBACK_SECONDS,
+    TIMEOUT_READ_ONLY_TOOLS,
+)
 
 class TokenState(enum.Enum):
     """Token usage state based on conversation token count."""
@@ -220,8 +223,9 @@ class AgentState:
                 warning = (
                     f'**Time critical**: Agent has exceeded the timeout '
                     f'({timeout}s). Tool restrictions are now active. '
-                    f'Only the Respond tool is available. Please finish your work '
-                    f'and respond immediately.'
+                    f'Only Respond, SummarizeTool and the read-only tools '
+                    f'are available. Please finish your work and respond '
+                    f'immediately.'
                 )
             self.last_time_warning = warning
             self.last_time_warning_count = int(elapsed_seconds)
@@ -465,11 +469,22 @@ class AgentState:
         is True the allow-list is chosen strictly by restriction_reason:
 
         - 'turn': Only Respond is allowed (agent must finish immediately).
-        - 'timeout': Only Respond is allowed (agent exceeded runtime limit).
+        - 'timeout': Respond + SummarizeTool + the explicit read-only set
+          ``TIMEOUT_READ_ONLY_TOOLS`` (see thoughtmachine.timeout_constants).
+          The runtime budget is spent, so no new WORK may start, but the agent
+          must still be able to read code/tests/logs while writing up its
+          response -- a Respond-only allow-list forced it to narrate from
+          memory or guess. SummarizeTool is included so compaction still works.
         - 'pause': Only Respond is allowed (externally paused; wait it out).
         - 'token': Respond + SummarizeTool allowed (SummarizeTool needed to
           reduce context).
         - anything else (unknown, None, empty string): Only Respond.
+
+        Display-only: enforcement happens in ``is_tool_allowed()``, which
+        computes the same decision inline. The two MUST agree -- the
+        tool-rejection prose in ``agent/core/tool_executor.py`` renders the
+        ``Available tools:`` list directly from this method, so it has to name
+        the read-only set now that those tools are actually permitted.
 
         The final branch is a fail-safe: an unattributable reason must never
         grant a broader allow-list than the narrowest one, otherwise a
@@ -480,8 +495,11 @@ class AgentState:
         reason = getattr(self, 'restriction_reason', None)
         if reason == 'token':
             return ['Respond', 'SummarizeTool']
-        # 'timeout', 'turn', 'pause' and every unrecognised reason: fail safe
-        # to Respond-only rather than assuming the token allow-list.
+        if reason == 'timeout':
+            # Sorted for a stable, diffable allow-list in logs and error prose.
+            return ['Respond', 'SummarizeTool'] + sorted(TIMEOUT_READ_ONLY_TOOLS)
+        # 'turn', 'pause' and every unrecognised reason: fail safe to
+        # Respond-only rather than assuming the token allow-list.
         return ['Respond']
 
     def is_tool_allowed(self, tool_name: str) -> bool:
@@ -504,7 +522,14 @@ class AgentState:
         reason = getattr(self, 'restriction_reason', None)
         if reason == 'token':
             return tool_name in ('Respond', 'SummarizeTool')
-        # 'timeout', 'turn', 'pause' and every unrecognised reason (including
-        # a missing `restriction_reason`): fail safe to Respond-only rather
-        # than assuming the token allow-list.
+        if reason == 'timeout':
+            # Budget spent: no new work, but read-only tools stay usable so the
+            # agent can still inspect the code/logs it is reporting on.
+            return (
+                tool_name in TIMEOUT_READ_ONLY_TOOLS
+                or tool_name in ('Respond', 'SummarizeTool')
+            )
+        # 'turn', 'pause' and every unrecognised reason (including a missing
+        # `restriction_reason`): fail safe to Respond-only rather than assuming
+        # the token allow-list.
         return tool_name == 'Respond'

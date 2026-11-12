@@ -320,12 +320,13 @@ def test_control_verb_raises_under_a_bumped_epoch(registry):
 # -- 9: spawn resolves the mode and carries the identity through -----------
 
 
-def test_spawn_thread_mode_resolves_mode_and_captures_identity(registry):
+def test_spawn_default_mode_resolves_to_process_and_captures_identity(registry):
     seed = FakeWorker(generation=7)
 
     handle = WorkerRuntimeHandle.spawn(seed, environ={})
 
-    assert handle.mode == MODE_THREAD
+    # Absent flag -> the isolation default (DEFAULT_RUNTIME_MODE).
+    assert handle.mode == MODE_PROCESS
     assert handle.epoch == 7
     assert handle._session_id == SESSION
     assert handle._worker_name == WORKER

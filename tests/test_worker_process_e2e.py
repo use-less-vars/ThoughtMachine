@@ -29,9 +29,10 @@ the two claims it is asked to support are both asserted here: the handle the
 production path built says ``process`` (test 1), and a dispatch through that
 handle is answered by a different OS process, whose pid it echoes (test 2).
 
-Test 3 pins the other direction: with the flag unset the same spawn site must
-still resolve ``thread``, so wiring process mode cannot quietly become the
-default.
+Test 3 pins the default: with the flag unset the same spawn site must resolve
+``process`` and answer from a real child, so the opt-in flag and the default
+cannot drift apart (``DEFAULT_RUNTIME_MODE`` in
+``tools/workspace/worker_runtime.py``).
 
 If the runtime silently falls back to threads, test 1 goes red on
 ``handle.mode``. That red is the entire point of C40 -- a green test over a
@@ -54,7 +55,6 @@ import tools.workspace.worker_thread as worker_thread_module
 from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_runtime import (
     MODE_PROCESS,
-    MODE_THREAD,
     WORKER_RUNTIME_MODE_ENV,
     WorkerRuntimeHandle,
     resolve_runtime_mode,
@@ -334,13 +334,25 @@ def test_process_mode_envelope_comes_back_from_a_spawned_child(tmp_path):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# 3. The default path is unaffected
+# 3. The default path (flag unset) is process mode
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_the_default_spawn_path_is_still_thread_mode(tmp_path, monkeypatch):
-    """With the flag unset the same spawn site must resolve ``thread``."""
+@pytest.mark.skipif(
+    not _can_spawn_processes(),
+    reason="this platform cannot create OS processes; process mode is untestable",
+)
+def test_the_default_spawn_path_is_process_mode(tmp_path, monkeypatch):
+    """With the flag unset the same spawn site must resolve ``process``.
+
+    ``DEFAULT_RUNTIME_MODE`` is ``process``, so an operator who never sets the
+    flag still gets isolation. Red if the default drifts back to ``thread``: the
+    handle comes back thread-mode and nothing is spawned.
+    """
     monkeypatch.delenv(WORKER_RUNTIME_MODE_ENV, raising=False)
+    assert WORKER_RUNTIME_MODE_ENV not in os.environ, (
+        "precondition: the flag must genuinely be absent"
+    )
 
     created: List[Any] = []
     session_id, result, fake = _drive_the_production_spawn_site(
@@ -349,7 +361,20 @@ def test_the_default_spawn_path_is_still_thread_mode(tmp_path, monkeypatch):
     handle = fake._runtime_handle
     try:
         assert result.get("spawned") is True, f"the spawn itself failed: {result!r}"
-        assert handle.mode == MODE_THREAD
+        assert handle.mode == MODE_PROCESS, (
+            f"with {WORKER_RUNTIME_MODE_ENV} unset the production spawn site "
+            f"built a {handle.mode!r} handle; the default must be "
+            f"{MODE_PROCESS!r}"
+        )
+        reply = handle.dispatch_query(SENTINEL, timeout=30)
+        child_pid = _pid_from_reply(reply)
+        assert child_pid != os.getpid(), (
+            f"the reply claims to come from pid {child_pid}, which is this "
+            f"interpreter: the default path did not spawn a child"
+        )
+        assert reply.endswith(f":{SENTINEL}"), (
+            f"the child must echo the sentinel it was given: {reply!r}"
+        )
     finally:
         handle.close(grace_ms=2000)
         worker_module._worker_registry.pop((session_id, WORKER, 1), None)

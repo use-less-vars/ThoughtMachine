@@ -7,7 +7,7 @@ scripts/build_onboarding.sh parses (see scripts/lib/kb_manifest.sh, which
 requires a "## 2." heading and backticked numbered items) and that
 scripts/check_kb_staleness.sh verifies for staleness.
 
-Every manifest entry carries the digest of the file it names, recorded inline
+Most manifest entries carry the digest of the file they name, recorded inline
 as ``- sha256:<64 hex>``. There is deliberately no second lockfile: a lockfile
 drifts away from the section it claims to guard, and the section is what the
 bundle actually ships. The recorded digest is over the file's BYTES. The shell
@@ -15,6 +15,19 @@ side (``kb_sha256`` in scripts/lib/kb_manifest.sh -- it prefers ``shasum -a 256`
 and falls back to ``sha256sum``, then ``openssl dgst -sha256``) must agree with ``hashlib.sha256`` here or
 every check reports a false positive, so the rule is stated once per language
 and nowhere else.
+
+THE ADVISORY EXCEPTION: an entry listed in ``ADVISORY`` below is still listed
+in the manifest but records NO digest. A recorded digest is a merge-time
+tripwire -- "these are the bytes HANDOFF was generated from" -- which only
+means something for a file whose bytes are STABLE across branches. The live
+work queue (``PRIORITIES.md``) is not such a file: it is edited by every branch
+that opens, closes or re-words a C-item and rewritten whenever dev is merged,
+so its digest is branch-local BY DEFINITION. Hard-recording it would red the
+contract test on any branch that is merely up to date with dev, and the only
+cure anyone would find for that false alarm is hand-editing the router -- the
+exact drift the digest exists to catch. So it stays first in the list (it is
+the first thing to read) and simply carries no token. The twin rule on the
+shell side is ``KB_ADVISORY_ENTRIES`` in scripts/lib/kb_manifest.sh.
 
 The git facts (branch head, subject, recent commits) are read from git but each
 one is overridable from the command line, so the generator also runs in a
@@ -42,6 +55,25 @@ MANIFEST = [
     (f"{KB}/vision_ledger.md", "the five standing commitments (V1-V5)."),
     (f"{KB}/INFRA_ONBOARDING.md", "the environment you are working in."),
 ]
+
+# Manifest entries that are LISTED but carry NO recorded digest.
+#
+# A recorded digest is a merge-time tripwire: it means "these are the bytes
+# HANDOFF was generated from". That tripwire is only worth anything for a file
+# whose bytes are STABLE across branches -- there, any drift means the router
+# describes a tree it was not generated from. PRIORITIES.md is the one member
+# that is not stable: it is the live work queue, edited by every branch that
+# opens, closes or re-words a C-item and rewritten whenever dev is merged. Its
+# digest is therefore branch-local BY DEFINITION, and hard-recording it
+# guarantees a red contract test on any branch that is merely up to date with
+# dev -- teaching everyone to hand-edit the router, which is the drift the
+# digest exists to stop. So it stays listed (it is the first thing to read)
+# and just carries no digest.
+#
+# Cross-language: the shell side must agree -- see ``KB_ADVISORY_ENTRIES`` in
+# scripts/lib/kb_manifest.sh. The rule is stated once per language and nowhere
+# else, exactly like the sha256 rule above.
+ADVISORY = frozenset({f"{KB}/PRIORITIES.md"})
 
 
 def sh(*args: str) -> str:
@@ -108,7 +140,13 @@ def render(root, open_items, dev_sha: str, dev_subj: str, recent: str) -> str:
         "",
     ]
     for i, (rel, prose) in enumerate(MANIFEST, 1):
-        out.append(f"{i}. `{rel}` -- {prose} - sha256:{sha256_file(root / rel)}")
+        line = f"{i}. `{rel}` -- {prose}"
+        # Advisory entries are listed but carry no digest: their digest would be
+        # branch-local, so recording it would make every branch that is merely
+        # up to date with dev fail the contract test (see ADVISORY above).
+        if rel not in ADVISORY:
+            line += f" - sha256:{sha256_file(root / rel)}"
+        out.append(line)
     out += ["", "## First task (from the live queue)", ""]
     for cid, body in open_items:
         out.append(f"- **{cid}** -- {body}")

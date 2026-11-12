@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.core.state import AgentState
+from thoughtmachine.timeout_constants import TIMEOUT_READ_ONLY_TOOLS
 
 
 def _state() -> AgentState:
@@ -84,15 +85,37 @@ def test_clear_restriction_without_reason_on_idle_state_returns_false():
 
 
 # f) allow-list per reason -- unknown reasons must fail safe to Respond-only
+# ('timeout' is deliberately NOT here: it is the widened axis, pinned below.)
 @pytest.mark.parametrize(
     'reason',
-    ['turn', 'timeout', 'pause', 'something-unknown', None],
+    ['turn', 'pause', 'something-unknown', None],
 )
 def test_allowed_tools_respond_only_for_non_token_reasons(reason):
     state = _state()
     state.restrictions_active = True
     state.restriction_reason = reason
     assert state.get_allowed_tools() == ['Respond']
+
+
+# f2) 'timeout' stops new WORK, not reading: Respond + SummarizeTool + the
+# explicit read-only set, taken from the single source of truth.
+def test_allowed_tools_timeout_reason_allows_respond_summarize_and_read_only():
+    """Display and gate must agree on the widened timeout allow-list."""
+    state = _state()
+    state.restrictions_active = True
+    state.restriction_reason = 'timeout'
+
+    expected = ['Respond', 'SummarizeTool'] + sorted(TIMEOUT_READ_ONLY_TOOLS)
+    assert state.get_allowed_tools() == expected
+    # Every advertised tool must actually pass the gate, and vice versa.
+    for name in expected:
+        assert state.is_tool_allowed(name) is True, name
+
+    # Read-only members are allowed...
+    assert state.is_tool_allowed('ReadFile') is True
+    # ...write/execute tools are refused under a spent budget.
+    assert state.is_tool_allowed('ApplyEdits') is False
+    assert state.is_tool_allowed('ContainerExecTool') is False
 
 
 def test_allowed_tools_token_reason_allows_summarize():

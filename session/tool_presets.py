@@ -25,6 +25,7 @@ _ALL_TOOLS = [
     # File operations
     "FileEditor",
     "ReadFile",
+    "ReadFileTool",
     "ApplyEdits",
     "CodeModifier",
     "RefactorTool",
@@ -101,7 +102,7 @@ AGENT_TOOLS = [
     "GlobTool",
     "host_bash",
     "KnowledgeBaseTool",
-    "ReadFile",
+    "ReadFileTool",
     "Respond",
     "SummarizeTool",
 ]

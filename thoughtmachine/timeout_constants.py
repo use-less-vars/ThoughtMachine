@@ -28,3 +28,38 @@ IDLE_TIMEOUT_SECONDS = 600
 SOFT_BUDGET_FALLBACK_SECONDS = 300
 
 SHIPPED_SOFT_BUDGET_SECONDS = 300
+
+
+# Tools that STAY available when the soft time budget hits CRITICAL
+# (``restriction_reason == 'timeout'``). They must be strictly read-only:
+# the timeout restriction exists to stop the agent from starting new work,
+# not to blind it while it writes up a response.
+#
+# This is an EXPLICIT, hand-maintained frozenset of canonical registry tool
+# names (``ToolBase.tool_name()``). It is deliberately NOT derived from the
+# tool registry at runtime: this module is dependency-free by contract (see
+# the module docstring) and the engine state must not import ``tools`` to
+# decide what it may run. Consequences of hand-maintenance are covered by
+# tests/test_state_timeout.py, which fails if any name here stops resolving
+# to a registered tool or if a tool with a write-ish ``required_categories``
+# ends up in the set.
+#
+# Deliberately NOT included:
+# - ``FileEditor``: one tool for read AND write/delete operations.
+# - ``KnowledgeBaseTool``: read and write operations share one tool.
+# - ``Worker``: declares ``required_categories: []`` (so a naive category
+#   check passes) but spawning nested workers under a timeout restriction is
+#   a footgun, not a read.
+# - task-list mutators (``WorkingDocument``, ``ProgressReport``): they write.
+# - ``Respond`` / ``SummarizeTool``: granted explicitly by AgentState on this
+#   axis (SummarizeTool so compaction still works).
+TIMEOUT_READ_ONLY_TOOLS: frozenset[str] = frozenset({
+    'CheckSystem',        # vault/system inspection, required_categories: []
+    'DirectoryTreeTool',  # filesystem:read
+    'FilePreviewTool',    # filesystem:read
+    'FileSearchTool',     # filesystem:read
+    'FileSummaryTool',    # filesystem:read
+    'GlobTool',           # filesystem:read
+    'ReadFile',           # filesystem:read
+    'git_read',           # git:read
+})

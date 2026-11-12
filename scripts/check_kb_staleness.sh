@@ -27,11 +27,23 @@
 # sync, which is exactly the drift this gate exists to catch. `--update`
 # recomputes and rewrites those tokens in place, and touches nothing else.
 #
-# FAIL CLOSED. An entry carrying no usable digest is STALE -- reported, not
-# skipped. An entry that quietly lost its hash would otherwise pass forever.
+# ADVISORY ENTRIES. One member is listed in the router WITHOUT a digest on
+# purpose: the live work queue (PRIORITIES.md) is edited by every branch that
+# touches a C-item and rewritten whenever dev is merged, so its digest is
+# branch-local by definition and could never be a staleness signal. For such an
+# entry the gate prints a NOTE (no digest recorded, or a digest that no longer
+# matches -- `--update` refreshes the latter) and does NOT fail. The list of
+# such entries is `KB_ADVISORY_ENTRIES` in lib/kb_manifest.sh; the generator's
+# twin is `ADVISORY` in scripts/gen_handoff.py. A missing advisory FILE still
+# fails: the bundle would not build.
+#
+# FAIL CLOSED. A NON-advisory entry carrying no usable digest is STALE --
+# reported, not skipped. An entry that quietly lost its hash would otherwise
+# pass forever. Only the advisory entries above are exempt from that rule, and
+# only they.
 #
 # EXIT CODES -- deliberately CI-hostile to staleness:
-#   0  PASS: HANDOFF.md is up to date. (nothing warned)
+#   0  PASS: HANDOFF.md is up to date. (nothing warned; NOTEs are not warnings)
 #   1  at least one WARNING was printed
 #   2  usage error (unknown argument)
 # Warnings failing the build is the point: CI runs this with --check, so a stale
@@ -49,7 +61,9 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 usage() {
   printf 'usage: %s [--check|--update]\n' "$0" >&2
   printf '  --check   (default) exit 1 when a manifest file no longer matches the sha256 recorded in the router\n' >&2
+  printf '            (advisory entries print a NOTE instead: their digest is branch-local)\n' >&2
   printf '  --update  recompute every manifest sha256 and rewrite the recorded values in place\n' >&2
+  printf '            (an advisory entry that carries no token is left untouched)\n' >&2
 }
 
 MODE=check
@@ -118,8 +132,16 @@ if [ "$MODE" = "update" ]; then
   # Rewrite line by line so the rest of the router is preserved byte for byte:
   # only section-2 entry lines change, and only their trailing digest token. That
   # is the difference between --update and regenerating the file.
+  #
+  # An ADVISORY entry that carries NO token is emitted untouched: the generator
+  # deliberately records none for it (see ADVISORY in scripts/gen_handoff.py),
+  # so appending one here would make --update disagree with a regeneration and
+  # hand-write state the generator would immediately drop. An advisory entry
+  # that DOES carry a token (e.g. a router from before the exemption) is
+  # rewritten like any other, so --update still clears a stale advisory digest.
   in_section=0
   index=0
+  written=0
   while IFS= read -r line || [ -n "$line" ]; do
     if [ "$in_section" -eq 0 ] && [[ "$line" =~ $KB_SECTION_RE ]]; then
       in_section=1
@@ -127,12 +149,20 @@ if [ "$MODE" = "update" ]; then
       in_section=0
     elif [ "$in_section" -eq 1 ] && [[ "$line" =~ $KB_ENTRY_RE ]]; then
       base="$line"
+      has_token=0
       # Drop an existing digest (well formed or not) before appending the new
       # one, so repeated --update runs cannot stack "sha256:" tokens.
       if [[ "$base" =~ [[:space:]]+-[[:space:]]+sha256:[^[:space:]]+$ ]]; then
         base="${base%${BASH_REMATCH[0]}}"
+        has_token=1
+      fi
+      if [ "$has_token" -eq 0 ] && kb_entry_is_advisory "${entries[$index]}"; then
+        printf '%s\n' "$line"
+        index=$((index + 1))
+        continue
       fi
       printf '%s - sha256:%s\n' "$base" "${fresh[$index]}"
+      written=$((written + 1))
       index=$((index + 1))
       continue
     fi
@@ -146,7 +176,7 @@ if [ "$MODE" = "update" ]; then
   fi
 
   mv "$tmp" "$HANDOFF_FILE"
-  printf 'Updated %d recorded sha256 values in %s.\n' "$count" "$HANDOFF_FILE"
+  printf 'Updated %d recorded sha256 values in %s.\n' "$written" "$HANDOFF_FILE"
   exit 0
 fi
 
@@ -156,20 +186,31 @@ while [ "$index" -lt "$count" ]; do
   entry="${entries[$index]}"
   want="${recorded[$index]}"
   if ! resolved=$(kb_resolve_entry "$HANDOFF_FILE" "$entry"); then
-    # The file is absent, so report the path where it was expected first.
+    # The file is absent, so report the path where it was expected first. This
+    # is a FAILURE for advisory entries too: the bundle would not build.
     printf 'WARNING: %s is missing. The handoff may be stale.\n' \
       "$(kb_rel_path "$repo_root" "$handoff_dir/$entry")"
     stale=1
   elif [ -z "$want" ]; then
-    printf 'WARNING: %s has no sha256 recorded, run --update. The handoff may be stale.\n' \
-      "$(kb_rel_path "$repo_root" "$resolved")"
-    stale=1
+    if kb_entry_is_advisory "$entry"; then
+      printf 'NOTE: %s carries no recorded sha256 because it is an advisory entry that changes on every branch; not a staleness failure.\n' \
+        "$(kb_rel_path "$repo_root" "$resolved")"
+    else
+      printf 'WARNING: %s has no sha256 recorded, run --update. The handoff may be stale.\n' \
+        "$(kb_rel_path "$repo_root" "$resolved")"
+      stale=1
+    fi
   else
     have=$(kb_sha256 "$resolved")
     if [ "$have" != "$want" ]; then
-      printf 'WARNING: %s changed since HANDOFF.md recorded sha256:%s (now sha256:%s). The handoff may be stale.\n' \
-        "$(kb_rel_path "$repo_root" "$resolved")" "$want" "$have"
-      stale=1
+      if kb_entry_is_advisory "$entry"; then
+        printf 'NOTE: %s changed since HANDOFF.md recorded sha256:%s (now sha256:%s); it is an advisory entry that changes on every branch, so the mismatch is expected -- run --update to refresh the recorded value.\n' \
+          "$(kb_rel_path "$repo_root" "$resolved")" "$want" "$have"
+      else
+        printf 'WARNING: %s changed since HANDOFF.md recorded sha256:%s (now sha256:%s). The handoff may be stale.\n' \
+          "$(kb_rel_path "$repo_root" "$resolved")" "$want" "$have"
+        stale=1
+      fi
     fi
   fi
   index=$((index + 1))

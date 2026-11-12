@@ -715,8 +715,16 @@ class TestWorkerJoinSemantics(_OpSemBase):
         result = _parse_result(tool.execute())
         self.assertIn("worker_query is required", result.get("error", ""))
 
-    def test_join_requires_worker_name(self):
-        """join without worker_name is rejected by the execute() guard."""
+    def test_join_defaults_worker_name_to_default(self):
+        """join without worker_name addresses the 'default' worker.
+
+        workers.json in this harness seeds w1..w10 only and none of them is
+        registered, so the call reaches the join handler under the resolved
+        name and fails there with the entry check's message --
+        ``Worker 'default' is not running``.  What it must never do again is
+        fail the old ``worker_name is required`` guard, which contradicted the
+        schema's optional ``worker_name``.
+        """
         tool = Worker(
             action="join",
             session_id=SESSION,
@@ -724,7 +732,9 @@ class TestWorkerJoinSemantics(_OpSemBase):
             worker_query="j1",
         )
         result = _parse_result(tool.execute())
-        self.assertIn("worker_name is required", result.get("error", ""))
+        self.assertEqual(tool.worker_name, "default")
+        self.assertEqual(result.get("error"), "Worker 'default' is not running")
+        self.assertNotIn("worker_name is required", result.get("error") or "")
 
 
 class TestWorkerPauseResumeSemantics(_OpSemBase):
