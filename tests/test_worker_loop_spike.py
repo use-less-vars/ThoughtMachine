@@ -94,18 +94,23 @@ class EchoToolProvider(LLMProvider):
 # Registration
 # ════════════════════════════════════════════════════════════════════════════
 
-@pytest.fixture(scope="module")
-def register_echo_tool_provider():
-    """Register EchoToolProvider in the ProviderFactory once for all tests.
+@pytest.fixture
+def register_echo_tool_provider(monkeypatch):
+    """Register EchoToolProvider in the ProviderFactory for one test.
 
     Avoids calling ProviderFactory._get_providers() which triggers lazy
     imports of ``openai``, ``anthropic``, etc.  We poke the private
     ``_providers`` dict directly instead.
+
+    ``monkeypatch`` restores the registry on teardown (C60): leaving a
+    hand-built dict in place would permanently disable the factory's lazy
+    population for the rest of the process.
     """
-    if ProviderFactory._providers is None:
-        ProviderFactory._providers = {}
-    if "echotool" not in ProviderFactory._providers:
-        ProviderFactory._providers["echotool"] = EchoToolProvider
+    monkeypatch.setattr(
+        ProviderFactory,
+        "_providers",
+        {**(ProviderFactory._providers or {}), "echotool": EchoToolProvider},
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════

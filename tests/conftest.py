@@ -479,3 +479,21 @@ def pytest_configure(config):
             )
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# C60: provider-registry isolation
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _restore_provider_registry():
+    """C60: no test may leave the provider registry mutated for the next one."""
+    from llm_providers.factory import ProviderFactory
+
+    saved = None if ProviderFactory._providers is None else dict(ProviderFactory._providers)
+    try:
+        yield
+    finally:
+        ProviderFactory._providers = saved
+
