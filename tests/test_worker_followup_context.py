@@ -28,6 +28,18 @@ from tools.workspace import worker_thread as wt
 
 STATUS_QUERY = "status?"
 
+#: Flat keys the dispatch time-budget envelope adds to EVERY timed worker action's
+#: result (``TimeBudget.as_envelope_fields()`` in tools/workspace/worker_thread.py:
+#: requested / effective / clamped / clamped_by / source).  Tests that guard the
+#: non-budget keys of an envelope strip them, so the two features do not collide.
+BUDGET_KEYS = frozenset({
+    "requested_timeout_seconds",
+    "effective_timeout_seconds",
+    "timeout_clamped",
+    "timeout_clamped_by",
+    "timeout_source",
+})
+
 
 class _FakeThread:
     """Duck-typed stand-in for WorkerThread: records what it is sent."""
@@ -207,9 +219,17 @@ def test_manually_paused_query_without_context_envelope_unchanged(harness):
 
     envelope = _run("query", worker_query=STATUS_QUERY)
 
-    assert envelope == {
+    # WHY the budget keys are stripped: every TIMED worker action now carries the
+    # ONE dispatch clock as flat keys (matched feature); this test guards the
+    # context_ignored behaviour and the pre-existing keys only.
+    envelope_without_budget = {
+        key: value for key, value in envelope.items() if key not in BUDGET_KEYS
+    }
+
+    assert envelope_without_budget == {
         "status": "paused",
         "message": "Worker is manually paused",
         "worker_name": "default",
         "session_id": "",
     }
+    assert "context_ignored" not in envelope

@@ -51,6 +51,15 @@ WS_ID = "ws_capability_freeze"
 #: The parent agent config every spawn in this suite runs under.
 PARENT_CFG = {"provider": "openai", "model": "gpt-4o"}
 
+#: Clock fields the spawn hop reports in the envelope alongside the outcome.
+BUDGET_KEYS = frozenset({
+    "requested_timeout_seconds",
+    "effective_timeout_seconds",
+    "timeout_clamped",
+    "timeout_clamped_by",
+    "timeout_source",
+})
+
 #: Fields every definition carries, so a missing key can never be mistaken for
 #: the behaviour under test.
 BASE_DEFINITION = {
@@ -218,8 +227,15 @@ def test_spawn_fails_loudly_on_missing_tool(spawn_harness):
 
     result = _spawn_worker(spawn_harness, "loud")
 
-    # Failure envelope: exactly these three keys, no success payload alongside.
-    assert set(result) == {"error", "worker_name", "missing_tools"}, result
+    # Failure envelope: these three keys and no success payload alongside; the
+    # TimeBudget clock fields are tolerated because the spawn hop reports its
+    # budget in the envelope too.
+    assert BUDGET_KEYS <= set(result), result
+    assert set(result) - BUDGET_KEYS == {
+        "error",
+        "worker_name",
+        "missing_tools",
+    }, result
     assert result["worker_name"] == "loud"
     assert result.get("spawned") is not True
     assert result["missing_tools"] == sorted(missing)
