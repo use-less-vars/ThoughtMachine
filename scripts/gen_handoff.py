@@ -52,6 +52,7 @@ MANIFEST = [
     (f"{KB}/MANDATORY_STOP.md", "the read-on-entry rules; none of them are optional."),
     (f"{KB}/architecture_invariants.md", "the invariants a design must not re-derive."),
     ("docs/ARCHITECTURE_MACHINE_MODEL.md", "what runs where, and what stops it."),
+    (f"{KB}/machine_history_and_vision.md", "the incidents behind the rules, and what they are for."),
     (f"{KB}/vision_ledger.md", "the five standing commitments (V1-V5)."),
     (f"{KB}/INFRA_ONBOARDING.md", "the environment you are working in."),
 ]
