@@ -19,6 +19,7 @@
 #                                absolute path, or non-zero when unresolvable
 #   kb_rel_path <root> <abs>     path made relative to <root> when possible
 #   kb_entry_hashes <router>     "<sha256><TAB><entry>" per manifest entry
+#   kb_entry_is_advisory <entry> 0 when the entry is advisory (no digest gate)
 #   kb_sha256 <file>             lowercase hex sha256 of a file's bytes
 
 # Section heading: "##" + whitespace + "2" + "." (title deliberately ignored).
@@ -32,6 +33,15 @@ KB_SECTION_RE=${KB_SECTION_RE:-'^##[[:space:]]+2[.]'}
 KB_ENTRY_RE=${KB_ENTRY_RE:-'^[[:space:]]*[0-9]+[.]?[[:space:]]+`([^`]+)`'}
 
 KB_DEFAULT_HANDOFF_REL=${KB_DEFAULT_HANDOFF_REL:-.thoughtmachine/knowledge/project/HANDOFF.md}
+
+# Advisory manifest entries: a space-separated list of BASENAMES that are listed
+# in the router but carry NO recorded digest, because their digest would be
+# branch-local rather than a staleness signal. Matched by basename so the list
+# survives the manifest moving the file to another directory.
+# Twin of ADVISORY in scripts/gen_handoff.py -- the generator decides which
+# entries get a digest token, this file decides what check_kb_staleness.sh
+# does when one is missing. They must agree.
+KB_ADVISORY_ENTRIES=${KB_ADVISORY_ENTRIES:-PRIORITIES.md}
 
 # _kb_section2_body <router-file>
 #   Prints the lines of section 2: everything after the "## 2." heading, up to
@@ -134,6 +144,24 @@ kb_entry_hashes() {
     printf 'ERROR: %s: section 2 lists no "N. `path`" manifest entries.\n' "$router" >&2
     return 1
   fi
+}
+
+# kb_entry_is_advisory <entry>
+#   Returns 0 when <entry>'s BASENAME is in $KB_ADVISORY_ENTRIES (space-separated
+#   names), 1 otherwise. A manifest entry is a PATH, the list holds NAMES:
+#   comparing whole paths would silently stop matching the day the manifest
+#   relocated the file. The generator's twin is ADVISORY in
+#   scripts/gen_handoff.py, next to the MANIFEST it applies to.
+kb_entry_is_advisory() {
+  local entry="${1:-}" base name
+  base="${entry##*/}"
+  # Unquoted on purpose: word splitting of the space-separated list is the point.
+  for name in $KB_ADVISORY_ENTRIES; do
+    if [ "$name" = "$base" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # kb_repo_root <router-file>
