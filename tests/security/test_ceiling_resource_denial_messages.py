@@ -197,7 +197,8 @@ class TestSandboxedExecutionDenialMessages:
             ).run(["git", "status"], required_category="git:read")
         msg = str(excinfo.value)
         assert msg == (
-            "Permission denied: requires git:read, but session allows "
-            "git:banned"
+            "Permission denied: requires git:read, but the effective grant is "
+            "git:banned (denied by: session grant)"
         )
         assert "workspace ceiling" not in msg
+        assert "session allows" not in msg

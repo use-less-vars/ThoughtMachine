@@ -550,6 +550,106 @@ def _fail_closed_reason_of(effective: Dict[str, Any]) -> str:
     return getattr(effective, "_fail_closed_reason", "") or ""
 
 
+class _HostResourceVetoDict(dict):
+    """Plain ``dict`` recording that the WORKSPACE host-resource policy
+    (``allow_host_resources``) is what forced ``host_bash`` to ``banned``.
+
+    Identical to a normal dict for equality, iteration, indexing, ``len``,
+    membership and JSON serialisation; it additionally carries
+    ``_host_resource_veto`` (always ``True``) and -- when the pre-veto mapping
+    was a :class:`_CeilingAnnotatedDict` -- a copy of that mapping's
+    ``_ceiling_annotations``, so wrapping never loses ceiling provenance.
+
+    Only built when the veto actually CHANGED ``host_bash`` (a session grant
+    that was already ``banned`` refuses the category on its own and keeps the
+    blame), so the ordinary resolution path stays a plain ``dict``.
+    """
+
+    __slots__ = ("_host_resource_veto", "_ceiling_annotations")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._host_resource_veto = True
+        self._ceiling_annotations: Dict[str, Dict[str, Any]] = {}
+
+
+def _mark_host_resource_veto(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return *result* carrying the host-resource-policy veto provenance."""
+    wrapped = _HostResourceVetoDict(result)
+    annotations = getattr(result, "_ceiling_annotations", None)
+    if annotations:
+        wrapped._ceiling_annotations = dict(annotations)
+    return wrapped
+
+
+def _host_resource_veto_of(effective: Dict[str, Any]) -> bool:
+    """True when the workspace host-resource policy is what refuses the call."""
+    return bool(getattr(effective, "_host_resource_veto", False))
+
+
+#: Grant values that refuse a category OUTRIGHT (no usable access at all) --
+#: as opposed to a lower-but-usable level (``read`` when ``write`` is asked
+#: for), which still lets the session use the category.
+_REFUSAL_GRANT_VALUES = frozenset({"banned", "none", "deny", "denied"})
+
+
+def _is_refusal_grant(value: Any) -> bool:
+    """True when *value* refuses the category outright.
+
+    ``False`` (boolean categories such as ``container``), ``None`` and the
+    ``banned``/``none``/``deny`` grant strings are refusals; ``ask``, ``read``,
+    ``write``, ``allow``, ``connect`` etc. are usable grants.
+    """
+    if value is False or value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in _REFUSAL_GRANT_VALUES
+    return False
+
+
+def _denial_layer_label(effective: Dict[str, Any], ceiling_level: str) -> str:
+    """Name the layer whose grant actually denies the call.
+
+    Precedence follows the resolution order: the workspace host-resource policy
+    veto is recorded only when it is the value that refuses ``host_bash``; the
+    workspace ceiling is named only when it is what lowered the grant below the
+    requirement; everything else is the session's own grant.
+    """
+    if _host_resource_veto_of(effective):
+        return "workspace host-resource policy"
+    if ceiling_level:
+        return f"workspace ceiling ({ceiling_level})"
+    return "session grant"
+
+
+def _denial_clause(
+    category: str,
+    allowed: Any,
+    effective: Dict[str, Any],
+    ceiling_level: str,
+) -> str:
+    """Return the ``but ...`` clause of a category denial, naming the denier.
+
+    A REFUSAL grant (``banned`` / ``none`` / ``False``) means the effective
+    permissions do not allow the category at all: the historical
+    ``but session allows host_bash:banned`` clause contradicted itself, and it
+    blamed the session grant even when a workspace layer (the host-resource
+    policy veto) had forced the value.  Such a denial names the layer that
+    actually denies the call instead.  Every non-refusal grant keeps the
+    historical clause byte-identical.
+
+    When the whole profile was forced onto the deny-all fail-closed shape, the
+    caller's trailing ``(fail-closed: <cause>)`` note already names the layer,
+    so no ``(denied by: ...)`` is appended here.
+    """
+    if not _is_refusal_grant(allowed):
+        return f"but session allows {category}:{allowed}"
+    clause = f"but the effective grant is {category}:{allowed}"
+    if not _fail_closed_reason_of(effective):
+        clause += f" (denied by: {_denial_layer_label(effective, ceiling_level)})"
+    return clause
+
+
 def _ceiling_level_label(value: Any) -> str:
     """Render a raw workspace ceiling value as a stable message label."""
     if isinstance(value, bool):
@@ -1140,6 +1240,12 @@ def get_effective_permissions(
         logger.warning("host-resource policy: vault_root unresolvable: %s", e)
         _workspace_allows_host_resources = False
     if not _workspace_allows_host_resources:
+        # Record the veto when -- and only when -- the policy is what actually
+        # refuses host_bash: a grant that was already ``banned`` refuses on its
+        # own and keeps the blame, so the ordinary path stays a plain dict and
+        # a denial never charges the session grant for the operator's policy.
+        if not _is_refusal_grant(result.get("host_bash")):
+            result = _mark_host_resource_veto(result)
         result["host_bash"] = "banned"
 
     # Surface the fail-closed cause on the RETURNED mapping so an
@@ -1592,16 +1698,20 @@ def check_required_categories(
                 # SESSION's pre-ceiling value and the CEILING value instead of
                 # mislabelling the capped value as the session's own grant.
                 return False, f"Permission denied: {contradiction}"
-            message = (
-                f"Permission denied: Tool requires {category}:{required_value}, "
-                f"but session allows {category}:{allowed}"
-            )
-            if ceiling_level:
+            # A refusal grant ("banned"/"none"/False) is never rendered as
+            # "session allows ...": the clause names the layer that actually
+            # denies the call (see ``_denial_clause``).
+            clause = _denial_clause(category, allowed, effective, ceiling_level)
+            if ceiling_level and not _is_refusal_grant(allowed):
                 # The workspace permission ceiling is what blocks this call
                 # (the session grant alone would allow it) — name it so the
                 # denial explains why a permissive-looking session profile
                 # still refuses.
-                message = f"{message} (workspace ceiling: {ceiling_level})"
+                clause = f"{clause} (workspace ceiling: {ceiling_level})"
+            message = (
+                f"Permission denied: Tool requires {category}:{required_value}, "
+                f"{clause}"
+            )
             fail_closed_reason = _fail_closed_reason_of(effective)
             if fail_closed_reason:
                 # The effective profile was forced onto the deny-all

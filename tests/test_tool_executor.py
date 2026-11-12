@@ -140,7 +140,8 @@ class TestToolExecutorPermissions:
         )
         assert result["tool_type"] == "normal"
         # Actual executor-path message (verified at runtime in the container):
-        # 'Permission denied: Tool requires container:true, but session allows container:False'
+        # 'Permission denied: Tool requires container:true, but the effective
+        #  grant is container:False (denied by: session grant)'
         assert result["result"].startswith("Permission denied: Tool requires container:true")
 
 
