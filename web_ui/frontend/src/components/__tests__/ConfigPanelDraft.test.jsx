@@ -280,6 +280,43 @@ describe('ConfigPanel draft persistence (disk-pure permissions flow)', () => {
     expect(useStore.getState().sessionDrafts['s1']).toBeUndefined()
   })
 
+  it('a config-only apply never writes the session permission sidecar (config change -> config message, never a permissions notice)', async () => {
+    // Trust invariant: a pure config change (temperature here, likewise
+    // max_turns/model/provider) must NOT PUT /api/session/{id}/permissions.
+    // That PUT is what makes the backend append "Your permissions have been
+    // updated..." to the live session, so firing it on a config change tells
+    // the user their PERMISSIONS changed when only CONFIG did. The counterpart
+    // (permission change -> permission message) is the permission-only apply
+    // test above: it still PUTs, so the permissions notice still fires.
+    const fetchMock = globalThis.fetch
+    const { sendCommand, container } = renderPanel()
+    // Let the sidecar GET land so the permissions tab is LOADED but CLEAN.
+    await openPermissionsTabLoaded()
+
+    fireEvent.click(screen.getByRole('button', { name: 'General' }))
+    const temperature = container.querySelector('input[type="range"]')
+    fireEvent.change(temperature, { target: { value: '0.9' } })
+    expect(screen.getByText('Unsaved changes')).toBeInTheDocument()
+    expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() => {
+      expect(sendCommand).toHaveBeenCalledWith('apply_config', expect.anything())
+    })
+
+    // No permission write at all -> the backend can never emit the
+    // permissions-changed notice for a config-only apply.
+    const putCall = fetchMock.mock.calls.find(
+      ([url, opts]) => String(url).includes('/api/session/s1/permissions') && opts && opts.method === 'PUT'
+    )
+    expect(putCall).toBeUndefined()
+
+    // The config change itself still travels: apply_config, permission-free.
+    const applyCall = sendCommand.mock.calls.find(([cmd]) => cmd === 'apply_config')
+    expect(applyCall[1].config.temperature).toBe(0.9)
+    expect(applyCall[1].config.session_permissions).toBeUndefined()
+  })
+
   it('clears the permissions dirty state after a successful PUT even when the GET raw carries a non-canonical legacy key', async () => {
     // The stored profile carries a legacy `system` grant next to the six
     // canonical keys: the GET returns it, but the PUT may send canonical keys
