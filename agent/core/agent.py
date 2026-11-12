@@ -538,7 +538,12 @@ class Agent:
         self.debug_context = DebugContext(self.logger)
         self._pending_warnings = []  # Buffer for token warnings, flushed after turn commit
         self._pending_warning_events = []  # Buffer for token warning events, yielded after turn commit
-        self.tool_classes = config.get_filtered_tool_classes()
+        # Defence in depth: ``resolved_tool_names`` (set only by a worker spawn
+        # from its frozen capability registry) narrows the runtime list by
+        # INTERSECTION; ``None`` on the main agent leaves this unchanged.
+        self.tool_classes = config.get_filtered_tool_classes(
+            allowed_names=config.resolved_tool_names
+        )
         # Register MCP tools in background (non-blocking, no startup delay)
         # MCP tools become available later once background registration completes.
         try:
@@ -854,7 +859,9 @@ class Agent:
 
         # Rebuild tools if enabled_tools changed
         if new_config.enabled_tools != old_config.enabled_tools:
-            self.tool_classes = new_config.get_filtered_tool_classes()
+            self.tool_classes = new_config.get_filtered_tool_classes(
+                allowed_names=new_config.resolved_tool_names
+            )
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
             # Preserve event bus from old executor before closing
             event_bus = self.tool_executor._event_bus if self.tool_executor else None
@@ -1004,7 +1011,9 @@ class Agent:
             self.provider = self.llm_client.provider
 
             # Rebuild tool_classes and tool_definitions
-            self.tool_classes = new_config.get_filtered_tool_classes()
+            self.tool_classes = new_config.get_filtered_tool_classes(
+                allowed_names=new_config.resolved_tool_names
+            )
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
             _cp_state_before = getattr(self, 'state', None)
             _cp_exec_state_before = getattr(getattr(self, 'tool_executor', None), 'state', None)

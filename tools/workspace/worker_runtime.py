@@ -37,9 +37,9 @@ child-side), where the stream actually is.
 
 Mode selection (§10, D11)
 -------------------------
-One flag, ``WORKER_RUNTIME_MODE`` ∈ ``{thread, process}``, default ``thread``
-through S4, read **at spawn time** so a single worker can be moved between
-modes without restarting the server (§10). The flag is therefore resolved on
+One flag, ``WORKER_RUNTIME_MODE`` ∈ ``{thread, process}``, default
+``process`` (:data:`DEFAULT_RUNTIME_MODE`), read **at spawn time** so a single
+worker can be moved between modes without restarting the server (§10). The flag is therefore resolved on
 every :meth:`WorkerRuntimeHandle.spawn` call and never cached at import time.
 
 Resolution fails closed: an unrecognised value is refused rather than
@@ -65,7 +65,7 @@ from tools.workspace.worker_runtime_protocol import Event, Heartbeat, WorkerStat
 #: The flag that selects the runtime mode (§10, D11).
 WORKER_RUNTIME_MODE_ENV = "WORKER_RUNTIME_MODE"
 
-#: Worker body runs in the supervisor's interpreter. The shipped default.
+#: Worker body runs in the supervisor's interpreter. Now opt-in only.
 MODE_THREAD = "thread"
 
 #: Worker body runs in its own OS process (S2: dispatch_query only).
@@ -73,6 +73,11 @@ MODE_PROCESS = "process"
 
 #: Exactly what the flag accepts. Nothing else is a mode.
 RUNTIME_MODES = (MODE_THREAD, MODE_PROCESS)
+
+#: What an ABSENT flag resolves to. Isolation is the default: a worker body
+#: that can reach the supervisor's interpreter is a choice an operator makes,
+#: not something that happens because a variable was not set.
+DEFAULT_RUNTIME_MODE = MODE_PROCESS
 
 #: The worker statuses a cancel is REFUSED for (§5.4) -- and the single source
 #: of truth for cancel acceptability across BOTH modes.
@@ -306,20 +311,20 @@ def resolve_runtime_mode(environ: Optional[Mapping[str, str]] = None) -> str:
     affects the next spawn without a restart. ``environ`` is injectable so the
     resolution rule can be tested without mutating the process environment.
 
-    Absent -> ``thread``. Anything present that is not exactly
+    Absent -> :data:`DEFAULT_RUNTIME_MODE` (``process``). Anything present that is not exactly
     :data:`MODE_THREAD` or :data:`MODE_PROCESS` -> :class:`InvalidRuntimeModeError`
     (fail closed: no trimming, no case folding, no empty-string-as-default).
     """
     source: Mapping[str, str] = os.environ if environ is None else environ
     raw = source.get(WORKER_RUNTIME_MODE_ENV)
     if raw is None:
-        return MODE_THREAD
+        return DEFAULT_RUNTIME_MODE
     if raw in RUNTIME_MODES:
         return raw
     raise InvalidRuntimeModeError(
         f"{WORKER_RUNTIME_MODE_ENV}={raw!r} is not one of {RUNTIME_MODES}; "
         "refusing to guess a runtime mode (unset the variable to get the "
-        f"{MODE_THREAD!r} default)"
+        f"{DEFAULT_RUNTIME_MODE!r} default)"
     )
 
 
@@ -1175,7 +1180,8 @@ def attach_thread_frame_sink(
     reason: an unrecognised value raises :class:`InvalidRuntimeModeError` here,
     before any worker starts, instead of silently running in-process. An
     explicit ``mode=`` still wins, and with the flag unset the resolution is
-    ``thread`` -- byte-identical to this function's previous default.
+    :data:`DEFAULT_RUNTIME_MODE` -- ``process`` as of the default flip, so an
+    omitted ``mode=`` no longer means "stay in this interpreter".
 
     This is the S5 production construction site: the one place a real
     ``WorkerThread`` gets a :class:`WorkerRuntimeHandle` and the runtime ->

@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Union
 
-from pydantic import Field, field_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from tools.base import ToolBase
 from tools.workspace.command_channel import (
@@ -740,6 +740,76 @@ _WORKER_BLOCKLIST: frozenset[str] = frozenset({
     "KnowledgeBaseTool", # persistent cross-session knowledge store
 })
 
+# ── Worker tool universe (single source of truth) ─────────────────────────────
+# Two universes exist in this build: ``SIMPLIFIED_TOOL_CLASSES`` (what
+# ``enabled_tools`` is filtered against, agent/config/models.py:379-401) and
+# ``iter_tool_classes()`` (what spawn-time class resolution used to walk).  A
+# tool present in the latter but not the former resolved at spawn and was then
+# silently filtered out at run time — silent narrowing, forbidden by design doc
+# §4.2.  ``_worker_tool_universe()`` is therefore the ONE universe: the classes
+# the runtime can actually instantiate, addressable by class name AND by the
+# stable ``tool_name()`` alias (``GitReadTool`` <-> ``git_read``).
+
+
+def _worker_tool_universe() -> Dict[str, type]:
+    """Return the authoritative worker tool universe: name -> class.
+
+    Keys are the class ``__name__`` (canonical) plus, for every class whose
+    stable ``tool_name()`` differs, that alias.  Canonical names win: aliases
+    are added with ``setdefault``, so a class can never shadow another class'
+    name.  Aliases of blocklisted classes are not added at all, so the
+    blocklist cannot be bypassed through a stable name.
+    """
+    from tools import simplified_tool_classes
+
+    universe: Dict[str, type] = {}
+    aliases: Dict[str, type] = {}
+    for cls in simplified_tool_classes():
+        name = getattr(cls, "__name__", "")
+        if not name:
+            continue
+        universe[name] = cls
+        if name in _WORKER_BLOCKLIST:
+            continue
+        try:
+            alias = cls.tool_name()
+        except Exception:
+            # ``tool_name()`` is optional for third-party tool classes.
+            continue
+        if alias and alias != name:
+            aliases.setdefault(alias, cls)
+    for alias, cls in aliases.items():
+        universe.setdefault(alias, cls)
+    return universe
+
+
+def _canonical_worker_tool_name(name: str) -> str:
+    """Map *name* to its canonical class ``__name__`` (identity when unknown)."""
+    cls = _worker_tool_universe().get(name)
+    if cls is None:
+        return name
+    return getattr(cls, "__name__", name)
+
+
+def _worker_granted_tool_names(registry: Any) -> List[str]:
+    """Granted tool names for *registry*, in ``simplified_tool_classes()`` order.
+
+    Deliberately NOT ``registry.names`` (which is sorted): the historical
+    ``tools: []`` derivation order is registration order and
+    tests/test_ci_read_tool.py mirrors it verbatim.  Values are de-duplicated by
+    class, so a tool's alias spelling can never add a second entry.
+    """
+    from tools import simplified_tool_classes
+
+    granted = set(registry.resolved.values())
+    names: List[str] = []
+    for cls in simplified_tool_classes():
+        name = getattr(cls, "__name__", "")
+        if name and name not in _WORKER_BLOCKLIST and cls in granted:
+            names.append(name)
+    return names
+
+
 # Default system prompt for worker sub-agents.
 # This is a fixed instruction rather than inheriting the main agent's prompt,
 # preventing delegation loops in Engineer mode.
@@ -1345,6 +1415,13 @@ def _adopt_predecessor_journal(
 #: boundaries look for, so it must stay stable across the role change below.
 INITIAL_CONTEXT_PREFIX = "Initial context: "
 
+#: Prefix of every FOLLOW-UP context payload (``action='query'`` /
+#: ``'submit_query'``). Deliberately NOT the initial-context prefix:
+#: ``is_initial_context_message()`` and the spawn-side prune/dedupe boundaries
+#: key on that exact marker, so reusing it for a follow-up query would make the
+#: query look like an initial-context message and corrupt that handling.
+FOLLOWUP_CONTEXT_PREFIX = "Follow-up context for this query:"
+
 
 def initial_context_message(initial_context: Dict[str, Any]) -> Dict[str, Any]:
     """Build the history message that carries a worker's initial context.
@@ -1452,6 +1529,12 @@ class WorkerThread(threading.Thread):
 
         # Tool classes available to this worker (name -> class)
         self._tool_classes: Dict[str, type[ToolBase]] = tool_classes or {}
+
+        # Frozen capability set: resolved lazily from ``definition["tools"]``
+        # on first use and cached for the life of this worker (§4.2 / §7.2).
+        # Annotated as a string because the registry import is deliberately
+        # lazy (it pulls in ``tools``, which imports this module's package).
+        self._capability_registry: Optional["CapabilityRegistry"] = None
 
         # Session permissions for gate-checking tool calls
         self._session_permissions: Dict[str, Any] = session_permissions or {}
@@ -2946,6 +3029,40 @@ class WorkerThread(threading.Thread):
         """Return elapsed seconds from the most recent query execution."""
         return getattr(self, '_last_elapsed_val', None)
 
+    def _resolve_capability_registry(self) -> "CapabilityRegistry":
+        """Resolve this worker's declared tool set once; cache the frozen result.
+
+        One resolution per worker: the registry is built from the definition,
+        so a later edit to the template affects only the next spawn.  Declared
+        names are canonicalised first, so a template that uses a tool's stable
+        name (``git_read``) resolves to the class instead of being reported as
+        "not shippable by this build".
+
+        ``permission_veto=None`` is deliberate: the registry says which tools
+        EXIST, the footprint gate in ``Worker._action_spawn`` says which of them
+        may RUN (design doc §7.2).
+        """
+        if self._capability_registry is not None:
+            return self._capability_registry
+        from tools.capability_registry import CapabilityRegistry
+
+        universe = _worker_tool_universe()
+        declared = [
+            _canonical_worker_tool_name(name)
+            for name in (self.definition.get("tools") or [])
+        ]
+        self._capability_registry = CapabilityRegistry.resolve(
+            declared,
+            available_names=tuple(universe),
+            lookup=universe,
+            blocklist=_WORKER_BLOCKLIST,
+            parent_enabled_tools=(self._agent_config_dict or {}).get(
+                "enabled_tools"
+            ),
+            permission_veto=None,
+        )
+        return self._capability_registry
+
     def _build_agent_config(self) -> Any:
         """
         Build an AgentConfig from the worker definition and parent agent config.
@@ -3006,18 +3123,43 @@ class WorkerThread(threading.Thread):
             if self.definition.get("temperature") is not None
             else WORKER_DEFAULT_TEMPERATURE
         )
-        worker_tools = self.definition.get("tools", [])
-        parent_enabled_tools = cfg.get("enabled_tools")
-        if worker_tools:
-            enabled_tools = [t for t in worker_tools if t not in _WORKER_BLOCKLIST]
-        else:
-            from tools import simplified_tool_classes
-            enabled_tools = [cls.__name__ for cls in simplified_tool_classes()
-                             if cls.__name__ not in _WORKER_BLOCKLIST]
-        # Intersect with parent's enabled_tools — worker cannot exceed parent
-        if parent_enabled_tools is not None:
-            enabled_tools = [t for t in enabled_tools if t in parent_enabled_tools]
+        # Tool set: resolved once through the capability registry.  The
+        # registry owns the blocklist, the parent clamp (narrowing recorded in
+        # ``.parent_denied``) and the implicit "all simplified tools" default,
+        # so ``enabled_tools`` can never be a silently narrowed subset.
+        resolved_tool_names: Optional[frozenset] = None
+        try:
+            _registry = self._resolve_capability_registry()
+            enabled_tools = _worker_granted_tool_names(_registry)
+            # The SAME frozen registry object that fed enabled_tools -- never a
+            # re-resolution and never a set rebuilt from enabled_tools, so the
+            # two cannot drift.  AgentConfig intersects this with enabled_tools
+            # at run time (defence in depth: widening enabled_tools cannot
+            # widen real tool availability).
+            resolved_tool_names = frozenset(_registry.names)
+        except Exception as exc:
+            # Never raise from here: the spawn boundary (Worker._action_spawn)
+            # is what fails loudly.  Fall back to the legacy derivation
+            # verbatim so config building stays total.
+            logger.debug(
+                "Worker '%s' could not resolve a capability registry (%s); "
+                "using the legacy enabled_tools derivation",
+                self.worker_name, exc,
+            )
+            worker_tools = self.definition.get("tools", [])
+            parent_enabled_tools = cfg.get("enabled_tools")
+            if worker_tools:
+                enabled_tools = [t for t in worker_tools if t not in _WORKER_BLOCKLIST]
+            else:
+                from tools import simplified_tool_classes
+                enabled_tools = [cls.__name__ for cls in simplified_tool_classes()
+                                 if cls.__name__ not in _WORKER_BLOCKLIST]
+            # Intersect with parent's enabled_tools — worker cannot exceed parent
+            if parent_enabled_tools is not None:
+                enabled_tools = [t for t in enabled_tools if t in parent_enabled_tools]
         worker_cfg["enabled_tools"] = enabled_tools
+        # None when the registry could not be resolved (legacy behaviour).
+        worker_cfg["resolved_tool_names"] = resolved_tool_names
         # Resolve max_turns: prefer definition, then parent config (treating
         # None as absent), then default 100.
         _inherit_max_turns = cfg.get("max_turns")
@@ -3087,7 +3229,25 @@ class WorkerThread(threading.Thread):
 
         log('DEBUG', 'core.token', f"Worker agent config: token_monitor_warning_threshold={worker_cfg.get('token_monitor_warning_threshold', 'NOT SET')} token_monitor_critical_threshold={worker_cfg.get('token_monitor_critical_threshold', 'NOT SET')} max_turns={worker_cfg.get('max_turns', 'NOT SET')} timeout_seconds={worker_cfg.get('timeout_seconds', 'NOT SET')}")
 
-        return AgentConfig(**worker_cfg)
+        _config = AgentConfig(**worker_cfg)
+        # ``_tool_classes`` used to be spawn-time data nothing ever read.  Feed it
+        # from the runtime authority instead: exactly the list the agent will
+        # hand to its ToolExecutor (enabled_tools intersected with
+        # resolved_tool_names).  The dict-keyed-by-class-name shape is kept for
+        # the process-mode kwarg map (worker_runtime_process._OPTIONAL_KWARGS).
+        try:
+            self._tool_classes = {
+                cls.__name__: cls
+                for cls in _config.get_filtered_tool_classes(
+                    allowed_names=resolved_tool_names
+                )
+            }
+        except Exception as exc:
+            logger.debug(
+                "Worker '%s' could not mirror the runtime tool classes (%s)",
+                self.worker_name, exc,
+            )
+        return _config
 
     def _run_tool_loop(
         self,
@@ -5157,6 +5317,14 @@ def get_worker_event_buses_for_session(session_id: str) -> Dict[str, Any]:
 # Tool
 # ---------------------------------------------------------------------------
 
+#: The worker an action lands on when the caller omits ``worker_name``.
+#: ``resources/worker_templates/default.json`` ships a template of this name, so
+#: "omitted" always names a worker that exists rather than demanding a name the
+#: agent was never told to supply (the schema said ``worker_name`` was optional
+#: while ``execute()`` rejected None -- that contradiction cost a turn).
+DEFAULT_WORKER_NAME = "default"
+
+
 class Worker(ToolBase):
     """Manage background or child worker processes.
 
@@ -5172,6 +5340,13 @@ class Worker(ToolBase):
     queries are kept); it never terminates anything.  Terminating (``kill``)
     and reviving (``resume``) a worker are operator-only operations exposed in
     the workspace UI, not actions this tool offers the agent.
+
+    ``worker_name`` is genuinely optional: omit it (or leave it blank) and every
+    action that needs a worker uses the ``default`` worker.  A spawn task may be
+    given either as the top-level ``query`` argument or as ``context['query']``
+    — the same task, run on the same blocking dispatch path; passing both is
+    only accepted when they are identical, otherwise the call is rejected as
+    ambiguous rather than silently dropping one of them.
     """
 
     tool: str = "Worker"
@@ -5187,9 +5362,12 @@ class Worker(ToolBase):
         "operator can revive it — a stop is therefore never a termination. "
         "Killing and resuming a worker are operator-only (workspace UI), not "
         "agent actions. "
-        "When action='spawn' and context has a 'query' key, the spawn call "
-        "BLOCKS until the worker finishes the task and returns the full result. "
-        "Without a 'query' key, spawn returns immediately; use action='query' later. "
+        "When action='spawn' and a task is given -- as the top-level 'query' "
+        "argument or as context['query'] -- the spawn call BLOCKS until the "
+        "worker finishes the task and returns the full result. The two "
+        "spellings are the same task: give both and they must agree, or the "
+        "call is rejected as ambiguous. With no task, spawn returns "
+        "immediately; use action='query' later. "
         "action='submit_query' enqueues a query and returns immediately with a job_id "
         "(non-blocking); poll progress with action='job_status' (worker_query = job id, "
         "or empty to list this worker's jobs)."
@@ -5197,7 +5375,12 @@ class Worker(ToolBase):
 
     worker_name: Optional[str] = Field(
         default=None,
-        description="Name of the worker",
+        description=(
+            "Name of the worker, as listed in workers.json. Optional: when "
+            f"omitted (or blank) every action that needs a worker uses the "
+            f"'{DEFAULT_WORKER_NAME}' worker. "
+            "Use action='list' to see the available names."
+        ),
     )
 
     worker_query: Optional[str] = Field(
@@ -5205,17 +5388,37 @@ class Worker(ToolBase):
         description="Query string to send to an already-spawned worker. "
         "Only valid with action='query' (the call BLOCKS until the worker responds), "
         "action='submit_query' (non-blocking; returns a job handle immediately), "
-        "or action='job_status' (job id to look up; empty lists jobs for the worker).",
+        "or action='job_status' (job id to look up; empty lists jobs for the worker). "
+        "On 'query'/'submit_query' any 'context' you also pass is prepended to "
+        "this string; worker_query stays authoritative.",
+    )
+
+    query: Optional[str] = Field(
+        default=None,
+        description="The task for action='spawn' (e.g. query='Review src/'). "
+        "The spawn call BLOCKS until the worker finishes and returns the "
+        "worker's result. This is the same task as context['query'] -- "
+        "passing both is only accepted when they are identical, otherwise the "
+        "call is rejected as ambiguous. Only valid with action='spawn'; for "
+        "an already-spawned worker use worker_query.",
     )
 
     context: Optional[Union[Dict, str]] = Field(
         default=None,
-        description="Optional context dict passed only on action='spawn'. "
-        "If this dict includes a 'query' key (e.g., {'query': 'Review src/'}), "
-        "the worker executes that task immediately and the spawn call BLOCKS "
-        "until the worker finishes. The 'query' value becomes the worker's "
-        "first instruction. Other keys (e.g., config) are passed as metadata. "
-        "You may also pass a plain string, which will be treated as the query.",
+        description="Optional context dict or briefing string. "
+        "Valid on action='spawn', 'query' and 'submit_query'; on any other "
+        "action it is ignored (and the response says so via 'context_ignored'). "
+        "On 'spawn': if this dict includes a 'query' key (e.g., {'query': "
+        "'Review src/'}), the worker executes that task immediately and the "
+        "spawn call BLOCKS until the worker finishes. The 'query' value becomes "
+        "the worker's first instruction. Other keys (e.g., config) are passed "
+        "as metadata. You may also pass a plain string, which will be treated "
+        "as the query. "
+        "On 'query'/'submit_query' the context is PREPENDED to worker_query as a "
+        "labelled 'Follow-up context for this query:' block, so a follow-up "
+        "keeps the briefing channel. worker_query is authoritative there: a "
+        "'query' key inside the context is dropped (the response notes it via "
+        "'context_note'), and a plain string is used verbatim as briefing text.",
     )
 
     timeout_seconds: Optional[int] = Field(
@@ -5273,6 +5476,36 @@ class Worker(ToolBase):
     # agent actions.  The agent's "stop" DETACHES (recoverable park).
     VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "reset"]
 
+    #: Actions that cannot do anything without naming a worker.  Every other
+    #: action keeps ``worker_name=None``: for pause/stop that None is
+    #: MEANINGFUL (session/main scope), not a missing argument -- defaulting
+    #: them to a worker name would silently redirect a main-agent pause onto
+    #: one worker.
+    ACTIONS_REQUIRING_WORKER: ClassVar[tuple[str, ...]] = (
+        "spawn", "check", "query", "submit_query", "join", "wait_for_job", "reset",
+    )
+
+    #: Actions that DO carry a ``context`` payload.  Every other action ignores
+    #: one (reported as ``context_ignored``), because the field used to accept a
+    #: context on every action and silently drop it on all but spawn.
+    CONTEXT_ACTIONS: ClassVar[tuple[str, ...]] = ("spawn", "query", "submit_query")
+
+    #: ``context`` exactly as the caller supplied it.  ``coerce_context`` below
+    #: rewrites a plain string to ``{"query": <str>}``, which erases the
+    #: difference between "raw briefing text" and a genuine dict carrying a
+    #: 'query' key; the follow-up renderer needs that difference.
+    _raw_context: Any = PrivateAttr(default=None)
+
+    @model_validator(mode='wrap')
+    @classmethod
+    def _capture_raw_context(cls, data: Any, handler: Any) -> Any:
+        """Keep the pre-coercion ``context`` so a string stays distinguishable."""
+        raw = data.get('context') if isinstance(data, dict) else None
+        obj = handler(data)
+        if isinstance(raw, str):
+            obj._raw_context = raw
+        return obj
+
     # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
     @field_validator('context', mode='before')
     @classmethod
@@ -5280,6 +5513,14 @@ class Worker(ToolBase):
         """If the LLM passes a plain string as context, wrap it as a query dict."""
         if isinstance(v, str):
             return {"query": v}
+        return v
+
+    @field_validator('worker_name', mode='before')
+    @classmethod
+    def blank_worker_name_means_omitted(cls, v: Any) -> Any:
+        """A blank/whitespace name is OMITTED, never a worker called ``''``."""
+        if isinstance(v, str) and not v.strip():
+            return None
         return v
 
     # ------------------------------------------------------------------
@@ -5307,10 +5548,19 @@ class Worker(ToolBase):
                     "available_actions": self.VALID_ACTIONS,
                 })
 
-            if self.action in ("spawn", "check", "query", "submit_query", "join", "wait_for_job", "reset") and not self.worker_name:
-                return json.dumps({
-                    "error": f"worker_name is required for action '{self.action}'",
-                })
+            # An omitted worker_name is not an error: every action that NEEDS a
+            # worker lands on DEFAULT_WORKER_NAME.  pause/resume/stop (and
+            # 'list', 'job_status') keep None, because there None means
+            # session/main scope rather than a missing argument.
+            if self.action in self.ACTIONS_REQUIRING_WORKER and self.worker_name is None:
+                self.worker_name = DEFAULT_WORKER_NAME
+
+            # A top-level 'query' is the spawn task, folded into the context so
+            # both spellings run the ONE blocking dispatch path below.
+            try:
+                self._fold_query_into_context()
+            except ValueError as exc:
+                return json.dumps({"error": str(exc), "action": self.action})
 
             # === Resolve the workspace id the worker must inherit ===
             # The parent's own workspace_path wins over SessionRegistry; see
@@ -5335,14 +5585,133 @@ class Worker(ToolBase):
             }[self.action]
 
             result = handler()
+            if self.action not in self.CONTEXT_ACTIONS and self.context is not None:
+                # A context this action cannot carry must be dropped VISIBLY.
+                result["context_ignored"] = (
+                    "context is only used by spawn/query/submit_query"
+                )
             return json.dumps(result, indent=2, default=str)
         except Exception as exc:
             logger.exception("Worker failed")
-            return json.dumps(
-                {"error": str(exc), "action": self.action}, indent=2
-            )
+            error_envelope = {"error": str(exc), "action": self.action}
+            if self.action not in self.CONTEXT_ACTIONS and self.context is not None:
+                # Even a failed action must not drop a context invisibly.
+                error_envelope["context_ignored"] = (
+                    "context is only used by spawn/query/submit_query"
+                )
+            return json.dumps(error_envelope, indent=2)
 
     # -- helpers -----------------------------------------------------
+
+    def _fold_query_into_context(self) -> None:
+        """Fold the top-level ``query`` argument into ``context['query']``.
+
+        ``context={'query': ...}`` is the long-standing spelling and the only
+        one with a dispatch behind it (``_action_spawn`` copies ``context`` into
+        ``thread._initial_context`` and then BLOCKS on the worker's first reply
+        because that dict has a 'query' key).  ``query=`` exists because it is
+        the shape an agent reaches for, so it is merged INTO the context instead
+        of growing a second dispatch path that could drift from the first.
+
+        Both precedence rules are explicit:
+
+        * top-level ``query`` + a context WITHOUT a 'query' key -> the
+          top-level value becomes the task;
+        * both present and DIFFERENT -> ``ValueError`` naming both, because
+          silently picking one drops work the caller asked for;
+        * both present and equal -> accepted once (the context already carries
+          exactly that task, so nothing is duplicated or dispatched twice).
+        """
+        if self.query is None or not self.query.strip():
+            return
+        task = self.query
+        if self.action != "spawn":
+            raise ValueError(
+                f"'query' is only valid with action='spawn'; for "
+                f"action='{self.action}' the task belongs in 'worker_query'. "
+                "Nothing was dispatched."
+            )
+        if not isinstance(self.context, dict):
+            self.context = {"query": task}
+            return
+        existing = self.context.get("query")
+        if existing is None or (isinstance(existing, str) and not existing.strip()):
+            merged = dict(self.context)
+            merged["query"] = task
+            self.context = merged
+            return
+        if str(existing) != task:
+            raise ValueError(
+                f"Conflicting tasks: query={task!r} but "
+                f"context['query']={existing!r}. They differ, so this call was "
+                "rejected rather than dispatching one of them silently -- pass "
+                "the task once, either as query= or as context={'query': ...}."
+            )
+
+    def _followup_context_block(self) -> tuple[Optional[str], Optional[str]]:
+        """Render ``context`` for a FOLLOW-UP query (``query``/``submit_query``).
+
+        Returns ``(block, note)``.  ``block`` is the labelled text to PREPEND to
+        ``worker_query`` -- ``None`` when the caller supplied no usable context.
+        ``note`` is what the envelope should say about anything that was
+        dropped.
+
+        ``worker_query`` is authoritative on a follow-up, so a ``query`` key
+        inside a context dict is DROPPED here and reported in ``note``; it is
+        never merged and can never override the query being sent.
+
+        A plain string is raw BRIEFING text, not a task.  ``coerce_context``
+        turned it into ``{"query": <str>}``, which looks exactly like a genuine
+        dict, so the pre-coercion value (``_raw_context``) is used instead.
+        """
+        raw = self._raw_context
+        if isinstance(raw, str):
+            text = raw.strip()
+            return (
+                f"{FOLLOWUP_CONTEXT_PREFIX}\n{text}" if text else None
+            ), None
+
+        context = self.context
+        if context is None:
+            return None, None
+        if isinstance(context, str):
+            text = context.strip()
+            return (
+                f"{FOLLOWUP_CONTEXT_PREFIX}\n{text}" if text else None
+            ), None
+        if not isinstance(context, dict):
+            text = str(context).strip()
+            return (
+                f"{FOLLOWUP_CONTEXT_PREFIX}\n{text}" if text else None
+            ), None
+
+        payload = dict(context)
+        note = None
+        if "query" in payload:
+            dropped = payload.pop("query")
+            note = (
+                "context['query'] ignored; worker_query wins "
+                f"(context['query']={dropped!r})"
+            )
+        if not payload:
+            return None, note
+        rendered = json.dumps(
+            payload, default=str, ensure_ascii=True, sort_keys=True
+        )
+        return f"{FOLLOWUP_CONTEXT_PREFIX}\n{rendered}", note
+
+    def _compose_followup_query(self) -> tuple[str, Optional[str]]:
+        """``worker_query`` with any follow-up context PREPENDED to it.
+
+        One string, on purpose: every delivery path (direct ``send_query``, the
+        detached FIFO ``enqueue_query``, the paused-resume dispatch) carries a
+        single string, so one composition serves all three.  With no context
+        supplied the result is ``worker_query`` byte-for-byte.
+        """
+        block, note = self._followup_context_block()
+        if not block:
+            return self.worker_query, note
+        return f"{block}\n\n{self.worker_query}", note
 
     def _load_workers(self, ws_id: Optional[str]) -> list:
         """
@@ -6201,10 +6570,9 @@ class Worker(ToolBase):
                 "worker_name": self.worker_name,
             }
 
-        # Resolve tool classes from definition
-        tool_classes: Dict[str, type[ToolBase]] = {}
-        missing_tools: list[str] = []
-        tool_names = definition.get("tools", [])
+        # Declared tool names.  An empty list is the implicit "all simplified
+        # tools" default; the capability registry below owns that meaning.
+        tool_names = list(definition.get("tools") or [])
         worker_perms = definition.get("permission_footprint") or definition.get("worker_permissions", {})
         # ── Fail-closed spawn guard ────────────────────────────────────
         # The worker footprint may only RESTRICT categories the session
@@ -6226,15 +6594,65 @@ class Worker(ToolBase):
         # Effective worker profile: session (ceiling) intersected with the
         # worker footprint.  Used for spawn-time tool validation below.
         spawn_effective = _restrictive_merge(session_perms, worker_perms)
+        # ── Capability resolution (fail loud, before the thread is built) ──
+        # The registry says which tools EXIST for this build; the footprint gate
+        # below says which of them may RUN (§7.2).  A name this build cannot
+        # ship aborts the spawn here, before any worker object is constructed,
+        # so no half-capable worker can ever start.
+        from tools.capability_registry import (
+            CapabilityRegistry,
+            CapabilityResolveError,
+        )
+
+        universe = _worker_tool_universe()
+        try:
+            capability_registry = CapabilityRegistry.resolve(
+                [_canonical_worker_tool_name(name) for name in tool_names],
+                available_names=tuple(universe),
+                lookup=universe,
+                blocklist=_WORKER_BLOCKLIST,
+                parent_enabled_tools=(self.agent_config or {}).get("enabled_tools"),
+                permission_veto=None,
+            )
+        except CapabilityResolveError as err:
+            return {
+                "error": (
+                    f"Worker '{self.worker_name}' requires tool(s) not "
+                    "shippable by this build: "
+                    f"{', '.join(err.missing_names)}"
+                ),
+                "worker_name": self.worker_name,
+                "missing_tools": list(err.missing_names),
+            }
+
+        # Canonical class map: keyed by class name, so a tool's alias spelling
+        # cannot create a second entry for the same class.
+        tool_classes: Dict[str, type[ToolBase]] = {
+            cls.__name__: cls for cls in capability_registry.resolved.values()
+        }
+        missing_tools: list[str] = []
+
+        if not tool_names:
+            # Implicit "all simplified tools" default: report the privilege,
+            # never grant it silently (§4.2).  The spawn envelope is unchanged.
+            implicit_granted = _worker_granted_tool_names(capability_registry)
+            if implicit_granted:
+                logger.warning(
+                    "Worker '%s' has an empty tool list (implicit / "
+                    "unrestricted): resolved to %d tool(s) from the default "
+                    "universe",
+                    self.worker_name, len(implicit_granted),
+                )
+
         if tool_names:
-            for tool_name in tool_names:
-                if tool_name in _WORKER_BLOCKLIST:
-                    missing_tools.append(f"{tool_name} (excluded for worker safety)")
-                    continue
-                cls = self._resolve_tool_class(tool_name)
-                if cls is None:
-                    missing_tools.append(tool_name)
-                    continue
+            # Blocklist exclusions stay SOFT (the worker spawns without them)
+            # and are reported to the operator, never silently dropped.
+            for excluded_name in capability_registry.excluded:
+                logger.warning(
+                    "Worker '%s': tool %s (excluded for worker safety)",
+                    self.worker_name, excluded_name,
+                )
+            for tool_name, cls in capability_registry.resolved.items():
                 # Spawn-time footprint validation: check tool categories against
                 # the worker's declared permission footprint.
                 tool_cats = cls.get_required_categories({})
@@ -6249,7 +6667,7 @@ class Worker(ToolBase):
                             f" for {tool_name}"
                         ),
                         # Footprint already intersected into spawn_effective
-                        # via _restrictive_merge \u2014 pass None so the gate does
+                        # via _restrictive_merge — pass None so the gate does
                         # not re-apply the raw footprint on top.
                         permission_footprint=None,
                         is_worker_context=True,
@@ -6258,8 +6676,7 @@ class Worker(ToolBase):
                         missing_tools.append(
                             f"{tool_name} (permission denied by worker footprint)"
                         )
-                        continue
-                tool_classes[tool_name] = cls
+                        tool_classes.pop(tool_name, None)
 
         # Resolve project root from workspace config so tools get the right
         # workspace_path (the project root, not the worker's internal dir).
@@ -6771,6 +7188,11 @@ class Worker(ToolBase):
                 "error": "worker_query is required for action 'query'",
             }
 
+        # A follow-up carries its context INSIDE the query string: one code
+        # path then serves the direct, detached-queue and paused-resume
+        # deliveries alike.  No context -> delivered_query IS worker_query.
+        delivered_query, context_note = self._compose_followup_query()
+
         # PHASE 2.1b: a submission against a DETACHED worker is QUEUED and
         # returns immediately -- it does NOT resume the worker. Resuming is
         # operator-initiated only (docs/design-worker-lifecycle.md, "Queries
@@ -6782,9 +7204,9 @@ class Worker(ToolBase):
             try:
                 enqueue = getattr(thread, "enqueue_query", None)
                 if callable(enqueue):
-                    enqueue(job_id, self.worker_query)
+                    enqueue(job_id, delivered_query)
                 else:  # pragma: no cover - duck-typed thread doubles
-                    thread._input_queue.put((job_id, self.worker_query, None))
+                    thread._input_queue.put((job_id, delivered_query, None))
             except Exception as exc:
                 return {
                     "error": f"Failed to enqueue query: {exc}",
@@ -6817,7 +7239,7 @@ class Worker(ToolBase):
                     except Exception:
                         pass
                     raise
-            return {
+            detached_envelope = {
                 "worker_name": self.worker_name,
                 "instance_id": iid,
                 "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
@@ -6827,6 +7249,9 @@ class Worker(ToolBase):
                         "runs only once an operator resumes the worker. Poll with "
                         "action='job_status' / action='join'.",
             }
+            if context_note is not None:
+                detached_envelope["context_note"] = context_note
+            return detached_envelope
         if thread.status == "paused":
             # A paused worker must never be queried destructively (BUG 3):
             # the old behavior blocked up to 300s, then stopped the worker
@@ -6834,12 +7259,21 @@ class Worker(ToolBase):
             # query immediately (non-destructively); normal pauses are
             # auto-resumed and the query proceeds normally below.
             if getattr(thread, "_manual_only_pause", False):
-                return {
+                paused_envelope = {
                     "status": "paused",
                     "message": "Worker is manually paused",
                     "worker_name": self.worker_name,
                     "session_id": self.session_id or "",
                 }
+                if self.context is not None:
+                    # The query was NOT sent, so the context was not delivered
+                    # either -- say so instead of dropping it silently.
+                    paused_envelope["context_note"] = (
+                        "context was NOT delivered: the worker is manually paused "
+                        "and the query was not sent. Re-send it with the query "
+                        "once the worker is resumed."
+                    )
+                return paused_envelope
             try:
                 _resume_outcome = thread.resume()
             except Exception as exc:
@@ -6874,7 +7308,7 @@ class Worker(ToolBase):
             )
         try:
             # Block until the worker responds
-            response = thread.send_query(self.worker_query, timeout=wait)
+            response = thread.send_query(delivered_query, timeout=wait)
             elapsed = thread._last_elapsed()
             result = {
                 "worker_name": self.worker_name,
@@ -6885,6 +7319,8 @@ class Worker(ToolBase):
             }
             if thread._last_reasoning is not None:
                 result["reasoning"] = thread._last_reasoning
+            if context_note is not None:
+                result["context_note"] = context_note
             return result
         except TimeoutError as exc:
             # Cooperative stop: the query deadline elapsed with no reply. Stop
@@ -7000,6 +7436,9 @@ class Worker(ToolBase):
             }
         if not self.worker_query:
             return {"error": "worker_query is required for action 'submit_query'"}
+        # Same single-string composition as action='query': the queued item is
+        # what the worker later reads, so the context must ride inside it.
+        delivered_query, context_note = self._compose_followup_query()
         job_id = uuid.uuid4().hex
         try:
             # PHASE 2.1b: append through the bookkept FIFO appender. This only
@@ -7007,9 +7446,9 @@ class Worker(ToolBase):
             # running turn; a detached worker stays parked and burns nothing).
             enqueue = getattr(thread, "enqueue_query", None)
             if callable(enqueue):
-                enqueue(job_id, self.worker_query)
+                enqueue(job_id, delivered_query)
             else:  # pragma: no cover - duck-typed thread doubles
-                thread._input_queue.put((job_id, self.worker_query, None))
+                thread._input_queue.put((job_id, delivered_query, None))
         except Exception as exc:
             return {"error": f"Failed to enqueue query: {exc}", "worker_name": self.worker_name}
         registry = _get_worker_job_registry()
@@ -7039,7 +7478,7 @@ class Worker(ToolBase):
                 except Exception:
                     pass
                 raise
-        return {
+        submitted_envelope = {
             "worker_name": self.worker_name,
             "instance_id": iid,
             "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
@@ -7049,6 +7488,9 @@ class Worker(ToolBase):
                     "WORKER_PARTIAL_RESULT / WORKER_COMPLETED events; poll with "
                     "action='job_status'.",
         }
+        if context_note is not None:
+            submitted_envelope["context_note"] = context_note
+        return submitted_envelope
 
     def _action_job_status(self, workers: list) -> dict:
         """Read job records from the registry (non-blocking, Phase 2B)."""

@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.core.state import AgentState, TokenState, TurnState, TimeState
+from thoughtmachine.timeout_constants import TIMEOUT_READ_ONLY_TOOLS
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -52,12 +53,54 @@ def state() -> AgentState:
 class TestGetAllowedTools:
     """Verify get_allowed_tools() returns the correct tool lists."""
 
-    def test_get_allowed_tools_timeout_returns_only_respond(self, state: AgentState):
-        """When restriction_reason is 'timeout', only 'Respond' should be allowed."""
+    def test_get_allowed_tools_timeout_returns_respond_and_read_only(self, state: AgentState):
+        """On 'timeout', Respond + SummarizeTool + the read-only set are allowed.
+
+        The runtime budget being spent must stop new WORK, not blind the agent
+        while it writes up its (mandatory) response.
+        """
         state.restrictions_active = True
         state.restriction_reason = 'timeout'
         allowed = state.get_allowed_tools()
-        assert allowed == ['Respond'], f"Expected ['Respond'], got {allowed}"
+        expected = {'Respond', 'SummarizeTool'} | set(TIMEOUT_READ_ONLY_TOOLS)
+        assert set(allowed) == expected, f"Expected {sorted(expected)}, got {allowed}"
+        assert len(allowed) == len(set(allowed)), f'Duplicates in {allowed}'
+        # No work tools leak in through the timeout branch.
+        for write_tool in ('ApplyEdits', 'FileEditor', 'DockerCodeRunner',
+                           'ContainerExecTool', 'Worker', 'ProgressReport'):
+            assert write_tool not in allowed, (
+                f'{write_tool} must not be allowed on the timeout axis: {allowed}'
+            )
+
+    def test_get_allowed_tools_timeout_matches_is_tool_allowed(self, state: AgentState):
+        """get_allowed_tools() is display-only but must agree with the gate.
+
+        The tool-rejection prose renders ``Available tools:`` from
+        get_allowed_tools(), so a disagreement would advertise tools the gate
+        then refuses (or hide tools that are permitted).
+        """
+        state.restrictions_active = True
+        state.restriction_reason = 'timeout'
+        allowed = set(state.get_allowed_tools())
+        probes = set(allowed) | {
+            'ApplyEdits', 'FileEditor', 'DockerCodeRunner', 'ContainerExecTool',
+            'CodeModifier', 'NonexistentToolOnPurpose',
+        }
+        for name in sorted(probes):
+            assert state.is_tool_allowed(name) == (name in allowed), (
+                f'is_tool_allowed({name!r}) disagrees with get_allowed_tools()'
+            )
+
+    def test_get_allowed_tools_timeout_allows_read_refuses_write(self, state: AgentState):
+        """Read-only tools survive the timeout; write tools do not."""
+        state.restrictions_active = True
+        state.restriction_reason = 'timeout'
+        assert state.is_tool_allowed('ReadFile') is True
+        assert state.is_tool_allowed('FileSearchTool') is True
+        assert state.is_tool_allowed('git_read') is True
+        assert state.is_tool_allowed('ApplyEdits') is False
+        assert state.is_tool_allowed('ContainerExecTool') is False
+        assert state.is_tool_allowed('Respond') is True
 
     def test_get_allowed_tools_token_critical_returns_respond_and_summarize(self, state: AgentState):
         """When restriction_reason is 'token', both Respond and SummarizeTool should be allowed."""
@@ -192,6 +235,104 @@ class TestRestrictionReason:
         assert state.restrictions_active is False
 
 
+class TestTimeoutReadOnlyAllowlistRot:
+    """Rot protection for ``TIMEOUT_READ_ONLY_TOOLS``.
+
+    The constant is an explicit, hand-maintained frozenset (it must not be
+    derived from the tool registry at runtime -- see the comment in
+    thoughtmachine/timeout_constants.py). These tests are the counterweight:
+    they fail if a name stops resolving to a registered tool, or if a tool
+    with a write-ish ``required_categories`` entry ever lands in the set.
+    """
+
+    # Every permission category that is unambiguously read-scoped. Derived by
+    # grepping ``required_categories`` / ``get_required_categories`` across
+    # ``tools/`` (tools/base.py:90 is the declaring ClassVar). Any category
+    # NOT listed here (filesystem:write, container:true, mcp:connect,
+    # host_bash:allow, visual:view, network:outbound, git:write, ci:read is
+    # read-scoped ...) is treated as write-ish by default -- fail closed, so a
+    # newly invented category cannot silently join the read-only set.
+    READ_SCOPED_CATEGORIES = frozenset({
+        'filesystem:read',
+        'git:read',
+        'ci:read',
+    })
+
+    # Tools that are excluded on purpose even though a naive category check
+    # would let them through. Documented in timeout_constants.py too.
+    EXPLICITLY_EXCLUDED = frozenset({
+        'KnowledgeBaseTool',  # read and write operations share one tool
+        'Worker',             # required_categories == [] but spawns nested agents
+        'FileEditor',         # read AND write/delete in one tool
+        'WorkingDocument',    # task-list/memory mutator
+        'ProgressReport',     # always writes a file
+    })
+
+    @staticmethod
+    def _registry() -> dict:
+        """Map canonical tool name -> tool class, from the live registry."""
+        import tools  # local import: keeps this module importable without tools
+        return {cls.tool_name(): cls for cls in tools.TOOL_CLASSES}
+
+    def test_every_name_resolves_to_a_registered_tool(self):
+        registry = self._registry()
+        assert registry, 'tools.TOOL_CLASSES is empty -- registry did not load'
+        missing = sorted(n for n in TIMEOUT_READ_ONLY_TOOLS if n not in registry)
+        assert not missing, (
+            f'TIMEOUT_READ_ONLY_TOOLS names no registered tool: {missing}. '
+            f'Registered names: {sorted(registry)}'
+        )
+
+    def test_no_member_declares_write_ish_categories(self):
+        registry = self._registry()
+        offenders = []
+        for name in sorted(TIMEOUT_READ_ONLY_TOOLS):
+            cls = registry.get(name)
+            if cls is None:
+                continue  # covered by the resolution test
+            # Static check with no params: tools with operation-level
+            # granularity (FileEditor, KnowledgeBaseTool, Worker) report their
+            # most permissive categories here, which is what we want.
+            cats = set(cls.get_required_categories({}) or [])
+            write_ish = cats - self.READ_SCOPED_CATEGORIES
+            if write_ish:
+                offenders.append((name, sorted(write_ish)))
+        assert not offenders, (
+            'Tools with write-ish required_categories must NOT stay available '
+            f'on the timeout axis: {offenders}'
+        )
+
+    def test_explicitly_excluded_tools_are_absent(self):
+        leaked = sorted(self.EXPLICITLY_EXCLUDED & set(TIMEOUT_READ_ONLY_TOOLS))
+        assert not leaked, (
+            f'These tools are excluded on purpose and must not be in '
+            f'TIMEOUT_READ_ONLY_TOOLS: {leaked}'
+        )
+
+    def test_no_registered_write_tool_is_a_member(self):
+        """Any registry tool that needs a write-ish category is refused."""
+        registry = self._registry()
+        gate = AgentState(config=MagicMock(), logger=MagicMock())
+        gate.reset()
+        gate.restrictions_active = True
+        gate.restriction_reason = 'timeout'
+        leaked = []
+        for name, cls in sorted(registry.items()):
+            try:
+                cats = set(cls.get_required_categories({}) or [])
+            except Exception:  # pragma: no cover - registry anomaly
+                continue
+            if cats - self.READ_SCOPED_CATEGORIES:
+                if gate.is_tool_allowed(name):
+                    leaked.append(name)
+        # Respond/SummarizeTool are granted explicitly on every restricted axis
+        # and are not read tools; the timeout branch grants them deliberately.
+        leaked = [n for n in leaked if n not in ('Respond', 'SummarizeTool')]
+        assert not leaked, (
+            f'Write-ish tools are allowed under timeout: {leaked}'
+        )
+
+
 class TestTimeoutWarningMessage:
     """Verify the timeout warning messages contain the expected text."""
 
@@ -235,8 +376,8 @@ class TestTimeoutWarningMessage:
         warning_events = [e for e in events if e['type'] == 'time_warning']
         assert len(warning_events) > 0
         msg = warning_events[0].get('warning_message', '')
-        assert 'Only the Respond tool is available' in msg, (
-            f"Critical message should mention only Respond. Got: {msg}"
+        assert 'Only Respond, SummarizeTool and the read-only tools are available' in msg, (
+            f"Critical message should mention Respond + SummarizeTool + read-only. Got: {msg}"
         )
         assert 'Please finish your work and respond immediately' in msg, (
             f"Critical message should ask to finish work. Got: {msg}"

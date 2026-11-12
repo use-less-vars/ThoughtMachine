@@ -1126,12 +1126,29 @@ class TestWorker:
     #  Worker tool — misc
     # ═══════════════════════════════════════════════════════════════════
 
-    def test_action_missing_worker_name(self):
-        """spawn/check/query return error when worker_name is missing."""
-        tool = Worker(action="spawn", worker_name=None, workspace_path="/tmp/test_ws")
+    @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
+    @patch("tools.workspace.worker._workspace_dir")
+    def test_action_missing_worker_name(self, mock_ws_dir, mock_resolve):
+        """An omitted worker_name resolves to the 'default' worker.
+
+        The schema always said worker_name was optional, so "omitted" must
+        name the seeded default worker instead of failing a required-name
+        guard the caller was never told about.
+        """
+        mock_dir = MagicMock()
+        mock_file = MagicMock()
+        mock_file.exists.return_value = True
+        mock_file.read_text.return_value = json.dumps([
+            {"name": "default", "status": "ready", "permission_subset": []},
+        ])
+        mock_dir.__truediv__.return_value = mock_file
+        mock_ws_dir.return_value = mock_dir
+
+        tool = Worker(action="check", worker_name=None, workspace_path="/tmp/test_ws")
+        assert tool.worker_name is None  # omitted, not spoofed by the caller
         result = _parse_result(tool.execute())
-        assert "error" in result
-        assert "worker_name is required" in result["error"]
+        assert tool.worker_name == "default"
+        assert "worker_name is required" not in (result.get("error") or "")
 
     def test_unknown_action(self):
         """Unknown action returns error with available actions."""

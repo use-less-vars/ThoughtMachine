@@ -126,6 +126,13 @@ worker_live_test.txt
 !.thoughtmachine/working_docs/tool_no_wrapping_guard.py
 # Protocols are meant to be run by someone else — they are not scratch.
 !.thoughtmachine/working_docs/protocol-*.md
+# Capability-registry design pass: the worker capability-registry design doc is a
+# deliverable, not scratch, but it lives in ignored space --
+# `.thoughtmachine/working_docs/*` (the re-ignore above) excludes it wholesale, so
+# `git add` would refuse it and `git clean -xdf` would destroy it. This negation is
+# load-bearing ONLY because it sits AFTER that re-ignore; do not move it above it,
+# and do not delete it as "another working-doc file".
+!.thoughtmachine/working_docs/design-worker-capability-registry.md
 .thoughtmachine/knowledge/project/test_protocols.md
 
 # Node.js binary distribution (vendored)

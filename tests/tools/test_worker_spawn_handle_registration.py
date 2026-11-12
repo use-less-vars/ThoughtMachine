@@ -44,6 +44,7 @@ from fastapi.testclient import TestClient
 from tools.workspace import worker_runtime
 from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_runtime import (
+    MODE_THREAD,
     StaleWorkerFence,
     attach_thread_frame_sink,
     register_runtime_handle,
@@ -153,7 +154,10 @@ def _register_like_the_spawn_site(worker, *, epoch=None):
     division of labour the spawn site has, so the key these tests register under
     is the key the routes look up with.
     """
-    handle = attach_thread_frame_sink(worker)
+    # Mode is pinned: every double here is a thread-mode stand-in (it owns no
+    # definition/workspace to rebuild a spec from), and these tests are about
+    # thread-mode dispatch, verbs and the fence -- not about the default.
+    handle = attach_thread_frame_sink(worker, mode=MODE_THREAD)
     register_runtime_handle(
         handle,
         session_id=worker.session_id,
