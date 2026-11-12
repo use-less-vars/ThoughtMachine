@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Union
 
-from pydantic import Field, field_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from tools.base import ToolBase
 from tools.workspace.command_channel import (
@@ -1414,6 +1414,13 @@ def _adopt_predecessor_journal(
 #: Prefix of every initial-context payload. It is the marker the F1/WLM prune
 #: boundaries look for, so it must stay stable across the role change below.
 INITIAL_CONTEXT_PREFIX = "Initial context: "
+
+#: Prefix of every FOLLOW-UP context payload (``action='query'`` /
+#: ``'submit_query'``). Deliberately NOT the initial-context prefix:
+#: ``is_initial_context_message()`` and the spawn-side prune/dedupe boundaries
+#: key on that exact marker, so reusing it for a follow-up query would make the
+#: query look like an initial-context message and corrupt that handling.
+FOLLOWUP_CONTEXT_PREFIX = "Follow-up context for this query:"
 
 
 def initial_context_message(initial_context: Dict[str, Any]) -> Dict[str, Any]:
@@ -5355,7 +5362,9 @@ class Worker(ToolBase):
         description="Query string to send to an already-spawned worker. "
         "Only valid with action='query' (the call BLOCKS until the worker responds), "
         "action='submit_query' (non-blocking; returns a job handle immediately), "
-        "or action='job_status' (job id to look up; empty lists jobs for the worker).",
+        "or action='job_status' (job id to look up; empty lists jobs for the worker). "
+        "On 'query'/'submit_query' any 'context' you also pass is prepended to "
+        "this string; worker_query stays authoritative.",
     )
 
     query: Optional[str] = Field(
@@ -5370,12 +5379,20 @@ class Worker(ToolBase):
 
     context: Optional[Union[Dict, str]] = Field(
         default=None,
-        description="Optional context dict passed only on action='spawn'. "
-        "If this dict includes a 'query' key (e.g., {'query': 'Review src/'}), "
-        "the worker executes that task immediately and the spawn call BLOCKS "
-        "until the worker finishes. The 'query' value becomes the worker's "
-        "first instruction. Other keys (e.g., config) are passed as metadata. "
-        "You may also pass a plain string, which will be treated as the query.",
+        description="Optional context dict or briefing string. "
+        "Valid on action='spawn', 'query' and 'submit_query'; on any other "
+        "action it is ignored (and the response says so via 'context_ignored'). "
+        "On 'spawn': if this dict includes a 'query' key (e.g., {'query': "
+        "'Review src/'}), the worker executes that task immediately and the "
+        "spawn call BLOCKS until the worker finishes. The 'query' value becomes "
+        "the worker's first instruction. Other keys (e.g., config) are passed "
+        "as metadata. You may also pass a plain string, which will be treated "
+        "as the query. "
+        "On 'query'/'submit_query' the context is PREPENDED to worker_query as a "
+        "labelled 'Follow-up context for this query:' block, so a follow-up "
+        "keeps the briefing channel. worker_query is authoritative there: a "
+        "'query' key inside the context is dropped (the response notes it via "
+        "'context_note'), and a plain string is used verbatim as briefing text.",
     )
 
     timeout_seconds: Optional[int] = Field(
@@ -5441,6 +5458,27 @@ class Worker(ToolBase):
     ACTIONS_REQUIRING_WORKER: ClassVar[tuple[str, ...]] = (
         "spawn", "check", "query", "submit_query", "join", "wait_for_job", "reset",
     )
+
+    #: Actions that DO carry a ``context`` payload.  Every other action ignores
+    #: one (reported as ``context_ignored``), because the field used to accept a
+    #: context on every action and silently drop it on all but spawn.
+    CONTEXT_ACTIONS: ClassVar[tuple[str, ...]] = ("spawn", "query", "submit_query")
+
+    #: ``context`` exactly as the caller supplied it.  ``coerce_context`` below
+    #: rewrites a plain string to ``{"query": <str>}``, which erases the
+    #: difference between "raw briefing text" and a genuine dict carrying a
+    #: 'query' key; the follow-up renderer needs that difference.
+    _raw_context: Any = PrivateAttr(default=None)
+
+    @model_validator(mode='wrap')
+    @classmethod
+    def _capture_raw_context(cls, data: Any, handler: Any) -> Any:
+        """Keep the pre-coercion ``context`` so a string stays distinguishable."""
+        raw = data.get('context') if isinstance(data, dict) else None
+        obj = handler(data)
+        if isinstance(raw, str):
+            obj._raw_context = raw
+        return obj
 
     # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
     @field_validator('context', mode='before')
@@ -5521,12 +5559,21 @@ class Worker(ToolBase):
             }[self.action]
 
             result = handler()
+            if self.action not in self.CONTEXT_ACTIONS and self.context is not None:
+                # A context this action cannot carry must be dropped VISIBLY.
+                result["context_ignored"] = (
+                    "context is only used by spawn/query/submit_query"
+                )
             return json.dumps(result, indent=2, default=str)
         except Exception as exc:
             logger.exception("Worker failed")
-            return json.dumps(
-                {"error": str(exc), "action": self.action}, indent=2
-            )
+            error_envelope = {"error": str(exc), "action": self.action}
+            if self.action not in self.CONTEXT_ACTIONS and self.context is not None:
+                # Even a failed action must not drop a context invisibly.
+                error_envelope["context_ignored"] = (
+                    "context is only used by spawn/query/submit_query"
+                )
+            return json.dumps(error_envelope, indent=2)
 
     # -- helpers -----------------------------------------------------
 
@@ -5574,6 +5621,71 @@ class Worker(ToolBase):
                 "rejected rather than dispatching one of them silently -- pass "
                 "the task once, either as query= or as context={'query': ...}."
             )
+
+    def _followup_context_block(self) -> tuple[Optional[str], Optional[str]]:
+        """Render ``context`` for a FOLLOW-UP query (``query``/``submit_query``).
+
+        Returns ``(block, note)``.  ``block`` is the labelled text to PREPEND to
+        ``worker_query`` -- ``None`` when the caller supplied no usable context.
+        ``note`` is what the envelope should say about anything that was
+        dropped.
+
+        ``worker_query`` is authoritative on a follow-up, so a ``query`` key
+        inside a context dict is DROPPED here and reported in ``note``; it is
+        never merged and can never override the query being sent.
+
+        A plain string is raw BRIEFING text, not a task.  ``coerce_context``
+        turned it into ``{"query": <str>}``, which looks exactly like a genuine
+        dict, so the pre-coercion value (``_raw_context``) is used instead.
+        """
+        raw = self._raw_context
+        if isinstance(raw, str):
+            text = raw.strip()
+            return (
+                f"{FOLLOWUP_CONTEXT_PREFIX}\n{text}" if text else None
+            ), None
+
+        context = self.context
+        if context is None:
+            return None, None
+        if isinstance(context, str):
+            text = context.strip()
+            return (
+                f"{FOLLOWUP_CONTEXT_PREFIX}\n{text}" if text else None
+            ), None
+        if not isinstance(context, dict):
+            text = str(context).strip()
+            return (
+                f"{FOLLOWUP_CONTEXT_PREFIX}\n{text}" if text else None
+            ), None
+
+        payload = dict(context)
+        note = None
+        if "query" in payload:
+            dropped = payload.pop("query")
+            note = (
+                "context['query'] ignored; worker_query wins "
+                f"(context['query']={dropped!r})"
+            )
+        if not payload:
+            return None, note
+        rendered = json.dumps(
+            payload, default=str, ensure_ascii=True, sort_keys=True
+        )
+        return f"{FOLLOWUP_CONTEXT_PREFIX}\n{rendered}", note
+
+    def _compose_followup_query(self) -> tuple[str, Optional[str]]:
+        """``worker_query`` with any follow-up context PREPENDED to it.
+
+        One string, on purpose: every delivery path (direct ``send_query``, the
+        detached FIFO ``enqueue_query``, the paused-resume dispatch) carries a
+        single string, so one composition serves all three.  With no context
+        supplied the result is ``worker_query`` byte-for-byte.
+        """
+        block, note = self._followup_context_block()
+        if not block:
+            return self.worker_query, note
+        return f"{block}\n\n{self.worker_query}", note
 
     def _load_workers(self, ws_id: Optional[str]) -> list:
         """
@@ -7050,6 +7162,11 @@ class Worker(ToolBase):
                 "error": "worker_query is required for action 'query'",
             }
 
+        # A follow-up carries its context INSIDE the query string: one code
+        # path then serves the direct, detached-queue and paused-resume
+        # deliveries alike.  No context -> delivered_query IS worker_query.
+        delivered_query, context_note = self._compose_followup_query()
+
         # PHASE 2.1b: a submission against a DETACHED worker is QUEUED and
         # returns immediately -- it does NOT resume the worker. Resuming is
         # operator-initiated only (docs/design-worker-lifecycle.md, "Queries
@@ -7061,9 +7178,9 @@ class Worker(ToolBase):
             try:
                 enqueue = getattr(thread, "enqueue_query", None)
                 if callable(enqueue):
-                    enqueue(job_id, self.worker_query)
+                    enqueue(job_id, delivered_query)
                 else:  # pragma: no cover - duck-typed thread doubles
-                    thread._input_queue.put((job_id, self.worker_query, None))
+                    thread._input_queue.put((job_id, delivered_query, None))
             except Exception as exc:
                 return {
                     "error": f"Failed to enqueue query: {exc}",
@@ -7096,7 +7213,7 @@ class Worker(ToolBase):
                     except Exception:
                         pass
                     raise
-            return {
+            detached_envelope = {
                 "worker_name": self.worker_name,
                 "instance_id": iid,
                 "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
@@ -7106,6 +7223,9 @@ class Worker(ToolBase):
                         "runs only once an operator resumes the worker. Poll with "
                         "action='job_status' / action='join'.",
             }
+            if context_note is not None:
+                detached_envelope["context_note"] = context_note
+            return detached_envelope
         if thread.status == "paused":
             # A paused worker must never be queried destructively (BUG 3):
             # the old behavior blocked up to 300s, then stopped the worker
@@ -7113,12 +7233,21 @@ class Worker(ToolBase):
             # query immediately (non-destructively); normal pauses are
             # auto-resumed and the query proceeds normally below.
             if getattr(thread, "_manual_only_pause", False):
-                return {
+                paused_envelope = {
                     "status": "paused",
                     "message": "Worker is manually paused",
                     "worker_name": self.worker_name,
                     "session_id": self.session_id or "",
                 }
+                if self.context is not None:
+                    # The query was NOT sent, so the context was not delivered
+                    # either -- say so instead of dropping it silently.
+                    paused_envelope["context_note"] = (
+                        "context was NOT delivered: the worker is manually paused "
+                        "and the query was not sent. Re-send it with the query "
+                        "once the worker is resumed."
+                    )
+                return paused_envelope
             try:
                 _resume_outcome = thread.resume()
             except Exception as exc:
@@ -7153,7 +7282,7 @@ class Worker(ToolBase):
             )
         try:
             # Block until the worker responds
-            response = thread.send_query(self.worker_query, timeout=wait)
+            response = thread.send_query(delivered_query, timeout=wait)
             elapsed = thread._last_elapsed()
             result = {
                 "worker_name": self.worker_name,
@@ -7164,6 +7293,8 @@ class Worker(ToolBase):
             }
             if thread._last_reasoning is not None:
                 result["reasoning"] = thread._last_reasoning
+            if context_note is not None:
+                result["context_note"] = context_note
             return result
         except TimeoutError as exc:
             # Cooperative stop: the query deadline elapsed with no reply. Stop
@@ -7279,6 +7410,9 @@ class Worker(ToolBase):
             }
         if not self.worker_query:
             return {"error": "worker_query is required for action 'submit_query'"}
+        # Same single-string composition as action='query': the queued item is
+        # what the worker later reads, so the context must ride inside it.
+        delivered_query, context_note = self._compose_followup_query()
         job_id = uuid.uuid4().hex
         try:
             # PHASE 2.1b: append through the bookkept FIFO appender. This only
@@ -7286,9 +7420,9 @@ class Worker(ToolBase):
             # running turn; a detached worker stays parked and burns nothing).
             enqueue = getattr(thread, "enqueue_query", None)
             if callable(enqueue):
-                enqueue(job_id, self.worker_query)
+                enqueue(job_id, delivered_query)
             else:  # pragma: no cover - duck-typed thread doubles
-                thread._input_queue.put((job_id, self.worker_query, None))
+                thread._input_queue.put((job_id, delivered_query, None))
         except Exception as exc:
             return {"error": f"Failed to enqueue query: {exc}", "worker_name": self.worker_name}
         registry = _get_worker_job_registry()
@@ -7318,7 +7452,7 @@ class Worker(ToolBase):
                 except Exception:
                     pass
                 raise
-        return {
+        submitted_envelope = {
             "worker_name": self.worker_name,
             "instance_id": iid,
             "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
@@ -7328,6 +7462,9 @@ class Worker(ToolBase):
                     "WORKER_PARTIAL_RESULT / WORKER_COMPLETED events; poll with "
                     "action='job_status'.",
         }
+        if context_note is not None:
+            submitted_envelope["context_note"] = context_note
+        return submitted_envelope
 
     def _action_job_status(self, workers: list) -> dict:
         """Read job records from the registry (non-blocking, Phase 2B)."""
