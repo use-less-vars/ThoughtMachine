@@ -23,7 +23,7 @@ b43163dc docs: log security boundary C-items
 5. `docs/ARCHITECTURE_MACHINE_MODEL.md` -- what runs where, and what stops it. - sha256:ed240aba0bc0e0ac757d5ce10e6306317380529d691b81d8a9fd88d5a3c9544c
 6. `.thoughtmachine/knowledge/project/machine_history_and_vision.md` -- the incidents behind the rules, and what they are for. - sha256:b444c581ca3648f9b6ddd985c6aa5e486e767abd07651edb07953b5df2bd6032
 7. `.thoughtmachine/knowledge/project/vision_ledger.md` -- the five standing commitments (V1-V5). - sha256:5a01a13c684e94f5bc0e762807b8183d9e06f283b20caf3389aec662149ff930
-8. `.thoughtmachine/knowledge/project/ORCHESTRATOR_GUIDE.md` -- how to run workers without believing the brief. - sha256:36dfb786917609a2157ca3dc58d8069244fb3d49c0db295e6a6d08af1a160fa9
+8. `.thoughtmachine/knowledge/project/ORCHESTRATOR_GUIDE.md` -- how to run workers without believing the brief. - sha256:dfb01550569ee64826e30b5e54cb97b8916db6803323d2a3cbea8ae0807fec40
 9. `.thoughtmachine/knowledge/project/CI_PROCESS.md` -- what CI actually runs, and what this repo cannot see. - sha256:85a02df0358a432461bf3041c863786e40c745d37ab600d264da0c2798a3120c
 10. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:aa6670275083f6a38f9943843bb0efc759ec8dce2e7986605f2dfeea0122bd38
 
@@ -78,6 +78,34 @@ b43163dc docs: log security boundary C-items
 - **Pause = soft wind-down. Stop = hard abort. Timeout = detach.**
 - **The 4 Lego Pieces are law:** Persistent State, Interrupt Signal, Tool Return Contract, Loop Gate.
 - **The container envelope is its birth certificate.** Stop -> Edit -> Restart (recreate).
+
+## Message to the next generation
+
+- **The runtime-mode seam exists; the process does not.** `DEFAULT_RUNTIME_MODE` is
+  `MODE_PROCESS` and `resolve_runtime_mode()` is fail-closed, so worker handles are
+  *labelled* process - but the production spawn site builds the handle and never
+  starts it (`tools/workspace/worker_thread.py:6827-6843`). Workers still run inside
+  the supervisor's interpreter. Real process creation is
+  `WorkerRuntimeHandle.spawn` (`tools/workspace/worker_runtime.py:595`), whose only
+  non-test caller is `scripts/prove_worker_pid.py`. See the MODE_PROCESS follow-ups
+  item in PRIORITIES.md.
+- **Two different objects are called `CapabilityRegistry`.** The live one is
+  `tools/capability_registry.py`: resolved before worker construction, and a
+  `CapabilityResolveError` aborts the spawn. The `CapabilityRegistry` deprecated in
+  `thoughtmachine/security.py` is a different object with the same name. Always say
+  which one you mean.
+- **C60 is fixed; CI stability is a prediction, not a fact.** The
+  `ProviderNotFoundError: Provider 'openai_compatible' not found` signature is gone
+  (fixtures no longer bare-assign `ProviderFactory._providers`). The suite is still
+  not order-independent: a single-process run OOM-kills at ~79%, and the chunked run
+  records 10 failures whose polluting file is not yet identified. Do not spend the
+  next generation's budget trusting 'CI is green' until someone records a green run.
+- **C61 is the largest open correctness item.** TimeBudget is live; the recorded
+  measurement is 205.63 s against a 60 s budget. That gap is the ticket.
+- **Read the manuals before touching their subjects.** `machine_history_and_vision.md`
+  section 3.2 is required reading before `thoughtmachine/host_port.py`.
+  `ORCHESTRATOR_GUIDE.md` is the operating manual for this role. `HANDOFF.md` is only
+  the router; long prose belongs in the guide.
 
 ---
 
