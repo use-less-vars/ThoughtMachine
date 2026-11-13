@@ -434,8 +434,9 @@ if ! $DEV_MODE; then
     FRONTEND_DIR="$SCRIPT_DIR/web_ui/frontend"
     # dist/ is inspected by scripts/frontend_build_gate.py, not here.
     VITE_BIN="$FRONTEND_DIR/node_modules/.bin/vite"
-    # Stale-bundle gate: rebuild only when the frontend sources (or the build
-    # command) changed, when dist/ is missing/empty, or when forced.  See
+    # Stale-bundle gate: rebuild only when the frontend sources changed (a
+    # change of BUILD TOOLING is tracked by bumping SCHEMA in the gate script,
+    # not by the hash), when dist/ is missing/empty, or when forced.  See
     # scripts/frontend_build_gate.py for the exact input set and stamp format.
     GATE="$SCRIPT_DIR/scripts/frontend_build_gate.py"
     if [ -x "$VITE_BIN" ]; then BUILD_CMD="vite build"; else BUILD_CMD="npm run build"; fi

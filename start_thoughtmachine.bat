@@ -229,7 +229,8 @@ REM -- Frontend build gate -----------------------------------------------------
 REM Rebuild dist/ only when the frontend inputs changed.  Mirrors the shell
 REM launcher: scripts/frontend_build_gate.py decides, `stamp` records the hash
 REM only after a successful build.  --rebuild-frontend / TM_FORCE_FRONTEND_BUILD
-REM force a rebuild (same as the .sh).
+REM force a rebuild (same as the .sh).  A change of BUILD TOOLING is tracked by
+REM bumping SCHEMA in the gate script, not by the hash.
 set "GATE=%SCRIPT_DIR%scripts\frontend_build_gate.py"
 set "BUILD_CMD=npm run build"
 set "FORCE_ARG="
