@@ -195,6 +195,18 @@ class _FakeThread(_SpecCarryingWorker):
     def start(self) -> None:
         self.started = True
 
+    def send_query(self, query: str, timeout: float = 120.0) -> str:
+        """Answer in this interpreter, the way thread mode really answers.
+
+        In thread mode ``WorkerRuntimeHandle.dispatch_query`` delegates to
+        ``worker.send_query``, so the answer is produced in-process -- the
+        same process that holds the handle. In process mode the handle goes
+        to the child instead and never calls this. Stamping our own pid here
+        is therefore the honest thread-mode reply, and it is what makes the
+        pid in the envelope evidence about *where* the body ran.
+        """
+        return f"{_REPLY_PREFIX}{os.getpid()}:{query}"
+
 
 def _drive_the_production_spawn_site(tmp_path, monkeypatch, created: List[Any]) -> Any:
     """Run the REAL ``Worker._action_spawn`` with a fake thread class.

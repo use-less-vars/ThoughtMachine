@@ -61,9 +61,10 @@ import re
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -74,6 +75,8 @@ from tools.workspace.worker_runtime import (  # noqa: E402 - path fixed above
     MODE_THREAD,
     WORKER_RUNTIME_MODE_ENV,
     WorkerRuntimeHandle,
+    attach_thread_frame_sink,
+    resolve_runtime_mode,
 )
 
 WORKER_NAME = "prove-pid-w"
@@ -339,6 +342,55 @@ def _dispatch_query(handle: Any, query: str, timeout: float) -> str:
     return handle.dispatch_query(query, timeout=timeout)
 
 
+@contextmanager
+def _flag_unset() -> Iterator[None]:
+    """Run with ``WORKER_RUNTIME_MODE`` absent, then restore it as it was found.
+
+    The shipped default is only observable with the flag out of the way, so the
+    *claim* (:func:`_resolve_default_mode`) and the *measurement*
+    (:func:`observe_default_mode`) both go through this window instead of each
+    inventing its own restore.  A variable that was absent must come back
+    absent: writing ``''`` (or ``None``) back is a different environment, and it
+    would silently change what the next spawn in this process resolves.
+    """
+
+    previous: Optional[str] = os.environ.pop(WORKER_RUNTIME_MODE_ENV, None)
+    try:
+        yield
+    finally:
+        if previous is not None:
+            os.environ[WORKER_RUNTIME_MODE_ENV] = previous
+
+
+def _env_flag_state() -> Tuple[bool, Optional[str]]:
+    """Whether ``WORKER_RUNTIME_MODE`` is set here, and to what value.
+
+    Printed next to the default because "the default is ``thread``" and "this
+    shell asked for ``process``" are two different claims and only the first
+    one is about the shipped default.
+    """
+
+    if WORKER_RUNTIME_MODE_ENV in os.environ:
+        return True, os.environ[WORKER_RUNTIME_MODE_ENV]
+    return False, None
+
+
+def _resolve_default_mode() -> str:
+    """The mode a spawn resolves while ``WORKER_RUNTIME_MODE`` is absent.
+
+    ``resolve_runtime_mode()`` (``tools/workspace/worker_runtime.py``) is the
+    authority: this is the same function the production spawn site
+    (``worker_thread._action_spawn`` -> ``attach_thread_frame_sink(thread)``
+    with no ``mode=``) reaches, asked the same question, with the flag removed
+    only for the length of the call.  Deliberately not the ``MODE_THREAD``
+    constant: the constant is a claim *about* the default, and the line this
+    replaces kept printing ``'thread'`` no matter what the code resolved.
+    """
+
+    with _flag_unset():
+        return resolve_runtime_mode()
+
+
 def observe_thread_mode(workspace_dir: str) -> Observation:
     """Measure the worker body under the shipped default (``thread``)."""
     worker = _ProbeWorker(session_id="prove-pid-thread", workspace_dir=workspace_dir)
@@ -427,6 +479,50 @@ def observe_process_mode(workspace_dir: str) -> Observation:
         handle.close(grace_ms=2000)
 
 
+def observe_default_mode(workspace_dir: str) -> Observation:
+    """Measure the worker body on the SHIPPED default -- flag left unset.
+
+    The other two observers *ask for* a mode; this one asks for nothing and
+    reports what the spawn path answers.  The handle is built by
+    :func:`attach_thread_frame_sink` -- the very call
+    ``worker_thread._action_spawn`` makes, with no ``mode=`` argument -- so the
+    mode measured here is the one production resolves rather than one this
+    script chose.  Nothing is assumed: the mode is read back off the handle
+    (``handle.mode``, filled from ``resolve_runtime_mode()``) and the substrate
+    is *measured* -- the PID the worker stamps on its reply, against this
+    interpreter's.  Flip the default and this layer moves with it, so the
+    printed claim stays true instead of staying tidy.
+    """
+
+    with _flag_unset():
+        worker = _ProbeWorker(
+            session_id="prove-pid-default", workspace_dir=workspace_dir
+        )
+        handle = attach_thread_frame_sink(worker)
+        try:
+            reply = _dispatch_query(handle, SENTINEL, PROOF_TIMEOUT)
+            worker_pid = parse_pid_from_reply(reply)
+            fields = reply_fields(reply)
+            in_process = worker_pid == os.getpid()
+            return Observation(
+                mode=handle.mode,
+                worker_pid=worker_pid,
+                detail={
+                    "resolved_mode": handle.mode,
+                    "substrate": (
+                        "this interpreter -- the worker body ran on a thread"
+                        if in_process
+                        else f"a separate OS process (PID {worker_pid})"
+                    ),
+                    "thread_ident": fields.get("tid"),
+                    "in_process": in_process,
+                    "process_runtime": handle._process_runtime is not None,
+                },
+            )
+        finally:
+            handle.close(grace_ms=2000)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Reporting
 # ─────────────────────────────────────────────────────────────────────────────
@@ -458,20 +554,36 @@ def main(argv: Optional[list] = None) -> int:
     print(f"{'parent PID':<26}: {parent_pid}")
     print(f"{'interpreter':<26}: {sys.executable}")
     print(f"{'repo root':<26}: {_REPO_ROOT}")
+    env_set, env_value = _env_flag_state()
     print(
-        f"{'default mode (unset)':<26}: {MODE_THREAD!r} "
-        f"({WORKER_RUNTIME_MODE_ENV} read at spawn time)"
+        f"{'env flag':<26}: {WORKER_RUNTIME_MODE_ENV} "
+        + (f"is set to {env_value!r}" if env_set else "is NOT set in this process")
+    )
+    print(
+        f"{'default mode (unset)':<26}: {_resolve_default_mode()!r} "
+        f"({WORKER_RUNTIME_MODE_ENV} removed for the call: resolve_runtime_mode() "
+        "is the authority -- layer 2 measures it)"
     )
 
     try:
+        default_obs = observe_default_mode(str(_REPO_ROOT))
+        print()
+        print(f"\u2500\u2500 layer 2: the shipped default ({WORKER_RUNTIME_MODE_ENV} unset) \u2500\u2500\u2500\u2500\u2500\u2500")
+        _print_observation("worker body PID", default_obs)
+        print(
+            f"{'  resolved mode':<26}: {default_obs.detail.get('resolved_mode')!r} "
+            "(from resolve_runtime_mode(), not a constant)"
+        )
+        print(f"{'  substrate':<26}: {default_obs.detail.get('substrate')}")
+
         thread_obs = observe_thread_mode(str(_REPO_ROOT))
         print()
-        print(f"── layer 2: {WORKER_RUNTIME_MODE_ENV}={MODE_THREAD} ────────────────────")
+        print(f"── layer 3: {WORKER_RUNTIME_MODE_ENV}={MODE_THREAD} ────────────────────")
         _print_observation("worker body PID", thread_obs)
 
         process_obs = observe_process_mode(str(_REPO_ROOT))
         print()
-        print(f"── layer 3: {WORKER_RUNTIME_MODE_ENV}={MODE_PROCESS} ───────────────────")
+        print(f"── layer 4: {WORKER_RUNTIME_MODE_ENV}={MODE_PROCESS} ───────────────────")
         _print_observation("worker body PID", process_obs)
     except WorkerPidUnavailable as exc:
         print()
@@ -499,11 +611,19 @@ def main(argv: Optional[list] = None) -> int:
     print()
     print("── verdict ─────────────────────────────────────────────────────")
     print(f"VERDICT: {verdict_line}")
+    default_isolated = default_obs.worker_pid != parent_pid
     print(
-        f"VERDICT: default {WORKER_RUNTIME_MODE_ENV}={MODE_THREAD} is NOT isolated -- "
-        f"worker body PID {thread_obs.worker_pid} == parent PID {parent_pid}; only "
-        f"{WORKER_RUNTIME_MODE_ENV}={MODE_PROCESS} moves the worker body into its own "
-        "OS process"
+        f"VERDICT: the shipped default ({WORKER_RUNTIME_MODE_ENV} unset) resolves "
+        f"{default_obs.mode!r} and the worker body "
+        + (
+            f"runs in another OS process (PID {default_obs.worker_pid} != parent "
+            f"PID {parent_pid})"
+            if default_isolated
+            else f"does NOT leave this interpreter -- worker body PID "
+            f"{default_obs.worker_pid} == parent PID {parent_pid}; "
+            f"{WORKER_RUNTIME_MODE_ENV}={MODE_PROCESS} is what moves it into its own "
+            "OS process"
+        )
     )
     return 0 if proven else 1
 
