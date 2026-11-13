@@ -851,3 +851,79 @@ def test_substrate_survives_a_broken_child_handle(tmp_path) -> None:
     assert raw["child_pid"] is None
     assert raw["child_alive"] is None
     assert raw["same_process"] is None
+
+
+def test_inspect_sees_a_real_forked_child_as_a_different_os_process(tmp_path) -> None:
+    """A REAL child process, observed through the real ``inspect`` action.
+
+    Everything here is real: ``ProcessWorkerRuntime.start()`` forks a child and
+    waits for its ``hello`` (~1.9 s), the handle is registered in the same
+    ``_RUNTIME_HANDLES`` store production uses, the worker sits in
+    ``_worker_registry`` under the instance key ``inspect`` walks, and the
+    reading comes back through ``Worker(action="inspect").execute()`` -- not
+    from ``substrate()`` called directly -- so the registry walk and the handle
+    lookup are exercised, not just the accessor.
+
+    The claim under test is the one a self-check exists for: the child is a
+    DIFFERENT OS process from the parent, alive, and reported as such. No
+    query is dispatched and no ``Agent`` is built, so there is no LLM call and
+    no network -- the child only reaches ``hello`` and waits.
+
+    The runtime is closed in ``finally`` (``ProcessWorkerRuntime.close`` sends
+    ``shutdown`` then SIGKILLs anything that outlives the grace period), so no
+    child leaks into another test or hangs pytest.
+    """
+    import os
+
+    from tools.workspace.worker import _registry_lock, _worker_registry
+    from tools.workspace.worker_runtime_process import (
+        ProcessWorkerRuntime,
+        spec_from_worker,
+    )
+    from tools.workspace.worker_thread import Worker
+
+    session_id = "sess-inspect-fork"
+    thread = _make_worker(tmp_path)
+    handle = _process_handle(thread)
+    # Built directly rather than through ``_ensure_process_runtime``: that path
+    # fences first, and this WorkerThread was never started (it has no Agent to
+    # run), so its ``is_alive()`` is False by construction. The child below is
+    # a real one either way, and the handle owns it, so close() reaps it.
+    runtime = ProcessWorkerRuntime(
+        spec_from_worker(thread, epoch=0), on_frame=handle.on_frame
+    )
+    handle._process_runtime = runtime
+    key = (session_id, "seam-w", 1)
+    parent_pid = os.getpid()
+    try:
+        runtime.start()
+        assert runtime.pid is not None
+
+        worker_runtime.register_runtime_handle(
+            handle, session_id=session_id, worker_name="seam-w", instance_id=1
+        )
+        with _registry_lock:
+            _worker_registry[key] = thread
+        try:
+            tool = Worker(action="inspect", session_id=session_id)
+            tool._resolve_worker_workspace_id = lambda: None
+            tool._load_workers = lambda ws_id: [{"name": "seam-w"}]
+
+            payload = json.loads(tool.execute())
+        finally:
+            with _registry_lock:
+                _worker_registry.pop(key, None)
+
+        assert payload["parent_pid"] == parent_pid
+        entry = payload["workers"][0]
+        assert entry["worker_name"] == "seam-w"
+        assert entry["has_runtime_handle"] is True
+        assert entry["runtime_mode"] == worker_runtime.MODE_PROCESS
+        assert entry["child_exists"] is True
+        assert isinstance(entry["child_pid"], int)
+        assert entry["child_pid"] != parent_pid
+        assert entry["child_alive"] is True
+        assert entry["parent_pid"] == parent_pid
+        assert entry["same_process"] is False
+    finally:
+        handle.close()
