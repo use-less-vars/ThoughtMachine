@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from tools.workspace.worker_runtime import (
+    DEFAULT_RUNTIME_MODE,
     MODE_PROCESS,
     MODE_THREAD,
     WORKER_RUNTIME_MODE_ENV,
@@ -834,11 +835,11 @@ def test_an_expected_fence_refuses_a_malformed_axis(worker, instance, epoch):
 # --------------------------------------------------------------------------
 
 
-def test_an_absent_flag_means_thread():
-    # The default is truthful, not aspirational: the production spawn site
-    # starts no out-of-process body, so "thread" is what an unset flag has to
-    # resolve to. C62 flips this to ``process`` once one is actually started.
-    assert resolve_runtime_mode({}) == MODE_THREAD
+def test_an_absent_flag_means_the_default():
+    # Bound to the constant, never to a literal: what an unset flag resolves to
+    # IS :data:`DEFAULT_RUNTIME_MODE` by definition, so flipping the default
+    # (C62 did: ``thread`` -> ``process``) cannot silently invalidate this test.
+    assert resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE
 
 
 @pytest.mark.parametrize("value", [MODE_THREAD, MODE_PROCESS])
@@ -859,7 +860,8 @@ def test_anything_else_fails_closed(value):
 
 def test_the_default_reads_the_process_environment(monkeypatch):
     monkeypatch.delenv(WORKER_RUNTIME_MODE_ENV, raising=False)
-    assert resolve_runtime_mode() == MODE_THREAD
+    # Unset -> the constant, whatever it is (never a hardcoded mode literal).
+    assert resolve_runtime_mode() == DEFAULT_RUNTIME_MODE
     monkeypatch.setenv(WORKER_RUNTIME_MODE_ENV, MODE_THREAD)
     assert resolve_runtime_mode() == MODE_THREAD
     monkeypatch.setenv(WORKER_RUNTIME_MODE_ENV, MODE_PROCESS)
@@ -869,9 +871,9 @@ def test_the_default_reads_the_process_environment(monkeypatch):
 def test_the_flag_is_read_every_time_and_not_memoised():
     # The ORDER is the proof: alternating answers cannot come from a memoised
     # resolver, and every value is still the one just asked for.
-    assert resolve_runtime_mode({}) == MODE_THREAD
+    assert resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE
     assert resolve_runtime_mode({WORKER_RUNTIME_MODE_ENV: MODE_PROCESS}) == MODE_PROCESS
-    assert resolve_runtime_mode({}) == MODE_THREAD
+    assert resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE
 
 
 # --------------------------------------------------------------------------
@@ -1002,9 +1004,8 @@ def test_spawn_reads_the_mode_from_the_process_environment(monkeypatch):
     finally:
         handle.close()
     monkeypatch.delenv(WORKER_RUNTIME_MODE_ENV)
-    # Flag gone -> back to DEFAULT_RUNTIME_MODE, which is ``thread`` while the
-    # production spawn site starts no process (C62 flips it).
-    assert WorkerRuntimeHandle.spawn(FakeWorker()).mode == MODE_THREAD
+    # Flag gone -> back to DEFAULT_RUNTIME_MODE (the constant, not a literal).
+    assert WorkerRuntimeHandle.spawn(FakeWorker()).mode == DEFAULT_RUNTIME_MODE
 
 
 def test_process_mode_is_accepted_in_s2():

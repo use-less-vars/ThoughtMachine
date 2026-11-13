@@ -38,8 +38,7 @@ child-side), where the stream actually is.
 Mode selection (§10, D11)
 -------------------------
 One flag, ``WORKER_RUNTIME_MODE`` ∈ ``{thread, process}``, default
-``thread`` (:data:`DEFAULT_RUNTIME_MODE` -- the truthful default while the
-production spawn site starts no out-of-process body; C62 flips it), read **at
+``process`` (:data:`DEFAULT_RUNTIME_MODE`, per C62), read **at
 spawn time** so a single worker can be moved between modes without restarting the server (§10). The flag is therefore resolved on
 every :meth:`WorkerRuntimeHandle.spawn` call and never cached at import time.
 
@@ -75,14 +74,13 @@ MODE_PROCESS = "process"
 #: Exactly what the flag accepts. Nothing else is a mode.
 RUNTIME_MODES = (MODE_THREAD, MODE_PROCESS)
 
-#: What an ABSENT flag resolves to. The default is truthful, not aspirational:
-#: the production spawn site (``worker_thread._action_spawn``, the
-#: ``_runtime_handle = attach_thread_frame_sink(thread)`` line) builds the
-#: handle and never starts an out-of-process body, so a ``process`` default
-#: only *labelled* workers isolated while they ran in this interpreter. C62 is
-#: the item that flips this back once the process is actually started; until
-#: then ``WORKER_RUNTIME_MODE=process`` is how the seam is exercised.
-DEFAULT_RUNTIME_MODE = MODE_THREAD
+#: What an ABSENT flag resolves to: ``process`` (C62). The production spawn
+#: site (``worker_thread._action_spawn``) leaves the mode unset, so a spawned
+#: worker is now served by a real child process; the child is started lazily
+#: by the handle at its first verb (``_ensure_process_runtime``).
+#: ``WORKER_RUNTIME_MODE=thread`` remains the explicit opt-in for the
+#: in-process body.
+DEFAULT_RUNTIME_MODE = MODE_PROCESS
 
 #: The worker statuses a cancel is REFUSED for (§5.4) -- and the single source
 #: of truth for cancel acceptability across BOTH modes.
@@ -316,8 +314,7 @@ def resolve_runtime_mode(environ: Optional[Mapping[str, str]] = None) -> str:
     affects the next spawn without a restart. ``environ`` is injectable so the
     resolution rule can be tested without mutating the process environment.
 
-    Absent -> :data:`DEFAULT_RUNTIME_MODE` (``thread``: the truthful default
-    while the production spawn site starts no process; C62 flips it). Anything
+    Absent -> :data:`DEFAULT_RUNTIME_MODE` (``process``, per C62). Anything
     present that is not exactly :data:`MODE_THREAD` or :data:`MODE_PROCESS` ->
     :class:`InvalidRuntimeModeError` (fail closed: no trimming, no case folding,
     no empty-string-as-default).
@@ -1187,11 +1184,11 @@ def attach_thread_frame_sink(
     reason: an unrecognised value raises :class:`InvalidRuntimeModeError` here,
     before any worker starts, instead of silently running in-process. An
     explicit ``mode=`` still wins, and with the flag unset the resolution is
-    :data:`DEFAULT_RUNTIME_MODE` -- ``thread``, which is the truthful default
-    for this call site: its production caller starts no out-of-process body, and
-    C62 flips the default once one is actually started. Setting
-    ``WORKER_RUNTIME_MODE=process`` (or passing ``mode=``) reaches process mode
-    in the meantime.
+    :data:`DEFAULT_RUNTIME_MODE` -- ``process`` (C62): the production caller
+    passes no ``mode=``, so its worker is served by a real child process,
+    spawned lazily at the handle's first verb. Setting
+    ``WORKER_RUNTIME_MODE=thread`` (or passing ``mode=MODE_THREAD``) keeps the
+    in-process body.
 
     This is the S5 production construction site: the one place a real
     ``WorkerThread`` gets a :class:`WorkerRuntimeHandle` and the runtime ->

@@ -348,19 +348,18 @@ def test_process_mode_envelope_comes_back_from_a_spawned_child(tmp_path):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# 3. The default path (flag unset) is thread mode -- the truthful default
+# 3. The default path (flag unset) resolves DEFAULT_RUNTIME_MODE
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def test_the_default_spawn_path_is_thread_mode(tmp_path, monkeypatch):
-    """With the flag unset the same spawn site must resolve ``thread``.
+def test_the_default_spawn_path_resolves_the_default_mode(tmp_path, monkeypatch):
+    """With the flag unset the same spawn site must resolve the DEFAULT mode.
 
-    ``DEFAULT_RUNTIME_MODE`` is ``thread`` because that is what the production
-    path actually does: ``attach_thread_frame_sink(thread)`` builds the handle
-    and starts no out-of-process body. Red if the default drifts back to
-    ``process`` -- a ``process`` label over a handle that owns no child is
-    exactly the silent breakage this file exists to notice. C62 flips the
-    default once the spawn site really starts one.
+    Bound to :data:`DEFAULT_RUNTIME_MODE` / :func:`resolve_runtime_mode`, never
+    to a mode literal: the claim under test is "the production spawn site
+    reaches the configured default", which stays true across a flip (C62
+    flipped ``thread`` -> ``process``). The concrete mode is pinned elsewhere,
+    by tests that set ``WORKER_RUNTIME_MODE`` explicitly.
     """
     monkeypatch.delenv(WORKER_RUNTIME_MODE_ENV, raising=False)
     assert WORKER_RUNTIME_MODE_ENV not in os.environ, (
@@ -374,15 +373,15 @@ def test_the_default_spawn_path_is_thread_mode(tmp_path, monkeypatch):
     handle = fake._runtime_handle
     try:
         assert result.get("spawned") is True, f"the spawn itself failed: {result!r}"
-        assert handle.mode == MODE_THREAD, (
+        assert handle.mode == resolve_runtime_mode(), (
             f"with {WORKER_RUNTIME_MODE_ENV} unset the production spawn site "
-            f"built a {handle.mode!r} handle; while this path starts no "
-            f"out-of-process body the default must be {MODE_THREAD!r} (C62)"
+            f"built a {handle.mode!r} handle; the configured default is "
+            f"{resolve_runtime_mode()!r} ({DEFAULT_RUNTIME_MODE!r})"
         )
-        # The other half of the claim: no child was started, so ``thread`` is
-        # a fact about this handle and not a label over a live process.
+        # Spawn starts no body of either kind: the handle is lazy, so a child
+        # (process mode) is only built at the first dispatch_query.
         assert handle._process_runtime is None, (
-            "thread mode owns no out-of-process runtime, but this handle built one"
+            "spawn must not build an out-of-process runtime; it is created lazily"
         )
     finally:
         handle.close(grace_ms=2000)

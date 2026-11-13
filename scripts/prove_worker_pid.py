@@ -13,9 +13,10 @@ Three PIDs are printed, because the runtime has two modes and only one of them
 is isolated:
 
 1. the **parent** -- the interpreter running this script;
-2. the **worker body** under ``WORKER_RUNTIME_MODE=thread`` (the shipped
-   default): the same PID, because the agent really does run as a *thread* in
-   this process.  Printed as a measured fact, not as an accusation;
+2. the **worker body** with an explicit ``WORKER_RUNTIME_MODE=thread`` (the
+   opt-in in-process mode; the shipped default is ``process``): the same PID,
+   because in this mode the agent really does run as a *thread* in this
+   process.  Printed as a measured fact, not as an accusation;
 3. the **worker body** under ``WORKER_RUNTIME_MODE=process``: a different OS
    PID, corroborated three ways -- the pid the child puts in its ``hello``
    frame, the pid ``multiprocessing`` gave the child, and the pid the child
@@ -365,9 +366,9 @@ def _flag_unset() -> Iterator[None]:
 def _env_flag_state() -> Tuple[bool, Optional[str]]:
     """Whether ``WORKER_RUNTIME_MODE`` is set here, and to what value.
 
-    Printed next to the default because "the default is ``thread``" and "this
-    shell asked for ``process``" are two different claims and only the first
-    one is about the shipped default.
+    Printed next to the default because "what the default resolves to" and "what
+    this shell asked for" are two different claims and only the first one is
+    about the shipped default.
     """
 
     if WORKER_RUNTIME_MODE_ENV in os.environ:
@@ -392,7 +393,7 @@ def _resolve_default_mode() -> str:
 
 
 def observe_thread_mode(workspace_dir: str) -> Observation:
-    """Measure the worker body under the shipped default (``thread``)."""
+    """Measure the worker body in the explicit in-process ``thread`` mode."""
     worker = _ProbeWorker(session_id="prove-pid-thread", workspace_dir=workspace_dir)
     handle = WorkerRuntimeHandle.spawn(
         worker, environ={WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
