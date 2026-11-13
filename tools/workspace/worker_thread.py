@@ -1508,11 +1508,18 @@ class WorkerThread(threading.Thread):
         max_runtime_s: Optional[float] = None,
         frame_sink: Optional[Callable[[Any], None]] = None,
         initial_context: Optional[Dict[str, Any]] = None,
+        epoch: Optional[int] = None,
     ) -> None:
         # S4a: assigned before anything else -- every other attribute below can
         # reach a helper that calls _write_status_file, so the sink is set
         # first rather than left to a getattr() default.
         self._frame_sink = frame_sink
+        # C3-1: is THIS object the body, or the supervisor's handle for a body
+        # that lives in a child interpreter? Default False ("I am only a
+        # handle") is the safe answer: ``start()`` refuses to run a body for an
+        # object that is not the child, and the spawned child sets it True in
+        # ``worker_runtime_main`` -- the one interpreter that IS the body.
+        self.is_runtime_child: bool = False
         self.instance_id = instance_id
         instance_label = _WorkerRegistry.instance_label(name, instance_id)
         super().__init__(daemon=True, name=f"worker-{instance_label}")
@@ -1541,7 +1548,7 @@ class WorkerThread(threading.Thread):
         # F2: generation token — a monotonic per-worker counter that guards
         # context.json against stale-thread overwrites after a force-spawn
         # (a still-alive old thread must not clobber the replacement's file).
-        self._generation: int = self._allocate_generation()
+        self._generation: int = self._next_generation(epoch)
 
         # Tool classes available to this worker (name -> class)
         self._tool_classes: Dict[str, type[ToolBase]] = tool_classes or {}
@@ -2595,6 +2602,63 @@ class WorkerThread(threading.Thread):
         except Exception:
             pass
         return job_ids
+
+    # ── C3: who owns the body, and who owns command.json ─────────────
+
+    def _next_generation(self, epoch: Optional[int] = None) -> int:
+        """The epoch this incarnation owns (C3-3).
+
+        A supervisor allocates one; a spawned child is HANDED the supervisor's
+        epoch and adopts it instead, so ``generation == handle.epoch ==
+        child_epoch``. The re-allocation the child used to do for itself is
+        what made it run at ``supervisor_epoch + 1`` and refuse its own
+        supervisor's fenced commands.
+        """
+        if epoch is not None:
+            return int(epoch)
+        return self._allocate_generation()
+
+    def polls_command(self) -> bool:
+        """Does THIS body read ``command.json``? (C3-2)
+
+        Exactly one body may claim a command from the channel. Under the
+        process substrate the child is the only body that runs, so it claims
+        and the supervisor-side handle must not race it for the same file.
+        Thread mode keeps its single in-process body, polling as it always has.
+        """
+        from tools.workspace.worker_runtime import MODE_THREAD
+
+        if getattr(self, "is_runtime_child", False):
+            return True
+        return getattr(self, "_runtime_mode", MODE_THREAD) == MODE_THREAD
+
+    def start(self) -> None:
+        """Start the body -- unless this object is only a supervisor's handle.
+
+        C3-1: under the process substrate the body lives in a child
+        interpreter, so an object whose ``runtime_mode`` is ``process`` must not
+        run a second turn loop beside it: the handle registered at spawn wraps a
+        body that is never started here. The child itself does start -- it IS the
+        body -- and says so with ``is_runtime_child``, which
+        ``worker_runtime_main`` sets before it calls this. The mode is read from
+        the marker the runtime handle stamps, never inferred from a pid, and an
+        unmarked worker keeps the legacy in-process behaviour.
+        """
+        from tools.workspace.worker_runtime import MODE_THREAD
+
+        runtime_mode = getattr(self, "_runtime_mode", MODE_THREAD)
+        if runtime_mode != MODE_THREAD and not getattr(
+            self, "is_runtime_child", False
+        ):
+            logger.debug(
+                "Worker '%s' instance %r: %s runtime mode -- not starting an "
+                "in-process body; the body lives in the child process",
+                getattr(self, "worker_name", self.name),
+                getattr(self, "instance_id", None),
+                runtime_mode,
+            )
+            return
+        super().start()
 
     def reset(self) -> Dict[str, Any]:
         """Reset per-query and persisted context state; the thread stays alive.

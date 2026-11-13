@@ -155,13 +155,47 @@ def test_item2_exactly_one_body_claims_command_json(tmp_path: Path):
     (``tools/workspace/command_channel.py:237``). Two bodies that both poll
     means two claimers, and the loser silently loses the command.
     """
-    bodies = build_contract_fake_worker(), build_contract_fake_worker()
-    claimers = sum(1 for b in bodies if getattr(b, "polls_command", lambda: False)())
+    # C3-1/C3-2: the two bodies are the REAL objects, not two stand-ins -- the
+    # seam is ``WorkerThread.polls_command`` and the question is what it
+    # answers for the supervisor's handle versus for the spawned child.
+    supervisor_side = WorkerThread(
+        name="contract",
+        definition={},
+        agent_config={},
+        workspace_dir=tmp_path,
+        session_id="s",
+        instance_id=1,
+    )
+    # The handle the supervisor registers at spawn stamps process mode on the
+    # worker it speaks for -- and that object is NOT the body.
+    wr.WorkerRuntimeHandle(supervisor_side, mode=wr.MODE_PROCESS)
+    child_side = WorkerThread(
+        name="contract",
+        definition={},
+        agent_config={},
+        workspace_dir=tmp_path,
+        session_id="s",
+        instance_id=2,
+        epoch=63,
+    )
+    # ``worker_runtime_main`` marks the one interpreter that IS the body.
+    child_side.is_runtime_child = True
+
+    bodies = (supervisor_side, child_side)
+    claimers = sum(1 for b in bodies if b.polls_command())
     assert claimers == 1, (
         "item 2: exactly one body may poll command.json, found "
-        f"{claimers} of {len(bodies)} bodies (no body declares a "
+        f"{claimers} of {len(bodies)} bodies -- the supervisor-side body must "
+        "not race the child for the same command (no body declares a "
         "polls_command() seam at all, and worker_thread.py:7087 starts the "
         "supervisor's body unconditionally, so the same file has two readers)"
+    )
+    assert supervisor_side.polls_command() is False, (
+        "item 2: a process-mode supervisor-side WorkerThread must not poll "
+        "command.json; the child it spawned is the only claimer"
+    )
+    assert child_side.polls_command() is True, (
+        "item 2: the spawned child IS the body and must claim command.json"
     )
 
 
@@ -207,12 +241,16 @@ def test_item4_the_fence_accepts_the_supervisors_own_command():
     """C3-4: the supervisor's command must be accepted; a stale one quarantined.
 
     The supervisor writes its command with the epoch it issued (item 3's
-    ``handle.epoch``); the child's own fence carries the epoch it re-allocated
-    (``worker_thread.py:1544``). Because those disagree by one today, the
-    supervisor's command is refused and the quarantine path runs.
+    ``handle.epoch``); since C3-3 the child's own fence carries that same
+    epoch -- it adopts the one it is handed (``_next_generation``) instead of
+    re-allocating it (``worker_thread.py:1544``), so the two agree by design
+    and a command one epoch behind is still refused.
     """
     supervisor_epoch = int(_spec()["epoch"])
-    child_epoch = supervisor_epoch + 1  # worker_thread.py:1544: the child re-allocates
+    # C3-3: no more re-allocation -- the child is HANDED the supervisor's epoch
+    # (worker_runtime_main passes it, _next_generation adopts it), so the
+    # child's fence expects exactly what the supervisor writes.
+    child_epoch = supervisor_epoch
     child_fence = CommandFence(
         session_id="s", worker_name="contract", instance_id=1, epoch=child_epoch
     )

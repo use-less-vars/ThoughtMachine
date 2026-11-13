@@ -290,7 +290,20 @@ def worker_runtime_main(
         if factory is None:
             factory = _resolve_factory(spec.get("worker_factory"))
         kwargs = dict(spec.get("worker_kwargs") or {})
+        # C3-3: the child adopts the supervisor's epoch instead of allocating a
+        # second one at construction -- that second allocation is what made the
+        # child run at ``supervisor_epoch + 1``. A stand-in factory with a
+        # narrower signature is still built, just without the keyword.
+        if factory is None or _accepts_epoch(factory):
+            kwargs.setdefault("epoch", epoch)
         worker = _build_worker(factory, kwargs)
+        # C3-1: THIS interpreter is the body. Say so before ``start()``, which
+        # refuses to run a body for an object that is only a supervisor-side
+        # handle under process mode.
+        try:
+            worker.is_runtime_child = True
+        except (AttributeError, TypeError):  # a read-only stand-in
+            pass
         # The outbox exists BEFORE the worker starts (§4.6). ``start`` runs the
         # turn loop on its own thread and publishes ``worker_spawned`` on the
         # way in, so an outbox built after ``start`` returned would drop -- or,
@@ -316,6 +329,10 @@ def worker_runtime_main(
         # never blocks, so a tick never waits on the socket.
         worker._frame_sink = outbox.put
         _subscribe_child_events(worker, outbox)
+        # C3-3: the child RUNS the epoch it was handed, or it does not run at
+        # all. Verified against the sidecar the supervisor's allocation wrote,
+        # not merely assumed: below this line the fence is law.
+        _verify_handed_epoch(worker, epoch)
         worker.start()
         outbox.put(
             Hello(
@@ -743,6 +760,79 @@ def _resolve_factory(ref: Optional[str]) -> Optional[Callable[..., Any]]:
         )
     module = importlib.import_module(module_name)
     return getattr(module, attribute)
+
+
+def _accepts_epoch(factory: Any) -> bool:
+    """Does *factory* take the ``epoch`` keyword (or ``**kwargs``)?
+
+    The child hands the supervisor's epoch to the worker it builds (C3-3). A
+    factory that cannot take it -- a test stand-in with a fixed signature --
+    must not be built twice, nor made to fail the spawn, so the keyword is
+    offered only where it will be accepted.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return False
+    if "epoch" in params:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _verify_handed_epoch(worker: Any, epoch: int) -> None:
+    """Fail closed unless *worker* really is running *epoch* (C3-3).
+
+    Adopting the handed-in epoch is not the same as being entitled to it, so
+    the child checks the two things it can see:
+
+    * the epoch the worker reports for itself (``_generation``) -- an adoption
+      that silently did not happen would leave the child at the supervisor's
+      epoch + 1 and every fenced command would be refused; and
+    * ``worker_dir/generation``, the sidecar ``_allocate_generation`` writes
+      (``worker_thread.py:4748``) and the number every other part of the fence
+      logic compares against. A recorded value that disagrees with the spec
+      means this spec was built for a different incarnation (a force-spawn that
+      overtook this child), so the child refuses to run rather than thrash a
+      fence nobody owns.
+
+    An ABSENT sidecar is not a mismatch: a hand-built spec has nothing to
+    verify, and the supervisor's own allocation is what writes it. Stand-in
+    workers own no directory and no epoch, and are left alone.
+
+    Raising here is the fail-closed edge: ``worker_runtime_main`` turns it into
+    a ``Fatal`` frame and exit code 1, which is what the supervisor already
+    treats as "the child is gone" -- never as a live worker at the wrong epoch.
+    """
+    adopted = getattr(worker, "_generation", None)
+    if isinstance(adopted, int) and not isinstance(adopted, bool):
+        if adopted != int(epoch):
+            raise RuntimeError(
+                f"child epoch {adopted} != handed-in epoch {int(epoch)}: the "
+                "worker did not adopt the supervisor's epoch (C3-3)"
+            )
+    worker_dir = getattr(worker, "_worker_dir", None)
+    if worker_dir is None:
+        return
+    gen_file = os.path.join(str(worker_dir), "generation")
+    try:
+        with open(gen_file, "r", encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except FileNotFoundError:
+        return
+    try:
+        recorded = int(raw or 0)
+    except ValueError:
+        recorded = None
+    if recorded != int(epoch):
+        raise RuntimeError(
+            f"worker_dir/generation says {raw!r}, the spec says epoch "
+            f"{int(epoch)}: refusing to run at an epoch this directory does "
+            "not record (C3-3)"
+        )
 
 
 def _build_worker(
