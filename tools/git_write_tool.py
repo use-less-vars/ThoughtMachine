@@ -196,11 +196,11 @@ class GitWriteTool(GitReadTool):
     operation: Literal[
         "commit", "init", "clone", "push", "branch_create", "checkout",
         "stage", "unstage", "worktree_add", "worktree_remove", "stash_push",
-        "stash_pop",
+        "stash_pop", "stash_drop",
     ] = Field(
         description="Git write operation to perform: commit, init, clone, "
         "push, branch_create, checkout, stage, unstage, worktree_add, "
-        "worktree_remove, stash_push, stash_pop"
+        "worktree_remove, stash_push, stash_pop, stash_drop"
     )
 
     force: bool = Field(
@@ -216,13 +216,15 @@ class GitWriteTool(GitReadTool):
         default=None,
         description="Optional path list for stash_push: only the named "
         "pathspecs are stashed (git stash push -m <msg> -- <paths>). When "
+        "omitted, file_path is used as the path scope; when both are "
         "omitted, git's default tracked-file stash is used (never -a/-u)."
     )
 
     index: int = Field(
         default=0,
-        description="Stash index for stash_pop (git stash pop stash@{index}). "
-        "Must be a non-negative integer; default 0 is the most recent stash."
+        description="Stash index for stash_pop (git stash pop stash@{index}) "
+        "and stash_drop (git stash drop stash@{index}). Must be a "
+        "non-negative integer; default 0 is the most recent stash."
     )
 
     base: Optional[str] = Field(
@@ -487,6 +489,8 @@ class GitWriteTool(GitReadTool):
                 return self._git_push(repo_root)
             elif self.operation == "stash_pop":
                 return self._git_stash_pop(repo_root)
+            elif self.operation == "stash_drop":
+                return self._git_stash_drop(repo_root)
             else:
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         except Exception as e:
@@ -639,8 +643,14 @@ class GitWriteTool(GitReadTool):
             repo_root, resolve_args, timeout=30
         )
         if exit_code != 0:
+            # LOUD and SPECIFIC: name the ref that failed to resolve, state what
+            # that means, and say explicitly that NO fallback was used. A
+            # branch is never silently based on dev/HEAD instead.
             return self._with_mode(self._truncate_output(
-                f"Git command failed (exit code {exit_code}):\n{stderr}"
+                f"Git command failed (exit code {exit_code}):\n{stderr}\n"
+                f"Error: base ref {base_expr!r} did not resolve to a commit "
+                "SHA; no branch was created and no fallback base (dev/HEAD) "
+                "was used."
             ))
         sha = stdout.strip()
         if not sha:
@@ -655,11 +665,19 @@ class GitWriteTool(GitReadTool):
             return self._with_mode(self._truncate_output(output))
         return self._with_mode(self._truncate_output(
             f"Created branch '{name}' at {sha} (base: {base_expr}); "
-            "working tree HEAD not moved \u2014 use checkout to switch."
+            "working tree HEAD not moved \u2014 no checkout/switch was run, so "
+            "the working tree and HEAD are untouched. Use checkout to switch."
         ))
 
     def _git_checkout(self, repo_root: Path) -> str:
-        """Check out an existing branch (git checkout <name>)."""
+        """Check out an existing branch (git checkout <name>).
+
+        A CLEAN switch makes git print nothing, so this operation used to
+        return an EMPTY body while HEAD had in fact moved. The body therefore
+        always reports the state BEFORE the switch, the branch now checked
+        out, and the commit HEAD is expected to point at, and says so
+        explicitly when that cannot be determined.
+        """
         # git permission gate (fail closed): direct callers must also
         # pass the session git permission check.
         if not self._git_write_allowed():
@@ -670,11 +688,66 @@ class GitWriteTool(GitReadTool):
             name = self._validate_branch_name(self.branch)
         except ValueError as e:
             return self._truncate_output(f"Error: {e}")
+        # Snapshot the PRE-switch state and resolve the target branch's commit
+        # BEFORE the switch, so the checkout argv stays the LAST git command
+        # this operation issues (the switch itself is never buried behind a
+        # probe, and the previous state is still observable).
+        previous = self._describe_head(repo_root)
+        target_sha, target_note = self._resolve_ref_sha(repo_root, name)
         # No -b: only existing branches may be checked out (creating branches
         # is the branch_create operation). No '--' separator: the validated
         # name can never look like an option.
         output = self._run_git(repo_root, ["checkout", name])
-        return self._with_mode(self._truncate_output(output))
+        if self._is_git_error_output(output):
+            return self._with_mode(self._truncate_output(output))
+        lines = [f"Checked out '{name}'.", f"previous state: {previous}"]
+        if target_sha:
+            lines.append(
+                f"now: branch '{name}', HEAD commit {target_sha}"
+            )
+        else:
+            lines.append(
+                f"now: branch '{name}' (git checkout reported success), but "
+                f"the new HEAD commit could not be determined: {target_note}"
+            )
+        stdout_only = (output or "").strip()
+        if stdout_only:
+            lines.append(stdout_only)
+        return self._with_mode(self._truncate_output("\n".join(lines)))
+
+    def _describe_head(self, repo_root: Path) -> str:
+        """Best-effort description of the workspace HEAD for reporting.
+
+        Returns ``branch '<name>'`` on a branch, ``DETACHED at <sha>`` (or
+        ``DETACHED (<reason>)``) when HEAD is detached, and an explicit
+        ``UNKNOWN (...)`` string -- never a guess -- when it cannot be read.
+        """
+        exit_code, stdout, stderr = self._run_git_raw(
+            repo_root, ["rev-parse", "--abbrev-ref", "HEAD"], timeout=30
+        )
+        ref = (stdout or "").strip()
+        if exit_code != 0 or not ref:
+            detail = (stderr or stdout or "").strip() or "no output from git"
+            return f"UNKNOWN (HEAD ref could not be read: {detail})"
+        if ref == "HEAD":
+            sha, note = self._head_sha(repo_root)
+            return f"DETACHED at {sha}" if sha else f"DETACHED ({note})"
+        return f"branch '{ref}'"
+
+    def _head_sha(self, repo_root: Path) -> tuple[str, str]:
+        """Return ``(sha, "")`` for the workspace HEAD commit, else ``("", why)``."""
+        return self._resolve_ref_sha(repo_root, "HEAD")
+
+    def _resolve_ref_sha(self, repo_root: Path, ref: str) -> tuple[str, str]:
+        """Resolve ``ref`` to a commit SHA; ``("", why)`` when it does not."""
+        exit_code, stdout, stderr = self._run_git_raw(
+            repo_root, ["rev-parse", "--verify", f"{ref}^{{commit}}"], timeout=30
+        )
+        sha = (stdout or "").strip()
+        if exit_code != 0 or not sha:
+            detail = (stderr or stdout or "").strip() or "no output from git"
+            return "", f"rev-parse of {ref!r} returned no commit ({detail})"
+        return sha, ""
 
     def _git_stage(self, repo_root: Path) -> str:
         """Stage file path(s) (git add -- <paths>)."""
@@ -1303,9 +1376,14 @@ class GitWriteTool(GitReadTool):
         if not self.message or not self.message.strip():
             return "Error: message is required for stash_push operation"
         args = ["stash", "push", "-m", self.message]
-        if self.paths:
+        # Path scope: ``paths`` (the stash-specific list) wins; otherwise fall
+        # back to the base-class ``file_path`` the operator/model naturally
+        # uses. Without that fallback a supplied file_path was silently
+        # IGNORED and the whole tracked worktree got stashed.
+        scope = self.paths if self.paths else self.file_path
+        if scope:
             try:
-                rels = self._validated_rel_paths(repo_root, self.paths)
+                rels = self._validated_rel_paths(repo_root, scope)
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
             if rels:
@@ -1328,12 +1406,68 @@ class GitWriteTool(GitReadTool):
         # pass the session git permission check.
         if not self._git_write_allowed():
             return self._flag_gate_error()
-        if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
+        if self._stash_index_invalid():
             return "Error: index must be a non-negative integer for stash_pop"
         args = ["stash", "pop", f"stash@{{{self.index}}}"]
         exit_code, stdout, stderr = self._run_git_raw(repo_root, args, timeout=30)
         if exit_code != 0:
             return self._with_mode(self._truncate_output(
                 f"Git command failed (exit code {exit_code}):\n{stdout}{stderr}"
+            ))
+        return self._with_mode(self._truncate_output(stdout))
+
+    def _stash_index_invalid(self) -> bool:
+        """True when ``index`` is not a non-negative int (bool included).
+
+        Shared by ``stash_pop`` and ``stash_drop``: the index only ever
+        reaches git as ``stash@{N}``, so a negative, bool or non-int value is
+        refused before any subprocess.
+        """
+        return (
+            isinstance(self.index, bool)
+            or not isinstance(self.index, int)
+            or self.index < 0
+        )
+
+    def _stash_index_range_hint(self, repo_root: Path) -> str:
+        """Name the valid stash index range (or why it is unknown)."""
+        exit_code, stdout, stderr = self._run_git_raw(
+            repo_root, ["stash", "list"], timeout=30
+        )
+        if exit_code != 0:
+            detail = (stderr or stdout or "").strip() or "no output from git"
+            return (
+                "The number of stash entries could not be determined "
+                f"(git stash list failed: {detail})."
+            )
+        entries = [line for line in (stdout or "").splitlines() if line.strip()]
+        if not entries:
+            return "There are no stash entries at all."
+        return (
+            f"Valid indices are 0..{len(entries) - 1} "
+            f"({len(entries)} stash entries)."
+        )
+
+    def _git_stash_drop(self, repo_root: Path) -> str:
+        """Drop a stash entry (git stash drop stash@{index}); never forced."""
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        if self._stash_index_invalid():
+            return "Error: index must be a non-negative integer for stash_drop"
+        args = ["stash", "drop", f"stash@{{{self.index}}}"]
+        exit_code, stdout, stderr = self._run_git_raw(repo_root, args, timeout=30)
+        if exit_code != 0:
+            message = f"{stdout}{stderr}"
+            if "not a valid reference" in message:
+                # LOUD and SPECIFIC: an absent index names the valid range
+                # instead of surfacing git's bare reflog complaint.
+                return self._with_mode(self._truncate_output(
+                    f"Error: stash index {self.index} does not exist. "
+                    f"{self._stash_index_range_hint(repo_root)}"
+                ))
+            return self._with_mode(self._truncate_output(
+                f"Git command failed (exit code {exit_code}):\n{message}"
             ))
         return self._with_mode(self._truncate_output(stdout))

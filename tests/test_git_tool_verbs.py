@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from tools.git_info_tool import GitReadTool
+from tools.git_write_tool import GitWriteTool
 
 #: Every git tool result ends with these two diagnostics lines (see the
 #: ``GitReadTool`` docstring).  They are real output; the helpers below strip
@@ -75,6 +76,209 @@ def _tool(tmp_path: Path, argv: list, raw=(0, "", ""), git_out: str = "", **over
     object.__setattr__(tool, "_run_git", fake_run_git)
     object.__setattr__(tool, "_run_git_raw", fake_run_git_raw)
     return tool
+
+
+# ---------------------------------------------------------------------------
+# WRITE verbs (branch_create base, checkout state, stash scope, stash_drop).
+# Same fake-seam style as above; ``GitWriteTool`` additionally needs the
+# effective git/filesystem grant, otherwise every verb returns FLAG_ERROR.
+# ---------------------------------------------------------------------------
+
+
+def _write_tool(tmp_path: Path, argv: list, raw=(0, "", ""), git_out: str = "", **overrides):
+    """Build a ``GitWriteTool`` whose faked git seam records argv."""
+    params = {
+        "session_id": "s-verbs",
+        "workspace_id": "ws-verbs",
+        "session_permissions": {},
+    }
+    params.update(overrides)
+    tool = GitWriteTool(**params)
+
+    object.__setattr__(tool, "effective_permissions", {"git": "write", "filesystem": "write"})
+    object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+    object.__setattr__(tool, "_resolved_workspace_id", "ws-verbs")
+    object.__setattr__(tool, "_use_container_mode", lambda: False)
+    object.__setattr__(tool, "_validate_path", lambda p: str(p))
+
+    def fake_run_git(repo_root, args, timeout=30):
+        argv.append(list(args))
+        return git_out
+
+    def fake_run_git_raw(repo_root, args, timeout=30):
+        argv.append(list(args))
+        return raw
+
+    object.__setattr__(tool, "_run_git", fake_run_git)
+    object.__setattr__(tool, "_run_git_raw", fake_run_git_raw)
+    return tool
+
+
+def test_branch_create_base_dev_is_resolved_not_head(tmp_path):
+    """``base="dev"`` resolves DEV -- no HEAD probe, no fallback to HEAD."""
+    argv: list = []
+    tool = _write_tool(
+        tmp_path, argv, raw=(0, "deadbeef\n", ""),
+        operation="branch_create", branch="feat/x", base="dev",
+    )
+
+    tool._git_branch_create(tmp_path)
+
+    assert ["rev-parse", "--verify", "dev^{commit}"] in argv, argv
+    flat = [item for call in argv for item in call]
+    assert "HEAD" not in flat, f"an explicit base must never probe HEAD: {argv}"
+    assert "HEAD^{commit}" not in flat, argv
+    assert argv[-1] == ["branch", "feat/x", "deadbeef"], argv
+
+
+def test_branch_create_never_emits_checkout_or_switch(tmp_path):
+    """Create-only: no checkout/switch verb may appear anywhere in the argv."""
+    argv: list = []
+    tool = _write_tool(
+        tmp_path, argv, raw=(0, "cafe1234\n", ""),
+        operation="branch_create", branch="feat/x", base="dev",
+    )
+
+    tool._git_branch_create(tmp_path)
+
+    verbs = [call[0] for call in argv if call]
+    assert "checkout" not in verbs and "switch" not in verbs, argv
+    assert verbs == ["rev-parse", "branch"], argv
+
+
+def test_branch_create_reports_base_sha_and_untouched_tree(tmp_path):
+    """The body names the resolved base SHA and says the tree was not moved."""
+    body = _body(
+        _write_tool(
+            tmp_path, [], raw=(0, "cafe1234\n", ""),
+            operation="branch_create", branch="feat/x", base="dev",
+        )._git_branch_create(tmp_path)
+    )
+
+    assert "feat/x" in body and "dev" in body and "cafe1234" in body, body
+    assert "HEAD not moved" in body, body
+
+
+def test_branch_create_unresolvable_base_names_the_ref(tmp_path):
+    """A base that does not resolve fails LOUDLY and names it (no fallback)."""
+    result = _write_tool(
+        tmp_path, [], raw=(128, "", "fatal: Needed a single revision\n"),
+        operation="branch_create", branch="feat/x", base="nope",
+    )._git_branch_create(tmp_path)
+
+    assert result.startswith("Git command failed (exit code 128):"), result
+    assert "'nope'" in result, result
+    assert "no fallback" in result, result
+
+
+def test_checkout_reports_previous_ref_new_branch_and_sha(tmp_path):
+    """A clean switch prints nothing in git -- the body must still say what moved."""
+    argv: list = []
+    tool = _write_tool(tmp_path, argv, operation="checkout", branch="feature/x")
+
+    def fake_run_git_raw(repo_root, args, timeout=30):
+        argv.append(list(args))
+        if args[:2] == ["rev-parse", "--abbrev-ref"]:
+            return (0, "main\n", "")
+        if args[:2] == ["rev-parse", "--verify"]:
+            return (0, "cafe1234\n", "")
+        return (0, "", "")
+
+    object.__setattr__(tool, "_run_git_raw", fake_run_git_raw)
+    out = tool._git_checkout(tmp_path)
+    body = _body(out)
+
+    assert body.strip(), f"checkout must never return an empty body: {out!r}"
+    assert "feature/x" in body and "cafe1234" in body, body
+    assert "main" in body, body
+    # the switch is the LAST git command issued, and it is the only checkout
+    assert argv[-1] == ["checkout", "feature/x"], argv
+    assert [c for c in argv if c[:1] == ["checkout"]] == [["checkout", "feature/x"]]
+
+
+def test_checkout_says_so_when_new_state_is_unknown(tmp_path):
+    """If the target SHA cannot be resolved the body says so, not a bare name."""
+    def fake_run_git_raw(repo_root, args, timeout=30):
+        if args[:2] == ["rev-parse", "--abbrev-ref"]:
+            return (0, "main\n", "")
+        return (128, "", "fatal: not a valid object name\n")
+
+    tool = _write_tool(tmp_path, [], operation="checkout", branch="feature/x")
+    object.__setattr__(tool, "_run_git_raw", fake_run_git_raw)
+    body = _body(tool._git_checkout(tmp_path))
+
+    assert "could not be determined" in body, body
+    assert "feature/x" in body, body
+
+
+def test_stash_push_file_path_scopes_the_argv(tmp_path):
+    """``file_path`` is honoured as the stash path scope (it used to be IGNORED)."""
+    argv: list = []
+    tool = _write_tool(
+        tmp_path, argv, raw=(0, "Saved working directory\n", ""),
+        operation="stash_push", message="wip", file_path=["a.py", "b.py"],
+    )
+
+    tool._git_stash_push(tmp_path)
+
+    assert argv == [["stash", "push", "-m", "wip", "--", "a.py", "b.py"]], argv
+    flat = [item for call in argv for item in call]
+    assert "-a" not in flat and "-u" not in flat, argv
+
+
+def test_stash_push_paths_still_win_over_file_path(tmp_path):
+    """When both are given, the stash-specific ``paths`` list is the scope."""
+    argv: list = []
+    tool = _write_tool(
+        tmp_path, argv, raw=(0, "", ""),
+        operation="stash_push", message="wip", paths=["p.py"], file_path=["f.py"],
+    )
+
+    tool._git_stash_push(tmp_path)
+
+    assert argv == [["stash", "push", "-m", "wip", "--", "p.py"]], argv
+
+
+def test_stash_drop_validates_index(tmp_path):
+    """Same index contract as stash_pop; a valid index drops stash@{N}."""
+    argv: list = []
+    tool = _write_tool(tmp_path, argv, operation="stash_drop", index=-1)
+
+    assert tool._git_stash_drop(tmp_path) == (
+        "Error: index must be a non-negative integer for stash_drop"
+    )
+    assert argv == []
+
+    object.__setattr__(tool, "index", True)
+    assert tool._git_stash_drop(tmp_path) == (
+        "Error: index must be a non-negative integer for stash_drop"
+    )
+    assert argv == []
+
+    valid = _write_tool(
+        tmp_path, argv, raw=(0, "Dropped refs/stash@{2}\n", ""),
+        operation="stash_drop", index=2,
+    )
+    out = valid._git_stash_drop(tmp_path)
+
+    assert argv == [["stash", "drop", "stash@{2}"]], argv
+    assert out.startswith("Dropped refs/stash@{2}"), out
+    assert "execution_mode" in out, out
+
+
+def test_stash_drop_missing_index_names_the_valid_range(tmp_path):
+    """An absent stash index explains the range instead of a bare git error."""
+    def fake_run_git_raw(repo_root, args, timeout=30):
+        if args[:2] == ["stash", "list"]:
+            return (0, "stash@{0}: WIP on main\nstash@{1}: other\n", "")
+        return (1, "", "error: stash@{5} is not a valid reference\n")
+
+    tool = _write_tool(tmp_path, [], operation="stash_drop", index=5)
+    object.__setattr__(tool, "_run_git_raw", fake_run_git_raw)
+    body = _body(tool._git_stash_drop(tmp_path))
+
+    assert "5" in body and "does not exist" in body, body
+    assert "0..1" in body, body
 
 
 # ---------------------------------------------------------------------------
