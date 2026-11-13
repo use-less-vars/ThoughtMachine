@@ -1764,8 +1764,32 @@ class TestReflog:
 
 
 class TestShowFile:
-    def test_default_argv(self, tmp_path):
+    """``show_file`` argv contracts.
+
+    The tool's ``source`` DEFAULT is now ``"working"`` (a disk read, no git
+    call), so a test that asserts on a git argv MUST say
+    ``source="committed"``.  That is not a contract change for these tests:
+    they have always been about the committed-blob read, they just reached it
+    through the default, and the default is now explicit instead of incidental.
+    """
+
+    def test_default_source_is_working(self, tmp_path):
+        """An omitted ``source`` reads the WORKING TREE -- and never git."""
+        (tmp_path / "a.txt").write_text("disk-bytes\n", encoding="utf-8")
         tool = _read_host_tool(tmp_path, operation="show_file", path="a.txt")
+        calls = _shadow_run_git_raw(tool, stdout="HEAD-BLOB\n")
+        out = tool._git_show_file(tmp_path)
+
+        assert calls == [], f"a working-tree read must not consult git: {calls!r}"
+        assert "disk-bytes" in out
+        assert "HEAD-BLOB" not in out
+        assert out.splitlines()[0].startswith("source: working")
+
+    def test_committed_argv(self, tmp_path):
+        """``source="committed"`` keeps the pinned ``HEAD:<path>`` argv."""
+        tool = _read_host_tool(
+            tmp_path, operation="show_file", path="a.txt", source="committed"
+        )
         calls = _shadow_run_git_raw(tool, stdout="hello\n")
         out = tool._git_show_file(tmp_path)
         assert calls == [["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]]
@@ -1773,7 +1797,8 @@ class TestShowFile:
 
     def test_custom_ref(self, tmp_path):
         tool = _read_host_tool(
-            tmp_path, operation="show_file", ref="main", path="a.txt"
+            tmp_path, operation="show_file", ref="main", path="a.txt",
+            source="committed",
         )
         calls = _shadow_run_git_raw(tool, stdout="x\n")
         tool._git_show_file(tmp_path)
@@ -1782,7 +1807,11 @@ class TestShowFile:
         ]
 
     def test_missing_ref_error_before_git(self, tmp_path):
-        tool = _read_host_tool(tmp_path, operation="show_file", ref=None, path="a.txt")
+        # The committed read is the one that REQUIRES a ref.
+        tool = _read_host_tool(
+            tmp_path, operation="show_file", ref=None, path="a.txt",
+            source="committed",
+        )
         calls = _shadow_run_git_raw(tool)
         out = tool._git_show_file(tmp_path)
         assert out.startswith("Error:")
@@ -1805,7 +1834,9 @@ class TestShowFile:
         assert calls == []
 
     def test_not_tracked_at_ref_is_error(self, tmp_path):
-        tool = _read_host_tool(tmp_path, operation="show_file", path="a.txt")
+        tool = _read_host_tool(
+            tmp_path, operation="show_file", path="a.txt", source="committed"
+        )
         calls = _shadow_run_git_raw(
             tool, stdout="", exit_code=128,
             stderr="fatal: path 'a.txt' does not exist in 'HEAD'",
@@ -1816,7 +1847,9 @@ class TestShowFile:
         assert "does not exist" in out
 
     def test_empty_file_is_not_error(self, tmp_path):
-        tool = _read_host_tool(tmp_path, operation="show_file", path="a.txt")
+        tool = _read_host_tool(
+            tmp_path, operation="show_file", path="a.txt", source="committed"
+        )
         calls = _shadow_run_git_raw(tool, stdout="", exit_code=0)
         out = tool._git_show_file(tmp_path)
         assert calls == [["show", "--no-ext-diff", "--no-textconv", "HEAD:a.txt"]]

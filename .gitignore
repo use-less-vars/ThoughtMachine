@@ -233,6 +233,10 @@ venv*
 .thoughtmachine/gate_log.txt
 web_ui/frontend/.npmrc
 web_ui/frontend/.npmrc
+# Frontend build-gate artefact: a LOCAL stamp (content hash of the built dist/),
+# never a source file -- the same directory whose .npmrc/dist/.vite are already
+# ignored here and in web_ui/frontend/.gitignore.
+web_ui/frontend/.dist-build-stamp
 
 # --- KB onboarding contract (Gen 48, 2026-10-23) --------------------------
 # KB_POLICY says "all KB is gitignored". That left MANDATORY_STOP.md -- the
