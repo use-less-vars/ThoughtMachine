@@ -343,3 +343,77 @@ def test_show_file_missing_everywhere_says_there_is_no_fallback(tmp_path):
         f"an absent committed version must be stated, not guessed: {out!r}"
     )
 
+
+# ---------------------------------------------------------------------------
+# show_file: a binary / non-UTF-8 file is REFUSED, not shown as mojibake
+# ---------------------------------------------------------------------------
+
+def test_show_file_working_refuses_a_binary_file(tmp_path):
+    """A NUL byte means this is not a text file: refuse, do not show it."""
+    (tmp_path / "bin.dat").write_bytes(b"PK\x03\x04\x00\x00payload")
+    argv: list = []
+
+    out = _tool(tmp_path, argv, operation="show_file", path="bin.dat")._git_show_file(
+        tmp_path
+    )
+
+    assert argv == [], f"a refused read must not consult git: {argv!r}"
+    assert out.startswith("Error:"), out
+    assert "contains a NUL byte at offset 4" in out, out
+    assert "text reader" in out, (
+        f"the refusal must say show_file is a text reader: {out!r}"
+    )
+    assert "payload" not in out, f"the bytes must not be leaked: {out!r}"
+
+
+def test_show_file_working_refuses_non_utf8_text(tmp_path):
+    """Replacement characters used to turn latin-1 into plausible-looking text."""
+    (tmp_path / "latin1.txt").write_bytes(b"caf\xe9 au lait\n")
+    argv: list = []
+
+    out = _tool(
+        tmp_path, argv, operation="show_file", path="latin1.txt"
+    )._git_show_file(tmp_path)
+
+    assert out.startswith("Error:"), out
+    assert "not UTF-8 text" in out, out
+    assert "0xe9 at offset 3" in out, out
+    assert "caf" not in out, f"no bytes may be echoed back: {out!r}"
+
+
+def test_show_file_working_keeps_valid_multibyte_utf8(tmp_path):
+    """Strict decoding must not refuse ordinary UTF-8."""
+    (tmp_path / "u.txt").write_text("caf\u00e9 \u2615\n", encoding="utf-8")
+    argv: list = []
+
+    out = _tool(tmp_path, argv, operation="show_file", path="u.txt")._git_show_file(
+        tmp_path
+    )
+
+    assert "caf\u00e9 \u2615" in out, out
+    assert "Error:" not in out, out
+
+
+def test_show_file_working_bound_tolerates_a_char_cut_by_the_bound(
+    tmp_path, monkeypatch
+):
+    """The read bound may slice a multi-byte character in half; that is NOT a
+    non-UTF-8 file, and the header must say the read was a prefix."""
+    import tools.git_info_tool as git_info_tool
+
+    monkeypatch.setattr(git_info_tool, "_SHOW_FILE_MAX_READ_BYTES", 8)
+    (tmp_path / "cut.txt").write_bytes(b"abcdefg\xc3\xa9")
+    argv: list = []
+
+    out = _tool(tmp_path, argv, operation="show_file", path="cut.txt")._git_show_file(
+        tmp_path
+    )
+
+    assert "abcdefg" in out, out
+    assert "not UTF-8" not in out, (
+        f"a character cut by the bound is not a decoding failure: {out!r}"
+    )
+    assert "first 8 bytes only" in out, (
+        f"a bounded read must declare itself: {out!r}"
+    )
+

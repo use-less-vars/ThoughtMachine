@@ -1,6 +1,7 @@
 # tools/git_info_tool.py
 from typing import Any, ClassVar, Literal, Optional, List, Union
 from pydantic import Field
+import codecs
 import logging
 import subprocess
 import unicodedata
@@ -34,6 +35,12 @@ _SHOW_FILE_DEFAULT_SPAN = 200
 _SHOW_FILE_ASSUMED_LINE_CHARS = 80
 #: Span cap applied when the tool has no usable token budget configured.
 _SHOW_FILE_MAX_SPAN_FALLBACK = 2000
+
+#: Hard ceiling on the bytes ``show_file(source="working")`` reads from disk.
+#: The token budget is NOT a memory bound (``token_limit`` defaults to None), so
+#: the READ itself is bounded: a larger file is decoded from this prefix only and
+#: the header says so, instead of slurping an arbitrarily large file into memory.
+_SHOW_FILE_MAX_READ_BYTES = 4 * 1024 * 1024
 
 
 class GitUnavailableError(FileNotFoundError):
@@ -2255,7 +2262,29 @@ class GitReadTool(ToolBase):
         No git call is made: this is the file as it is now, so an uncommitted
         edit is visible here (unlike the committed-blob read, which shows the
         bytes at ``ref``).
+
+        Reading disk IS a filesystem read, so this path is bound to the SAME
+        read-capable effective ``filesystem`` grain as the git exec paths
+        (:meth:`_filesystem_read_allowed`): a denied grain refuses BEFORE any
+        filesystem contact -- path resolution and the directory stat included --
+        and never falls back to the committed blob, which is a different read
+        the caller did not ask for.
+
+        The bytes are read as a BOUNDED binary read (at most
+        ``_SHOW_FILE_MAX_READ_BYTES``) that must be UTF-8 with no NUL byte in
+        that window: ``show_file`` is a text reader, so a binary or non-UTF-8
+        file is refused by name instead of being shown with replacement
+        characters that read like content.
         """
+        if not self._filesystem_read_allowed():
+            gate = self._filesystem_read_gate_error()
+            if gate.startswith("Error: "):
+                gate = gate[len("Error: "):]
+            return self._truncate_output(
+                'Error: show_file source="working" reads the filesystem, which '
+                "this session may not do (filesystem:read denied: "
+                f"{gate}). Nothing was read."
+            )
         if not self.path:
             return self._truncate_output(
                 "Error: path is required for show_file operation"
@@ -2274,7 +2303,8 @@ class GitReadTool(ToolBase):
                 f"Error: working-tree path {rel!r} is a directory, not a file"
             )
         try:
-            content = target.read_text(encoding="utf-8", errors="replace")
+            with target.open("rb") as handle:
+                raw = handle.read(_SHOW_FILE_MAX_READ_BYTES + 1)
         except FileNotFoundError:
             # Honest failure, never a silent fallback into history: report BOTH
             # facts -- absent from the working tree, and what the committed tree
@@ -2283,14 +2313,40 @@ class GitReadTool(ToolBase):
                 f"Error: working-tree path {rel!r} is absent from the working "
                 f"tree; {self._committed_existence_note(repo_root, rel)}"
             )
+        truncated = len(raw) > _SHOW_FILE_MAX_READ_BYTES
+        if truncated:
+            raw = raw[:_SHOW_FILE_MAX_READ_BYTES]
+        nul = raw.find(b"\x00")
+        if nul != -1:
+            return self._truncate_output(
+                f"Error: working-tree path {rel!r} is binary, not text: it "
+                f"contains a NUL byte at offset {nul}, and show_file is a "
+                "text reader (UTF-8), so it was not shown"
+            )
+        # An incremental decoder tolerates a multi-byte character cut in half by
+        # the read bound (``final=False``); anything else is genuinely not UTF-8.
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        try:
+            content = decoder.decode(raw, final=not truncated)
+        except UnicodeDecodeError as e:
+            return self._truncate_output(
+                f"Error: working-tree path {rel!r} is not UTF-8 text: byte "
+                f"0x{raw[e.start]:02x} at offset {e.start} does not decode, "
+                "and show_file is a text reader, so it was not shown"
+            )
         body = (
             content if line_window is None
             else self._slice_line_window(content, line_window)
         )
-        return self._with_mode(
-            self._truncate_output(
-                f"source: working (path={rel}, read from disk)\n{body}"
+        header = f"source: working (path={rel}, read from disk"
+        if truncated:
+            header += (
+                f", first {_SHOW_FILE_MAX_READ_BYTES} bytes only: the file "
+                "is larger"
             )
+        header += ")"
+        return self._with_mode(
+            self._truncate_output(f"{header}\n{body}")
         )
 
     def _committed_existence_note(self, repo_root: Path, rel: str) -> str:
