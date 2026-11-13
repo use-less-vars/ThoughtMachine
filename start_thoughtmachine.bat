@@ -12,6 +12,8 @@ REM
 REM  Usage:
 REM    start_thoughtmachine.bat          Development mode (hot-reload via Vite)
 REM    start_thoughtmachine.bat --prod   Production mode (serves from dist/)
+REM    start_thoughtmachine.bat --prod --rebuild-frontend
+REM                                      ... rebuild dist/ even if unchanged
 REM==============================================================================
 
 setlocal enabledelayedexpansion
@@ -25,8 +27,10 @@ set "TM_PYTHON=%VENV_DIR%\Scripts\python.exe"
 
 REM -- Parse flags -------------------------------------------------------------
 set PROD_MODE=false
+set "FORCE_FRONTEND_BUILD=false"
 if /i "%~1"=="--prod" set PROD_MODE=true
 if /i "%~1"=="-p" set PROD_MODE=true
+if /i "%~1"=="--rebuild-frontend" set "FORCE_FRONTEND_BUILD=true"
 if /i "%~1"=="--help" goto :show_help
 if /i "%~1"=="-h" goto :show_help
 
@@ -173,11 +177,11 @@ pause
 exit /b %ERRORLEVEL%
 
 REM ═══════════════════════════════════════════════════════════════════════════
-REM  Production mode (auto-build fresh, then serve)
+REM  Production mode (gated rebuild, then serve)
 REM ═══════════════════════════════════════════════════════════════════════════
 :prod_mode
 
-echo   Mode:    PRODUCTION (fresh build from source)
+echo   Mode:    PRODUCTION (serves the built bundle from dist/)
 echo   Server:  http://127.0.0.1:8000
 echo   Stop:    Ctrl+C
 echo(
@@ -221,6 +225,52 @@ if not exist "%FRONTEND_DIR%\node_modules\" (
     echo(
 )
 
+REM -- Frontend build gate -------------------------------------------------------
+REM Rebuild dist/ only when the frontend inputs changed.  Mirrors the shell
+REM launcher: scripts/frontend_build_gate.py decides, `stamp` records the hash
+REM only after a successful build.  --rebuild-frontend / TM_FORCE_FRONTEND_BUILD
+REM force a rebuild (same as the .sh).
+set "GATE=%SCRIPT_DIR%scripts\frontend_build_gate.py"
+set "BUILD_CMD=npm run build"
+set "FORCE_ARG="
+if /i "%FORCE_FRONTEND_BUILD%"=="true" set "FORCE_ARG=--force"
+if defined TM_FORCE_FRONTEND_BUILD set "FORCE_ARG=--force"
+
+set "GATE_LINE="
+if exist "%GATE%" (
+    for /f "usebackq delims=" %%L in (`"%TM_PYTHON%" "%GATE%" check --frontend-dir "%FRONTEND_DIR%" --build-cmd "%BUILD_CMD%" %FORCE_ARG%`) do set "GATE_LINE=%%L"
+)
+
+set "NEED_BUILD=true"
+if not defined GATE_LINE (
+    echo   [i] Frontend build gate produced no decision - building to be safe.
+) else (
+    echo !GATE_LINE! | findstr /c:"TM_FRONTEND_DECISION=skip" >nul 2>&1
+    if not errorlevel 1 (
+        echo   Frontend up to date, skipping build.
+        set "NEED_BUILD=false"
+    )
+)
+
+if "!NEED_BUILD!"=="true" (
+    echo   Building the production frontend bundle ...
+    echo(
+    pushd "%FRONTEND_DIR%"
+    call npm run build
+    if errorlevel 1 (
+        popd
+        echo   [FAIL] production build failed.
+        pause
+        exit /b 1
+    )
+    popd
+    if exist "%GATE%" (
+        "%TM_PYTHON%" "%GATE%" stamp --frontend-dir "%FRONTEND_DIR%" --build-cmd "%BUILD_CMD%" >nul
+        if errorlevel 1 echo   [WARNING] could not write the frontend build stamp; the next run will rebuild.
+    )
+    echo(
+)
+
 cd /d "%SCRIPT_DIR%"
 "%TM_PYTHON%" -m web_ui.backend.server --serve-frontend
 pause
@@ -232,10 +282,14 @@ REM ═════════════════════════�
 REM  Help
 REM ═══════════════════════════════════════════════════════════════════════════
 :show_help
-echo Usage: %~nx0 [--prod]
+echo Usage: %~nx0 [--prod] [--rebuild-frontend]
 echo(
-echo   --prod    Production mode (fresh build from source, then serve)
+echo   --prod    Production mode (builds the bundle only if the frontend
+echo             sources changed, then serves it from dist/)
 echo            Default is development mode with hot-reload.
+echo   --rebuild-frontend
+echo             Rebuild the production bundle even if the inputs are unchanged
+echo             (same as setting TM_FORCE_FRONTEND_BUILD=1)
 echo   --help    Show this help
 pause
 exit /b 0
