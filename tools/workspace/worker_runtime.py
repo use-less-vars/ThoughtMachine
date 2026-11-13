@@ -881,6 +881,53 @@ class WorkerRuntimeHandle:
             paused_manually=bool(worker._manual_only_pause),
         )
 
+    def substrate(self) -> Dict[str, Any]:
+        """What this handle is made of -- read-only, and never forks.
+
+        A self-check, not a control verb: it answers the six substrate
+        questions about a live worker WITHOUT driving it -- the mode the handle
+        was built in, whether a child runtime object exists, the child's pid,
+        whether that child is alive, this process's pid, and whether the child
+        turns out to be this very process (``same_process``).
+
+        Deliberately does NOT call :meth:`_ensure_process_runtime`: that forks
+        a child simply in order to describe one, and a self-check must never
+        change what it is measuring. A process-mode handle that has not been
+        dispatched into therefore reports ``child_exists=False`` -- the truthful
+        answer, not a missing one.
+
+        ``child_pid``, ``child_alive`` and ``same_process`` are ``None`` when
+        there is no child process to speak of (thread mode, always; process
+        mode, before the first dispatch): ``same_process`` is a comparison
+        against ``parent_pid``, and with no child there is nothing to compare.
+        """
+        parent_pid = os.getpid()
+        runtime = self._process_runtime
+        child_pid: Optional[int] = None
+        child_alive: Optional[bool] = None
+        if runtime is not None:
+            try:
+                child_pid = runtime.pid
+                child_alive = runtime.alive
+            except Exception as exc:  # noqa: BLE001 - a self-check never raises
+                _LOGGER.debug(
+                    "runtime substrate for (%r, %r) could not read the child "
+                    "process: %s; reporting it as unknown",
+                    self._session_id,
+                    self._worker_name,
+                    exc,
+                )
+                child_pid = None
+                child_alive = None
+        return {
+            "runtime_mode": self._mode,
+            "child_exists": runtime is not None,
+            "child_pid": child_pid,
+            "child_alive": child_alive,
+            "parent_pid": parent_pid,
+            "same_process": None if child_pid is None else child_pid == parent_pid,
+        }
+
     def on_frame(self, frame: Any) -> None:
         """Cache what the last frame told us about the worker (S4, D1).
 

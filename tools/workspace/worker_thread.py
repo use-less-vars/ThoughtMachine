@@ -5372,7 +5372,11 @@ class Worker(ToolBase):
 
     action: str = Field(
         description="Action: list, spawn, check, query, stop, submit_query, job_status, "
-        "join, wait_for_job, pause, reset. "
+        "join, wait_for_job, pause, reset, inspect. "
+        "action='inspect' is a READ-ONLY substrate self-check: it reports, per "
+        "worker instance, the runtime mode, whether a child process exists, its "
+        "pid, whether it is alive, this process's pid and whether the child is "
+        "this very process. It never starts, drives or forks anything. "
         "action='stop' DETACHES the worker: it parks (status 'detached', context "
         "saved, containers and registration kept, queued work preserved) and an "
         "operator can revive it — a stop is therefore never a termination. "
@@ -5490,7 +5494,7 @@ class Worker(ToolBase):
     # Termination ("kill") and revival ("resume") are deliberately NOT here:
     # both are operator-only operations (web UI / workspace HTTP routes), never
     # agent actions.  The agent's "stop" DETACHES (recoverable park).
-    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "reset"]
+    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "reset", "inspect"]
 
     #: Actions that cannot do anything without naming a worker.  Every other
     #: action keeps ``worker_name=None``: for pause/stop that None is
@@ -5632,6 +5636,7 @@ class Worker(ToolBase):
                 "wait_for_job": lambda: self._action_join(workers),
                 "pause": lambda: self._action_pause(workers),
                 "reset": lambda: self._action_reset(workers),
+                "inspect": lambda: self._action_inspect(workers),
             }[self.action]
 
             result = handler()
@@ -6221,6 +6226,74 @@ class Worker(ToolBase):
                 augmented.append(entry)
 
         return {"workers": augmented, "count": len(augmented)}
+
+    def _action_inspect(self, workers: list) -> dict:
+        """Report each worker instance's RUNTIME SUBSTRATE -- read-only.
+
+        A self-check, not a control verb: for every live instance of every
+        worker defined here it answers "what is actually running this worker?"
+        -- the mode its runtime handle was built in, whether a child process
+        exists, that child's pid and liveness, the pid of THIS process, and
+        whether the child turns out to be this very process.
+
+        Nothing here starts, drives or forks anything: the per-instance
+        answers come from ``WorkerRuntimeHandle.substrate()``, which never
+        calls ``_ensure_process_runtime``. A worker with no live handle is
+        reported (``has_runtime_handle=False``, no substrate) rather than
+        hidden, because "there is no handle here" is itself the finding.
+        """
+        from tools.workspace.worker import _registry_lock, _worker_registry
+        from tools.workspace.worker_runtime import runtime_handle_for
+
+        session_key = self.session_id or _NO_SESSION_KEY
+        parent_pid = os.getpid()
+        entries = []
+        for w in workers:
+            name = w.get("name", "")
+            with _registry_lock:
+                instances = sorted(
+                    (key[2] if len(key) >= 3 else 1, thread)
+                    for key, thread in _worker_registry.items()
+                    if key[0] == session_key and key[1] == name
+                )
+            if not instances:
+                entries.append({
+                    "worker_name": name,
+                    "instance_id": None,
+                    "has_runtime_handle": False,
+                    "runtime_mode": None,
+                    "child_exists": None,
+                    "child_pid": None,
+                    "child_alive": None,
+                    "parent_pid": parent_pid,
+                    "same_process": None,
+                })
+                continue
+            for iid, thread in instances:
+                handle = runtime_handle_for(session_key, name, iid)
+                entry = {
+                    "worker_name": name,
+                    "instance_id": iid,
+                    "has_runtime_handle": handle is not None,
+                }
+                if handle is None:
+                    entry.update({
+                        "runtime_mode": None,
+                        "child_exists": None,
+                        "child_pid": None,
+                        "child_alive": None,
+                        "parent_pid": parent_pid,
+                        "same_process": None,
+                    })
+                else:
+                    entry.update(handle.substrate())
+                entries.append(entry)
+
+        return {
+            "workers": entries,
+            "count": len(entries),
+            "parent_pid": parent_pid,
+        }
 
     def _action_spawn(self, workers: list, ws_id: Optional[str]) -> dict:
         """Spawn a worker thread from its definition in workers.json."""
