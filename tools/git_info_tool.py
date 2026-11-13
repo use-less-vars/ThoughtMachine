@@ -500,6 +500,19 @@ class GitReadTool(ToolBase):
         )
     )
     
+    # show_file parameters
+    source: Literal["working", "committed"] = Field(
+        default="working",
+        description=(
+            "show_file ONLY: where the file bytes come from. 'working' (the "
+            "DEFAULT) reads the file from disk exactly as it is now; "
+            "'committed' reads the blob at ref (history, NOT the working "
+            "tree). Every result names the source it used -- and the ref, for "
+            "'committed' -- so a caller never has to guess whether it saw "
+            "disk or history."
+        ),
+    )
+
     # Commit parameters
     message: Optional[str] = Field(
         default=None,
@@ -1638,7 +1651,48 @@ class GitReadTool(ToolBase):
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
         output = self._run_git(repo_root, args)
+        if not output.strip():
+            # An empty ``git diff`` is ambiguous on its own: "nothing changed"
+            # and "the named path matched nothing" look IDENTICAL. Say which
+            # one it was instead of returning a silent empty result.
+            try:
+                scoped = self._validated_rel_paths(repo_root, self.file_path) \
+                    if self.file_path else []
+            except ValueError:
+                scoped = [p for p in (self.file_path if isinstance(self.file_path, list)
+                                      else [self.file_path]) if isinstance(p, str)]
+            return self._with_mode(
+                self._truncate_output(self._empty_diff_hint(scoped))
+            )
         return self._with_mode(self._truncate_output(output))
+
+    def _empty_diff_hint(self, rels: List[str]) -> str:
+        """Explain an EMPTY ``git diff`` result: no changes vs. nothing matched.
+
+        ``rels`` are the repo-relative paths the diff was scoped to (empty =
+        whole tree). The two empty cases are different diagnoses and must not
+        read the same:
+
+        * scoped paths -> the named path(s) produced no hunk: either they are
+          genuinely unchanged, or the name matched nothing (wrong
+          spelling/case, untracked file, or the change is staged and belongs
+          to ``diff_cached``);
+        * no paths -> the whole tree matches the base ref.
+        """
+        base = self.commit1 or "HEAD"
+        if self.commit2:
+            base = f"{self.commit1 or 'HEAD'}..{self.commit2}"
+        if rels:
+            scope = ", ".join(rels)
+            return (
+                f"(no diff output) Nothing matched inside '{scope}' against "
+                f"{base}: no hunk was produced. Check the path spelling/case "
+                "and whether the file is untracked (git status); a STAGED "
+                "change needs diff_cached instead."
+            )
+        return (
+            f"(no diff output) No changes: the working tree matches {base}."
+        )
     
     def _git_log(self, repo_root: Path) -> str:
         """Run git log."""
@@ -1663,6 +1717,18 @@ class GitReadTool(ToolBase):
             # error form, never silently ignored.
             try:
                 args.append(self._validate_git_ref(self.branch, field="branch"))
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+        elif self.ref and self.ref != "HEAD":
+            # ``ref`` now SCOPES the log as well. It used to be ignored here
+            # entirely -- only ``branch`` ever reached the argv -- so
+            # ``log(ref="release-1.0")`` silently returned the whole history
+            # from HEAD. ``ref`` defaults to "HEAD", which is git's own log
+            # default, so the omitted-ref argv stays byte-identical (pinned by
+            # tests/security/test_git_info_tool_operations.py::
+            # TestLogRevisionHonoured::test_no_branch_argv_unchanged).
+            try:
+                args.append(self._validate_git_ref(self.ref, field="ref"))
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
         if self.file_path:
@@ -2155,6 +2221,136 @@ class GitReadTool(ToolBase):
         return self._with_mode(self._truncate_output(stdout))
 
     def _git_show_file(self, repo_root: Path) -> str:
+        """Show a single file, naming WHERE the bytes came from.
+
+        ``source`` selects the origin (see the field description):
+
+        * ``"working"`` (the DEFAULT) -- the file on disk right now, resolved
+          through the same path validation every other tool path uses;
+        * ``"committed"`` -- the blob at ``ref`` (``git show <ref>:<path>``),
+          i.e. history, NOT the working tree.
+
+        DELIBERATE CONTRACT CHANGE: the default used to be the committed blob
+        and it said nothing about it, so a caller inspecting a file could be
+        handed stale history while believing it had read the working tree (this
+        nearly committed 500 unreviewed lines).  The default is now
+        ``"working"`` and EVERY result STARTS with a ``source:`` line naming
+        the origin -- plus the ref for ``committed`` -- so the two can never be
+        confused again.  The two pinned tests that used to prove the ``ref``
+        default by forcing a git call now pass ``source="committed"``
+        explicitly, which is the read they had always silently relied on; their
+        subject (the ``ref`` default of ``HEAD``) is unchanged.
+
+        ``line_start``/``line_end`` behave identically for both sources: the
+        window is sliced from whichever bytes were obtained, before the output
+        budget is applied (see :meth:`_show_file_line_window`).
+        """
+        if self.source == "committed":
+            return self._show_file_committed(repo_root)
+        return self._show_file_working(repo_root)
+
+    def _show_file_working(self, repo_root: Path) -> str:
+        """Read ``path`` from the WORKING TREE (disk) and window it.
+
+        No git call is made: this is the file as it is now, so an uncommitted
+        edit is visible here (unlike the committed-blob read, which shows the
+        bytes at ``ref``).
+        """
+        if not self.path:
+            return self._truncate_output(
+                "Error: path is required for show_file operation"
+            )
+        try:
+            rels = self._validated_rel_paths(repo_root, self.path)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        rel = rels[0]
+        # Same window contract as the committed read: an impossible range
+        # fails before any I/O happens.
+        line_window = self._show_file_line_window()
+        target = repo_root / rel
+        if target.is_dir():
+            return self._truncate_output(
+                f"Error: working-tree path {rel!r} is a directory, not a file"
+            )
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            # Honest failure, never a silent fallback into history: report BOTH
+            # facts -- absent from the working tree, and what the committed tree
+            # says about the same path -- so the caller knows what to ask next.
+            return self._truncate_output(
+                f"Error: working-tree path {rel!r} is absent from the working "
+                f"tree; {self._committed_existence_note(repo_root, rel)}"
+            )
+        body = (
+            content if line_window is None
+            else self._slice_line_window(content, line_window)
+        )
+        return self._with_mode(
+            self._truncate_output(
+                f"source: working (path={rel}, read from disk)\n{body}"
+            )
+        )
+
+    def _committed_existence_note(self, repo_root: Path, rel: str) -> str:
+        """Say whether ``rel`` exists in the committed tree -- or that we did
+        not find out.
+
+        One ``git cat-file -e <ref>:<path>`` probe through the tool's EXISTING
+        backend (``_run_git_raw``): no new plumbing, and the same validation and
+        permission gates as every other read.  When the probe cannot run (no
+        ref, a ref carrying its own ``:`` selector, an invalid ref, a failed
+        call) the note says the presence was NOT established instead of
+        guessing -- a wrong "it exists" hint is exactly the kind of confident
+        misinformation this whole change exists to remove.
+        """
+        ref = self.ref or "HEAD"
+        if ":" in ref:
+            return (
+                f"its presence at {ref!r} was NOT probed (the ref carries its "
+                "own ':' selector); pass source='committed' with a plain ref "
+                "to read the committed blob"
+            )
+        try:
+            validated = self._validate_git_ref(ref, field="ref")
+        except ValueError as e:
+            return (
+                f"its presence at {ref!r} was NOT probed ({e}); pass "
+                "source='committed' with a valid ref to read the committed "
+                "blob"
+            )
+        try:
+            exit_code, _stdout, _stderr = self._run_git_raw(
+                repo_root, ["cat-file", "-e", f"{validated}:{rel}"]
+            )
+        except (TimeoutError, RuntimeError, PermissionError):
+            # Availability/permission failures must propagate exactly as they
+            # do for the real read; only the probe RESULT is optional.
+            raise
+        except Exception as e:  # pragma: no cover - defensive
+            return f"its presence at {validated} could NOT be probed ({e})"
+        if exit_code == 0:
+            return (
+                f"it DOES exist in {validated}, so pass source='committed' to "
+                "read the committed blob instead of the working tree"
+            )
+        return (
+            f"it does NOT exist in {validated} either, so there is no "
+            "committed version to fall back to"
+        )
+
+    def _slice_line_window(self, text: str, line_window: tuple) -> str:
+        """Return the 1-based inclusive ``(start, end)`` window of ``text``."""
+        start, end = line_window
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        # ``end`` is inclusive and 1-based; Python's slice end is exclusive,
+        # and an out-of-range ``end`` simply clamps to the end of the file.
+        return "\n".join(lines[start - 1:end])
+
+    def _show_file_committed(self, repo_root: Path) -> str:
         """Show a single tracked file at a ref (``git show <ref>:<path>``).
 
         A non-zero exit is the explicit "path not tracked at ref" signal and is
@@ -2204,15 +2400,17 @@ class GitReadTool(ToolBase):
                     f"Git command failed (exit code {exit_code}):\n{stderr}"
                 )
             )
-        if line_window is None:
-            return self._with_mode(self._truncate_output(stdout))
-        start, end = line_window
-        lines = stdout.split("\n")
-        if lines and lines[-1] == "":
-            lines.pop()
-        # ``end`` is inclusive and 1-based; Python's slice end is exclusive, and
-        # an out-of-range ``end`` simply clamps to the end of the file.
-        return self._with_mode(self._truncate_output("\n".join(lines[start - 1:end])))
+        # ALWAYS name the origin: the default is no longer "what you already
+        # had", so a reader must never have to guess whether it saw disk or
+        # history (this line used to be emitted only for an explicit source).
+        header = (
+            f"source: committed (ref={ref}, from history not the working tree)\n"
+        )
+        body = (
+            stdout if line_window is None
+            else self._slice_line_window(stdout, line_window)
+        )
+        return self._with_mode(self._truncate_output(header + body))
 
     def _show_file_max_span(self) -> int:
         """Largest line span a single ``show_file`` call will return.

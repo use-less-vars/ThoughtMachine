@@ -90,7 +90,14 @@ def test_show_file_ref_with_selector_is_refused(tmp_path, ref, path):
     (tmp_path / path).write_text("x\n")
 
     argv = []
-    tool = _tool(tmp_path, argv, operation="show_file", ref=ref, path=path)
+    # ``source="committed"`` is EXPLICIT: this module proves the ``ref``
+    # selector contract, which only exists on the committed read.  The tool's
+    # default is now the working tree (no git call, no selector built), so an
+    # omitted source would never exercise the code under test.
+    tool = _tool(
+        tmp_path, argv, operation="show_file", ref=ref, path=path,
+        source="committed",
+    )
     result = tool._git_show_file(tmp_path)
 
     # LOUD: a human-readable refusal (the exact vocabulary is not pinned here).
@@ -112,7 +119,12 @@ def test_legitimate_refs_unchanged(tmp_path, ref):
     (tmp_path / "README.md").write_text("x\n")
 
     argv = []
-    tool = _tool(tmp_path, argv, operation="show_file", ref=ref, path="README.md")
+    # The ref is forwarded only by the committed read; the working-tree default
+    # makes no git call at all (see test_legitimate_default_ref_unchanged).
+    tool = _tool(
+        tmp_path, argv, operation="show_file", ref=ref, path="README.md",
+        source="committed",
+    )
     tool._git_show_file(tmp_path)
 
     assert argv == [
@@ -121,11 +133,23 @@ def test_legitimate_refs_unchanged(tmp_path, ref):
 
 
 def test_legitimate_default_ref_unchanged(tmp_path):
-    """An omitted ``ref`` keeps defaulting to ``HEAD``."""
+    """An omitted ``ref`` keeps defaulting to ``HEAD``.
+
+    ``source="committed"`` is EXPLICIT here, and that is the whole point: the
+    subject of this test is the DEFAULT REF (``HEAD``) that the committed read
+    embeds in its ``<ref>:<path>`` selector.  The test used to reach that read
+    through the tool's default source, but the default is now the WORKING TREE
+    (which makes no git call), so the source is named out loud instead of being
+    relied on incidentally.  What is asserted -- ``HEAD:README.md`` -- has not
+    changed.
+    """
     (tmp_path / "README.md").write_text("x\n")
 
     argv = []
-    tool = _tool(tmp_path, argv, operation="show_file", path="README.md")
+    tool = _tool(
+        tmp_path, argv, operation="show_file", path="README.md",
+        source="committed",
+    )
     tool._git_show_file(tmp_path)
 
     assert argv == [

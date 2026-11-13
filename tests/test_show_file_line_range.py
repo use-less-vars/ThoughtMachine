@@ -22,9 +22,13 @@ MARKER = "MIDFILE_MARKER_950"
 
 #: The git tools append a trailer to every result (see the class docstring
 #: "Execution mode and failure diagnostics are reported per call for EVERY
-#: operation via two trailing lines").  It is real output, so the tests strip it
-#: before comparing the BODY -- they do not weaken the window assertions.
-_TRAILER_LINE = re.compile(r"^(execution_mode|failure_reason):")
+#: operation via two trailing lines"), and every ``show_file`` result now starts
+#: with the ``source:`` line that names where the bytes came from (the default
+#: source is the WORKING TREE, not the committed blob).  Both are real output,
+#: so the tests strip the NAMING lines before comparing the BODY -- they do not
+#: weaken the window assertions: exact line content and line counts are still
+#: compared.
+_TRAILER_LINE = re.compile(r"^(execution_mode|failure_reason|source):")
 
 
 def _content() -> str:
@@ -34,6 +38,11 @@ def _content() -> str:
 
 
 def _tool(**kwargs) -> GitReadTool:
+    # This module tests the LINE WINDOW, which is source-independent; it drives
+    # the committed-blob read because that is the read its fake seam supplies.
+    # ``source`` is therefore explicit: the tool's default is the working tree,
+    # which would never reach the faked git call.
+    kwargs.setdefault("source", "committed")
     tool = GitReadTool(operation="show_file", path="big.py", **kwargs)
     tool._run_git_raw = lambda *a, **k: (0, _content(), "")
     tool._validated_rel_paths = lambda repo_root, p: [p]
@@ -45,14 +54,18 @@ def _full_output(tool: GitReadTool) -> str:
 
 
 def _body(tool: GitReadTool) -> str:
-    """Return the output with the execution-mode/failure-reason trailer removed."""
+    """Return the output with the provenance/trailer naming lines removed."""
     out = _full_output(tool)
     lines = out.splitlines()
     stripped = [line for line in lines if _TRAILER_LINE.match(line)]
     # The trailer must actually be present, or this helper would be hiding a
     # missing diagnostic rather than ignoring a known one.
     assert stripped, f"expected an execution_mode/failure_reason trailer in {out[-300:]!r}"
-    while lines and (not lines[-1].strip() or _TRAILER_LINE.match(lines[-1])):
+    # Drop the naming lines WHEREVER they appear (``source:`` is now the FIRST
+    # line of the result, the trailer lines the last two), then the blank line
+    # that ``_with_mode`` inserts before the trailer.
+    lines = [line for line in lines if not _TRAILER_LINE.match(line)]
+    while lines and not lines[-1].strip():
         lines.pop()
     return "\n".join(lines)
 
