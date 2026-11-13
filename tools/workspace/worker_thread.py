@@ -1524,6 +1524,12 @@ class WorkerThread(threading.Thread):
         # Container manager used to stop/remove containers owned by this
         # worker at teardown (see _cleanup_worker_containers).
         self._container_manager: Optional[Any] = container_manager
+        # Process mode rebuilds this worker in a child interpreter from a
+        # spec whose ``workspace_dir`` crossed the boundary as a ``str``
+        # (``worker_runtime_process.py:205``); coerce once, here, so every
+        # caller -- thread, child and test -- gets the same Path maths.
+        if not isinstance(workspace_dir, Path):
+            workspace_dir = Path(workspace_dir)
         self._worker_dir = workspace_dir / "workers" / instance_label
         self._worker_dir.mkdir(parents=True, exist_ok=True)
         # The workspace root under its own name (as passed, not re-derived by

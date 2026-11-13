@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -654,3 +655,62 @@ def test_every_age_reading_reports_ignorance_rather_than_zero() -> None:
     )
     assert empty._last_heartbeat_at is None
     assert isinstance(empty._last_received_at, float)
+
+
+def test_the_worker_dir_is_built_from_a_str_workspace_dir(tmp_path) -> None:
+    """A ``str`` workspace_dir must not break construction (C62c, defect 1).
+
+    ``spec_from_worker`` puts ``str(worker.workspace_dir)`` in the spec
+    (``worker_runtime_process.py:205``) because it has to pickle into a spawn
+    child, and ``__init__`` divides it by ``"workers"``. Before the coercion
+    the child died in bootstrap with ``TypeError: unsupported operand
+    type(s) for /: 'str' and 'str'``, so the shipped process default could not
+    start a worker at all.
+    """
+    worker = WorkerThread(
+        name="seam-str-w",
+        definition={},
+        agent_config={"provider": "openai", "model": "gpt-4"},
+        workspace_dir=str(tmp_path),
+        session_permissions={},
+        instance_id=1,
+    )
+
+    assert isinstance(worker.workspace_dir, Path)
+    assert worker._worker_dir.is_dir()
+    assert worker._worker_dir.parent.parent == Path(tmp_path)
+    assert worker._worker_dir == Path(tmp_path) / "workers" / worker._worker_dir.name
+
+
+def test_the_spec_carries_the_briefing_but_not_the_spawn_query(tmp_path) -> None:
+    """Only the briefing crosses to the child (C62c, defect 2).
+
+    The spawn query is already executed by the parent-side thread -- its reply
+    is what the spawner reads back at ``worker_thread.py:7032`` -- so shipping
+    it in the spec makes the rebuilt worker self-queue it (``run()`` at
+    ``:4004`` / ``:4047``) and pay for the same turn twice. The child-side
+    construction is exercised here without forking anything.
+    """
+    from tools.workspace.worker_runtime_main import _build_worker
+    from tools.workspace.worker_runtime_process import spec_from_worker
+
+    worker = _make_worker(tmp_path)
+    worker.session_id = "sess-seam-spec"
+    worker._initial_context = {
+        "query": "SPAWN-QUERY-ALREADY-EXECUTED",
+        "purpose": "prove the boundary",
+        "style": "precise",
+    }
+
+    spec = spec_from_worker(worker, epoch=0)
+    briefing = spec["worker_kwargs"]["initial_context"]
+
+    assert "query" not in briefing
+    assert briefing["purpose"] == "prove the boundary"
+    assert briefing["style"] == "precise"
+
+    child_worker = _build_worker(None, dict(spec["worker_kwargs"]))
+
+    assert isinstance(child_worker, WorkerThread)
+    assert child_worker._initial_context == briefing
+    assert child_worker._worker_dir.is_dir()
