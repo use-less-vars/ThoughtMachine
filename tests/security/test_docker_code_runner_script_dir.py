@@ -72,7 +72,7 @@ def test_run_does_not_litter_the_workspace_bind(tmp_path, monkeypatch):
             pass
 
         def start(self, image=None, worker_name=None, *, lifecycle_class=None,
-                  heal_missing=False):
+                  heal_missing=False, cpu_quota=None):
             return {"id": "a" * 16, "name": "agent-scratch",
                     "status": "created", "note": ""}
 

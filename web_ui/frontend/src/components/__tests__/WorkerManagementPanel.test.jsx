@@ -205,6 +205,7 @@ describe('WorkerManagementPanel — Stop All Workers', () => {
     expect(
       screen.getByRole('heading', { name: 'Stop All Workers' })
     ).toBeInTheDocument()
+    expect(screen.getByText(/They park as detached and can be resumed later/)).toBeTruthy()
     expect(calls.filter((c) => c.url.includes('/workers/stop_all'))).toHaveLength(0)
   })
 

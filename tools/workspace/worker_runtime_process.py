@@ -122,6 +122,9 @@ _OPTIONAL_KWARGS = (
     ("max_container_count", "max_container_count"),
     ("max_token_usage", "max_token_usage"),
     ("max_runtime_s", "max_runtime_s"),
+    # The initial context ("briefing") and the query that rides in it. Without
+    # this line the child interpreter builds a worker with no brief at all.
+    ("initial_context", "_initial_context"),
 )
 
 
@@ -161,6 +164,26 @@ class WorkerQueryTimeout(TimeoutError):
         super().__init__(message)
         #: The terminal ``reply`` this side synthesised; ``ok`` is ``False``.
         self.reply = reply
+
+
+def _briefing_only(
+    initial_context: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """``initial_context`` without the spawn query, for the process boundary.
+
+    The spawn query is executed by the parent-side thread; its reply is what
+    the spawner reads back at ``worker_thread.py:7032``. A worker rebuilt from
+    this spec self-queues ``initial_context["query"]`` in ``run()``
+    (``worker_thread.py:4004`` fresh / ``:4047`` loaded context), so letting
+    the query travel would pay for the same turn twice and repeat its side
+    effects. The briefing (purpose/style/context) still crosses, because the
+    child needs it to serve ``dispatch_query`` coherently.
+    """
+    if not initial_context:
+        return initial_context
+    briefing = dict(initial_context)
+    briefing.pop("query", None)
+    return briefing
 
 
 def spec_from_worker(worker: Any, *, epoch: Optional[int] = None) -> Dict[str, Any]:
@@ -203,6 +226,9 @@ def spec_from_worker(worker: Any, *, epoch: Optional[int] = None) -> Dict[str, A
         "instance_id": int(worker.instance_id),
     }
     for target, source in _OPTIONAL_KWARGS:
+        if target == "initial_context":
+            kwargs[target] = _briefing_only(getattr(worker, source, None))
+            continue
         kwargs[target] = getattr(worker, source, None)
     # ``container_manager`` is deliberately NOT carried: it holds live handles,
     # locks and possibly client objects and cannot be pickled. Container

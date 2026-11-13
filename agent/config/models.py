@@ -1,7 +1,7 @@
 """
 Configuration models for the ThoughtMachine agent.
 """
-from typing import ClassVar, Optional, Callable, List, Any, Dict, Literal
+from typing import ClassVar, Optional, Callable, List, Any, Dict, FrozenSet, Literal
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, Field, field_validator, model_validator, model_serializer, ConfigDict
@@ -11,6 +11,26 @@ from agent.config.presets import AGENT_TOOLS, ENGINEER_TOOLS
 from tools import SIMPLIFIED_TOOL_CLASSES
 from thoughtmachine.security import SessionPermissions
 from thoughtmachine.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
+
+
+# Legacy class names (configs written before the naming cleanup, e.g.
+# enabled_tools: ["GitInfoTool"]) map onto the stable tool names so they keep
+# working after GitInfoTool -> GitReadTool.
+_LEGACY_TOOL_NAMES = {
+    "GitInfoTool": "git_read",
+    "GitWriteTool": "git_write",
+}
+
+
+def _tool_matches_names(cls, names) -> bool:
+    """The ONE tool-name matching rule used for every filter in this module.
+
+    Stable ``tool_name()`` first, then the class ``__name__``, so any registry,
+    preset or allowlist holding either identifier matches.  Deliberately not a
+    second canonicalisation: a parallel matcher is how the two-universe hazard
+    (a tool resolvable at spawn but filtered out at run time) creeps back in.
+    """
+    return cls.tool_name() in names or cls.__name__ in names
 
 
 def normalize_base_url(url: Optional[str]) -> Optional[str]:
@@ -89,6 +109,7 @@ class AgentConfig(BaseModel):
         'max_file_size_mb': GLOBAL_STATIC,
         'max_backup_files': GLOBAL_STATIC,
         'workspace_path': RESTART_REQUIRED,  # DEPRECATED: tools should resolve via SessionRegistry → WorkspaceRegistry instead
+        'worktree_root': RESTART_REQUIRED,
         'detail': HOT_SWAPPABLE,
         'rag_enabled': RESTART_REQUIRED,
         'rag_embedding_model': RESTART_REQUIRED,
@@ -177,6 +198,7 @@ class AgentConfig(BaseModel):
     max_file_size_mb: int = Field(default=10, description='Maximum log file size in MB before rotation')
     max_backup_files: int = Field(default=5, description='Maximum number of backup log files to keep')
     workspace_path: Optional[str] = Field(default=None, description='[DEPRECATED] Root directory for file operations (None = unrestricted). Tools should resolve workspace path via SessionRegistry → WorkspaceRegistry instead of relying on this field.')
+    worktree_root: Optional[str] = Field(default=None, description='Optional narrower root for path-anchored tool operations (e.g. a git worktree inside the registered workspace). None = use the registered workspace root. Must be an existing directory inside the registered workspace; invalid values fail closed with ValueError.')
     rag_enabled: bool = Field(default=False, description='Enable RAG functionality')
     rag_embedding_model: str = Field(default='BAAI/bge-small-en-v1.5', description='Model name for sentence-transformers embeddings')
     rag_vector_store_path: Optional[str] = Field(default=None, description='Path to vector store database (None = default .thoughtmachine/rag/)')
@@ -189,6 +211,14 @@ class AgentConfig(BaseModel):
     tool_output_token_limit: int = Field(default=10000, description='Maximum token limit for tool outputs (default 10,000 tokens)')
     detail: Literal['minimal', 'normal', 'verbose'] = Field(default='normal', description='Detail level for event display')
     enabled_tools: List[str] = Field(default_factory=lambda: [cls.tool_name() for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool names (stable tool_name(); legacy class names also accepted)')
+    # Defence in depth (capability registry phase 2): the tool names a frozen
+    # ``CapabilityRegistry`` resolved for THIS instance.  ``None`` (the default)
+    # means "no narrowing", so the main agent and every pre-registry path keep
+    # exactly the ``enabled_tools``-only behaviour.  When set, the runtime tool
+    # list becomes the INTERSECTION of ``enabled_tools`` and this set (see
+    # ``get_filtered_tool_classes``), so a bug that widens ``enabled_tools``
+    # cannot widen real tool availability.
+    resolved_tool_names: Optional[FrozenSet[str]] = Field(default=None, description='Resolved capability-registry tool names; None means no narrowing beyond enabled_tools')
     timeout_seconds: int = Field(default=SOFT_BUDGET_FALLBACK_SECONDS, description='Maximum runtime in seconds before timeout')
     time_monitor_enabled: bool = Field(default=False, description='Enable time-based execution monitoring')
     time_warning_threshold: int = Field(default=240, description='Elapsed seconds at which a time warning is issued (default 80% of timeout)')
@@ -364,12 +394,18 @@ class AgentConfig(BaseModel):
         d.pop('stop_check', None)
         return d
 
-    def get_filtered_tool_classes(self, enabled_tools=None):
+    def get_filtered_tool_classes(self, enabled_tools=None, allowed_names=None):
         """Get tool classes filtered based on rag_enabled and enabled_tools.
 
         Args:
             enabled_tools: Optional override list of enabled tool names.
                           If None, uses self.enabled_tools.
+            allowed_names: Optional capability-registry allowlist.  ``None``
+                          (the default) means NO narrowing: the result is
+                          exactly the ``enabled_tools``-only filtering.  When
+                          provided, a class must ALSO match one of these names,
+                          so the runtime list is an intersection and the
+                          allowlist can only withdraw, never grant.
 
         Returns:
             List of tool class objects.
@@ -385,18 +421,27 @@ class AgentConfig(BaseModel):
             # Legacy class names (configs written before the naming cleanup,
             # e.g. enabled_tools: ["GitInfoTool"]) map onto the stable tool
             # names so they keep working after GitInfoTool -> GitReadTool.
-            _LEGACY_TOOL_NAMES = {
-                "GitInfoTool": "git_read",
-                "GitWriteTool": "git_write",
-            }
             active_tools = [_LEGACY_TOOL_NAMES.get(name, name) for name in active_tools]
             # Match by stable tool name first, then legacy class name, so
             # presets/configs written with either identifier keep working.
-            tool_classes = [
-                cls
-                for cls in tool_classes
-                if cls.tool_name() in active_tools or cls.__name__ in active_tools
-            ]
+            tool_classes = [cls for cls in tool_classes if _tool_matches_names(cls, active_tools)]
+        if allowed_names is not None:
+            # Defence in depth: the runtime tool list is the INTERSECTION of
+            # enabled_tools and the frozen registry's resolved set, so a
+            # widening bug in enabled_tools cannot widen real availability.
+            # Only withdraws: a class already dropped by enabled_tools above is
+            # not resurrected by appearing in allowed_names.
+            allowed = frozenset(_LEGACY_TOOL_NAMES.get(name, name) for name in allowed_names)
+            kept = [cls for cls in tool_classes if _tool_matches_names(cls, allowed)]
+            if not kept and (enabled_tools is not None or self.enabled_tools):
+                log(
+                    'WARNING',
+                    'config.models',
+                    'enabled_tools/registry intersection is EMPTY -- dropping '
+                    f'{len(tool_classes)} tool(s): '
+                    f'{sorted({cls.tool_name() for cls in tool_classes})}',
+                )
+            tool_classes = kept
         return tool_classes
 
     def resolve_from_profile(self, manager) -> 'AgentConfig':

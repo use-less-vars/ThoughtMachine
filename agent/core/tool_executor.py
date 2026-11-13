@@ -160,6 +160,48 @@ def _ensure_gate_imported() -> bool:
 # agent/config/defaults.py so existing importers keep seeing it here).
 from agent.config.defaults import DEFAULT_SESSION_PERMISSIONS
 
+
+def is_interrupted_tool_entry(entry: Any) -> bool:
+    """Report whether an executed tool entry records an interrupted result.
+
+    An interrupted tool result is a CONTROL signal, not an observation: it
+    says the call did not complete because the turn was paused or cancelled.
+    The dispatch loop must recognise it (via this predicate) so the turn can
+    be concluded with Respond instead of feeding the envelope back to the
+    model as if it were an ordinary tool observation.
+
+    Two envelope dialects are accepted:
+
+    * the sleep tool reports ``{"tool": "sleep", "ok": false,
+      "interrupted": true, "reason": "paused" | "turn_cancelled"}`` -- a
+      boolean flag and no ``status`` key at all;
+    * container / DockerCodeRunner calls report ``{"status":
+      "interrupted", "interrupted": true, "exit_code": null}``.
+
+    Args:
+        entry: An entry from ``execute_tool_calls``' returned list. Its
+            ``result`` may be a JSON string (the normal case), an already
+            parsed dict, or absent.
+
+    Returns:
+        True if the entry's result is an interrupted envelope, otherwise
+        False. Malformed input (non-dict entry, missing/unparseable result,
+        non-dict result) is simply not an interruption; this predicate never
+        raises and never mutates its argument.
+    """
+    if not isinstance(entry, dict):
+        return False
+    result = entry.get("result")
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(result, dict):
+        return False
+    return result.get("interrupted") is True or result.get("status") == "interrupted"
+
+
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
 
@@ -269,6 +311,18 @@ class ToolExecutor:
                     })
                 return (executed_tools, False, None, None, None)
             tool_name = tool_call['function']['name']
+            # Control-plane instrumentation (Gen 61 dispatch 13). Diagnostic only:
+            # prints the identity of the state object that reached the gate so it
+            # can be compared with the identity stamped at the mutation site.
+            # getattr() is READ-ONLY here: it does not change the fail-open
+            # semantics under test, it only reports them.
+            logger.info(
+                '[CONTROL_PLANE_GATE] event=gate-check tool=%s state_id=%s '
+                'restrictions_active=%s restriction_reason=%s session_id=%s',
+                tool_name, id(self.state),
+                getattr(self.state, 'restrictions_active', None),
+                getattr(self.state, 'restriction_reason', None), session_id,
+            )
             if not self.state.is_tool_allowed(tool_name):
                 tool_result = self._create_tool_rejection_message(tool_name)
                 add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
@@ -350,6 +404,37 @@ class ToolExecutor:
             if 'success' in tool_execution_result:
                 tool_entry['success'] = tool_execution_result['success']
             executed_tools.append(tool_entry)
+            # Pause wind-down: an interrupted tool result is a CONTROL signal,
+            # not an observation.  When the interruption was caused by a pause,
+            # stop running this batch instead of feeding the envelope back to
+            # the model as if it were an ordinary result -- the caller then
+            # lets the model write its own summary.
+            if (is_interrupted_tool_entry(tool_entry)
+                    and getattr(self.state, 'restriction_reason', None) == 'pause'):
+                remaining_content = json.dumps({
+                    "status": "interrupted",
+                    "interrupted": True,
+                    "reason": "paused",
+                    "skipped": True,
+                    "message": "Not run: the session was paused while an earlier tool was executing.",
+                })
+                # One tool result per tool_call id is REQUIRED for pairing: the
+                # provider rejects an assistant tool_calls message whose ids are
+                # not all answered, so the skipped calls are padded (the same
+                # idiom as the stop_check early exit above), never dropped.
+                for tc in tool_calls[_tc_index + 1:]:
+                    add_tool_result({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": remaining_content,
+                    })
+                    executed_tools.append({
+                        "name": tc["function"]["name"],
+                        "arguments": {},
+                        "result": remaining_content,
+                        "tool_call_id": tc.get("id", ""),
+                    })
+                return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
         return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
 
     def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns, session_id: str = "", workspace_id: str = "") -> Dict[str, Any]:
@@ -392,7 +477,7 @@ class ToolExecutor:
             except ValidationError as e:
                 # Provide LLM-friendly error with valid field names
                 try:
-                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions", "session_id", "is_worker_context"}
+                    infra_fields = {"workspace_path", "worktree_root", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions", "session_id", "is_worker_context"}
                     valid_fields = [f for f in valid_field_names if f not in infra_fields]
                     valid_fields_str = ', '.join(valid_fields)
                     return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal', 'success': False}
@@ -402,6 +487,12 @@ class ToolExecutor:
             # workspace_path is ALWAYS taken from the executor config: it is an
             # infrastructure field, so a caller-supplied value must never win.
             tool_args['workspace_path'] = self.config.workspace_path
+            # worktree_root is an infrastructure field too, but it is injected
+            # ONLY when the config carries one: a None config must leave
+            # tool_args byte-identical to the pre-worktree behaviour, so
+            # existing tool instances keep seeing no key at all.
+            if getattr(self.config, 'worktree_root', None):
+                tool_args['worktree_root'] = self.config.worktree_root
             if self.config.tool_output_token_limit is not None:
                 tool_args['token_limit'] = self.config.tool_output_token_limit
             # Check permission categories using the unified security gate
@@ -425,25 +516,66 @@ class ToolExecutor:
             effective: Optional[Dict[str, Any]] = None
 
             if GATE_AVAILABLE and session_perms_obj is not None:
-                # Resolve workspace ID to load workspace capabilities
+                # Resolve the workspace ID the gate is entitled to enforce.
+                #
+                # PRECEDENCE (security-relevant -- do not reorder):
+                #   1. the explicitly passed `workspace_id`, i.e. the id the
+                #      agent hands down from its LIVE session record on every
+                #      tool call (agent.py:1952);
+                #   2. the persisted session record, read through the store's
+                #      purpose-built probe (`load_session_workspace_id`: one
+                #      file-existence check / registry hit, no payload parse)
+                #      or, when the store does not expose it, the legacy
+                #      payload probe;
+                #   3. `self.config.workspace_path` -- LAST, and only as a
+                #      legacy fallback.
+                #
+                # `config.workspace_path` is a DEPRECATED, RESTART_REQUIRED
+                # construction-time snapshot: a hot-swap replaces
+                # `self.config` wholesale with an AgentConfig that carries no
+                # workspace_path at all (agent.py:791-797), so resolving from
+                # the snapshot FIRST silently loses the workspace the session
+                # is actually pinned to and the gate then enforces the wrong
+                # capability ceiling (or the fail-closed floor). The live
+                # identities are authoritative; the snapshot is not.
+                #
+                # Widening or narrowing this set changes WHO can execute
+                # category-gated tools: whichever id wins decides the
+                # capability ceiling and the on-disk grant record the gate
+                # reads, so a source that yields the wrong id both under- and
+                # over-privileges.
                 workspace_path = getattr(self.config, 'workspace_path', None)
-                ws_id = resolve_workspace_id(workspace_path) if (workspace_path and resolve_workspace_id) else None
                 required_categories = tool_class.get_required_categories(arguments)
-                # Fail-closed: when a workspace_path is configured but its
-                # workspace ID cannot be resolved, deny execution instead of
-                # silently falling back to (potentially permissive) default
-                # capabilities. Only tools that actually declare required
-                # capability categories are gated -- tools with no required
-                # categories have nothing to be permissive about and keep
-                # executing (e.g. introspection probes in tests).
+                ws_id = workspace_id or None
+                if not ws_id and session_id:
+                    try:
+                        _store = self._get_session_store()
+                        _load_ws_id = getattr(_store, 'load_session_workspace_id', None)
+                        if callable(_load_ws_id):
+                            ws_id = _load_ws_id(session_id) or None
+                    except Exception:  # noqa: BLE001 - best-effort probe
+                        pass
+                    if not ws_id:
+                        ws_id = self._resolve_workspace_id_from_session(session_id)
+                if not ws_id and workspace_path and resolve_workspace_id:
+                    ws_id = resolve_workspace_id(workspace_path)
+                # Fail-closed: when a workspace_path is configured but NO
+                # source above could resolve a workspace id, deny execution
+                # instead of silently falling back to (potentially
+                # permissive) default capabilities. The refusal NAMES why it
+                # is refusing, so an unresolvable-workspace denial stays
+                # distinguishable from a category denial. Only tools that
+                # actually declare required capability categories are gated
+                # -- tools with no required categories have nothing to be
+                # permissive about and keep executing (e.g. introspection
+                # probes in tests).
                 if workspace_path and not ws_id and required_categories:
-                    return {'result': f"DENIED: could not resolve workspace_id for workspace_path={workspace_path}; tool execution denied (fail-closed).", 'tool_type': 'normal', 'success': False}
-                # Fallback workspace-id resolution when no workspace_path is
-                # configured: prefer the explicitly passed workspace_id (agent
-                # session context), then a cached best-effort lookup of the
-                # persisted session record's top-level 'workspace_id'.
-                if not ws_id:
-                    ws_id = workspace_id or self._resolve_workspace_id_from_session(session_id)
+                    return {'result': (
+                        f"DENIED: could not resolve workspace_id for workspace_path={workspace_path}; "
+                        "tool execution denied (fail-closed). No workspace id resolved from the "
+                        "explicit workspace_id argument, the persisted session record, or the "
+                        "configured workspace_path."
+                    ), 'tool_type': 'normal', 'success': False}
                 caps = get_workspace_capabilities(ws_id) if ws_id else WorkspaceCapabilities()
                 # Disk-authoritative permissions mode: when BOTH a session id
                 # and a workspace id are available, ask the gate to read the
@@ -770,6 +902,33 @@ class ToolExecutor:
         except Exception:  # noqa: BLE001 - observability only, never blocking
             pass
 
+    def _get_session_store(self):
+        """Lazily create and cache the session store used for workspace-id probes.
+
+        Cached so the workspace gate above and the legacy resolver below share
+        ONE instance instead of allocating a throwaway store per gated tool
+        call.  A probe that cannot get a store simply falls through to the next
+        resolution source, so construction failures return None rather than
+        raising.
+
+        The import stays local to this method on purpose: tests (and the gate
+        probe) monkeypatch ``session.store.FileSystemSessionStore``, so the
+        lookup has to happen at call time, not at executor construction.
+        """
+        store = getattr(self, '_session_store', None)
+        if store is not None:
+            return store
+        try:
+            from session.store import FileSystemSessionStore
+        except Exception:  # noqa: BLE001 - optional dependency / partial import
+            return None
+        try:
+            store = FileSystemSessionStore()
+        except Exception:  # noqa: BLE001 - best-effort probe
+            return None
+        self._session_store = store
+        return store
+
     def _resolve_workspace_id_from_session(self, session_id: str) -> Optional[str]:
         """Best-effort resolve a session's workspace_id from its persisted
         session record (top-level 'workspace_id' field).  Never raises and
@@ -781,8 +940,9 @@ class ToolExecutor:
         if cached:
             return cached
         try:
-            from session.store import FileSystemSessionStore
-            store = FileSystemSessionStore()
+            store = self._get_session_store()
+            if store is None:
+                return None
             path = store._find_session_path(session_id)
             if path is None:
                 return None

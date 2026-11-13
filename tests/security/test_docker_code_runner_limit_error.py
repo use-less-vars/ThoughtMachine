@@ -42,7 +42,7 @@ def test_start_error_dict_surfaces_limit_message(tmp_path, monkeypatch):
             pass
 
         def start(self, image=None, worker_name=None, *, lifecycle_class=None,
-                  heal_missing=False):
+                  heal_missing=False, cpu_quota=None):
             # Real ContainerManager.start() signature: accepts worker_name
             # (thoughtmachine.worker ownership label on fresh creates) and
             # heal_missing (recorded so the runner is asserted to pass True).
@@ -86,7 +86,7 @@ def test_drift_deny_removes_and_restarts_exactly_once(tmp_path, monkeypatch):
             pass
 
         def start(self, image=None, worker_name=None, *, lifecycle_class=None,
-                  heal_missing=False):
+                  heal_missing=False, cpu_quota=None):
             calls["start"] += 1
             calls["heal_missing"].append(heal_missing)
             if calls["start"] == 1:
@@ -142,7 +142,7 @@ def test_drift_deny_without_container_id_raises(tmp_path, monkeypatch):
             pass
 
         def start(self, image=None, worker_name=None, *, lifecycle_class=None,
-                  heal_missing=False):
+                  heal_missing=False, cpu_quota=None):
             calls["start"] += 1
             calls["heal_missing"].append(heal_missing)
             return {

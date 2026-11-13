@@ -39,22 +39,40 @@ const CONFIG_PANEL_DEFAULT_WIDTH = 280
 // ChatPanel re-renders (and re-runs its scroll effects) on every update.
 const EMPTY_MESSAGES = []
 // Chat messages carry no id/message_id in this app (verified: only session /
-// workspace metadata has ids), so compare role + content of the FIRST and
-// LAST messages. Length + first/last-message equality matches the store's
-// update pattern (streaming mutates the LAST message; earlier messages are
-// immutable, so the first message pins the conversation start).
+// workspace metadata has ids). The previous version only compared role +
+// content of the FIRST and LAST message, so a change in the MIDDLE of the list
+// was invisible: inserting a message (e.g. a system notice) anywhere between
+// the first and last element left length, first and last identical, the
+// equality fn returned true and the selector handed back the stale array —
+// ChatPanel never rendered the new message.  Hence the full walk below.
+// It is deliberately allocation-free (no joined string / hash / JSON dump):
+// this runs as the zustand equality fn on every store update, i.e. once per
+// streamed token, so it must stay a cheap early-exit loop.
 function messagesEqual(a, b) {
   if (a === b) return true
   if (!a || !b) return false
-  if (a.length !== b.length) return false
-  if (a.length === 0) return true
-  const fa = a[0]
-  const fb = b[0]
-  const la = a[a.length - 1]
-  const lb = b[b.length - 1]
-  return !!(fa && fb && la && lb) &&
-    fa.role === fb.role && fa.content === fb.content &&
-    la.role === lb.role && la.content === lb.content
+  const len = a.length
+  if (len !== b.length) return false
+  for (let i = 0; i < len; i++) {
+    const ma = a[i]
+    const mb = b[i]
+    if (ma === mb) continue
+    // One side empty/undefined: differ unless BOTH are (handled above).
+    if (!ma || !mb) return false
+    if (
+      ma.role !== mb.role ||
+      ma.content !== mb.content ||
+      ma.is_system_notification !== mb.is_system_notification ||
+      ma.is_final !== mb.is_final ||
+      ma.is_summary !== mb.is_summary ||
+      ma.client_only !== mb.client_only ||
+      ma.is_streaming !== mb.is_streaming ||
+      ma.response_type !== mb.response_type
+    ) {
+      return false
+    }
+  }
+  return true
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -146,6 +164,17 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const config = sessionConfig?.config ?? null
   const providers = sessionConfig?.providers ?? []
   const availableTools = sessionConfig?.tools ?? []
+  // ── Host-shell danger flag ──
+  // host_bash runs commands on the HOST, outside the sandbox, so an ENABLED
+  // grant must never read as just another permission: it earns a danger badge
+  // in the header. Levels rank banned < ask < allow (mirrors
+  // data/permissionVocab.js SESSION_RESOURCE_VOCAB.host_bash and
+  // security/security_gate.py _HOST_BASH_CEILING_RANKS); 'allow' and the
+  // boolean true are the ENABLED forms. The live WS-sourced effective grants
+  // win over the config snapshot, and every other value (ask / banned / false /
+  // absent) shows NOTHING — an unknown grant is never painted as dangerous.
+  const hostBashGrant = sessionConfig?.permissions?.host_bash ?? config?.session_permissions?.host_bash
+  const hostBashEnabled = hostBashGrant === 'allow' || hostBashGrant === true || hostBashGrant === 'true'
   const history = sessionMessages ?? EMPTY_MESSAGES
   // Streaming view: history plus (only while a turn is streaming) the in-flight
   // assistant bubble. Kept out of `history` because the store may not hold a
@@ -690,16 +719,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         })
         const notes = visibleMessages.filter(m => m.is_system_notification);
         if (notes.length > 0) console.log('🔔 SYSTEM NOTIFICATIONS:', notes);
-        // Detect context compaction messages — force scroll to bottom (R3)
-        if (notes.some(m => {
-          const text = (m.content || '').toLowerCase()
-          return text.includes('context now free') ||
-                 text.includes('summar') ||
-                 text.includes('compact') ||
-                 text.includes('messages removed')
-        })) {
-          setScrollToBottomKey(k => k + 1)
-        }
+        // No substring-triggered scrolling here: stick-to-bottom is owned by
+        // useStickToBottom inside the panels, so message TEXT must never move the
+        // viewport (compaction/summary notices used to force-scroll via markers
+        // like 'summar'/'compact').
         // Server-authoritative replace, but client-only notices (e.g. the
         // CASE-3 cold-start status notice) are not part of the server payload,
         // so keep them instead of letting this replace wipe them.
@@ -1296,6 +1319,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
               >
                 Rename
               </button>
+              {hostBashEnabled ? (
+                <span
+                  className="session-header-host-bash-badge"
+                  title="Host shell (host_bash) is ENABLED for this session: the agent may run commands on the host, outside the sandbox."
+                >
+                  host_bash
+                </span>
+              ) : null}
               <div className="session-header-spacer" />
               <button
                 className="session-header-btn session-header-details-btn"

@@ -1295,10 +1295,6 @@ def _stop_worker_instance(
     * write ``command.json`` with ``{"action": "stop"}`` (detach) or
       ``{"action": "kill"}`` (terminate) so the polling worker thread picks
       the signal up (within its poll interval),
-    * optimistically write ``status.json`` with the matching
-      ``runtime_status`` (``"detached"`` for stop, ``"killed"`` for kill) so
-      the UI sees the new state immediately (instead of "jumping back" to
-      "busy" before the worker processes the command),
     * fast-path the in-memory registry thread, optionally narrowed by
       ``session_id`` and ``instance_id``: ``thread.stop()`` (which detaches,
       PHASE 2.1a) or, when ``terminate`` is set, ``thread.kill()``.
@@ -1371,17 +1367,6 @@ def _stop_worker_instance(
         worker_name=name,
         instance_id=resolved_instance_id,
     )
-
-    # Immediately write status.json with the state the worker is heading for
-    # ("detached" on stop, "killed" on kill) so the UI doesn't "jump back"
-    # to "busy" on the next poll before the worker thread has a chance to
-    # process the command.
-    _atomic_write_json({
-        "runtime_status": "killed" if terminate else "detached",
-        "current_task": None,
-        "last_heartbeat": datetime.now(timezone.utc).isoformat(),
-        "error": None,
-    }, worker_dir / "status.json")
 
     # Fast-path: if the thread is in-memory (same process), signal directly.
     # Registry keys are tuples (session_id, worker_name[, instance_id]), so
@@ -1462,8 +1447,7 @@ async def stop_all_workers(
     Enumerates instances from the same on-disk layout the per-worker ``stop``
     route uses (``workers/<session_id>/<name>[/<name>#<N>]`` and legacy
     ``workers/<name>``/``workers/<name>#<N>``) and stops each one through the
-    shared per-worker helper: a file-based ``command.json`` signal plus an
-    optimistic ``status.json`` (``runtime_status: "detached"``) plus the
+    shared per-worker helper: a file-based ``command.json`` signal plus the
     in-memory registry fast-path.  PHASE 2.1a: ``stop`` DETACHES — no
     ``Thread.kill``, the workers park and can be resumed; terminate with the
     per-worker ``kill`` route.  No job_registry or container changes.
@@ -1545,11 +1529,6 @@ async def stop_worker(
     registry.  Returns immediately — the worker will transition to
     ``detached`` asynchronously.
 
-    Also immediately writes ``status.json`` with ``runtime_status: "detached"``
-    so the web UI's next poll sees the new state right away (instead of
-    "jumping back" to "busy" when the optimistic update gets overwritten
-    before the worker processes the stop).
-
     Returns:
         200 with ``{"status": "ok", "name": name}`` on success.
         404 if the worker directory does not exist.
@@ -1592,11 +1571,6 @@ async def kill_worker(
     Also attempts an in-memory kill as a fast path if the thread is in the
     registry.  Returns immediately — the worker will transition to ``killed``
     asynchronously.
-
-    Also immediately writes ``status.json`` with ``runtime_status: "killed"``
-    so the web UI's next poll sees the terminal state right away (instead of
-    "jumping back" to "busy" when the optimistic update gets overwritten
-    before the worker processes the kill).
 
     Returns:
         200 with ``{"status": "ok", "name": name}`` on success.
@@ -1840,12 +1814,8 @@ async def pause_worker(
     registry.  Returns immediately — the worker will transition to ``paused``
     asynchronously.
 
-    Also immediately writes ``status.json`` with ``runtime_status: "pausing"``
-    so the web UI's next poll shows the pending pause right away.  The worker
-    transitions to ``"paused"`` only once its current turn actually completes.
-
     Returns:
-        200 with ``{"status": "pausing", "name": name}`` on success.
+        200 with ``{"status": "accepted", "name": name}`` on success.
         404 if the worker directory does not exist.
     """
     ensure_workspace_dirs(ws_id)
@@ -1911,15 +1881,6 @@ async def pause_worker(
         instance_id=resolved_instance_id,
     )
 
-    # Immediately write status.json as "pausing" (the pause is in flight).
-    # The worker flips to "paused" only when its current turn completes.
-    _atomic_write_json({
-        "runtime_status": "pausing",
-        "current_task": None,
-        "last_heartbeat": datetime.now(timezone.utc).isoformat(),
-        "error": None,
-    }, worker_dir / "status.json")
-
     # Fast-path: if the thread is in-memory (same process), signal directly.
     # Registry keys are tuples (session_id, worker_name[, instance_id]), so
     # iterate all entries matching the worker name — optionally narrowed to
@@ -1936,7 +1897,7 @@ async def pause_worker(
             except Exception:
                 pass  # File-based pause will still work
 
-    resp = {"status": "pausing", "name": name}
+    resp = {"status": "accepted", "name": name}
     if target_label is not None:
         resp["instance_id"] = instance_id
         resp["instance_label"] = target_label
@@ -1974,8 +1935,20 @@ async def resume_worker(
     ``ready``/``busy`` asynchronously.
 
     Returns:
-        200 with ``{"status": "resumed", "name": name}`` on success.
-        404 if the worker directory does not exist.
+        200 with ``{"status": "resumed", "name": name}`` when an in-memory
+            thread for this worker was genuinely revived (the fast path).
+        200 with ``{"status": "queued", "resumed_command_written": true,
+            "in_process": false}`` when no in-memory thread matched: the
+            resume travels over the fenced command channel
+            (``tools/workspace/command_channel.py``, "for cross-process worker
+            control"), which a worker running in a separate OS process polls
+            within ~2 seconds.  That is delivery, not a confirmed revive, so
+            the body does not claim "resumed".
+        404 only if the worker directory does not exist -- the body is
+            ``{"status": "not_found", "name": name}`` under ``detail``.
+        200 with ``{"status": "refused", "workers_refused": [...]}`` when the
+            matching live instance refused because a stop is already in
+            flight.
     """
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
@@ -2077,6 +2050,24 @@ async def resume_worker(
                     "worker_name": wname,
                     "instance_id": tid,
                 })
+
+    if not resumed_threads and not refused_threads:
+        # Zero in-memory matches.  That is EXPECTED for a worker running in
+        # another process: the resume command travels over the fenced
+        # command.json channel (tools/workspace/command_channel.py), which the
+        # worker polls within ~2s, and the in-memory revive above is only a
+        # fast path.  So this is not a failure -- but it is also not a
+        # confirmed revive, so do not claim "resumed".
+        resp: Dict[str, Any] = {
+            "status": "queued",
+            "name": name,
+            "resumed_command_written": True,
+            "in_process": False,
+        }
+        if target_label is not None:
+            resp["instance_id"] = instance_id
+            resp["instance_label"] = target_label
+        return resp
 
     if refused_threads and not resumed_threads:
         # Every in-memory thread we found refused: the resume command file was
@@ -2590,8 +2581,10 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
     except Exception:
         active_workers = []
 
-    # Open sessions for this workspace.
+    # Sessions for this workspace: ``active_sessions`` is the open-only view,
+    # ``total_sessions_count`` counts every registered session (open or closed).
     active_sessions: List[Dict[str, Any]] = []
+    total_sessions_count = 0
     try:
         from session.session_registry import SessionRegistry
 
@@ -2600,7 +2593,10 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
             for s in sessions.values():
                 if not isinstance(s, dict):
                     continue
-                if s.get("workspace_id") != ws_id or not s.get("is_open"):
+                if s.get("workspace_id") != ws_id:
+                    continue
+                total_sessions_count += 1
+                if not s.get("is_open"):
                     continue
                 active_sessions.append(
                     {
@@ -2614,6 +2610,7 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
             active_sessions.sort(key=lambda s: s["session_id"])
     except Exception:
         active_sessions = []
+        total_sessions_count = 0
 
     # Provisioned (agent-facing) containers for this workspace.  The agent
     # enumeration excludes resource containers (list_containers hides them).
@@ -2658,6 +2655,7 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
         "worker_templates": worker_templates,
         "active_workers": active_workers,
         "active_sessions": active_sessions,
+        "total_sessions_count": total_sessions_count,
         "containers_in_use": containers_in_use,
         "containers_listed": containers_listed,
         "tools": tools,

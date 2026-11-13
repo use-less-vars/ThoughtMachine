@@ -37,11 +37,11 @@ Verdicts: **PASS** (implemented as specified), **PARTIAL** (implemented with gap
 - Host path disables them: `tools/git_info_tool.py` L406-415 (`core.hooksPath=/dev/null`) + L416-419 (`--no-verify` on commit).
 - Commit flow: stage L896-898 → `git commit` L909-910; repo-local hooks never consulted on the host path.
 
-## (d) Shared `.git/hooks/pre-commit` — NOT READABLE from this environment (gitfile indirection); repo `.githooks/pre-commit` inspected
+## (d) Shared `.git/hooks/pre-commit` — NOT READABLE from this environment (gitfile indirection); repo `.githooks/pre-commit` DOES NOT EXIST
 
 - `/workspace/.git` is an 84-byte gitfile → gitdir `/home/jojo/PycharmProjects/ThoughtMachine/.git/worktrees/ThoughtMachine-dev` (outside the sandbox mount) → `.git/hooks` cannot be listed/read here. Direct inspection verdict: **NOT READABLE** (infrastructure constraint, not a code defect).
-- Repo-owned hook **`.githooks/pre-commit`** (tracked in workspace, readable): executable, 11,677 B, 279 lines. Content = "fast gate": (1) import `web_ui.backend.server`; (2) live health check on `127.0.0.1:<random-high-port>` via urllib, asserting `{"status":"ok"}` and `revision == git rev-parse HEAD`; (3) hermetic websocket smoke (starlette `TestClient`, temp HOME, patched `Path.home`, purged modules, `new_session(custom)` → `session_loaded`); (4) conditional pytest run of `tests/integration/test_session_creation_contract.py` only if steps 1-3 finish < 3 s, with `--ignore` for the RED test (exit 5 treated as SKIP). Python resolution `$PYTHON` → `.venv/bin/python` → `python3`; EXIT trap cleanup; `mktemp -d ${TMPDIR:-/tmp}/tm_precommit.XXXXXX`; `setsid` process-group kill. No `mcp_servers.json` creation anywhere.
-- `.pre-commit-config.yaml` is **absent** from the repo (verified via glob). Whether `.githooks` actually fires on commit depends on the operator's host `core.hooksPath` wiring — unverifiable from the sandbox.
+- Repo-owned hook **`.githooks/pre-commit`**: **DOES NOT EXIST** in this workspace. Verified directly: `ls -la .githooks/` → "No such file or directory", and `find . -name 'pre-commit*' -not -path './.git/*'` → 0 matches. There is no repository hook to be tracked, wired, or executed on either git path today. What actually protects the git path is argv-level hardening in `tools/git_info_tool.py`, not a hook: (1) the `-c` pins applied to EVERY host invocation, `_exec_host_raw` L1051-1064 — `core.hooksPath=/dev/null` L1051, `core.attributesFile=/dev/null` L1052, `diff.external=` L1053, `core.fsmonitor=` L1054, `filter.clean=` L1055, `filter.smudge=` L1056, `diff.textconv=` L1057, `credential.helper=` L1058, plus `core.autocrlf=input`/`core.eol=lf` L1063-1064; (2) `--no-verify` prepended to every commit L1066-1069; (3) the **fail-closed refusal** at L1034-1044 — if a `.githooks/pre-commit` file ever appears, a host-mode commit is refused outright rather than silently bypassing it ("Error: refusing commit: repository hooks are configured (.githooks/pre-commit) but host execution mode neutralizes them (core.hooksPath=/dev/null, --no-verify) … Use container mode, or remove the configured hooks to accept the bypass."); (4) on the container path, `core.hooksPath` is pinned at the workspace `.githooks` dir instead L1155-1162, so repo-local `.git/hooks` is never consulted on either path.
+- `.pre-commit-config.yaml` is **absent** from the repo (verified via glob). With `.githooks/` absent as well, there is nothing for an operator's host `core.hooksPath` wiring to fire — the question of whether it would run is moot, not merely unverifiable.
 
 ## (e) Vault hooks (`~/.thoughtmachine/hooks/<workspace_id>/`) — REMOVED
 
@@ -96,7 +96,7 @@ Verdicts: **PASS** (implemented as specified), **PARTIAL** (implemented with gap
 | (a) Containerized git execution | PASS |
 | (b) Host fallback git (hooks disabled, no Docker) | PASS |
 | (c) Hook execution boundary (container allows / host disables) | PASS (by design) |
-| (d) Shared `.git/hooks/pre-commit` | NOT READABLE from sandbox (gitfile); `.githooks/pre-commit` inspected (279 lines); `.pre-commit-config.yaml` absent |
+| (d) Shared `.git/hooks/pre-commit` | NOT READABLE from sandbox (gitfile); `.githooks/pre-commit` DOES NOT EXIST (no hook to inspect); `.pre-commit-config.yaml` absent |
 | (e) Vault hooks | REMOVED (`_run_vault_hooks` deleted; `~/.thoughtmachine/hooks/` never created by any code path) |
 | (f) Linked-worktree / common git-dir resolution | PASS |
 | (g) ResourceContainerManager mounts/hardening | PASS |

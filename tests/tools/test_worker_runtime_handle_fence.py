@@ -320,12 +320,15 @@ def test_control_verb_raises_under_a_bumped_epoch(registry):
 # -- 9: spawn resolves the mode and carries the identity through -----------
 
 
-def test_spawn_thread_mode_resolves_mode_and_captures_identity(registry):
+def test_spawn_with_an_explicit_flag_resolves_to_process_and_captures_identity(registry):
     seed = FakeWorker(generation=7)
 
-    handle = WorkerRuntimeHandle.spawn(seed, environ={})
+    handle = WorkerRuntimeHandle.spawn(
+        seed, environ={WORKER_RUNTIME_MODE_ENV: MODE_PROCESS}
+    )
 
-    assert handle.mode == MODE_THREAD
+    # Explicit flag -> process mode, independent of DEFAULT_RUNTIME_MODE.
+    assert handle.mode == MODE_PROCESS
     assert handle.epoch == 7
     assert handle._session_id == SESSION
     assert handle._worker_name == WORKER

@@ -162,3 +162,66 @@ honest version and A's enum addition should be dropped with it.
 - `bridge.py:1755-1776`'s `getattr(thread, "status", None) != "paused"` guard — the `paused` guard is
   correct; the worker-side `paused` status is real (`tools/workspace/worker_thread.py:2363`), unlike
   the agent-side enum value. Do not "fix" the worker status to match the agent enum.
+
+## CORRECTION (appended, verified at HEAD by read-only recon)
+
+**Status:** the premise of this ticket is stale; the reported symptom is real but arrives by a different mechanism.
+
+### What was claimed vs. what is true now
+
+| claim in this ticket | actual state at HEAD |
+|---|---|
+| `ExecutionState` has no `paused` | `agent/core/state.py:22-28` defines RUNNING/PAUSING/PAUSED/STOPPED/READY |
+| the state mapping lives at `bridge.py:3160-3170` and has dead keys | `bridge.py:3160-3170` is `_core_persisted_error_notice`; the real mapping is **`bridge.py:3233-3249`**, 9 keys, including `"paused": "PAUSED"` and `"pausing": "PAUSING"` |
+| nothing produces PAUSED | `agent/controller/__init__.py:559` sets PAUSING, `:575` sets PAUSED |
+| no test proves the mapping | `tests/integration/test_state_transitions.py:388-419` is a green parametrized test asserting `("paused","PAUSED")`, `("pausing","PAUSING")`, `("ready","IDLE")`, `("waiting","WAITING_FOR_USER")` |
+
+### The real root cause of the reported symptom
+
+A **load/reconnect** path collapses the state (`store/useStore.js:179`):
+`state: payload?.is_running ? 'RUNNING' : 'IDLE'`
+
+`session_loaded` (`bridge.py:2767-2783`) carries only the boolean `is_running`, computed as
+`controller.is_busy` = `execution_state in (RUNNING, PAUSING)` (`agent/controller/__init__.py:113`).
+Therefore on reload:
+
+- PAUSED -> `is_running=False` -> painted **IDLE**
+- PAUSING -> `is_running=True` -> painted **RUNNING** (wrong in the other direction)
+
+And there is no recovery: `session_loaded` carries no state string / `is_paused` / `can_resume`;
+`bridge.py:2773-2776` documents that the server deliberately no longer sends a follow-up
+`state_changed` (Fix 2a); and `grep` for `get_state|request_state|is_paused|can_resume` in non-test
+frontend `src` returns **zero hits**. `QueryBar.jsx:136` is `disabled={!isPaused}`, so a reloaded
+paused session shows Idle **and its Resume button is dead** — the reported symptom, reproduced
+without any missing execution state.
+
+Live sessions are unaffected: `SessionTab.jsx:579-589` + `store/useStore.js:283-293` store the real
+`state_changed` value faithfully.
+
+### Also verified NOT broken (do not "fix" these)
+
+- Pause/stop system notices are persisted and rendered. `agent/core/message.py:48-63` builds them
+  (`role='user'`, `is_system_notification=True`, `metadata.kind` = `pause_nudge`/`stop_notice`);
+  `bridge.py:2476-2485` re-normalises and injects the flag; `bridge.py:3016-3057` persists +
+  broadcasts via `conversation_changed`; `MessageBubble` renders them through `SystemNoticeText`.
+  There is no transient notice event.
+- `pending_warnings` and `pause_nudge` have **zero hits** in `web_ui/frontend/src`;
+  `role === 'system'` has **zero hits**. No frontend filter hides these notices.
+- The only message filter, `SessionTab.jsx:693-701`, drops stale
+  `[SYSTEM NOTIFICATION] Configuration updated` duplicates (with a TODO that dedup belongs on the
+  backend). Unrelated to pause/stop.
+
+### Remaining real defects (recommend re-scoping this ticket to these)
+
+1. `store/useStore.js:179` load-path collapse (above). Candidate fix: add the execution state string
+   to the `session_loaded` payload and prefer it client-side, falling back to the current
+   `is_running` logic. *This adds a field; it does not re-add the `state_changed` broadcast that
+   Fix 2a removed.*
+2. `SessionTab.jsx:46-58` `messagesEqual` compares only length + first/last role+content, and is the
+   zustand equality fn at `SessionTab.jsx:143`, so a mid-list message change is treated as equal and
+   never re-renders. Appends and streaming-tail updates are fine.
+3. Coverage gaps: `store/__tests__/useStore.test.js:537-538` only loads `is_running:true`, so the
+   collapse is untested. `SessionTabHubStatus.test.jsx` only sends synthetic `state_changed` payloads
+   and never exercises the Python mapping, and `StatusBar`/`TabBar` have almost no direct
+   paused/pausing coverage.
+

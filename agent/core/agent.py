@@ -30,6 +30,7 @@ from llm_providers.exceptions import ProviderError, RateLimitExceeded
 from tools import SIMPLIFIED_TOOL_CLASSES
 from tools.utils import model_to_openai_tool
 from tools.summarize_tool import SummarizeTool
+from tools.cancellation import _active_pause_event
 from agent.core.message import Message, is_system_notice_text, make_system_notice
 from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
@@ -40,7 +41,7 @@ from .token_counter import TokenCounter
 from .llm_client import LLMClient, LLMError
 from .stream_events import Done, Interrupted, ReasoningDelta, TextDelta, ToolCallComplete, UsageUpdate
 from .conversation_manager import ConversationManager
-from .tool_executor import ToolExecutor
+from .tool_executor import ToolExecutor, is_interrupted_tool_entry
 from .turn_transaction import TurnTransaction
 from .debug_context import DebugContext
 from .message_utils import group_messages_into_turns, group_messages_into_turns_with_indices
@@ -104,6 +105,11 @@ def config_requires_respawn(old_config, new_config) -> bool:
         return True
     # Workspace path changes require a full restart
     if new_config.workspace_path != old_config.workspace_path:
+        return True
+    # A worktree_root change re-anchors every path-anchored tool, so it needs
+    # a restart too: hot-swapping it would leave the live ToolExecutor pointed
+    # at the old root (see ToolExecutor.config assignment in Agent._hot_swap).
+    if new_config.worktree_root != old_config.worktree_root:
         return True
     # Provider config changes (e.g. timeout/max_retries) require a full
     # restart so the LLM provider is re-initialised with the new settings.
@@ -420,7 +426,54 @@ def _discard_session_main_pause(session_id: Optional[str], *, worker_mode: bool)
     if not paused or session_id not in paused:
         return False
     paused.discard(session_id)
+    # PHASE 2g (operator ruling): the session pause is over, so the worker
+    # pauses this proxy applied on its behalf must be lifted too.  The marker
+    # could not have been set unless the worker stack was already imported, so
+    # reusing ``module`` here cannot create the agent <-> tools import cycle.
+    # Scoped to the targets this process actually recorded, never a sweep.
+    # Wrapped so a failed resume can never break the operator's turn.
+    resume_proxied = getattr(module, "_resume_proxied_join_targets", None)
+    if resume_proxied is not None:
+        try:
+            resume_proxied(session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log('WARNING', 'core.agent', f'process_query: lifting proxied worker pauses failed: {exc}')
     return True
+
+
+def _pause_aware_sleep(seconds: float) -> bool:
+    """Sleep *seconds* on this thread, waking early when a pause is requested.
+
+    The two rate-limit waits in :meth:`Agent.process_query` block the
+    turn-running thread for up to a minute, and a pause request has no way to
+    reach a thread that is sitting in ``time.sleep``.  The pause signal does
+    reach it as the SHARED ``Event`` the controller owns and
+    ``tools.cancellation.bind_pause_event`` holds a per-thread reference to, so
+    the wait is taken one slice at a time and that event ends it within one
+    slice -- the same plumbing ``Sleep`` uses for a tool call.
+
+    The event is resolved ONCE for the calling thread.  ``None`` (unbound: the
+    worker/direct path, tests) means a plain ``time.sleep`` with no early
+    return, so without a pause binding the behaviour is what it was.  Nothing
+    here sets or clears the event: it belongs to the controller.
+
+    Returns:
+        True when a pause request cut the wait short, False when the full
+        duration elapsed.
+    """
+    pause_event = _active_pause_event()
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # 0.1 s slices bound the pause latency, and each slice is clipped to
+        # what is left so the wait never runs past the deadline.
+        slice_seconds = min(0.1, remaining)
+        if pause_event is None:
+            time.sleep(slice_seconds)
+        elif pause_event.wait(slice_seconds):
+            return True
 
 
 class Agent:
@@ -485,7 +538,12 @@ class Agent:
         self.debug_context = DebugContext(self.logger)
         self._pending_warnings = []  # Buffer for token warnings, flushed after turn commit
         self._pending_warning_events = []  # Buffer for token warning events, yielded after turn commit
-        self.tool_classes = config.get_filtered_tool_classes()
+        # Defence in depth: ``resolved_tool_names`` (set only by a worker spawn
+        # from its frozen capability registry) narrows the runtime list by
+        # INTERSECTION; ``None`` on the main agent leaves this unchanged.
+        self.tool_classes = config.get_filtered_tool_classes(
+            allowed_names=config.resolved_tool_names
+        )
         # Register MCP tools in background (non-blocking, no startup delay)
         # MCP tools become available later once background registration completes.
         try:
@@ -519,6 +577,14 @@ class Agent:
         self._pause_requested = False
         # Reading mode: at most ONE pause nudge per turn.
         self._pause_nudge_sent = False
+        # Resume notice: armed by leave_reading_mode() when a 'pause'-owned
+        # restriction is actually released, consumed ONCE by
+        # _apply_resume_notice() on the turn thread.  Starts disarmed, so a
+        # session that was never paused never emits a resume notice.
+        self._resume_notice_pending = False
+        # Pause wind-down: set while the loop is re-entering so the model can
+        # write its own summary after an interrupted tool batch.
+        self._pause_winddown = False
         # Stop: at most ONE stop notice per turn.
         self._stop_notice_sent = False
         self.rate_limit_delay = 1.0
@@ -793,7 +859,9 @@ class Agent:
 
         # Rebuild tools if enabled_tools changed
         if new_config.enabled_tools != old_config.enabled_tools:
-            self.tool_classes = new_config.get_filtered_tool_classes()
+            self.tool_classes = new_config.get_filtered_tool_classes(
+                allowed_names=new_config.resolved_tool_names
+            )
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
             # Preserve event bus from old executor before closing
             event_bus = self.tool_executor._event_bus if self.tool_executor else None
@@ -943,9 +1011,17 @@ class Agent:
             self.provider = self.llm_client.provider
 
             # Rebuild tool_classes and tool_definitions
-            self.tool_classes = new_config.get_filtered_tool_classes()
+            self.tool_classes = new_config.get_filtered_tool_classes(
+                allowed_names=new_config.resolved_tool_names
+            )
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
+            _cp_state_before = getattr(self, 'state', None)
+            _cp_exec_state_before = getattr(getattr(self, 'tool_executor', None), 'state', None)
+            log('INFO', '[CONTROL_PLANE_RESTART]', f'phase=before state_id={id(_cp_state_before) if _cp_state_before is not None else None} executor_state_id={id(_cp_exec_state_before) if _cp_exec_state_before is not None else None} same_object={_cp_exec_state_before is _cp_state_before}')
             self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self, event_bus=old_event_bus or global_event_bus, is_worker_context=new_config.worker_mode)
+            _cp_state_after = getattr(self, 'state', None)
+            _cp_exec_state_after = getattr(getattr(self, 'tool_executor', None), 'state', None)
+            log('INFO', '[CONTROL_PLANE_RESTART]', f'phase=after state_id={id(_cp_state_after) if _cp_state_after is not None else None} executor_state_id={id(_cp_exec_state_after) if _cp_exec_state_after is not None else None} same_object={_cp_exec_state_after is _cp_state_after}')
 
             # Rebuild context builder
             self.context_builder = self.llm_client.create_context_builder()
@@ -1286,6 +1362,7 @@ class Agent:
         call changed the restriction, False when 'pause' was already in force.
         """
         changed = self.state.restrict(reason)
+        log('INFO', '[CONTROL_PLANE_PAUSE]', f'event=enter_reading_mode reason={reason} session_id={self.session_id} state_id={id(self.state)}')
         self._pause_requested = True
         pause_debug(f'enter_reading_mode({reason!r}) -> changed={changed}')
         return changed
@@ -1303,10 +1380,23 @@ class Agent:
 
         Returns True only when this call actually released the restriction.
         """
+        prior_reason = getattr(self.state, 'restriction_reason', None)
         released = self.state.clear_restriction(reason)
         if released:
             self._pause_requested = False
             self._pause_nudge_sent = False
+            # The wind-down grant is over the moment the pause is released.
+            self._pause_winddown = False
+            # RESUME NOTICE (symmetric with the pause nudge): the model was
+            # told "tool calls are refused, the session stays paused until it
+            # is resumed".  Without the matching notice on the way OUT it stays
+            # latched in that state.  Flag only -- no Message is built here
+            # (see the cross-thread rule above); the turn thread materialises
+            # it once via _apply_resume_notice().  Guarded on prior_reason so
+            # an owner-agnostic clear that released a 'token'/'timeout'/'turn'
+            # restriction never claims a pause was lifted.
+            if prior_reason == 'pause':
+                self._resume_notice_pending = True
         pause_debug(f'leave_reading_mode({reason!r}) -> released={released}')
         return released
 
@@ -1351,6 +1441,39 @@ class Agent:
         if self._pause_requested:
             pause_debug('Consuming _pause_requested: reading mode is in force')
             self._pause_requested = False
+
+    def _apply_resume_notice(self) -> None:
+        """Emit the one-shot resume notice, mirroring the pause nudge.
+
+        Runs ON THE TURN THREAD, before the next LLM call -- the exact
+        counterpart of _apply_pause_reading_mode().  leave_reading_mode()
+        arms ``_resume_notice_pending`` from whatever thread performs the
+        resume; this method is the only place a Message is constructed, so
+        the cross-thread contract on enter/leave_reading_mode() holds.
+
+        Delivered straight to history rather than via _pending_warnings:
+        every _pending_warnings flush site sits AFTER the LLM call, so a
+        notice buffered there would not be in the messages the model reads
+        on the first call after the resume -- which is the whole point.
+        The stop-notice path writes to history the same way.
+
+        Once per resume: the flag is cleared before the message is built, so
+        a second resume would have to arm it again, and calling resume twice
+        does not (leave_reading_mode() returns False the second time because
+        nothing is left to release).
+
+        It is a no-op when nothing is armed, which is the never-paused case.
+        """
+        if not getattr(self, '_resume_notice_pending', False):
+            return
+        self._resume_notice_pending = False
+        notice = make_system_notice(
+            'You are resumed. The pause is lifted. Tool calls are allowed.',
+            kind='resume_notice',
+            resume_notice=True,
+        )
+        self._add_to_conversation(notice)
+        log('DEBUG', 'core.pause', 'RESUME NOTICE: pause lifted, resume notice written to history')
 
     def request_pause(self):
         """Request pause at the next atomic turn boundary.
@@ -1455,6 +1578,11 @@ class Agent:
             self._pause_requested = False
             self._pause_nudge_sent = False
             self._stop_notice_sent = False
+            # The wind-down grant is scoped to a single query.
+            self._pause_winddown = False
+            # A resume that happened while the session was IDLE delivers its
+            # notice here, at the start of the next turn.
+            self._apply_resume_notice()
             current_exec_state = self.state.execution_state
             if current_exec_state == ExecutionState.RUNNING:
                 log('WARNING', 'core.agent', f'process_query called while already in RUNNING state')
@@ -1486,13 +1614,21 @@ class Agent:
             for turn in range(self.config.max_turns):
                 turn_start_time = time.time()
                 log('DEBUG', 'core.agent', f'process_query: starting turn {turn}/{self.config.max_turns}, conversation length={len(self.conversation)}')
+                # A resume that lands WHILE this turn is running delivers its
+                # notice at the top of the next iteration, before messages are
+                # built, so the model reads it on this turn's next LLM call.
+                self._apply_resume_notice()
 
                 if self.logger:
                     self.logger.log_turn_start(turn)
                     if turn % 5 == 0:
                         self.logger.log_system_resources()
                 log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start')
-                if self.stop_check and self.stop_check():
+                _winddown = (getattr(self, '_pause_winddown', False)
+                             and getattr(self.state, 'restriction_reason', None) == 'pause')
+                if _winddown:
+                    log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start: waved through -- pause wind-down in progress, stop_check suppressed so the model can write its summary')
+                if not _winddown and self.stop_check and self.stop_check():
                     log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start: DETECTED')
                     events = self.state.set_execution_state(ExecutionState.PAUSING)
                     for event in events:
@@ -1597,7 +1733,9 @@ class Agent:
                     if delay > 0:
                         if self.logger and hasattr(self.logger, 'py_logger'):
                             log('INFO', 'core.agent', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
-                        time.sleep(delay)
+                        # Pause-aware: a pause request ends this wait within one
+                        # slice instead of holding the turn thread for `delay`.
+                        _pause_aware_sleep(delay)
                 tools = self.llm_client.format_tools(self.tool_definitions)
                 # EMERGENCY TRACE: dump conversation and messages before LLM call
                 log('DEBUG', 'core.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
@@ -1633,6 +1771,8 @@ class Agent:
                     output_tokens = 0
                     final_pending = False
                     halted = False
+                    # Per-turn tool observations; empty on a tool-less turn.
+                    executed_tools: list = []
                     stream_agen = self.llm_client.stream_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
                     for stream_event in _iter_stream_events(stream_agen):
                         # In-stream HARD STOP interception. A cooperative pause is
@@ -1853,7 +1993,10 @@ class Agent:
                     event_dict = {'type': 'rate_limit_warning', 'message': f'Rate limit exceeded. Waiting {wait_time}s before retrying. Delay between turns: {self.rate_limit_delay}s', 'wait_time': wait_time, 'turn_delay': self.rate_limit_delay, 'rate_limit_count': self.rate_limit_count, 'turn': self._display_turn}
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
-                    time.sleep(wait_time)
+                    # Only the WAIT is pause-aware: the event / notification
+                    # sequence below is unchanged, it just stops waiting out the
+                    # full backoff once a pause has been requested.
+                    _pause_aware_sleep(wait_time)
                     if self.session is not None:
                         self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts', is_system_notification=True))
                     stop_reason_event = {'type': 'stop_reason', 'stop_reason': 'rate_limit', 'message': f'Rate limit exceeded after {self.rate_limit_count} attempts', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
@@ -2061,6 +2204,22 @@ class Agent:
                 for warning in self._pending_warnings:
                     self._add_to_conversation(warning)
                 self._pending_warnings.clear()
+                # ── PAUSE WIND-DOWN GATE ──────────────────────────────────
+                # An interrupted tool batch is a CONTROL signal (see
+                # ToolExecutor.is_interrupted_tool_entry): the model must read
+                # the interrupted results plus the pause notice flushed above
+                # and write its OWN summary, ending the turn when it calls
+                # Respond -- never be handed a hardcoded terminal with empty
+                # content.  Everything that had to be persisted or yielded
+                # (turn_transaction.commit(), the tool_call/tool_result events,
+                # the notice flush) is already behind us, so continuing the
+                # loop here is safe.
+                if (tool_calls
+                        and any(is_interrupted_tool_entry(entry) for entry in executed_tools)
+                        and getattr(self.state, 'restriction_reason', None) == 'pause'):
+                    self._pause_winddown = True
+                    log('DEBUG', 'core.pause', f'PAUSE WIND-DOWN: interrupted tool batch in turn {turn}; continuing the loop so the model writes the summary')
+                    continue
                 if not tool_calls:
                     log('DEBUG', 'core.agent', f'No tool calls in turn {turn}, committing directly and yielding final')
                     if turn_transaction and turn_transaction.has_assistant_message():

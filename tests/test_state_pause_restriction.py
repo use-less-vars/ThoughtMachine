@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.core.state import AgentState
+from thoughtmachine.timeout_constants import TIMEOUT_WRITE_ESCAPE_TOOLS
 
 
 def _state() -> AgentState:
@@ -84,15 +85,40 @@ def test_clear_restriction_without_reason_on_idle_state_returns_false():
 
 
 # f) allow-list per reason -- unknown reasons must fail safe to Respond-only
+# ('timeout' is deliberately NOT here: it is the widened axis, pinned below.)
 @pytest.mark.parametrize(
     'reason',
-    ['turn', 'timeout', 'pause', 'something-unknown', None],
+    ['turn', 'pause', 'something-unknown', None],
 )
 def test_allowed_tools_respond_only_for_non_token_reasons(reason):
     state = _state()
     state.restrictions_active = True
     state.restriction_reason = reason
     assert state.get_allowed_tools() == ['Respond']
+
+
+# f2) 'timeout' stops new WORK *and* further reading: Respond + SummarizeTool
+# + the single write-only escape hatch, from the single source of truth.
+def test_allowed_tools_timeout_reason_allows_respond_summarize_and_write_escape():
+    """Display and gate must agree on the timeout allow-list."""
+    state = _state()
+    state.restrictions_active = True
+    state.restriction_reason = 'timeout'
+
+    expected = ['Respond', 'SummarizeTool'] + sorted(TIMEOUT_WRITE_ESCAPE_TOOLS)
+    assert state.get_allowed_tools() == expected
+    # Every advertised tool must actually pass the gate, and vice versa.
+    for name in expected:
+        assert state.is_tool_allowed(name) is True, name
+
+    # The write-only hatch is the ONE thing this axis adds: it can dump working
+    # memory to disk, then the agent yields and compacts.
+    assert state.is_tool_allowed('WorkingDocument') is True
+    # Nothing that would let the agent keep INVESTIGATING is allowed -- the
+    # restriction is resource management, not salvage.
+    for refused in ('ReadFile', 'FileSearchTool', 'git_read',
+                    'ApplyEdits', 'ContainerExecTool'):
+        assert state.is_tool_allowed(refused) is False, refused
 
 
 def test_allowed_tools_token_reason_allows_summarize():
@@ -114,6 +140,16 @@ def test_is_tool_allowed_on_paused_state():
     state.restrict('pause')
     assert state.is_tool_allowed('Respond') is True
     assert state.is_tool_allowed('ContainerExecTool') is False
+
+
+# j) fail-closed: an object missing `restrictions_active` is NOT unrestricted
+#    (docs/CONTROL_PLANE.md 6.3 Option B / 6.4)
+def test_is_tool_allowed_fail_closed_when_restrictions_active_missing():
+    # A plain object has no `restrictions_active` attribute at all -- exactly
+    # the fail-open edge the pre-Option-B implementation walked through.
+    stub = object()
+    assert AgentState.is_tool_allowed(stub, 'Respond') is True
+    assert AgentState.is_tool_allowed(stub, 'ContainerExecTool') is False
 
 
 # h) last writer wins on the reason, which is what makes ownership meaningful

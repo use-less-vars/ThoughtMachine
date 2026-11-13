@@ -21,8 +21,17 @@ import time
 from typing import Any, Dict, Optional
 
 from agent.config.defaults import EXEC_KILL_GRACE, QUERY_WAIT_GRACE_SECONDS, WORKER_TIMEOUT_SECONDS
+from thoughtmachine.timebudget import (
+    DECLARED_CEILING,
+    DEFAULT_REQUEST_SECONDS,
+    TimeBudget,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Legacy default wait of ``join`` / ``wait_for_job`` when the caller requests
+#: nothing.  Named so the one clock has one fallback instead of a literal.
+JOIN_DEFAULT_WAIT_SECONDS = 60
 
 
 def _worker_timeout_detected(agent_state: Any, last_elapsed_val: Any, timeout_seconds: Any) -> bool:
@@ -58,45 +67,109 @@ def _worker_timeout_detected(agent_state: Any, last_elapsed_val: Any, timeout_se
     return elapsed_over_budget
 
 
-def _worker_query_wait_timeout(timeout_seconds: Any, fallback: float = 300.0) -> float:
+def _worker_query_wait_timeout(
+    timeout_seconds: Any, fallback: float = DEFAULT_REQUEST_SECONDS
+) -> float:
     """Return the wall-clock wait a caller should allow for a worker reply.
 
-    A worker whose agent soft-times-out at ``timeout_seconds`` replies with
-    its own timeout envelope at roughly that deadline, so the caller must wait
-    ``timeout_seconds + QUERY_WAIT_GRACE_SECONDS``. Non-numeric or non-positive
-    values (e.g. ``None``, a mock's auto-attribute) fall back to ``fallback``
-    (the legacy fixed wait).
+    Built on ONE resolved :class:`~thoughtmachine.timebudget.TimeBudget`, not on
+    an independent ``t + QUERY_WAIT_GRACE_SECONDS`` with an opaque 300 s
+    fallback: a worker whose agent soft-times-out at ``budget.effective``
+    replies with its own timeout envelope at roughly that deadline, so the
+    caller waits ``budget.effective + QUERY_WAIT_GRACE_SECONDS``.
+
+    Non-numeric or non-positive values (e.g. ``None``, a mock's
+    auto-attribute) are treated as ABSENT by the resolver and yield ``fallback``
+    unchanged (the legacy fixed wait, no grace); ``fallback`` itself is the one
+    named default (:data:`DEFAULT_REQUEST_SECONDS`).  A request above
+    :data:`DECLARED_CEILING` is clamped *and reported* here rather than hidden.
     """
-    if timeout_seconds is None:
-        return fallback
-    # isinstance check rather than try/float(): a MagicMock auto-attribute
-    # supports __float__ (returning 1.0), which would silently bypass the
-    # fallback. numbers.Real is True only for genuine numeric types.
-    if not isinstance(timeout_seconds, numbers.Real):
-        return fallback
-    t = float(timeout_seconds)
-    if t <= 0:
-        return fallback
-    return t + QUERY_WAIT_GRACE_SECONDS
+    budget = TimeBudget.resolve(
+        timeout_seconds,
+        default=fallback,
+        cap=DECLARED_CEILING,
+        source="worker_query_wait",
+    )
+    if budget.requested is None:
+        # Carried through UNCHANGED (no float()): a whole-second default must not
+        # acquire a '.0' in the user-visible "did not respond within Ns" message.
+        return budget.effective
+    if budget.clamped:
+        logger.warning("query wait: %s", budget.clamp_reason())
+    return float(budget.effective) + QUERY_WAIT_GRACE_SECONDS
 
 
-def clamped_wait_for_job_timeout(requested_timeout: Any, cap: float = 300.0) -> int:
-    """Clamp a ``wait_for_job`` timeout to the cap (default 300s).
+def clamped_wait_for_job_timeout(
+    requested_timeout: Any, cap: float = DECLARED_CEILING
+) -> int:
+    """Resolve a ``wait_for_job`` wait through the one clock.
 
-    Same math as ``Worker._action_join``: ``int(requested_timeout or 60)``
-    then ``min(..., cap)``. Returns an int number of seconds suitable for
-    ``time.monotonic() + total`` deadline math.
+    Delegates to :meth:`thoughtmachine.timebudget.TimeBudget.resolve` with the
+    declared ceiling, so a 420 s request is honoured as 420 s instead of being
+    silently reduced to the old hardcoded 300 s.  The name is kept for existing
+    callers and the return value stays an ``int`` (deadline math with
+    ``time.monotonic() + total``).
+
+    A request above ``cap`` (default :data:`DECLARED_CEILING`) is still clamped,
+    but the log now names the layer that clamped it and the ceiling it clamped
+    against -- a clamp is reported, never hidden.
     """
-    requested = int(requested_timeout or 60)
-    capped = int(cap)
-    if requested > capped:
-        logger.info(
-            "wait_for_job: requested timeout %ds exceeds %ds cap; clamped to %ds",
-            requested,
-            capped,
-            capped,
+    budget = TimeBudget.resolve(
+        requested_timeout,
+        default=JOIN_DEFAULT_WAIT_SECONDS,
+        cap=cap,
+        source="wait_for_job",
+    )
+    if budget.clamped:
+        logger.warning(
+            "wait_for_job: %s",
+            budget.clamp_reason(),
         )
-    return min(requested, capped)
+    return int(budget.effective)
+
+
+def budget_for_thread(
+    thread: Any,
+    requested: Any = None,
+    default: Any = DEFAULT_REQUEST_SECONDS,
+    source: str = "worker_query_wait",
+    strict: bool = False,
+) -> TimeBudget:
+    """Return the ONE clock for a later hop (query / join) on ``thread``.
+
+    The budget resolved at dispatch is stored on the thread
+    (``_time_budget``), so a later hop reuses that exact object instead of
+    re-resolving a different number.  An explicit per-call ``requested`` always
+    wins (that is the caller's request, not a thread attribute); otherwise the
+    thread's own effective ``_timeout_seconds`` is the request, which is the
+    number the worker's agent loop is already running against.
+    """
+    if requested is None:
+        stored = getattr(thread, "_time_budget", None)
+        # Duck-typed/duplicated thread doubles: only a real budget is reused
+        # (a MagicMock auto-attribute would otherwise pass as truthy).
+        if isinstance(stored, TimeBudget):
+            return stored
+    req = requested
+    if req is None:
+        req = getattr(thread, "_timeout_seconds", None)
+        if isinstance(req, bool) or not isinstance(req, numbers.Real):
+            req = None
+    return TimeBudget.resolve(
+        req,
+        default=default,
+        cap=DECLARED_CEILING,
+        strict=strict,
+        source=source,
+    )
+
+
+def store_budget_on_thread(thread: Any, budget: TimeBudget) -> None:
+    """Remember the dispatch-time budget on the thread (best effort)."""
+    try:
+        thread._time_budget = budget
+    except Exception:  # pragma: no cover - immutable/duck-typed doubles
+        pass
 
 
 def wait_for_worker_exit(thread: Any, worker_name: str) -> bool:

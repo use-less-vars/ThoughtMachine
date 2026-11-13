@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -237,7 +238,8 @@ def test_empty_registry_still_degrades_to_the_bare_action(tmp_path) -> None:
 
 def test_runtime_mode_report_agrees_with_resolve_runtime_mode() -> None:
     report = worker_runtime.runtime_mode_report({})
-    assert report["mode"] == worker_runtime.MODE_THREAD
+    # No flag in force = the default, whatever DEFAULT_RUNTIME_MODE currently is.
+    assert report["mode"] == worker_runtime.DEFAULT_RUNTIME_MODE
     assert report["error"] is None
     # S7a-3 makes the spawn path register for real, so this count is process
     # history (whoever this process spawned and has not torn down), not a
@@ -653,3 +655,275 @@ def test_every_age_reading_reports_ignorance_rather_than_zero() -> None:
     )
     assert empty._last_heartbeat_at is None
     assert isinstance(empty._last_received_at, float)
+
+
+def test_the_worker_dir_is_built_from_a_str_workspace_dir(tmp_path) -> None:
+    """A ``str`` workspace_dir must not break construction (C62c, defect 1).
+
+    ``spec_from_worker`` puts ``str(worker.workspace_dir)`` in the spec
+    (``worker_runtime_process.py:205``) because it has to pickle into a spawn
+    child, and ``__init__`` divides it by ``"workers"``. Before the coercion
+    the child died in bootstrap with ``TypeError: unsupported operand
+    type(s) for /: 'str' and 'str'``, so the shipped process default could not
+    start a worker at all.
+    """
+    worker = WorkerThread(
+        name="seam-str-w",
+        definition={},
+        agent_config={"provider": "openai", "model": "gpt-4"},
+        workspace_dir=str(tmp_path),
+        session_permissions={},
+        instance_id=1,
+    )
+
+    assert isinstance(worker.workspace_dir, Path)
+    assert worker._worker_dir.is_dir()
+    assert worker._worker_dir.parent.parent == Path(tmp_path)
+    assert worker._worker_dir == Path(tmp_path) / "workers" / worker._worker_dir.name
+
+
+def test_the_spec_carries_the_briefing_but_not_the_spawn_query(tmp_path) -> None:
+    """Only the briefing crosses to the child (C62c, defect 2).
+
+    The spawn query is already executed by the parent-side thread -- its reply
+    is what the spawner reads back at ``worker_thread.py:7032`` -- so shipping
+    it in the spec makes the rebuilt worker self-queue it (``run()`` at
+    ``:4004`` / ``:4047``) and pay for the same turn twice. The child-side
+    construction is exercised here without forking anything.
+    """
+    from tools.workspace.worker_runtime_main import _build_worker
+    from tools.workspace.worker_runtime_process import spec_from_worker
+
+    worker = _make_worker(tmp_path)
+    worker.session_id = "sess-seam-spec"
+    worker._initial_context = {
+        "query": "SPAWN-QUERY-ALREADY-EXECUTED",
+        "purpose": "prove the boundary",
+        "style": "precise",
+    }
+
+    spec = spec_from_worker(worker, epoch=0)
+    briefing = spec["worker_kwargs"]["initial_context"]
+
+    assert "query" not in briefing
+    assert briefing["purpose"] == "prove the boundary"
+    assert briefing["style"] == "precise"
+
+    child_worker = _build_worker(None, dict(spec["worker_kwargs"]))
+
+    assert isinstance(child_worker, WorkerThread)
+    assert child_worker._initial_context == briefing
+    assert child_worker._worker_dir.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Read-only substrate self-check (WorkerRuntimeHandle.substrate / action=inspect)
+# ---------------------------------------------------------------------------
+
+
+def test_substrate_reports_the_parent_for_an_undispatched_handle(tmp_path) -> None:
+    """A handle with no child reports the parent, in both modes.
+
+    Thread mode has no child by construction; a fresh process-mode handle has
+    none yet because process mode is built lazily. Either way the answer is
+    ``child_exists=False`` and a ``parent_pid`` that is THIS process -- and
+    reading it must not be the thing that creates a child.
+    """
+    import os
+
+    thread_handle = worker_runtime.WorkerRuntimeHandle(
+        _make_worker(tmp_path), mode=worker_runtime.MODE_THREAD
+    )
+    process_handle = _process_handle(_make_worker(tmp_path / "p"))
+
+    for handle, expected_mode in (
+        (thread_handle, worker_runtime.MODE_THREAD),
+        (process_handle, worker_runtime.MODE_PROCESS),
+    ):
+        raw = handle.substrate()
+
+        assert raw == {
+            "runtime_mode": expected_mode,
+            "child_exists": False,
+            "child_pid": None,
+            "child_alive": None,
+            "parent_pid": os.getpid(),
+            "same_process": None,
+        }
+        # The self-check did not start anything as a side effect.
+        assert handle._process_runtime is None
+
+
+def test_substrate_never_forks_a_child(tmp_path, monkeypatch) -> None:
+    """The anti-mirage test: a self-check must not create what it reports.
+
+    ``_ensure_process_runtime`` is the one call that forks, so it is made to
+    explode here. ``substrate()`` answering normally proves it reports the
+    substrate in front of it instead of forking one to describe.
+    """
+    handle = _process_handle(_make_worker(tmp_path))
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("substrate() must never fork a child runtime")
+
+    monkeypatch.setattr(handle, "_ensure_process_runtime", _explode)
+
+    raw = handle.substrate()
+
+    assert raw["child_exists"] is False
+    assert handle._process_runtime is None
+
+
+def test_inspect_reports_every_instance_with_its_substrate(tmp_path) -> None:
+    """action='inspect' enumerates instances and folds in the substrate.
+
+    The enumeration is the same registry walk ``_action_list`` does, so a live
+    instance whose handle was registered is reported WITH its substrate, and a
+    worker with no live instance is still reported -- ``has_runtime_handle
+    False`` is a finding, not a gap.
+    """
+    import os
+
+    from tools.workspace.worker import _registry_lock, _worker_registry
+    from tools.workspace.worker_thread import Worker
+
+    session_id = "sess-inspect-substrate"
+    thread = _make_worker(tmp_path)
+    handle = worker_runtime.WorkerRuntimeHandle(thread, mode=worker_runtime.MODE_THREAD)
+    worker_runtime.register_runtime_handle(
+        handle, session_id=session_id, worker_name="seam-live", instance_id=1
+    )
+    key = (session_id, "seam-live", 1)
+    with _registry_lock:
+        _worker_registry[key] = thread
+    try:
+        tool = Worker(action="inspect", session_id=session_id)
+        tool._resolve_worker_workspace_id = lambda: None
+        tool._load_workers = lambda ws_id: [{"name": "seam-live"}, {"name": "seam-idle"}]
+
+        payload = json.loads(tool.execute())
+    finally:
+        with _registry_lock:
+            _worker_registry.pop(key, None)
+
+    assert payload["count"] == 2
+    assert payload["parent_pid"] == os.getpid()
+    by_name = {entry["worker_name"]: entry for entry in payload["workers"]}
+
+    live = by_name["seam-live"]
+    assert live["instance_id"] == 1
+    assert live["has_runtime_handle"] is True
+    assert live["runtime_mode"] == worker_runtime.MODE_THREAD
+    assert live["child_exists"] is False
+    assert live["parent_pid"] == os.getpid()
+
+    idle = by_name["seam-idle"]
+    assert idle["instance_id"] is None
+    assert idle["has_runtime_handle"] is False
+    for field in ("runtime_mode", "child_exists", "child_pid", "child_alive", "same_process"):
+        assert field in idle
+    assert idle["parent_pid"] == os.getpid()
+
+
+def test_substrate_survives_a_broken_child_handle(tmp_path) -> None:
+    """A child that cannot be interrogated reports "unknown", not a crash.
+
+    ``substrate()`` promises it never raises, and the case that promise exists
+    for is exactly this one: a runtime whose ``pid`` blows up. The answer must
+    degrade to ``None`` -- an unreadable child is unknown, never a guess.
+    """
+    handle = worker_runtime.WorkerRuntimeHandle(
+        _make_worker(tmp_path), mode=worker_runtime.MODE_THREAD
+    )
+
+    class _Boom:
+        @property
+        def pid(self):
+            raise RuntimeError("boom")
+
+        alive = False
+
+    handle._process_runtime = _Boom()
+
+    raw = handle.substrate()
+
+    assert raw["child_exists"] is True
+    assert raw["child_pid"] is None
+    assert raw["child_alive"] is None
+    assert raw["same_process"] is None
+
+
+def test_inspect_sees_a_real_forked_child_as_a_different_os_process(tmp_path) -> None:
+    """A REAL child process, observed through the real ``inspect`` action.
+
+    Everything here is real: ``ProcessWorkerRuntime.start()`` forks a child and
+    waits for its ``hello`` (~1.9 s), the handle is registered in the same
+    ``_RUNTIME_HANDLES`` store production uses, the worker sits in
+    ``_worker_registry`` under the instance key ``inspect`` walks, and the
+    reading comes back through ``Worker(action="inspect").execute()`` -- not
+    from ``substrate()`` called directly -- so the registry walk and the handle
+    lookup are exercised, not just the accessor.
+
+    The claim under test is the one a self-check exists for: the child is a
+    DIFFERENT OS process from the parent, alive, and reported as such. No
+    query is dispatched and no ``Agent`` is built, so there is no LLM call and
+    no network -- the child only reaches ``hello`` and waits.
+
+    The runtime is closed in ``finally`` (``ProcessWorkerRuntime.close`` sends
+    ``shutdown`` then SIGKILLs anything that outlives the grace period), so no
+    child leaks into another test or hangs pytest.
+    """
+    import os
+
+    from tools.workspace.worker import _registry_lock, _worker_registry
+    from tools.workspace.worker_runtime_process import (
+        ProcessWorkerRuntime,
+        spec_from_worker,
+    )
+    from tools.workspace.worker_thread import Worker
+
+    session_id = "sess-inspect-fork"
+    thread = _make_worker(tmp_path)
+    handle = _process_handle(thread)
+    # Built directly rather than through ``_ensure_process_runtime``: that path
+    # fences first, and this WorkerThread was never started (it has no Agent to
+    # run), so its ``is_alive()`` is False by construction. The child below is
+    # a real one either way, and the handle owns it, so close() reaps it.
+    runtime = ProcessWorkerRuntime(
+        spec_from_worker(thread, epoch=0), on_frame=handle.on_frame
+    )
+    handle._process_runtime = runtime
+    key = (session_id, "seam-w", 1)
+    parent_pid = os.getpid()
+    try:
+        runtime.start()
+        assert runtime.pid is not None
+
+        worker_runtime.register_runtime_handle(
+            handle, session_id=session_id, worker_name="seam-w", instance_id=1
+        )
+        with _registry_lock:
+            _worker_registry[key] = thread
+        try:
+            tool = Worker(action="inspect", session_id=session_id)
+            tool._resolve_worker_workspace_id = lambda: None
+            tool._load_workers = lambda ws_id: [{"name": "seam-w"}]
+
+            payload = json.loads(tool.execute())
+        finally:
+            with _registry_lock:
+                _worker_registry.pop(key, None)
+
+        assert payload["parent_pid"] == parent_pid
+        entry = payload["workers"][0]
+        assert entry["worker_name"] == "seam-w"
+        assert entry["has_runtime_handle"] is True
+        assert entry["runtime_mode"] == worker_runtime.MODE_PROCESS
+        assert entry["child_exists"] is True
+        assert isinstance(entry["child_pid"], int)
+        assert entry["child_pid"] != parent_pid
+        assert entry["child_alive"] is True
+        assert entry["parent_pid"] == parent_pid
+        assert entry["same_process"] is False
+    finally:
+        handle.close()

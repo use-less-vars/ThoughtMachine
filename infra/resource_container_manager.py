@@ -52,8 +52,24 @@ Exec semantics
 --------------
 ``exec()`` runs the command as a raw argv list via ``container.exec_run``
 (``cmd=...``, NO ``/bin/sh -c`` wrapper) with a thread+queue timeout guard
-mirroring ``ContainerManager.exec``: on timeout the container is killed but
-NOT removed (so it can be reused/restarted), and ``TimeoutError`` is raised.
+mirroring ``ContainerManager.exec``. THREE outcomes:
+
+- success: ``{"exit_code": int, "stdout": str, "stderr": str}``;
+- timeout: the in-flight command is terminated, the container is recovered
+  IN PLACE (``restart()``, or ``kill()`` + ``start()`` as a fallback) and is
+  NEVER removed, and ``TimeoutError`` is raised carrying a
+  ``container_payload`` attribute (``timed_out=True``, ``exit_code=-2``,
+  ``timeout_seconds``, ``container_id``, ``container_killed``,
+  ``container_removed=False``, ``container_restarted``);
+- interrupted (the turn was cancelled while the command was in flight): the
+  wait returns promptly with a structured payload -- ``status="interrupted"``,
+  ``interrupted=True``, ``reason=...``, ``exec="container_exec"``,
+  ``container_id``, ``command``, ``elapsed``, plus ``exit_code=None``,
+  ``stdout=""``, ``stderr=""`` (the three keys the git tool hard-indexes) and
+  ``container_killed=False`` / ``container_removed=False``. The container is
+  NOT killed and NOT removed: this is a persistent git sandbox, and the
+  command we stopped waiting on may still be running inside it.
+
 ``NotFound``/``APIError`` from the
 daemon are converted to clear structured results or raised as ``RuntimeError``
 with actionable messages (see per-method docstrings).
@@ -66,6 +82,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 
 try:
@@ -1507,9 +1524,24 @@ class ResourceContainerManager:
         ``container.exec_run(cmd=list(...))`` directly, so a hook/command
         cannot smuggle shell metacharacters through an extra shell layer.
 
-        Timeout guard mirrors ``ContainerManager.exec`` (thread + queue):
-        on timeout the container is killed but NOT removed, so a later
-        ``ensure_container()`` can restart it; then ``TimeoutError`` is raised.
+        Timeout guard mirrors ``ContainerManager.exec`` (thread + queue).
+        On timeout the in-flight command is terminated and the container is
+        recovered IN PLACE -- ``container.restart()`` when the handle exposes
+        it, otherwise the ``kill()`` + ``start()`` fallback -- and it is NEVER
+        removed.  The recovery is best-effort (failures are logged and
+        swallowed); ``TimeoutError`` is then raised carrying a
+        ``container_payload`` attribute describing exactly what happened
+        (``timed_out``, ``exit_code=-2``, ``timeout_seconds``,
+        ``container_id``, ``container_killed``, ``container_removed=False``,
+        ``container_restarted``).
+
+        The wait is INTERRUPTIBLE: it is sliced and the current turn's
+        cancellation token is polled between the slices, so a cancelled turn
+        stops waiting promptly instead of blocking for the whole ``timeout``.
+        The interrupt path never kills and never removes the container (it is
+        a persistent git sandbox); it only stops WAITING and returns the
+        structured ``status="interrupted"`` payload documented at module
+        level.
 
         Raises:
             RuntimeError: if the container does not exist (call
@@ -1519,7 +1551,9 @@ class ResourceContainerManager:
             NotFound/APIError: propagated from the daemon for other failures.
 
         Returns:
-            dict: ``{"exit_code": int, "stdout": str, "stderr": str}``
+            dict: ``{"exit_code": int, "stdout": str, "stderr": str}`` on
+            completion, or the interrupted payload documented at module level
+            when the turn is cancelled before the command finishes.
         """
         container_id = self._container_id()
         if container_id is None:
@@ -1553,16 +1587,161 @@ class ResourceContainerManager:
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
-        thread.join(timeout)
+
+        # ── Interruptible wait ────────────────────────────────────────────
+        # The exec itself runs on the daemon thread above; what used to block
+        # here was a SINGLE full-timeout ``join``, so a cancelled turn could
+        # not be honoured until the timeout expired.  Wait in short slices
+        # instead and poll the CURRENT TURN's cancellation token between them
+        # (0.5 s: quick enough that a cancel feels immediate, coarse enough
+        # that we are not spinning a core through a long git command).
+        #
+        # Interrupting the WAIT is all that happens here.  This container is a
+        # long-lived, workspace-scoped PERSISTENT git sandbox, so the interrupt
+        # path touches it NOT AT ALL: no kill, no restart, no remove.  (The
+        # TIMEOUT path below is the only path that touches it: it terminates
+        # the in-flight command, recovers the container in place --
+        # ``restart()``, or ``kill()`` + ``start()`` as a fallback -- never
+        # removes it, and raises ``TimeoutError`` carrying a
+        # ``container_payload`` attribute.)  ``exec_run`` also hands us no
+        # killable handle, so the payload reports that we stopped WAITING on a
+        # command that may still be running inside an untouched container.
+        _WAIT_SLICE_SECONDS = 0.5
+        try:  # per-thread turn token / pause reference; no-ops when nothing is bound
+            from tools.cancellation import cancel_reason as _cancel_reason
+            from tools.cancellation import is_interrupted as _is_interrupted
+            from tools.cancellation import pause_requested as _pause_requested
+        except Exception:  # pragma: no cover - tools package is a hard dep
+            def _is_interrupted():
+                return False
+
+            def _cancel_reason():
+                return None
+
+            def _pause_requested():
+                return False
+
+        def _interrupt_reason():
+            """Why this turn was cancelled: thread-local reason first, then the event's."""
+            reason = _cancel_reason()
+            if reason:
+                return reason
+            try:
+                from tools.cancellation import _active_event
+                return getattr(_active_event(), "reason", None) or "turn_cancelled"
+            except Exception:  # pragma: no cover - defensive
+                return "turn_cancelled"
+
+        def _interrupted_payload(reason, why):
+            """The ONE interrupted return shape: cancel and pause agree on it."""
+            return {
+                "status": "interrupted",
+                "interrupted": True,
+                "reason": reason,
+                "exec": "container_exec",
+                "container_id": container_id,
+                "command": " ".join(cmd),
+                "elapsed": round(time.monotonic() - _wait_started, 3),
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "container_killed": False,
+                "container_removed": False,
+                "note": (
+                    f"Stopped WAITING for the {self.RESOURCE_KIND} command {why}. "
+                    "The container was NOT killed and NOT removed; the command "
+                    "may still be running inside it."
+                ),
+            }
+
+        _wait_started = time.monotonic()
+        _deadline = _wait_started + timeout
+        while thread.is_alive():
+            thread.join(max(0.0, min(_WAIT_SLICE_SECONDS, _deadline - time.monotonic())))
+            if not thread.is_alive():
+                break
+            if _is_interrupted():
+                return _interrupted_payload(
+                    _interrupt_reason(), "because the turn was cancelled"
+                )
+            if _pause_requested():
+                # A pause is NOT a cancel: the worker's pause is cooperative and
+                # its turn is supposed to conclude.  But a tool blocked here
+                # would sit out the WHOLE timeout first, so the conclusion never
+                # starts.  Abandon the WAIT for the same payload the cancel path
+                # returns, with its own reason so callers/tests can tell the two
+                # apart.  This container is a persistent sandbox: it stays
+                # untouched, exactly as the cancel path leaves it.
+                return _interrupted_payload("paused", "because the worker was paused")
+            if time.monotonic() >= _deadline:
+                break
 
         if thread.is_alive():
+            # ── Timeout recovery ladder (never remove) ────────────────────
+            # The exec timeout terminates the in-flight command, then recovers
+            # the container IN PLACE: ``restart()`` when the handle exposes it,
+            # else ``kill()`` + ``start()``.  The container is NEVER removed --
+            # it is the workspace's persistent git sandbox.  The whole ladder
+            # is best-effort and SWALLOWED: a failing restart/kill/start must
+            # never mask or replace the ``TimeoutError`` raised below.
+            container_killed = False
+            container_restarted = False
             try:
-                container.kill()
-            except Exception:
-                pass
-            raise TimeoutError(
+                restart = getattr(container, "restart", None)
+                if callable(restart):
+                    try:
+                        restart()
+                        container_restarted = True
+                    except Exception as exc:
+                        _LOG.warning(
+                            "Git resource container %s restart() failed after "
+                            "exec timeout (%s); falling back to kill()+start()",
+                            container_id,
+                            exc,
+                        )
+                if not container_restarted:
+                    # Fallback (also used when the handle has no restart()):
+                    # the flags track only the steps that ACTUALLY ran.
+                    try:
+                        container.kill()
+                        container_killed = True
+                    except Exception as exc:
+                        _LOG.warning(
+                            "Git resource container %s kill() failed after "
+                            "exec timeout (%s)",
+                            container_id,
+                            exc,
+                        )
+                    try:
+                        container.start()
+                        container_restarted = True
+                    except Exception as exc:
+                        _LOG.warning(
+                            "Git resource container %s start() failed after "
+                            "exec timeout (%s); the container was NOT removed",
+                            container_id,
+                            exc,
+                        )
+            except Exception as exc:  # pragma: no cover - defensive net
+                _LOG.warning(
+                    "Git resource container %s recovery ladder failed after "
+                    "exec timeout (%s); the container was NOT removed",
+                    container_id,
+                    exc,
+                )
+            timeout_error = TimeoutError(
                 f"Git resource command timed out after {timeout} seconds"
             )
+            timeout_error.container_payload = {
+                "timed_out": True,
+                "exit_code": -2,
+                "timeout_seconds": timeout,
+                "container_id": container_id,
+                "container_killed": container_killed,
+                "container_removed": False,
+                "container_restarted": container_restarted,
+            }
+            raise timeout_error
 
         try:
             exit_code, output, error = result_queue.get_nowait()

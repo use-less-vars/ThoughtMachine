@@ -564,6 +564,10 @@ export default function WorkspaceDetailPage({ workspaceId }) {
   const pendingChanges = hostChanged || permissionsDirty
 
   const activeSessions = summary?.active_sessions?.length || 0
+  // Every registered session for this workspace (open or closed). The backend
+  // reports it as `total_sessions_count`; older payloads omit it.
+  const totalSessions =
+    typeof summary?.total_sessions_count === 'number' ? summary.total_sessions_count : null
   const activeWorkers = summary?.active_workers?.length || 0
   const containerCount = summary?.containers_listed ?? 0
 
@@ -667,9 +671,14 @@ export default function WorkspaceDetailPage({ workspaceId }) {
             + New Session
           </button>
           <div className="wdp-counts">
-            <span className="wdp-count" title="Active sessions">
-              {activeSessions} sessions
+            <span className="wdp-count" title="Sessions open right now">
+              {activeSessions} open sessions
             </span>
+            {totalSessions != null && (
+              <span className="wdp-count" title="All sessions registered to this workspace">
+                {totalSessions} total sessions
+              </span>
+            )}
             <span className="wdp-count" title="Active workers">
               {activeWorkers} workers
             </span>
@@ -757,6 +766,12 @@ export default function WorkspaceDetailPage({ workspaceId }) {
                 <div className="wdp-stat-value">{activeSessions}</div>
                 <div className="wdp-stat-label">Active sessions</div>
               </div>
+              {totalSessions != null && (
+                <div className="wdp-stat">
+                  <div className="wdp-stat-value">{totalSessions}</div>
+                  <div className="wdp-stat-label">Total sessions</div>
+                </div>
+              )}
               <div className="wdp-stat">
                 <div className="wdp-stat-value">{containerCount}</div>
                 <div className="wdp-stat-label">Active containers</div>

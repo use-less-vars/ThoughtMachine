@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Union
 
-from pydantic import Field, field_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from tools.base import ToolBase
 from tools.workspace.command_channel import (
@@ -90,6 +90,13 @@ _NO_SESSION_KEY = "<no-session>"
 # consumed after ``resume()`` (that clears ``_park_event``) read as STOP and
 # silently drop every query queued behind it.
 _PARK_SENTINEL: Any = object()
+
+# Reply-wait granularity for ``WorkerThread.send_query``.  The wait is taken one
+# slice at a time so a pause / turn-cancel raised while the CALLER is blocked in
+# it lands within one slice instead of at the deadline (300 s + 60 s grace) --
+# unsliced, the pause stayed invisible for minutes and the turn was finally
+# reported as "timeout" (audit D16).
+QUERY_WAIT_SLICE_SECONDS: float = 0.5
 
 #: Reason stamped on a turn the DETACH park ABANDONED. It rides on the journal
 #: record the park flips to ``recoverable`` and on the envelope of the job the
@@ -201,10 +208,20 @@ from tools.workspace.worker_container import (
     worker_owner_label,
 )
 from tools.workspace.worker_timeout import (
+    JOIN_DEFAULT_WAIT_SECONDS,
     _worker_timeout_detected,
     _worker_query_wait_timeout,
+    budget_for_thread,
     clamped_wait_for_job_timeout,
+    store_budget_on_thread,
     wait_for_worker_exit,
+)
+from thoughtmachine.timebudget import (
+    CEILING_OWNER,
+    DECLARED_CEILING,
+    DEFAULT_REQUEST_SECONDS,
+    TimeBudget,
+    TimeBudgetExceeded,
 )
 from tools.workspace.worker_execution import ExecutionTracker
 
@@ -733,6 +750,76 @@ _WORKER_BLOCKLIST: frozenset[str] = frozenset({
     "KnowledgeBaseTool", # persistent cross-session knowledge store
 })
 
+# ── Worker tool universe (single source of truth) ─────────────────────────────
+# Two universes exist in this build: ``SIMPLIFIED_TOOL_CLASSES`` (what
+# ``enabled_tools`` is filtered against, agent/config/models.py:379-401) and
+# ``iter_tool_classes()`` (what spawn-time class resolution used to walk).  A
+# tool present in the latter but not the former resolved at spawn and was then
+# silently filtered out at run time — silent narrowing, forbidden by design doc
+# §4.2.  ``_worker_tool_universe()`` is therefore the ONE universe: the classes
+# the runtime can actually instantiate, addressable by class name AND by the
+# stable ``tool_name()`` alias (``GitReadTool`` <-> ``git_read``).
+
+
+def _worker_tool_universe() -> Dict[str, type]:
+    """Return the authoritative worker tool universe: name -> class.
+
+    Keys are the class ``__name__`` (canonical) plus, for every class whose
+    stable ``tool_name()`` differs, that alias.  Canonical names win: aliases
+    are added with ``setdefault``, so a class can never shadow another class'
+    name.  Aliases of blocklisted classes are not added at all, so the
+    blocklist cannot be bypassed through a stable name.
+    """
+    from tools import simplified_tool_classes
+
+    universe: Dict[str, type] = {}
+    aliases: Dict[str, type] = {}
+    for cls in simplified_tool_classes():
+        name = getattr(cls, "__name__", "")
+        if not name:
+            continue
+        universe[name] = cls
+        if name in _WORKER_BLOCKLIST:
+            continue
+        try:
+            alias = cls.tool_name()
+        except Exception:
+            # ``tool_name()`` is optional for third-party tool classes.
+            continue
+        if alias and alias != name:
+            aliases.setdefault(alias, cls)
+    for alias, cls in aliases.items():
+        universe.setdefault(alias, cls)
+    return universe
+
+
+def _canonical_worker_tool_name(name: str) -> str:
+    """Map *name* to its canonical class ``__name__`` (identity when unknown)."""
+    cls = _worker_tool_universe().get(name)
+    if cls is None:
+        return name
+    return getattr(cls, "__name__", name)
+
+
+def _worker_granted_tool_names(registry: Any) -> List[str]:
+    """Granted tool names for *registry*, in ``simplified_tool_classes()`` order.
+
+    Deliberately NOT ``registry.names`` (which is sorted): the historical
+    ``tools: []`` derivation order is registration order and
+    tests/test_ci_read_tool.py mirrors it verbatim.  Values are de-duplicated by
+    class, so a tool's alias spelling can never add a second entry.
+    """
+    from tools import simplified_tool_classes
+
+    granted = set(registry.resolved.values())
+    names: List[str] = []
+    for cls in simplified_tool_classes():
+        name = getattr(cls, "__name__", "")
+        if name and name not in _WORKER_BLOCKLIST and cls in granted:
+            names.append(name)
+    return names
+
+
 # Default system prompt for worker sub-agents.
 # This is a fixed instruction rather than inheriting the main agent's prompt,
 # preventing delegation loops in Engineer mode.
@@ -874,6 +961,178 @@ def _resolve_worker_thread(
         f"Worker '{worker_name}' is ambiguous: {len(candidates)} live "
         f"instances ({', '.join(labels)}). Specify instance_id."
     )
+
+
+def _pause_join_target(thread, worker_name: str) -> bool:
+    """Proxy the session main-agent pause onto the ONE worker a join waits on.
+
+    Operator ruling (b): "If Main is paused while waiting on a worker, the
+    worker must be paused."  The scope is deliberately the single worker the
+    caller is ACTIVELY waiting on (the ``join`` / ``wait_for_job`` target, and
+    only that thread) -- async workers the caller is not waiting on keep
+    running, which is what ``want_all`` already controls and what this helper
+    must never touch.
+
+    Idempotent by construction, because ``_action_join`` re-enters this branch
+    on every join call while the pause lasts:
+
+    * ``status == 'paused'``: the worker already parked -- do nothing.
+    * ``_park_event`` already set: ``WorkerThread.pause()`` was already issued
+      for this pause (the event is set synchronously by ``pause()``, the thread
+      status only flips later, at the run loop's next boundary).  Bailing here
+      is what stops a re-park, a fresh cross-process ``pause`` command write
+      and a repeated log line per call.
+    * the worker's own agent already carries a ``'pause'`` restriction:
+      leave it alone (never steal or re-own an existing pause restriction).
+
+    Never sets ``_manual_only_pause``: the proxied pause must stay
+    auto-resumable by the existing paths (``_action_query``'s paused branch,
+    ``_action_spawn``'s sole-paused path, the operator resume route).
+
+    Returns True only when this call actually issued ``thread.pause()``.
+    """
+    if getattr(thread, "status", None) == "paused":
+        return False
+    park = getattr(thread, "_park_event", None)
+    if park is not None and bool(getattr(park, "is_set", lambda: False)()):
+        return False
+    agent = getattr(thread, "_agent", None)
+    state = getattr(agent, "state", None)
+    if state is not None and getattr(state, "restriction_reason", None) == "pause":
+        return False
+    try:
+        thread.pause()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Main-pause proxy: pause failed for worker '%s': %s", worker_name, exc)
+        return False
+    logger.info(
+        "Main-pause proxy: paused worker '%s' (the join target of the paused caller)",
+        worker_name,
+    )
+    return True
+
+
+def _record_proxied_join_target(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: int,
+) -> None:
+    """Remember a worker that ``_pause_join_target`` actually parked for *session_id*.
+
+    This record is the whole safety story for the symmetric unpause (PHASE 2g):
+    ``_resume_proxied_join_targets`` can only ever resume a worker this proxy
+    itself paused -- never one the operator paused -- because only calls that got
+    ``True`` back from :func:`_pause_join_target` are recorded here.
+
+    Idempotent (a set of ``(worker_name, instance_id)`` triples) and defensive:
+    bookkeeping must never break the join that triggered it, so failures are
+    logged and swallowed.
+    """
+    if not session_id:
+        return
+    try:
+        with _PROXIED_JOIN_TARGETS_LOCK:
+            _PROXIED_JOIN_TARGETS.setdefault(session_id, set()).add(
+                (worker_name, int(instance_id))
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Main-pause proxy: could not record paused target '%s': %s",
+            worker_name,
+            exc,
+        )
+
+
+def _resume_proxied_join_targets(session_id: Optional[str]) -> list[str]:
+    """Lift the worker pauses that the session main-pause proxy applied.
+
+    Exact symmetry for :func:`_pause_join_target`: when the session-level "main
+    agent paused" marker is discarded at the start of a new operator turn
+    (``Agent._discard_session_main_pause``), the join targets this process
+    parked on its behalf are resumed as well.  This is strictly the RECORDED
+    targets -- never a sweep of the session's workers -- so a worker the
+    operator paused by hand is not touched here.
+
+    The record is popped before any resume happens (the lock guards the dict
+    mutation only and is never held across ``resume()``), so a failing or slow
+    resume cannot wedge the bookkeeping and a repeat call is a no-op.
+
+    Every target is independent and defensive: a missing/dead/ambiguous worker
+    (``_WorkerAmbiguityError``) is skipped, a killed worker refuses the resume
+    itself (``resume() -> False``), a detached worker is an operator stop and is
+    left alone, and an already-running worker is a silent no-op.  Never raises;
+    returns the worker names actually resumed.
+    """
+    if not session_id:
+        return []
+    with _PROXIED_JOIN_TARGETS_LOCK:
+        targets = _PROXIED_JOIN_TARGETS.pop(session_id, set())
+    resumed: list[str] = []
+    for worker_name, instance_id in sorted(targets):
+        try:
+            thread, _sid, _iid = _resolve_worker_thread(
+                worker_name,
+                instance_id=instance_id,
+                session_id=session_id,
+            )
+        except _WorkerAmbiguityError as exc:
+            logger.info(
+                "Main-pause proxy: leaving worker '%s' instance %s alone: %s",
+                worker_name,
+                instance_id,
+                exc,
+            )
+            continue
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Main-pause proxy: could not resolve worker '%s' to resume it: %s",
+                worker_name,
+                exc,
+            )
+            continue
+        status = getattr(thread, "status", None)
+        park = getattr(thread, "_park_event", None)
+        parked = park is not None and bool(getattr(park, "is_set", lambda: False)())
+        if getattr(thread, "_detach_requested", False) or status in (
+            "detached",
+            "detaching",
+            "killed",
+            "killing",
+        ):
+            logger.info(
+                "Main-pause proxy: not resuming worker '%s' (status=%s)",
+                worker_name,
+                status,
+            )
+            continue
+        if status != "paused" and not parked:
+            logger.info(
+                "Main-pause proxy: worker '%s' is already running; nothing to resume",
+                worker_name,
+            )
+            continue
+        try:
+            if thread.resume():
+                resumed.append(worker_name)
+                logger.info(
+                    "Main-pause proxy: resumed worker '%s' (symmetric unpause of "
+                    "the session main-pause, session '%s')",
+                    worker_name,
+                    session_id,
+                )
+            else:
+                logger.info(
+                    "Main-pause proxy: worker '%s' refused resume (killed); left as is",
+                    worker_name,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Main-pause proxy: resume failed for worker '%s': %s",
+                worker_name,
+                exc,
+            )
+    return resumed
+
 
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
@@ -1159,6 +1418,57 @@ def _adopt_predecessor_journal(
 
 
 # ---------------------------------------------------------------------------
+# Initial-context ("briefing") delivery
+# ---------------------------------------------------------------------------
+
+#: Prefix of every initial-context payload. It is the marker the F1/WLM prune
+#: boundaries look for, so it must stay stable across the role change below.
+INITIAL_CONTEXT_PREFIX = "Initial context: "
+
+#: Prefix of every FOLLOW-UP context payload (``action='query'`` /
+#: ``'submit_query'``). Deliberately NOT the initial-context prefix:
+#: ``is_initial_context_message()`` and the spawn-side prune/dedupe boundaries
+#: key on that exact marker, so reusing it for a follow-up query would make the
+#: query look like an initial-context message and corrupt that handling.
+FOLLOWUP_CONTEXT_PREFIX = "Follow-up context for this query:"
+
+
+def initial_context_message(initial_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the history message that carries a worker's initial context.
+
+    The payload is exactly what workers have always been given; only the ROLE
+    changed, from ``system`` to ``user``. It rides on the conversation's first
+    ``role='user'`` message so it is ordinary conversational history, because
+    ``LLMClient.ensure_system_prompt`` deletes every system message that is not
+    a conversation summary (agent/core/llm_client.py:229-234). That is what
+    used to happen to a briefing delivered as ``role='system'``: it was
+    stripped before the first LLM call, once by ``Agent.__init__``
+    (agent/core/agent.py:554) and again at the start of every turn
+    (agent/core/agent.py:1562), so the worker never saw its brief.
+    """
+    return {
+        "role": "user",
+        "content": (
+            f"{INITIAL_CONTEXT_PREFIX}"
+            f"{json.dumps(initial_context, default=str, ensure_ascii=True)}"
+        ),
+    }
+
+
+def is_initial_context_message(message: Any) -> bool:
+    """True when *message* carries an initial-context payload.
+
+    Role-agnostic on purpose: a ``context.json`` written before the delivery
+    role changed holds ``role='system'``, a current one holds ``role='user'``,
+    and the F1/WLM prune boundaries have to keep finding both.
+    """
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and content.startswith(INITIAL_CONTEXT_PREFIX)
+
+
+# ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
 
@@ -1197,6 +1507,7 @@ class WorkerThread(threading.Thread):
         max_token_usage: Optional[int] = None,
         max_runtime_s: Optional[float] = None,
         frame_sink: Optional[Callable[[Any], None]] = None,
+        initial_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         # S4a: assigned before anything else -- every other attribute below can
         # reach a helper that calls _write_status_file, so the sink is set
@@ -1213,6 +1524,12 @@ class WorkerThread(threading.Thread):
         # Container manager used to stop/remove containers owned by this
         # worker at teardown (see _cleanup_worker_containers).
         self._container_manager: Optional[Any] = container_manager
+        # Process mode rebuilds this worker in a child interpreter from a
+        # spec whose ``workspace_dir`` crossed the boundary as a ``str``
+        # (``worker_runtime_process.py:205``); coerce once, here, so every
+        # caller -- thread, child and test -- gets the same Path maths.
+        if not isinstance(workspace_dir, Path):
+            workspace_dir = Path(workspace_dir)
         self._worker_dir = workspace_dir / "workers" / instance_label
         self._worker_dir.mkdir(parents=True, exist_ok=True)
         # The workspace root under its own name (as passed, not re-derived by
@@ -1228,6 +1545,12 @@ class WorkerThread(threading.Thread):
 
         # Tool classes available to this worker (name -> class)
         self._tool_classes: Dict[str, type[ToolBase]] = tool_classes or {}
+
+        # Frozen capability set: resolved lazily from ``definition["tools"]``
+        # on first use and cached for the life of this worker (§4.2 / §7.2).
+        # Annotated as a string because the registry import is deliberately
+        # lazy (it pulls in ``tools``, which imports this module's package).
+        self._capability_registry: Optional["CapabilityRegistry"] = None
 
         # Session permissions for gate-checking tool calls
         self._session_permissions: Dict[str, Any] = session_permissions or {}
@@ -1396,7 +1719,16 @@ class WorkerThread(threading.Thread):
         # Agent instance + WorkerContext (created lazily in run())
         self._agent: Optional[Any] = None
         self._worker_ctx: Optional[Any] = None
-        self._initial_context: Optional[Dict[str, Any]] = None
+        # The initial context ("briefing") can arrive either here, at
+        # construction, or be assigned by the spawn action after construction
+        # (tools/workspace/worker_thread.py:_action_spawn). Both end up
+        # identical; the constructor argument exists because process mode
+        # rebuilds this thread in a child interpreter from a picklable spec
+        # (worker_runtime_process.spec_from_worker) and cannot assign attributes
+        # to an object it has not built yet.
+        self._initial_context: Optional[Dict[str, Any]] = (
+            dict(initial_context) if initial_context else None
+        )
 
         # Per-worker EventBus (created lazily in run() before Agent)
         self._event_bus: Optional[Any] = None
@@ -1601,8 +1933,95 @@ class WorkerThread(threading.Thread):
             return False
         return payload["query_id"] == query_id
 
+    def _wait_interrupt_reason(self) -> Optional[str]:
+        """``reason`` when the CALLER's turn was paused/cancelled, else ``None``.
+
+        Read from the bindings of the thread that is blocked in ``send_query``
+        (the turn-running thread the controller/agent binds), exactly as
+        ``Sleep.execute`` and ``Worker._join_cancel_check`` do:
+
+          * **pause** (``tools.cancellation.pause_requested``): the SHARED event
+            the controller owns.  It is the only pause signal that can cross
+            into a thread blocked inside a tool, which is why the controller
+            binds it to the turn-running thread for the turn.
+          * **turn cancel**: the turn token (``detach()``/``kill()``/a
+            cross-process 'stop').  Only a BOUND token counts, so an unbound
+            thread keeps the legacy full-deadline wait -- a leftover fallback
+            interrupt must never abort an unrelated wait.
+
+        Pause is checked first: it is a request to wind down, not a cancel, and
+        the two are distinguished by ``reason`` (see ``Sleep``).
+        """
+        from tools.sleep_tool import _tls, cancel_reason, is_interrupted, pause_requested
+        try:
+            if pause_requested():
+                return "paused"
+            if getattr(_tls, "event", None) is not None and is_interrupted():
+                return cancel_reason() or "turn_cancelled"
+        except Exception:  # pragma: no cover - defensive
+            return None
+        return None
+
+    def _interrupted_reply(self, query_id: str, reason: str, started: float) -> str:
+        """The envelope ``send_query`` returns when its WAIT is interrupted.
+
+        A JSON string, like every reply that method returns, using the same
+        interruption vocabulary as ``join``/``sleep`` (``status='interrupted'``,
+        ``interrupted=True``, ``reason``).  Only the WAIT is over: the worker may
+        still be running the query, so the envelope says so rather than
+        implying the turn completed.
+        """
+        return json.dumps({
+            "status": "interrupted",
+            "interrupted": True,
+            "reason": reason,
+            "query_id": query_id,
+            "worker_name": self.worker_name,
+            "elapsed_seconds": round(time.monotonic() - started, 1),
+            "note": (
+                "Wait interrupted; the query was NOT cancelled and the worker "
+                "may still be running it."
+            ),
+        }, default=str)
+
     def send_query(self, query: str, timeout: float = 120.0) -> str:
-        """Send a query to this worker and block for a response."""
+        """Send a query to this worker and block for a response.
+
+        The wait is interruptible: when the CALLING thread's pause event or
+        turn-cancel token is set, it returns an ``interrupted`` envelope within
+        ``QUERY_WAIT_SLICE_SECONDS`` instead of blocking out ``timeout``.  Only
+        the wait ends -- the query itself is not cancelled.
+        """
+        # Implicit UNPAUSE: a new query IS the resume.
+        #
+        # Pause is a wind-down, not a latch -- so a query arriving on a
+        # pause-restricted worker must find it RUNNING again *before* the turn
+        # is dispatched, otherwise the model is nudged to conclude a turn it
+        # has only just been asked to start.  A worker has no controller in its
+        # object graph (no pause_event to poke): the signals are this thread's
+        # own agent state plus the two park flags.
+        #
+        # The release is OWNER-SCOPED -- Agent.leave_reading_mode('pause') ->
+        # AgentState.clear_restriction('pause') -- so a 'token'/'timeout'/'turn'
+        # restriction owned by the agent's monitors survives untouched:
+        # clearing it here would let an operator escape a context-window
+        # restriction just by asking another question.  The park flags move to
+        # the running position ONLY on this path; an ordinary query leaves them
+        # exactly as it found them.
+        _qp_agent = getattr(self, "_agent", None)
+        _qp_state = getattr(_qp_agent, "state", None)
+        if _qp_state is not None and getattr(_qp_state, "restriction_reason", None) == "pause":
+            try:
+                _qp_agent.leave_reading_mode("pause")
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"Implicit unpause failed for worker '{self.worker_name}': {exc}")
+            self._park_event.clear()
+            self._resume_event.set()
+            log("DEBUG", "tools.worker",
+                f"Implicit unpause for worker '{self.worker_name}': new query resumes a "
+                f"pause-restricted worker (one query = resume; owner-scoped 'pause' "
+                f"release, park flags -> running)")
         # Workspace Lifecycle Manager fast path (feature-flagged, default off)
         try:
             used, reply = self._process_query_via_wlm(query, timeout=timeout)
@@ -1633,12 +2052,33 @@ class WorkerThread(threading.Thread):
         # defense in depth.
         reply_q: queue.Queue = queue.Queue()
         self._input_queue.put((query_id, query, reply_q))
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
         while True:
             remaining = deadline - time.monotonic()
+            # One SLICE at a time.  A reply still arrives on the private
+            # queue, but the wait never blocks longer than
+            # QUERY_WAIT_SLICE_SECONDS without re-reading the caller's
+            # pause/cancel signals, so an interruption lands within one slice
+            # instead of at the deadline.
+            slice_timeout = min(QUERY_WAIT_SLICE_SECONDS, remaining)
             try:
-                response = reply_q.get(timeout=remaining if remaining > 0 else 0)
+                response = reply_q.get(
+                    timeout=slice_timeout if slice_timeout > 0 else 0
+                )
             except queue.Empty:
+                # Interruption BEFORE the deadline: a pause (or a turn cancel)
+                # raised while this call is blocked is a request to wind the
+                # wait down, not a timeout.  Reporting it as "timeout" is what
+                # kept the pause invisible for minutes (audit D16) -- so this
+                # check deliberately precedes the deadline check.
+                interrupt_reason = self._wait_interrupt_reason()
+                if interrupt_reason is not None:
+                    return self._interrupted_reply(query_id, interrupt_reason, started)
+                if time.monotonic() < deadline:
+                    # Slice elapsed, deadline not reached: keep waiting for our
+                    # own envelope.
+                    continue
                 # Drain our private queue AND the shared fallback queue so a
                 # late reply (on either channel) cannot leak into the next
                 # call. Our queue is dropped anyway (local to this call), but
@@ -2553,6 +2993,14 @@ class WorkerThread(threading.Thread):
             # this the command.json would linger forever (no-op on every
             # poll).  Events are thread-safe, so this is safe even if the
             # blocked pause loop is waiting on _resume_event.
+            if self._stop_event.is_set() or self.status == "killed":
+                # Mirror WorkerThread.resume(): a killed worker is terminal and
+                # must not be revived by a channel 'resume'.
+                quarantine(claimed, "resume-on-killed")
+                log("WARNING", "tools.worker",
+                    f"Refusing channel resume for worker '{self.worker_name}': "
+                    f"worker has been killed (status={self.status})")
+                return
             discard(claimed)
             self._park_event.clear()
             self._resume_event.set()
@@ -2596,6 +3044,40 @@ class WorkerThread(threading.Thread):
     def _last_elapsed(self) -> Optional[float]:
         """Return elapsed seconds from the most recent query execution."""
         return getattr(self, '_last_elapsed_val', None)
+
+    def _resolve_capability_registry(self) -> "CapabilityRegistry":
+        """Resolve this worker's declared tool set once; cache the frozen result.
+
+        One resolution per worker: the registry is built from the definition,
+        so a later edit to the template affects only the next spawn.  Declared
+        names are canonicalised first, so a template that uses a tool's stable
+        name (``git_read``) resolves to the class instead of being reported as
+        "not shippable by this build".
+
+        ``permission_veto=None`` is deliberate: the registry says which tools
+        EXIST, the footprint gate in ``Worker._action_spawn`` says which of them
+        may RUN (design doc §7.2).
+        """
+        if self._capability_registry is not None:
+            return self._capability_registry
+        from tools.capability_registry import CapabilityRegistry
+
+        universe = _worker_tool_universe()
+        declared = [
+            _canonical_worker_tool_name(name)
+            for name in (self.definition.get("tools") or [])
+        ]
+        self._capability_registry = CapabilityRegistry.resolve(
+            declared,
+            available_names=tuple(universe),
+            lookup=universe,
+            blocklist=_WORKER_BLOCKLIST,
+            parent_enabled_tools=(self._agent_config_dict or {}).get(
+                "enabled_tools"
+            ),
+            permission_veto=None,
+        )
+        return self._capability_registry
 
     def _build_agent_config(self) -> Any:
         """
@@ -2657,18 +3139,43 @@ class WorkerThread(threading.Thread):
             if self.definition.get("temperature") is not None
             else WORKER_DEFAULT_TEMPERATURE
         )
-        worker_tools = self.definition.get("tools", [])
-        parent_enabled_tools = cfg.get("enabled_tools")
-        if worker_tools:
-            enabled_tools = [t for t in worker_tools if t not in _WORKER_BLOCKLIST]
-        else:
-            from tools import simplified_tool_classes
-            enabled_tools = [cls.__name__ for cls in simplified_tool_classes()
-                             if cls.__name__ not in _WORKER_BLOCKLIST]
-        # Intersect with parent's enabled_tools — worker cannot exceed parent
-        if parent_enabled_tools is not None:
-            enabled_tools = [t for t in enabled_tools if t in parent_enabled_tools]
+        # Tool set: resolved once through the capability registry.  The
+        # registry owns the blocklist, the parent clamp (narrowing recorded in
+        # ``.parent_denied``) and the implicit "all simplified tools" default,
+        # so ``enabled_tools`` can never be a silently narrowed subset.
+        resolved_tool_names: Optional[frozenset] = None
+        try:
+            _registry = self._resolve_capability_registry()
+            enabled_tools = _worker_granted_tool_names(_registry)
+            # The SAME frozen registry object that fed enabled_tools -- never a
+            # re-resolution and never a set rebuilt from enabled_tools, so the
+            # two cannot drift.  AgentConfig intersects this with enabled_tools
+            # at run time (defence in depth: widening enabled_tools cannot
+            # widen real tool availability).
+            resolved_tool_names = frozenset(_registry.names)
+        except Exception as exc:
+            # Never raise from here: the spawn boundary (Worker._action_spawn)
+            # is what fails loudly.  Fall back to the legacy derivation
+            # verbatim so config building stays total.
+            logger.debug(
+                "Worker '%s' could not resolve a capability registry (%s); "
+                "using the legacy enabled_tools derivation",
+                self.worker_name, exc,
+            )
+            worker_tools = self.definition.get("tools", [])
+            parent_enabled_tools = cfg.get("enabled_tools")
+            if worker_tools:
+                enabled_tools = [t for t in worker_tools if t not in _WORKER_BLOCKLIST]
+            else:
+                from tools import simplified_tool_classes
+                enabled_tools = [cls.__name__ for cls in simplified_tool_classes()
+                                 if cls.__name__ not in _WORKER_BLOCKLIST]
+            # Intersect with parent's enabled_tools — worker cannot exceed parent
+            if parent_enabled_tools is not None:
+                enabled_tools = [t for t in enabled_tools if t in parent_enabled_tools]
         worker_cfg["enabled_tools"] = enabled_tools
+        # None when the registry could not be resolved (legacy behaviour).
+        worker_cfg["resolved_tool_names"] = resolved_tool_names
         # Resolve max_turns: prefer definition, then parent config (treating
         # None as absent), then default 100.
         _inherit_max_turns = cfg.get("max_turns")
@@ -2738,7 +3245,25 @@ class WorkerThread(threading.Thread):
 
         log('DEBUG', 'core.token', f"Worker agent config: token_monitor_warning_threshold={worker_cfg.get('token_monitor_warning_threshold', 'NOT SET')} token_monitor_critical_threshold={worker_cfg.get('token_monitor_critical_threshold', 'NOT SET')} max_turns={worker_cfg.get('max_turns', 'NOT SET')} timeout_seconds={worker_cfg.get('timeout_seconds', 'NOT SET')}")
 
-        return AgentConfig(**worker_cfg)
+        _config = AgentConfig(**worker_cfg)
+        # ``_tool_classes`` used to be spawn-time data nothing ever read.  Feed it
+        # from the runtime authority instead: exactly the list the agent will
+        # hand to its ToolExecutor (enabled_tools intersected with
+        # resolved_tool_names).  The dict-keyed-by-class-name shape is kept for
+        # the process-mode kwarg map (worker_runtime_process._OPTIONAL_KWARGS).
+        try:
+            self._tool_classes = {
+                cls.__name__: cls
+                for cls in _config.get_filtered_tool_classes(
+                    allowed_names=resolved_tool_names
+                )
+            }
+        except Exception as exc:
+            logger.debug(
+                "Worker '%s' could not mirror the runtime tool classes (%s)",
+                self.worker_name, exc,
+            )
+        return _config
 
     def _run_tool_loop(
         self,
@@ -2819,9 +3344,20 @@ class WorkerThread(threading.Thread):
         # inline on this thread (agent/core/tool_executor.py:689), so binding at
         # the turn boundary is the narrowest point that covers every tool call
         # without touching the executor.
+        from tools.sleep_tool import bind_pause_event as _bind_pause_event
         from tools.sleep_tool import bind_turn_cancel as _bind_turn_cancel
         from tools.sleep_tool import unbind as _unbind_turn_cancel
         _bind_turn_cancel(self._turn_cancel)
+        # PAUSE PLUMBING: pause has no thread-local token of its own.  It is
+        # raised by the bridge/controller on ANOTHER thread, so the only way a
+        # tool blocked on THIS (the turn-running) thread can see it is a shared
+        # reference.  Bind this worker's own ``_park_event`` -- cleared =
+        # running, set = pause requested, exactly the polarity
+        # ``bind_pause_event`` documents -- so a tool that waits
+        # (``ContainerManager.exec``, ``Sleep``) wakes on a pause instead of
+        # blocking until its own timeout.  The event is never set or cleared
+        # here: it belongs to the worker, and ``pause()``/``resume()`` own it.
+        _bind_pause_event(self._park_event)
 
         # ── S7b-4a: ADOPT the dead predecessor's turn, ONCE, before WP1 ─────
         # A crashed incarnation leaves an ``inflight`` record in THIS directory
@@ -3198,6 +3734,11 @@ class WorkerThread(threading.Thread):
             logger.exception("Worker _run_tool_loop failed")
             final_content = json.dumps({"error": f"Worker execution failed: {exc}"})
         finally:
+            # Drop THIS thread's pause reference (``_unbind_turn_cancel`` below
+            # would clear it too, but the pairing is stated here so the turn
+            # boundary stays readable).  The event itself is untouched: it is
+            # the worker's, not this module's.
+            _bind_pause_event(None)
             _unbind_turn_cancel()
             if _worker_ctx_token is not None and WORKER_NAME_CONTEXTVAR is not None:
                 WORKER_NAME_CONTEXTVAR.reset(_worker_ctx_token)
@@ -3432,7 +3973,8 @@ class WorkerThread(threading.Thread):
                     {"role": "system", "content": system_prompt}
                 ]
                 if self._initial_context:
-                    ic_payload = f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}"
+                    ic_message = initial_context_message(self._initial_context)
+                    ic_payload = ic_message["content"]
                     # Auditability without leaking the brief: record only the
                     # payload length and a short digest of the exact string
                     # appended. Briefings can carry secrets, so no preview.
@@ -3442,10 +3984,7 @@ class WorkerThread(threading.Thread):
                         len(ic_payload),
                         hashlib.sha256(ic_payload.encode("utf-8")).hexdigest()[:12],
                     )
-                    user_history.append({
-                        "role": "system",
-                        "content": ic_payload,
-                    })
+                    user_history.append(ic_message)
                 # Reset cached token count for a fresh run
                 self._cached_context_tokens = None
                 self._worker_ctx = WorkerContext(
@@ -3488,11 +4027,11 @@ class WorkerThread(threading.Thread):
                             self._prune_abandoned_attempt_via_wlm(initial_query)
                         else:
                             self._prune_stale_attempt_before_merge(initial_query)
-                    # Add initial context as a system message for continuity
-                    ctx_msg = {
-                        "role": "system",
-                        "content": f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}",
-                    }
+                    # Add the initial context as the conversation's first user
+                    # message for continuity -- NOT as a system message, which
+                    # ensure_system_prompt would delete (see
+                    # initial_context_message).
+                    ctx_msg = initial_context_message(self._initial_context)
                     # Check if this initial_context was already injected (avoid duplicates
                     # on repeated spawn calls)
                     already_present = any(
@@ -3751,9 +4290,12 @@ class WorkerThread(threading.Thread):
                     if TurnState is not None:
                         self._agent.state.turn_state = TurnState.LOW
                         self._agent.state.last_turn_warning_state = TurnState.LOW
+                    _cp_before_restrictions_active = getattr(self._agent.state, 'restrictions_active', None)
+                    _cp_before_restriction_reason = getattr(self._agent.state, 'restriction_reason', None)
                     self._agent.state.restrictions_active = False
                     self._agent.state.restrictions_pending = False
                     self._agent.state.restriction_reason = None
+                    log('INFO', '[CONTROL_PLANE_WORKER_CLEAR]', f'state_id={id(self._agent.state)} before_restrictions_active={_cp_before_restrictions_active} before_restriction_reason={_cp_before_restriction_reason} after_restrictions_active={getattr(self._agent.state, "restrictions_active", None)} after_restriction_reason={getattr(self._agent.state, "restriction_reason", None)} session_id={self.session_id or "unknown"}')
                     # wall-clock time; agent.py uses time.time() for consistency
                     self._agent.state.time_start = time.time()
                     if TimeState is not None:
@@ -4347,10 +4889,7 @@ class WorkerThread(threading.Thread):
             return  # last attempt completed — completed work is kept
         history = self._worker_ctx.user_history
         ic_indices = [
-            i for i, msg in enumerate(history)
-            if msg.get("role") == "system"
-            and isinstance(msg.get("content"), str)
-            and msg["content"].startswith("Initial context: ")
+            i for i, msg in enumerate(history) if is_initial_context_message(msg)
         ]
         if not ic_indices:
             return
@@ -4398,10 +4937,7 @@ class WorkerThread(threading.Thread):
             return
         history = self._worker_ctx.user_history
         ic_indices = [
-            i for i, msg in enumerate(history)
-            if msg.get("role") == "system"
-            and isinstance(msg.get("content"), str)
-            and msg["content"].startswith("Initial context: ")
+            i for i, msg in enumerate(history) if is_initial_context_message(msg)
         ]
         if not ic_indices:
             return
@@ -4660,6 +5196,15 @@ class WorkerThread(threading.Thread):
 # their next safe loop boundary via WorkerThread.pause(); no thread is killed.
 _SESSION_MAIN_PAUSED: set[str] = set()
 
+# PHASE 2g: the join targets THIS process's proxy actually parked, per session
+# id: ``{session_id: {(worker_name, instance_id), ...}}``.  Written only where
+# ``_pause_join_target`` returned True and popped (never swept) by
+# ``_resume_proxied_join_targets`` when the session main-pause is discarded, so
+# the symmetric unpause can only ever touch a worker this proxy paused.  The
+# lock guards the dict mutation only -- never held across ``resume()``.
+_PROXIED_JOIN_TARGETS: dict[str, set[tuple[str, int]]] = {}
+_PROXIED_JOIN_TARGETS_LOCK = threading.Lock()
+
 
 # ============================================================================
 # workspace capabilities (CAPABILITIES_AVAILABLE, resolve_workspace_id, _load_template_workers, _workspace_dir)  (moved verbatim from tools.workspace.worker; W4 facade extraction)
@@ -4788,6 +5333,14 @@ def get_worker_event_buses_for_session(session_id: str) -> Dict[str, Any]:
 # Tool
 # ---------------------------------------------------------------------------
 
+#: The worker an action lands on when the caller omits ``worker_name``.
+#: ``resources/worker_templates/default.json`` ships a template of this name, so
+#: "omitted" always names a worker that exists rather than demanding a name the
+#: agent was never told to supply (the schema said ``worker_name`` was optional
+#: while ``execute()`` rejected None -- that contradiction cost a turn).
+DEFAULT_WORKER_NAME = "default"
+
+
 class Worker(ToolBase):
     """Manage background or child worker processes.
 
@@ -4803,6 +5356,13 @@ class Worker(ToolBase):
     queries are kept); it never terminates anything.  Terminating (``kill``)
     and reviving (``resume``) a worker are operator-only operations exposed in
     the workspace UI, not actions this tool offers the agent.
+
+    ``worker_name`` is genuinely optional: omit it (or leave it blank) and every
+    action that needs a worker uses the ``default`` worker.  A spawn task may be
+    given either as the top-level ``query`` argument or as ``context['query']``
+    — the same task, run on the same blocking dispatch path; passing both is
+    only accepted when they are identical, otherwise the call is rejected as
+    ambiguous rather than silently dropping one of them.
     """
 
     tool: str = "Worker"
@@ -4812,15 +5372,22 @@ class Worker(ToolBase):
 
     action: str = Field(
         description="Action: list, spawn, check, query, stop, submit_query, job_status, "
-        "join, wait_for_job, pause, reset. "
+        "join, wait_for_job, pause, reset, inspect. "
+        "action='inspect' is a READ-ONLY substrate self-check: it reports, per "
+        "worker instance, the runtime mode, whether a child process exists, its "
+        "pid, whether it is alive, this process's pid and whether the child is "
+        "this very process. It never starts, drives or forks anything. "
         "action='stop' DETACHES the worker: it parks (status 'detached', context "
         "saved, containers and registration kept, queued work preserved) and an "
         "operator can revive it — a stop is therefore never a termination. "
         "Killing and resuming a worker are operator-only (workspace UI), not "
         "agent actions. "
-        "When action='spawn' and context has a 'query' key, the spawn call "
-        "BLOCKS until the worker finishes the task and returns the full result. "
-        "Without a 'query' key, spawn returns immediately; use action='query' later. "
+        "When action='spawn' and a task is given -- as the top-level 'query' "
+        "argument or as context['query'] -- the spawn call BLOCKS until the "
+        "worker finishes the task and returns the full result. The two "
+        "spellings are the same task: give both and they must agree, or the "
+        "call is rejected as ambiguous. With no task, spawn returns "
+        "immediately; use action='query' later. "
         "action='submit_query' enqueues a query and returns immediately with a job_id "
         "(non-blocking); poll progress with action='job_status' (worker_query = job id, "
         "or empty to list this worker's jobs)."
@@ -4828,7 +5395,12 @@ class Worker(ToolBase):
 
     worker_name: Optional[str] = Field(
         default=None,
-        description="Name of the worker",
+        description=(
+            "Name of the worker, as listed in workers.json. Optional: when "
+            f"omitted (or blank) every action that needs a worker uses the "
+            f"'{DEFAULT_WORKER_NAME}' worker. "
+            "Use action='list' to see the available names."
+        ),
     )
 
     worker_query: Optional[str] = Field(
@@ -4836,17 +5408,37 @@ class Worker(ToolBase):
         description="Query string to send to an already-spawned worker. "
         "Only valid with action='query' (the call BLOCKS until the worker responds), "
         "action='submit_query' (non-blocking; returns a job handle immediately), "
-        "or action='job_status' (job id to look up; empty lists jobs for the worker).",
+        "or action='job_status' (job id to look up; empty lists jobs for the worker). "
+        "On 'query'/'submit_query' any 'context' you also pass is prepended to "
+        "this string; worker_query stays authoritative.",
+    )
+
+    query: Optional[str] = Field(
+        default=None,
+        description="The task for action='spawn' (e.g. query='Review src/'). "
+        "The spawn call BLOCKS until the worker finishes and returns the "
+        "worker's result. This is the same task as context['query'] -- "
+        "passing both is only accepted when they are identical, otherwise the "
+        "call is rejected as ambiguous. Only valid with action='spawn'; for "
+        "an already-spawned worker use worker_query.",
     )
 
     context: Optional[Union[Dict, str]] = Field(
         default=None,
-        description="Optional context dict passed only on action='spawn'. "
-        "If this dict includes a 'query' key (e.g., {'query': 'Review src/'}), "
-        "the worker executes that task immediately and the spawn call BLOCKS "
-        "until the worker finishes. The 'query' value becomes the worker's "
-        "first instruction. Other keys (e.g., config) are passed as metadata. "
-        "You may also pass a plain string, which will be treated as the query.",
+        description="Optional context dict or briefing string. "
+        "Valid on action='spawn', 'query' and 'submit_query'; on any other "
+        "action it is ignored (and the response says so via 'context_ignored'). "
+        "On 'spawn': if this dict includes a 'query' key (e.g., {'query': "
+        "'Review src/'}), the worker executes that task immediately and the "
+        "spawn call BLOCKS until the worker finishes. The 'query' value becomes "
+        "the worker's first instruction. Other keys (e.g., config) are passed "
+        "as metadata. You may also pass a plain string, which will be treated "
+        "as the query. "
+        "On 'query'/'submit_query' the context is PREPENDED to worker_query as a "
+        "labelled 'Follow-up context for this query:' block, so a follow-up "
+        "keeps the briefing channel. worker_query is authoritative there: a "
+        "'query' key inside the context is dropped (the response notes it via "
+        "'context_note'), and a plain string is used verbatim as briefing text.",
     )
 
     timeout_seconds: Optional[int] = Field(
@@ -4858,6 +5450,12 @@ class Worker(ToolBase):
     session_id: Optional[str] = Field(
         default=None,
         description="Session ID that spawned this worker (injected by ToolExecutor)",
+    )
+
+    worktree_root: Optional[str] = Field(
+        default=None,
+        description="Optional narrower workspace root for path-anchored tool "
+        "operations (injected by ToolExecutor when the session is bound to one).",
     )
 
     instance_id: Optional[int] = Field(
@@ -4896,7 +5494,37 @@ class Worker(ToolBase):
     # Termination ("kill") and revival ("resume") are deliberately NOT here:
     # both are operator-only operations (web UI / workspace HTTP routes), never
     # agent actions.  The agent's "stop" DETACHES (recoverable park).
-    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "reset"]
+    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "reset", "inspect"]
+
+    #: Actions that cannot do anything without naming a worker.  Every other
+    #: action keeps ``worker_name=None``: for pause/stop that None is
+    #: MEANINGFUL (session/main scope), not a missing argument -- defaulting
+    #: them to a worker name would silently redirect a main-agent pause onto
+    #: one worker.
+    ACTIONS_REQUIRING_WORKER: ClassVar[tuple[str, ...]] = (
+        "spawn", "check", "query", "submit_query", "join", "wait_for_job", "reset",
+    )
+
+    #: Actions that DO carry a ``context`` payload.  Every other action ignores
+    #: one (reported as ``context_ignored``), because the field used to accept a
+    #: context on every action and silently drop it on all but spawn.
+    CONTEXT_ACTIONS: ClassVar[tuple[str, ...]] = ("spawn", "query", "submit_query")
+
+    #: ``context`` exactly as the caller supplied it.  ``coerce_context`` below
+    #: rewrites a plain string to ``{"query": <str>}``, which erases the
+    #: difference between "raw briefing text" and a genuine dict carrying a
+    #: 'query' key; the follow-up renderer needs that difference.
+    _raw_context: Any = PrivateAttr(default=None)
+
+    @model_validator(mode='wrap')
+    @classmethod
+    def _capture_raw_context(cls, data: Any, handler: Any) -> Any:
+        """Keep the pre-coercion ``context`` so a string stays distinguishable."""
+        raw = data.get('context') if isinstance(data, dict) else None
+        obj = handler(data)
+        if isinstance(raw, str):
+            obj._raw_context = raw
+        return obj
 
     # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
     @field_validator('context', mode='before')
@@ -4905,6 +5533,14 @@ class Worker(ToolBase):
         """If the LLM passes a plain string as context, wrap it as a query dict."""
         if isinstance(v, str):
             return {"query": v}
+        return v
+
+    @field_validator('worker_name', mode='before')
+    @classmethod
+    def blank_worker_name_means_omitted(cls, v: Any) -> Any:
+        """A blank/whitespace name is OMITTED, never a worker called ``''``."""
+        if isinstance(v, str) and not v.strip():
+            return None
         return v
 
     # ------------------------------------------------------------------
@@ -4932,10 +5568,19 @@ class Worker(ToolBase):
                     "available_actions": self.VALID_ACTIONS,
                 })
 
-            if self.action in ("spawn", "check", "query", "submit_query", "join", "wait_for_job", "reset") and not self.worker_name:
-                return json.dumps({
-                    "error": f"worker_name is required for action '{self.action}'",
-                })
+            # An omitted worker_name is not an error: every action that NEEDS a
+            # worker lands on DEFAULT_WORKER_NAME.  pause/resume/stop (and
+            # 'list', 'job_status') keep None, because there None means
+            # session/main scope rather than a missing argument.
+            if self.action in self.ACTIONS_REQUIRING_WORKER and self.worker_name is None:
+                self.worker_name = DEFAULT_WORKER_NAME
+
+            # A top-level 'query' is the spawn task, folded into the context so
+            # both spellings run the ONE blocking dispatch path below.
+            try:
+                self._fold_query_into_context()
+            except ValueError as exc:
+                return json.dumps({"error": str(exc), "action": self.action})
 
             # === Resolve the workspace id the worker must inherit ===
             # The parent's own workspace_path wins over SessionRegistry; see
@@ -4944,6 +5589,40 @@ class Worker(ToolBase):
             ws_id = self._resolve_worker_workspace_id()
 
             workers = self._load_workers(ws_id)
+
+            # ── ONE CLOCK (defect #5): resolve the caller's budget here ──
+            # This is the earliest dispatch point.  ``strict=True`` means a
+            # request above DECLARED_CEILING FAILS AT DISPATCH: no spawn, no
+            # queue, no sleep -- a refusal envelope naming the request, the
+            # ceiling and the layer that owns it.  Nothing on this path is
+            # silently clamped any more.
+            self._dispatch_budget = None
+            if self.action in ("spawn", "query", "join", "wait_for_job"):
+                try:
+                    self._dispatch_budget = TimeBudget.resolve(
+                        self.timeout_seconds,
+                        default=DEFAULT_REQUEST_SECONDS,
+                        cap=DECLARED_CEILING,
+                        strict=True,
+                        source=f"worker_thread.{self.action}",
+                    )
+                except TimeBudgetExceeded as exc:
+                    return json.dumps(
+                        {
+                            "error": str(exc),
+                            "message": str(exc),
+                            "status": "rejected",
+                            "action": self.action,
+                            "worker_name": self.worker_name,
+                            "requested_timeout_seconds": exc.requested,
+                            "declared_ceiling_seconds": exc.ceiling,
+                            "timeout_ceiling_owner": exc.owner,
+                            "timeout_clamped": False,
+                            "timeout_source": exc.source,
+                        },
+                        indent=2,
+                        default=str,
+                    )
 
             handler = {
                 "list": lambda: self._action_list(workers),
@@ -4957,17 +5636,142 @@ class Worker(ToolBase):
                 "wait_for_job": lambda: self._action_join(workers),
                 "pause": lambda: self._action_pause(workers),
                 "reset": lambda: self._action_reset(workers),
+                "inspect": lambda: self._action_inspect(workers),
             }[self.action]
 
             result = handler()
+            # Every envelope a timed action returns carries the ONE clock it
+            # was given (requested / effective / clamped / clamped_by /
+            # source) as flat keys -- never buried in a string.
+            if isinstance(result, dict) and self._dispatch_budget is not None:
+                result = {**result, **self._dispatch_budget.as_envelope_fields()}
+            if self.action not in self.CONTEXT_ACTIONS and self.context is not None:
+                # A context this action cannot carry must be dropped VISIBLY.
+                result["context_ignored"] = (
+                    "context is only used by spawn/query/submit_query"
+                )
             return json.dumps(result, indent=2, default=str)
         except Exception as exc:
             logger.exception("Worker failed")
-            return json.dumps(
-                {"error": str(exc), "action": self.action}, indent=2
-            )
+            error_envelope = {"error": str(exc), "action": self.action}
+            if self.action not in self.CONTEXT_ACTIONS and self.context is not None:
+                # Even a failed action must not drop a context invisibly.
+                error_envelope["context_ignored"] = (
+                    "context is only used by spawn/query/submit_query"
+                )
+            return json.dumps(error_envelope, indent=2)
 
     # -- helpers -----------------------------------------------------
+
+    def _fold_query_into_context(self) -> None:
+        """Fold the top-level ``query`` argument into ``context['query']``.
+
+        ``context={'query': ...}`` is the long-standing spelling and the only
+        one with a dispatch behind it (``_action_spawn`` copies ``context`` into
+        ``thread._initial_context`` and then BLOCKS on the worker's first reply
+        because that dict has a 'query' key).  ``query=`` exists because it is
+        the shape an agent reaches for, so it is merged INTO the context instead
+        of growing a second dispatch path that could drift from the first.
+
+        Both precedence rules are explicit:
+
+        * top-level ``query`` + a context WITHOUT a 'query' key -> the
+          top-level value becomes the task;
+        * both present and DIFFERENT -> ``ValueError`` naming both, because
+          silently picking one drops work the caller asked for;
+        * both present and equal -> accepted once (the context already carries
+          exactly that task, so nothing is duplicated or dispatched twice).
+        """
+        if self.query is None or not self.query.strip():
+            return
+        task = self.query
+        if self.action != "spawn":
+            raise ValueError(
+                f"'query' is only valid with action='spawn'; for "
+                f"action='{self.action}' the task belongs in 'worker_query'. "
+                "Nothing was dispatched."
+            )
+        if not isinstance(self.context, dict):
+            self.context = {"query": task}
+            return
+        existing = self.context.get("query")
+        if existing is None or (isinstance(existing, str) and not existing.strip()):
+            merged = dict(self.context)
+            merged["query"] = task
+            self.context = merged
+            return
+        if str(existing) != task:
+            raise ValueError(
+                f"Conflicting tasks: query={task!r} but "
+                f"context['query']={existing!r}. They differ, so this call was "
+                "rejected rather than dispatching one of them silently -- pass "
+                "the task once, either as query= or as context={'query': ...}."
+            )
+
+    def _followup_context_block(self) -> tuple[Optional[str], Optional[str]]:
+        """Render ``context`` for a FOLLOW-UP query (``query``/``submit_query``).
+
+        Returns ``(block, note)``.  ``block`` is the labelled text to PREPEND to
+        ``worker_query`` -- ``None`` when the caller supplied no usable context.
+        ``note`` is what the envelope should say about anything that was
+        dropped.
+
+        ``worker_query`` is authoritative on a follow-up, so a ``query`` key
+        inside a context dict is DROPPED here and reported in ``note``; it is
+        never merged and can never override the query being sent.
+
+        A plain string is raw BRIEFING text, not a task.  ``coerce_context``
+        turned it into ``{"query": <str>}``, which looks exactly like a genuine
+        dict, so the pre-coercion value (``_raw_context``) is used instead.
+        """
+        raw = self._raw_context
+        if isinstance(raw, str):
+            text = raw.strip()
+            return (
+                f"{FOLLOWUP_CONTEXT_PREFIX}\n{text}" if text else None
+            ), None
+
+        context = self.context
+        if context is None:
+            return None, None
+        if isinstance(context, str):
+            text = context.strip()
+            return (
+                f"{FOLLOWUP_CONTEXT_PREFIX}\n{text}" if text else None
+            ), None
+        if not isinstance(context, dict):
+            text = str(context).strip()
+            return (
+                f"{FOLLOWUP_CONTEXT_PREFIX}\n{text}" if text else None
+            ), None
+
+        payload = dict(context)
+        note = None
+        if "query" in payload:
+            dropped = payload.pop("query")
+            note = (
+                "context['query'] ignored; worker_query wins "
+                f"(context['query']={dropped!r})"
+            )
+        if not payload:
+            return None, note
+        rendered = json.dumps(
+            payload, default=str, ensure_ascii=True, sort_keys=True
+        )
+        return f"{FOLLOWUP_CONTEXT_PREFIX}\n{rendered}", note
+
+    def _compose_followup_query(self) -> tuple[str, Optional[str]]:
+        """``worker_query`` with any follow-up context PREPENDED to it.
+
+        One string, on purpose: every delivery path (direct ``send_query``, the
+        detached FIFO ``enqueue_query``, the paused-resume dispatch) carries a
+        single string, so one composition serves all three.  With no context
+        supplied the result is ``worker_query`` byte-for-byte.
+        """
+        block, note = self._followup_context_block()
+        if not block:
+            return self.worker_query, note
+        return f"{block}\n\n{self.worker_query}", note
 
     def _load_workers(self, ws_id: Optional[str]) -> list:
         """
@@ -5281,6 +6085,16 @@ class Worker(ToolBase):
         if ws_path:
             result["workspace_path"] = ws_path
 
+        # Inheritance is deliberately ABSENT: worktree_root is forwarded only
+        # when THIS tool instance was itself given one, never copied from the
+        # parent agent's config.  A sub-worker must therefore be opted in
+        # explicitly, so it can never be silently dragged into a worktree
+        # (writing to a checkout its caller is not looking at) merely because
+        # the worker that spawned it happens to be bound there.
+        _wt = getattr(self, 'worktree_root', None)
+        if _wt:
+            result['worktree_root'] = _wt
+
         # Propagate the workspace-lifecycle-manager feature flag so the
         # WorkerThread's _wlm_flag_enabled() sees it at the top level.
         # ToolExecutor normally injects it already; the nested fallback
@@ -5412,6 +6226,74 @@ class Worker(ToolBase):
                 augmented.append(entry)
 
         return {"workers": augmented, "count": len(augmented)}
+
+    def _action_inspect(self, workers: list) -> dict:
+        """Report each worker instance's RUNTIME SUBSTRATE -- read-only.
+
+        A self-check, not a control verb: for every live instance of every
+        worker defined here it answers "what is actually running this worker?"
+        -- the mode its runtime handle was built in, whether a child process
+        exists, that child's pid and liveness, the pid of THIS process, and
+        whether the child turns out to be this very process.
+
+        Nothing here starts, drives or forks anything: the per-instance
+        answers come from ``WorkerRuntimeHandle.substrate()``, which never
+        calls ``_ensure_process_runtime``. A worker with no live handle is
+        reported (``has_runtime_handle=False``, no substrate) rather than
+        hidden, because "there is no handle here" is itself the finding.
+        """
+        from tools.workspace.worker import _registry_lock, _worker_registry
+        from tools.workspace.worker_runtime import runtime_handle_for
+
+        session_key = self.session_id or _NO_SESSION_KEY
+        parent_pid = os.getpid()
+        entries = []
+        for w in workers:
+            name = w.get("name", "")
+            with _registry_lock:
+                instances = sorted(
+                    (key[2] if len(key) >= 3 else 1, thread)
+                    for key, thread in _worker_registry.items()
+                    if key[0] == session_key and key[1] == name
+                )
+            if not instances:
+                entries.append({
+                    "worker_name": name,
+                    "instance_id": None,
+                    "has_runtime_handle": False,
+                    "runtime_mode": None,
+                    "child_exists": None,
+                    "child_pid": None,
+                    "child_alive": None,
+                    "parent_pid": parent_pid,
+                    "same_process": None,
+                })
+                continue
+            for iid, thread in instances:
+                handle = runtime_handle_for(session_key, name, iid)
+                entry = {
+                    "worker_name": name,
+                    "instance_id": iid,
+                    "has_runtime_handle": handle is not None,
+                }
+                if handle is None:
+                    entry.update({
+                        "runtime_mode": None,
+                        "child_exists": None,
+                        "child_pid": None,
+                        "child_alive": None,
+                        "parent_pid": parent_pid,
+                        "same_process": None,
+                    })
+                else:
+                    entry.update(handle.substrate())
+                entries.append(entry)
+
+        return {
+            "workers": entries,
+            "count": len(entries),
+            "parent_pid": parent_pid,
+        }
 
     def _action_spawn(self, workers: list, ws_id: Optional[str]) -> dict:
         """Spawn a worker thread from its definition in workers.json."""
@@ -5816,10 +6698,9 @@ class Worker(ToolBase):
                 "worker_name": self.worker_name,
             }
 
-        # Resolve tool classes from definition
-        tool_classes: Dict[str, type[ToolBase]] = {}
-        missing_tools: list[str] = []
-        tool_names = definition.get("tools", [])
+        # Declared tool names.  An empty list is the implicit "all simplified
+        # tools" default; the capability registry below owns that meaning.
+        tool_names = list(definition.get("tools") or [])
         worker_perms = definition.get("permission_footprint") or definition.get("worker_permissions", {})
         # ── Fail-closed spawn guard ────────────────────────────────────
         # The worker footprint may only RESTRICT categories the session
@@ -5841,15 +6722,65 @@ class Worker(ToolBase):
         # Effective worker profile: session (ceiling) intersected with the
         # worker footprint.  Used for spawn-time tool validation below.
         spawn_effective = _restrictive_merge(session_perms, worker_perms)
+        # ── Capability resolution (fail loud, before the thread is built) ──
+        # The registry says which tools EXIST for this build; the footprint gate
+        # below says which of them may RUN (§7.2).  A name this build cannot
+        # ship aborts the spawn here, before any worker object is constructed,
+        # so no half-capable worker can ever start.
+        from tools.capability_registry import (
+            CapabilityRegistry,
+            CapabilityResolveError,
+        )
+
+        universe = _worker_tool_universe()
+        try:
+            capability_registry = CapabilityRegistry.resolve(
+                [_canonical_worker_tool_name(name) for name in tool_names],
+                available_names=tuple(universe),
+                lookup=universe,
+                blocklist=_WORKER_BLOCKLIST,
+                parent_enabled_tools=(self.agent_config or {}).get("enabled_tools"),
+                permission_veto=None,
+            )
+        except CapabilityResolveError as err:
+            return {
+                "error": (
+                    f"Worker '{self.worker_name}' requires tool(s) not "
+                    "shippable by this build: "
+                    f"{', '.join(err.missing_names)}"
+                ),
+                "worker_name": self.worker_name,
+                "missing_tools": list(err.missing_names),
+            }
+
+        # Canonical class map: keyed by class name, so a tool's alias spelling
+        # cannot create a second entry for the same class.
+        tool_classes: Dict[str, type[ToolBase]] = {
+            cls.__name__: cls for cls in capability_registry.resolved.values()
+        }
+        missing_tools: list[str] = []
+
+        if not tool_names:
+            # Implicit "all simplified tools" default: report the privilege,
+            # never grant it silently (§4.2).  The spawn envelope is unchanged.
+            implicit_granted = _worker_granted_tool_names(capability_registry)
+            if implicit_granted:
+                logger.warning(
+                    "Worker '%s' has an empty tool list (implicit / "
+                    "unrestricted): resolved to %d tool(s) from the default "
+                    "universe",
+                    self.worker_name, len(implicit_granted),
+                )
+
         if tool_names:
-            for tool_name in tool_names:
-                if tool_name in _WORKER_BLOCKLIST:
-                    missing_tools.append(f"{tool_name} (excluded for worker safety)")
-                    continue
-                cls = self._resolve_tool_class(tool_name)
-                if cls is None:
-                    missing_tools.append(tool_name)
-                    continue
+            # Blocklist exclusions stay SOFT (the worker spawns without them)
+            # and are reported to the operator, never silently dropped.
+            for excluded_name in capability_registry.excluded:
+                logger.warning(
+                    "Worker '%s': tool %s (excluded for worker safety)",
+                    self.worker_name, excluded_name,
+                )
+            for tool_name, cls in capability_registry.resolved.items():
                 # Spawn-time footprint validation: check tool categories against
                 # the worker's declared permission footprint.
                 tool_cats = cls.get_required_categories({})
@@ -5864,7 +6795,7 @@ class Worker(ToolBase):
                             f" for {tool_name}"
                         ),
                         # Footprint already intersected into spawn_effective
-                        # via _restrictive_merge \u2014 pass None so the gate does
+                        # via _restrictive_merge — pass None so the gate does
                         # not re-apply the raw footprint on top.
                         permission_footprint=None,
                         is_worker_context=True,
@@ -5873,8 +6804,7 @@ class Worker(ToolBase):
                         missing_tools.append(
                             f"{tool_name} (permission denied by worker footprint)"
                         )
-                        continue
-                tool_classes[tool_name] = cls
+                        tool_classes.pop(tool_name, None)
 
         # Resolve project root from workspace config so tools get the right
         # workspace_path (the project root, not the worker's internal dir).
@@ -5891,11 +6821,34 @@ class Worker(ToolBase):
         # Compute effective timeout: explicit tool override, otherwise None so
         # WorkerThread.__init__ applies its SESSION-owned resolution chain
         # (definition > agent_config > session_config > WORKER_TIMEOUT_SECONDS).
-        effective_timeout = (
+        # ── ONE CLOCK (defect #5) ──────────────────────────────────────
+        # The SESSION-owned chain the thread would apply (definition >
+        # agent_config > session_config > WORKER_TIMEOUT_SECONDS) is evaluated
+        # here, exactly once, through the declared ceiling -- and the resolved
+        # ``effective`` is what the thread is given, so the worker's own agent
+        # loop (worker_thread.py:2985 -> AgentConfig.timeout_seconds) times out
+        # on the same number the caller waits for.
+        _chain_timeout = definition.get("timeout_seconds")
+        if _chain_timeout is None:
+            _chain_timeout = (agent_config or {}).get("worker_timeout_seconds")
+        if _chain_timeout is None:
+            _chain_timeout = (
+                (agent_config or {}).get("session_config") or {}
+            ).get("worker_timeout_seconds")
+        _requested_timeout = (
             self.timeout_seconds
             if self.timeout_seconds is not None
-            else definition.get("timeout_seconds")
+            else _chain_timeout
         )
+        budget = TimeBudget.resolve(
+            _requested_timeout,
+            default=WORKER_TIMEOUT_SECONDS,
+            cap=DECLARED_CEILING,
+            strict=True,
+            source="worker_thread.spawn",
+        )
+        self._dispatch_budget = budget
+        effective_timeout = budget.effective
 
         # Build a ContainerManager bound to this session/workspace so the
         # worker can stop/remove the containers it owns at teardown. Falls
@@ -5971,6 +6924,9 @@ class Worker(ToolBase):
             instance_id=spawn_iid,
             container_manager=container_manager,
         )
+        # Pin the dispatch-time budget on the thread so later hops (query /
+        # join) reuse THIS number instead of re-resolving a different one.
+        store_budget_on_thread(thread, budget)
 
         # S5: close the runtime -> supervisor frame seam for this worker. The
         # handle is built here and never started, so nothing about the thread's
@@ -6419,6 +7375,11 @@ class Worker(ToolBase):
                 "error": "worker_query is required for action 'query'",
             }
 
+        # A follow-up carries its context INSIDE the query string: one code
+        # path then serves the direct, detached-queue and paused-resume
+        # deliveries alike.  No context -> delivered_query IS worker_query.
+        delivered_query, context_note = self._compose_followup_query()
+
         # PHASE 2.1b: a submission against a DETACHED worker is QUEUED and
         # returns immediately -- it does NOT resume the worker. Resuming is
         # operator-initiated only (docs/design-worker-lifecycle.md, "Queries
@@ -6430,9 +7391,9 @@ class Worker(ToolBase):
             try:
                 enqueue = getattr(thread, "enqueue_query", None)
                 if callable(enqueue):
-                    enqueue(job_id, self.worker_query)
+                    enqueue(job_id, delivered_query)
                 else:  # pragma: no cover - duck-typed thread doubles
-                    thread._input_queue.put((job_id, self.worker_query, None))
+                    thread._input_queue.put((job_id, delivered_query, None))
             except Exception as exc:
                 return {
                     "error": f"Failed to enqueue query: {exc}",
@@ -6465,7 +7426,7 @@ class Worker(ToolBase):
                     except Exception:
                         pass
                     raise
-            return {
+            detached_envelope = {
                 "worker_name": self.worker_name,
                 "instance_id": iid,
                 "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
@@ -6475,6 +7436,9 @@ class Worker(ToolBase):
                         "runs only once an operator resumes the worker. Poll with "
                         "action='job_status' / action='join'.",
             }
+            if context_note is not None:
+                detached_envelope["context_note"] = context_note
+            return detached_envelope
         if thread.status == "paused":
             # A paused worker must never be queried destructively (BUG 3):
             # the old behavior blocked up to 300s, then stopped the worker
@@ -6482,12 +7446,21 @@ class Worker(ToolBase):
             # query immediately (non-destructively); normal pauses are
             # auto-resumed and the query proceeds normally below.
             if getattr(thread, "_manual_only_pause", False):
-                return {
+                paused_envelope = {
                     "status": "paused",
                     "message": "Worker is manually paused",
                     "worker_name": self.worker_name,
                     "session_id": self.session_id or "",
                 }
+                if self.context is not None:
+                    # The query was NOT sent, so the context was not delivered
+                    # either -- say so instead of dropping it silently.
+                    paused_envelope["context_note"] = (
+                        "context was NOT delivered: the worker is manually paused "
+                        "and the query was not sent. Re-send it with the query "
+                        "once the worker is resumed."
+                    )
+                return paused_envelope
             try:
                 _resume_outcome = thread.resume()
             except Exception as exc:
@@ -6510,19 +7483,28 @@ class Worker(ToolBase):
                     "instance_id": iid,
                 }
 
+        # ONE CLOCK: record the budget this hop actually uses (the thread's
+        # dispatch-time budget, or a per-call request) for the envelope.
+        self._dispatch_budget = budget_for_thread(
+            thread,
+            requested=self.timeout_seconds,
+            default=DEFAULT_REQUEST_SECONDS,
+            source="worker_thread.query",
+        )
         wait = _worker_query_wait_timeout(
             getattr(thread, "_timeout_seconds", None),
-            fallback=300.0,
+            fallback=DEFAULT_REQUEST_SECONDS,
         )
-        if wait != 300.0:
+        if wait != DEFAULT_REQUEST_SECONDS:
             logger.info(
-                "query wait %.0fs (effective timeout %.0fs + grace) exceeds legacy 300s cap",
+                "query wait %.0fs (effective timeout %.0fs + grace); "
+                "no cap applied -- bounded only by the declared ceiling",
                 wait,
                 wait - QUERY_WAIT_GRACE_SECONDS,
             )
         try:
             # Block until the worker responds
-            response = thread.send_query(self.worker_query, timeout=wait)
+            response = thread.send_query(delivered_query, timeout=wait)
             elapsed = thread._last_elapsed()
             result = {
                 "worker_name": self.worker_name,
@@ -6533,6 +7515,8 @@ class Worker(ToolBase):
             }
             if thread._last_reasoning is not None:
                 result["reasoning"] = thread._last_reasoning
+            if context_note is not None:
+                result["context_note"] = context_note
             return result
         except TimeoutError as exc:
             # Cooperative stop: the query deadline elapsed with no reply. Stop
@@ -6648,6 +7632,9 @@ class Worker(ToolBase):
             }
         if not self.worker_query:
             return {"error": "worker_query is required for action 'submit_query'"}
+        # Same single-string composition as action='query': the queued item is
+        # what the worker later reads, so the context must ride inside it.
+        delivered_query, context_note = self._compose_followup_query()
         job_id = uuid.uuid4().hex
         try:
             # PHASE 2.1b: append through the bookkept FIFO appender. This only
@@ -6655,9 +7642,9 @@ class Worker(ToolBase):
             # running turn; a detached worker stays parked and burns nothing).
             enqueue = getattr(thread, "enqueue_query", None)
             if callable(enqueue):
-                enqueue(job_id, self.worker_query)
+                enqueue(job_id, delivered_query)
             else:  # pragma: no cover - duck-typed thread doubles
-                thread._input_queue.put((job_id, self.worker_query, None))
+                thread._input_queue.put((job_id, delivered_query, None))
         except Exception as exc:
             return {"error": f"Failed to enqueue query: {exc}", "worker_name": self.worker_name}
         registry = _get_worker_job_registry()
@@ -6687,7 +7674,7 @@ class Worker(ToolBase):
                 except Exception:
                     pass
                 raise
-        return {
+        submitted_envelope = {
             "worker_name": self.worker_name,
             "instance_id": iid,
             "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
@@ -6697,6 +7684,9 @@ class Worker(ToolBase):
                     "WORKER_PARTIAL_RESULT / WORKER_COMPLETED events; poll with "
                     "action='job_status'.",
         }
+        if context_note is not None:
+            submitted_envelope["context_note"] = context_note
+        return submitted_envelope
 
     def _action_job_status(self, workers: list) -> dict:
         """Read job records from the registry (non-blocking, Phase 2B)."""
@@ -6740,8 +7730,10 @@ class Worker(ToolBase):
 
         Shared handler for both the ``join`` and ``wait_for_job`` actions.
         ``worker_query`` carries the job_id (same convention as ``job_status``).
-        Polls the job registry in 0.25s slices for a total of ``timeout_seconds``
-        (default 60, hard cap 300). Returns early on: job terminal state
+        Polls the job registry in 0.25s slices for a total of the RESOLVED
+        budget -- the per-call request if given, else the budget pinned on the
+        thread at spawn (default 60, bounded only by DECLARED_CEILING). There
+        is no 300 s cap. Returns early on: job terminal state
         (completed / timeout / error), a partial result (status ``partial_result``
         + preview), the worker thread pausing (``status == 'paused'``) or being
         detached (``status == 'detached'``), a kill signal (stop_event set /
@@ -6775,13 +7767,20 @@ class Worker(ToolBase):
                 "job_id": job_id,
                 "worker_name": self.worker_name,
             }
-        requested_timeout = int(self.timeout_seconds or 60)
-        if requested_timeout > 300:
-            logger.info(
-                "wait_for_job: requested timeout %ds exceeds 300s cap; clamped to 300s",
-                requested_timeout,
-            )
-        total = min(requested_timeout, 300)
+        # ── ONE CLOCK (defect #5): no more hardcoded 300 ───────────────
+        # The wait is the RESOLVED budget for this worker (the per-call request
+        # if given, else the budget resolved at dispatch), and the return value
+        # below is the effective number -- a 420 s request waits 420 s.
+        budget = budget_for_thread(
+            thread,
+            requested=self.timeout_seconds,
+            default=JOIN_DEFAULT_WAIT_SECONDS,
+            source="worker_thread.join",
+        )
+        self._dispatch_budget = budget
+        if budget.clamped:
+            logger.warning("wait_for_job: %s", budget.clamp_reason())
+        total = int(budget.effective)
         deadline = time.monotonic() + total
         last_status = rec.get("status")
         while True:
@@ -6816,6 +7815,13 @@ class Worker(ToolBase):
             # blocking wait is pointless — return paused promptly. Pause
             # propagates INTO join waits this way.
             if self.session_id and self.session_id in _SESSION_MAIN_PAUSED:
+                # PHASE 2f (operator ruling (b)): Main is paused while waiting
+                # on THIS worker, so this worker is paused too.  Scoped to the
+                # join target only -- async workers the caller is not waiting
+                # on are untouched (that is the ``want_all`` axis, not this
+                # one).  Idempotent; see _pause_join_target.
+                if _pause_join_target(thread, self.worker_name):
+                    _record_proxied_join_target(self.session_id, self.worker_name, iid)
                 return {
                     "worker_name": self.worker_name,
                     "instance_id": iid,

@@ -170,6 +170,7 @@ describe('registerSession', () => {
       permissions: null,
       providers: [],
       tools: [],
+      workspace_path: undefined,
       isLoaded: true,
     });
   });
@@ -225,6 +226,7 @@ describe('receiveSessionLoaded', () => {
       permissions: { network: 'banned' },
       providers: [{ id: 'p1' }],
       tools: ['read_file', 'glob'],
+      workspace_path: undefined,
       isLoaded: true,
     });
   });
@@ -236,8 +238,37 @@ describe('receiveSessionLoaded', () => {
       permissions: null,
       providers: [],
       tools: [],
+      workspace_path: undefined,
       isLoaded: true,
     });
+  });
+
+  // The server's authoritative `state` string now travels in the session_loaded
+  // payload. It must win over the is_running boolean — a PAUSED session reports
+  // is_running:false (which would read as IDLE) and a PAUSING session reports
+  // is_running:true (which would read as RUNNING).
+  it('takes the payload state string over is_running (PAUSED, is_running:false)', () => {
+    useStore.getState().receiveSessionLoaded('s1', { state: 'PAUSED', is_running: false });
+    expect(useStore.getState().sessionStates.s1.state).toBe('PAUSED');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(false);
+  });
+
+  it('takes the payload state string over is_running (PAUSING, is_running:true)', () => {
+    useStore.getState().receiveSessionLoaded('s1', { state: 'PAUSING', is_running: true });
+    expect(useStore.getState().sessionStates.s1.state).toBe('PAUSING');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(true);
+  });
+
+  it('falls back to RUNNING when state is null and is_running is true', () => {
+    useStore.getState().receiveSessionLoaded('s1', { state: null, is_running: true });
+    expect(useStore.getState().sessionStates.s1.state).toBe('RUNNING');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(true);
+  });
+
+  it('falls back to IDLE when the payload has no state key and is_running is false', () => {
+    useStore.getState().receiveSessionLoaded('s1', { config: { mode: 'custom' }, is_running: false });
+    expect(useStore.getState().sessionStates.s1.state).toBe('IDLE');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(false);
   });
 });
 
@@ -256,6 +287,7 @@ describe('receiveConfigChanged', () => {
       permissions: null,
       providers: [{ id: 'p1' }],
       tools: ['read_file'],
+      workspace_path: undefined,
       isLoaded: true,
     });
   });
@@ -272,6 +304,7 @@ describe('receiveConfigChanged', () => {
       permissions: null,
       providers: [{ id: 'p2' }],
       tools: ['glob'],
+      workspace_path: undefined,
       isLoaded: true,
     });
   });
@@ -437,6 +470,155 @@ describe('receiveConversationChanged — explicit merge mode', () => {
 });
 
 // ==========================================================================
+// receiveConversationChanged — tool call / outcome folding by tool_call_id
+// (duplicate-tool-bubble-in-chat).
+//
+// A tool call and its outcome arrive as two rows sharing one backend
+// `tool_call_id`, in ANY order and across ANY of the three merge modes. The
+// conversation slice must hold exactly ONE row for that id, at the call's
+// position, with `content` = the name/args JSON (what MessageBubble parses) and
+// `result` = the outcome text (what MessageBubble renders below it).
+// Rows without an id, and rows with DIFFERENT ids (even when name/args are
+// byte-identical), must never merge.
+// ==========================================================================
+describe('receiveConversationChanged — tool call/outcome folding', () => {
+  const CALL_ARGS = JSON.stringify({ name: 'read_file', arguments: { path: 'a.txt' } });
+  const callRow = (id, extra) => ({ role: 'tool_call', content: CALL_ARGS, tool_call_id: id, ...(extra || {}) });
+  const resultRow = (id, text, extra) => ({ role: 'tool_result', content: text, tool_call_id: id, ...(extra || {}) });
+  const rows = (sid = 's1') => useStore.getState().sessionMessages[sid] || [];
+
+  it('a: a streamed tool call + the authoritative replace of that call = one entry', () => {
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'read a.txt' }], {
+      mode: 'append',
+    });
+    useStore.getState().receiveConversationChanged('s1', [callRow('t1')], { mode: 'append' });
+    expect(rows()).toHaveLength(2);
+
+    // Full history replace re-sending the very same call row.
+    useStore.getState().receiveConversationChanged(
+      's1',
+      [{ role: 'user', content: 'read a.txt' }, callRow('t1')],
+      { mode: 'replace', preserveClientOnly: true }
+    );
+
+    expect(rows()).toHaveLength(2);
+    expect(rows().filter((m) => m.tool_call_id === 't1')).toHaveLength(1);
+    expect(rows()[1]).toEqual(callRow('t1'));
+  });
+
+  it('b: the same tool 3x with identical args but DISTINCT ids stays 3 entries', () => {
+    for (const id of ['t1', 't2', 't3']) {
+      useStore.getState().receiveConversationChanged('s1', [callRow(id)], { mode: 'append' });
+    }
+    expect(rows()).toHaveLength(3);
+    expect(rows().map((m) => m.tool_call_id)).toEqual(['t1', 't2', 't3']);
+    expect(rows().map((m) => m.content)).toEqual([CALL_ARGS, CALL_ARGS, CALL_ARGS]);
+
+    // Distinct ids never merge even inside ONE replace payload.
+    useStore.getState().receiveConversationChanged('s1', [callRow('t4'), callRow('t5'), callRow('t6')], {
+      mode: 'replace',
+    });
+    expect(rows()).toHaveLength(3);
+    expect(rows().map((m) => m.tool_call_id)).toEqual(['t4', 't5', 't6']);
+  });
+
+  it('c: a tool_result folds IN PLACE into its call (1 entry, position kept, outcome in `result`)', () => {
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'read a.txt' }], {
+      mode: 'append',
+    });
+    useStore.getState().receiveConversationChanged('s1', [callRow('t1')], { mode: 'append' });
+    useStore.getState().receiveConversationChanged('s1', [resultRow('t1', 'file contents: hello')], {
+      mode: 'append',
+    });
+
+    const msgs = rows();
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0]).toEqual({ role: 'user', content: 'read a.txt' });
+    expect(msgs[1].role).toBe('tool_call');
+    expect(msgs[1].tool_call_id).toBe('t1');
+    // MessageBubble: ToolCallContent(content) + TruncatableContent(result).
+    expect(msgs[1].content).toBe(CALL_ARGS);
+    expect(msgs[1].result).toBe('file contents: hello');
+  });
+
+  it('c2: one replace payload carrying BOTH phases folds to one bubble, order preserved', () => {
+    useStore.getState().receiveConversationChanged(
+      's1',
+      [
+        { role: 'user', content: 'read a.txt' },
+        callRow('t1'),
+        resultRow('t1', 'file contents: hello'),
+        { role: 'assistant', content: 'done' },
+      ],
+      { mode: 'replace', preserveClientOnly: true }
+    );
+
+    const msgs = rows();
+    expect(msgs).toHaveLength(3);
+    expect(msgs[1].role).toBe('tool_call');
+    expect(msgs[1].content).toBe(CALL_ARGS);
+    expect(msgs[1].result).toBe('file contents: hello');
+    expect(msgs[2]).toEqual({ role: 'assistant', content: 'done' });
+  });
+
+  it('d: a tool_result whose id matches nothing stays its own row and corrupts nothing', () => {
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'hi' }, callRow('t1')], {
+      mode: 'replace',
+    });
+    useStore.getState().receiveConversationChanged('s1', [resultRow('zzz-orphan', 'orphan outcome')], {
+      mode: 'append',
+    });
+
+    const msgs = rows();
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0]).toEqual({ role: 'user', content: 'hi' });
+    expect(msgs[1]).toEqual(callRow('t1'));
+    expect(msgs[1].result).toBeUndefined();
+    expect(msgs[2]).toEqual(resultRow('zzz-orphan', 'orphan outcome'));
+  });
+
+  it('e: rows without a tool_call_id behave exactly as before (never merged)', () => {
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'a' }], { mode: 'append' });
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'a' }], { mode: 'append' });
+    expect(rows()).toEqual([
+      { role: 'user', content: 'a' },
+      { role: 'user', content: 'a' },
+    ]);
+
+    // Id-less tool rows are NOT folded either — two identical ones stay two.
+    const idless = { role: 'tool_call', content: CALL_ARGS };
+    useStore.getState().receiveConversationChanged('s1', [{ ...idless }, { ...idless }], { mode: 'replace' });
+    expect(rows()).toHaveLength(2);
+    expect(rows().every((m) => m.result === undefined)).toBe(true);
+  });
+
+  it('f: prepend puts incoming rows first AND still folds by id (call after result)', () => {
+    // Newer page already loaded: the outcome is on screen without its call.
+    useStore.getState().receiveConversationChanged(
+      's1',
+      [resultRow('t1', 'file contents: hello'), { role: 'assistant', content: 'done' }],
+      { mode: 'replace' }
+    );
+    expect(rows()).toHaveLength(2);
+
+    useStore.getState().receiveConversationChanged(
+      's1',
+      [{ role: 'user', content: 'older line' }, callRow('t1')],
+      { mode: 'prepend' }
+    );
+
+    const msgs = rows();
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0]).toEqual({ role: 'user', content: 'older line' });
+    expect(msgs[1].role).toBe('tool_call');
+    expect(msgs[1].tool_call_id).toBe('t1');
+    expect(msgs[1].content).toBe(CALL_ARGS);
+    expect(msgs[1].result).toBe('file contents: hello');
+    expect(msgs[2]).toEqual({ role: 'assistant', content: 'done' });
+  });
+});
+
+// ==========================================================================
 // receiveStateChanged — derives isRunning, merges into session state
 // ==========================================================================
 describe('receiveStateChanged', () => {
@@ -511,6 +693,7 @@ describe('new slice cross-session isolation', () => {
       permissions: null,
       providers: [],
       tools: [],
+      workspace_path: undefined,
       isLoaded: true,
     });
     expect(st.sessionMessages.s2).toBeUndefined();

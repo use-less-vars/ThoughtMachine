@@ -109,6 +109,115 @@ class EventType(enum.Enum):
     REASONING_DELTA = 'reasoning_delta'
 
 
+#: Stream-transport-only events: emitted once per LLM chunk purely to drive live
+#: UI streaming (websocket arms in web_ui/backend/bridge.py).  They are NOT
+#: history, so they must never be persisted: one log line per streamed token
+#: floods the event log / session.log and pushes the real audit trail out of the
+#: 5 MB rotation window.  Persistence sites (EventLogger's bus subscriptions and
+#: Controller._emit_event's session.log sink) skip exactly these types; the
+#: global event bus still carries them unconditionally, because live UI
+#: streaming depends on it.
+STREAM_ONLY_EVENT_TYPES = frozenset({EventType.TEXT_DELTA, EventType.REASONING_DELTA})
+
+#: The explicit complement of ``STREAM_ONLY_EVENT_TYPES``: every event type that
+#: IS persisted.  Persistence is opt-out (a type is only excluded by appearing in
+#: ``STREAM_ONLY_EVENT_TYPES``), so this roster exists to keep the classification
+#: total and reviewable: ``tests/test_event_logger.py::
+#: test_event_type_classification_is_total`` fails the moment a new ``EventType``
+#: member is added without landing in exactly one of the two sets, so a future
+#: per-token type cannot silently open a second firehose.
+PERSISTED_EVENT_TYPES = frozenset({
+    EventType.AGENT_START,
+    EventType.AGENT_END,
+    EventType.LLM_REQUEST,
+    EventType.LLM_RESPONSE,
+    EventType.RAW_RESPONSE,
+    EventType.TOOL_CALL,
+    EventType.TOOL_CALL_START,
+    EventType.TOOL_RESULT,
+    EventType.CONVERSATION_UPDATE,
+    EventType.CONVERSATION_PRUNE,
+    EventType.EXECUTION_STATE_CHANGE,
+    EventType.SESSION_STATE_CHANGE,
+    EventType.TOKEN_WARNING,
+    EventType.TURN_WARNING,
+    EventType.TIME_WARNING,
+    EventType.TOKEN_UPDATE,
+    EventType.TURN_UPDATE,
+    EventType.AGENT_RESPONDED,
+    EventType.USER_INTERACTION_REQUESTED,
+    EventType.USER_QUERY,
+    EventType.FINAL_DETECTED,
+    EventType.FINAL,
+    EventType.STOP_SIGNAL,
+    EventType.MAX_TURNS_REACHED,
+    EventType.MAX_TURNS,
+    EventType.PAUSED,
+    EventType.STOPPED,
+    EventType.THREAD_FINISHED,
+    EventType.SESSION_STOP,
+    EventType.ERROR,
+    EventType.FILE_ACCESS,
+    EventType.SECURITY_VIOLATION,
+    EventType.DOCKER_SANDBOX,
+    EventType.CAPABILITY_CHECK,
+    EventType.SECURITY_PROMPT,
+    EventType.SECURITY_RESPONSE,
+    EventType.TURN,
+    EventType.RATE_LIMIT_WARNING,
+    EventType.SYSTEM_NOTIFICATION,
+    EventType.WORKER_SPAWNED,
+    EventType.WORKER_STATUS,
+    EventType.WORKER_COMPLETED,
+    EventType.WORKER_ERROR,
+    EventType.WORKER_MESSAGE,
+    EventType.ASSISTANT_MESSAGE,
+    EventType.USER_MESSAGE,
+    EventType.WEBSOCKET_CONNECT,
+    EventType.WEBSOCKET_DISCONNECT,
+    EventType.CONFIG_LOADED,
+    EventType.TOKENS_UPDATED,
+    EventType.CONTEXT_UPDATED,
+    EventType.STATUS_MESSAGE,
+    EventType.ERROR_OCCURRED,
+    EventType.CONFIG_CHANGED,
+    EventType.CONVERSATION_CHANGED,
+    EventType.TOKEN_RECOVERY,
+    EventType.CONTEXT_CLEARED,
+    EventType.CONTEXT_SUMMARIZED,
+    EventType.WORKER_RUNNING,
+    EventType.WORKER_STOPPING,
+    EventType.WORKER_HEARTBEAT,
+    EventType.WORKER_PARTIAL_RESULT,
+    EventType.WORKER_TIMEOUT,
+    EventType.WORKER_PAUSED,
+    EventType.WORKER_RESUMED,
+    EventType.CONTAINER_REMOVED,
+    EventType.CONTAINER_LIFECYCLE,
+    EventType.CREDENTIAL_USE,
+    EventType.CREDENTIAL_ROTATED,
+    EventType.CREDENTIAL_DELETED,
+})
+
+
+def is_stream_only_event_type(event_type: Union[EventType, str, None]) -> bool:
+    """Return True when *event_type* is a stream-only (never persisted) type.
+
+    Accepts an ``EventType`` member or its string value, so the typed event-bus
+    path and the legacy dict path (``Controller._emit_event``) both ask this one
+    classification question.  Unknown/unmappable names are not stream-only: the
+    failure mode is "persist", never "silently drop history".
+    """
+    if isinstance(event_type, EventType):
+        return event_type in STREAM_ONLY_EVENT_TYPES
+    if not event_type:
+        return False
+    try:
+        return EventType(event_type) in STREAM_ONLY_EVENT_TYPES
+    except ValueError:
+        return False
+
+
 class EventMetadata(BaseModel):
     """Metadata common to all events."""
     event_id: str = Field(default_factory=lambda: f'evt_{int(time.time() * 1000)}_{hash(time.time())}')

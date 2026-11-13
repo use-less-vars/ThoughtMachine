@@ -473,5 +473,28 @@ describe('fetchSessions', () => {
     const st = useWorkspaceStore.getState()
     expect(st.sessions).toEqual([{ session_id: 's1' }, { session_id: 's2' }])
     expect(st.currentWorkspace.sessions).toEqual([{ session_id: 's1' }, { session_id: 's2' }])
+    expect(st.sessionsError).toBe('')
+  })
+
+  it('records sessionsError on failure so an unreachable list is not read as empty', async () => {
+    useWorkspaceStore.setState({
+      workspaceList: [{ id: 'ws-1' }],
+      currentWorkspace: { id: 'ws-1', sessions: [] },
+      sessionsError: '',
+    })
+    stubFetchByUrl({ '/api/session/list': jsonErr('registry unavailable') })
+    await useWorkspaceStore.getState().fetchSessions('ws-1')
+    const st = useWorkspaceStore.getState()
+    // The list itself is untouched (still []), but the failure is recorded.
+    expect(st.sessions).toEqual([])
+    expect(st.sessionsError).toBe('registry unavailable')
+    expect(st.currentWorkspace.sessionsError).toBe('registry unavailable')
+  })
+
+  it('clears sessionsError after a later successful fetch', async () => {
+    useWorkspaceStore.setState({ sessionsError: 'registry unavailable' })
+    stubFetchByUrl({ '/api/session/list': jsonOk([{ session_id: 's1' }]) })
+    await useWorkspaceStore.getState().fetchSessions('ws-1')
+    expect(useWorkspaceStore.getState().sessionsError).toBe('')
   })
 })

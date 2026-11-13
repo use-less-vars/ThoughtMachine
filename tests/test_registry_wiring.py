@@ -142,7 +142,7 @@ class _FakeCM:
         self.started = []
         self.stopped = []
 
-    def start(self, image=None, name=None, note=None):
+    def start(self, image=None, name=None, note=None, cpu_quota=None):
         self.started.append({"image": image, "name": name, "note": note})
         return {"id": "legacy-1", "name": name or "agent-exec-x",
                 "status": "created", "note": ""}

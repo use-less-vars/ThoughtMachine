@@ -386,3 +386,22 @@ A slide-in panel (similar to VS Code's sidebar) that gives the user full visibil
 
 ## Archived
 Completed phases → `archive_arch_b.md` (`## SOURCE: roadmap.md — completed phases`).
+
+## 2026-11-09 — - **C13: Persistent Container Timeout Self-Healing.** **Open...
+
+- **C13: Persistent Container Timeout Self-Healing.** **Open** (filed by operator ruling, Gen 61 dispatch 6).
+  `ResourceContainerManager.exec` has three outcomes: success; timeout (`container.kill()`,
+  deliberately NOT remove, then `TimeoutError`); and interrupted (returned payload, container
+  untouched). The timeout path leaves a **killed-but-retained** container: `_container_id()`
+  resolves it by label, so every later git command on that workspace targets a dead container and
+  fails until someone intervenes. Deliberately NOT fixed in C11-prime — the two green tests
+  `tests/test_resource_container_exec_timeout_survival.py` (`assert container.removed == []`) and
+  `..._recovery.py` pin "survive the timeout, do not delete", and rebuilding the git sandbox on a
+  timeout risks uncommitted work. **Ruling in force:** Option A (status quo + explicit payload
+  reporting `container_killed=False` / `container_removed=False`) — do **not** self-heal via
+  `ensure_container()` without a dedicated design pass. Open design questions for that pass: who
+  owns sandbox recreation, can uncommitted work be detected/preserved before teardown, and should
+  a timeout instead be surfaced to the model as a retryable condition.
+  Filed in `.thoughtmachine/knowledge/project/PRIORITIES.md` (the tracked work queue, distinct from
+  `roadmap`): append there, never rename it to `vision_ledger.md`.
+

@@ -20,18 +20,28 @@ DELTA TABLE — spec vs REAL behaviour (all verified against current code):
                        | (agent/core/agent.py:898-906) mapped by
                        | bridge._map_and_emit (bridge.py:1983-1999) to
                        | state_changed {"state":"RUNNING","is_running":_is_busy}.
-    2. pause           | controller.pause() (controller/__init__.py:475-500)
-       RUNNING→        | sets PAUSING + emits execution_state_change pausing →
-       PAUSING→        | state_changed {"state":"PAUSING","is_running":True}.
-       PAUSED          | The legacy raw 'paused' event maps to NOTHING
-                       | (_map_and_emit has no branch for it, bridge.py:1952-
-                       | 2112) and ExecutionState (agent/core/state.py) has NO
-                       | 'paused' member — the 'PAUSED' mapping line
-                       | (bridge.py:1987) is DEAD CODE. Completion: controller
-                       | emits session_stop stop_reason='paused'
-                       | (controller/__init__.py:376-399) → state_changed IDLE.
-                       | REAL sequence: RUNNING → PAUSING → IDLE.
-    3. resume          | controller.resume() (controller/__init__.py:502-514)
+    2. pause           | controller.pause() (controller/__init__.py:550-578)
+       RUNNING→        | sets pause_event, enters reading mode and walks the
+       PAUSING→        | state through the setter: RUNNING → PAUSING, emitted
+       PAUSED          | as execution_state_change pausing → state_changed
+                       | {"state":"PAUSING","is_running":…}. ExecutionState DOES
+                       | define PAUSED (agent/core/state.py:22-28) and the
+                       | 'paused' → 'PAUSED' entry in _map_and_emit's frontend
+                       | map (bridge.py:3239) is LIVE. With nothing in flight
+                       | pause() settles on PAUSED at once
+                       | (controller/__init__.py:573-575); a turn that *is* in
+                       | flight lands there from the _run() finally block
+                       | (:854). The legacy raw 'paused' event still maps to
+                       | NOTHING (_map_and_emit has no branch for it,
+                       | bridge.py:3234-3407). Completion: the controller emits
+                       | session_stop (stop_reason 'paused' in the idle branch,
+                       | :473; otherwise the _run() reason, :862) and the
+                       | bridge's session_stop branch turns that into
+                       | state_changed {"state":"IDLE"} (bridge.py:3409-3420).
+                       | REAL sequence: RUNNING → PAUSING → PAUSED. The
+                       | IDLE on the wire is only a label riding session_stop,
+                       | never an ExecutionState member.
+    3. resume          | controller.resume() (controller/__init__.py:580-601)
        PAUSED→         | emits NO events → no state_changed. RUNNING only
        RUNNING         | returns when the agent re-enters process_query
                        | (another execution_state_change running).
@@ -354,8 +364,25 @@ def _assert_quiet(ws, path_label: str, timeout: float = 1.5):
     pytest.fail(f"{path_label}: expected NO further WS events, but got {_val!r}")
 
 
+def _make_agent_state(exec_state):
+    """Real ``AgentState`` parked in ``exec_state``.
+
+    ``AgentController.resume()`` routes the pause release through
+    ``state.set_execution_state()``, so the fixture has to hand it an object
+    that really implements that transition instead of a duck-typed fake.
+    No logger and a MagicMock config: nothing on these paths reads either.
+    """
+    from unittest.mock import MagicMock
+
+    from agent.core.state import AgentState
+
+    state = AgentState(config=MagicMock())
+    state.set_execution_state(exec_state)
+    return state
+
+
 def _make_bridge(events, exec_state=None):
-    """Fresh WebAgentBridge with an optional fake controller (no threads)."""
+    """Fresh WebAgentBridge with an optional controller (no threads)."""
     from types import SimpleNamespace
 
     from web_ui.backend.bridge import WebAgentBridge
@@ -365,8 +392,10 @@ def _make_bridge(events, exec_state=None):
     bridge = WebAgentBridge(session_store=FileSystemSessionStore())
     if exec_state is not None:
         ctrl = AgentController()
-        # Stub the agent so controller.is_busy reads our fake execution_state.
-        ctrl.agent = SimpleNamespace(state=SimpleNamespace(execution_state=exec_state))
+        # Stub the AGENT (controller.is_busy reads agent.state.execution_state)
+        # but wrap a REAL AgentState: resume() transitions the state object
+        # through set_execution_state(), which a SimpleNamespace fake lacks.
+        ctrl.agent = SimpleNamespace(state=_make_agent_state(exec_state))
         bridge.set_controller(ctrl)
     bridge.set_event_callback(events.append)
     return bridge
@@ -517,18 +546,62 @@ def test_session_stop_maps_to_idle_state_changed(contract_server):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# F. resume emits NO events (delta 3)
+# F. resume releases PAUSED and emits exactly one state_changed (supersedes delta 3)
 # ══════════════════════════════════════════════════════════════════════════
 
-def test_resume_emits_no_events(contract_server):
-    """controller.resume() emits NOTHING → no state_changed (delta 3)."""
+def test_resume_from_non_paused_emits_no_events(contract_server):
+    """resume() on a NON-paused controller emits NOTHING (no spurious events).
+
+    Supersedes ``test_resume_emits_no_events`` (delta 3), which asserted the
+    same "resume emits no events" claim for a PAUSING controller — but only
+    ever passed VACUOUSLY: the fixture's fake state object had no
+    ``set_execution_state``, so ``Controller.resume()`` never reached the
+    release block and the claim was never exercised against a real
+    transition.  The engineer has formally superseded that pin (authorised
+    ruling, not a test weakening): the anti-spurious-events intent is kept
+    here, where resume genuinely has no state to release, and the release
+    path itself is pinned by the test below.
+    """
     from agent.core.state import ExecutionState
 
     events = []
-    bridge = _make_bridge(events, exec_state=ExecutionState.PAUSING)
+    bridge = _make_bridge(events, exec_state=ExecutionState.READY)
     bridge.resume()
 
-    assert events == [], f"resume must not emit any events (got {events!r})"
+    assert events == [], f"resume from READY must not emit any events (got {events!r})"
+
+
+@pytest.mark.parametrize("paused_state", ["PAUSED", "PAUSING"])
+def test_resume_from_paused_emits_exactly_one_state_changed(contract_server, paused_state):
+    """resume() out of PAUSED/PAUSING emits EXACTLY ONE state_changed.
+
+    Pause is the only owner of those two states, so resume is the only writer
+    that can release them; the UI status banner is driven by this token, so
+    the transition must reach the bridge (→ state_changed) exactly once.  The
+    controller settles on READY when no query is processing, and the bridge
+    maps the raw ``ready`` value to the frontend token 'IDLE' (see the
+    section-A parametrisation ``("ready", "IDLE")``) — hence IDLE here, not
+    READY.
+    """
+    from agent.core.state import ExecutionState
+
+    events = []
+    bridge = _make_bridge(events, exec_state=ExecutionState[paused_state])
+    bridge.resume()
+
+    state_events = [e for e in events if e.get("type") == "state_changed"]
+    assert len(state_events) == 1, (
+        f"resume from {paused_state} must emit exactly one state_changed "
+        f"(got {events!r})"
+    )
+    assert state_events[0].get("state") in ("IDLE", "RUNNING"), (
+        f"state_changed.state after resume must be IDLE (or RUNNING while a "
+        f"turn is in flight), got {state_events[0].get('state')!r}"
+    )
+    assert isinstance(state_events[0].get("is_running"), bool), (
+        f"state_changed.is_running must be a bool "
+        f"(got {state_events[0].get('is_running')!r})"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -660,3 +733,58 @@ def test_ws_close_session_idle_state_changed(contract_server):
         f"close_session state_changed.is_running must be EXACTLY False "
         f"(got {evt.get('is_running')!r})"
     )
+
+
+def test_session_loaded_payload_carries_mapped_state_key():
+    """``session_loaded`` exposes the mapped execution state as a TOP-LEVEL key.
+
+    The frontend needs the initial execution state at load time; the bridge must
+    therefore carry the *mapped* frontend token (``PAUSED`` for the controller's
+    ``ExecutionState.PAUSED``) in the ``session_loaded`` payload itself, not only
+    in later ``state_changed`` events.
+    """
+    from agent.core.state import ExecutionState
+    from session.models import Session
+
+    events = []
+    bridge = _make_bridge(events, exec_state=ExecutionState.PAUSED)
+
+    session_id = "session-loaded-state-key"
+    bridge._session_store.save_session(Session.from_persistable_dict({
+        "session_id": session_id,
+        "metadata": {"name": "State Key"},
+        "user_history": [],
+    }))
+
+    assert bridge.load_session(session_id) is True
+
+    loaded = [e for e in events if e.get("type") == "session_loaded"]
+    assert len(loaded) == 1, f"expected exactly one session_loaded, got {loaded!r}"
+
+    # Events are FLAT dicts -- there is no "payload"/"data" wrapper, so the
+    # state key sits at the top level of the very dict we matched on.
+    payload = loaded[0]
+    assert "state" in payload, f"session_loaded lacks a top-level 'state': {payload!r}"
+    assert payload["state"] == "PAUSED", payload["state"]
+
+    # And the value must NEVER be None: a present-but-None ``state`` makes the
+    # server-side debug log slice it (event.get("state", ...)[:60]), which
+    # raises TypeError and silently DROPS the whole session_loaded frame.  A
+    # controller-less bridge must still emit a usable frontend token.
+    bare_events = []
+    bare_bridge = _make_bridge(bare_events)
+    bare_sid = "session-loaded-state-key-no-controller"
+    bare_bridge._session_store.save_session(Session.from_persistable_dict({
+        "session_id": bare_sid,
+        "metadata": {"name": "No Controller"},
+        "user_history": [],
+    }))
+    assert bare_bridge.load_session(bare_sid) is True
+
+    bare_loaded = [e for e in bare_events if e.get("type") == "session_loaded"]
+    assert len(bare_loaded) == 1, f"expected one session_loaded, got {bare_loaded!r}"
+    assert "state" in bare_loaded[0], bare_loaded[0]
+    assert isinstance(bare_loaded[0]["state"], str), bare_loaded[0]["state"]
+    assert bare_loaded[0]["state"] in {
+        "IDLE", "RUNNING", "PAUSED", "PAUSING", "STOPPED"
+    }, bare_loaded[0]["state"]

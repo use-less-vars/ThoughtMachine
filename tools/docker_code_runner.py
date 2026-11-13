@@ -305,8 +305,9 @@ chmod +x "{script_path}"
                 duration=duration
             ))
 
-        # Validate workspace path
-        ws_path = self._resolve_registry_workspace()
+        # Validate workspace path (worktree_root narrows this to the worktree
+        # when one is configured; None still refuses rather than mounting cwd)
+        ws_path = self._resolve_workspace_root()
         if ws_path is None:
             # Never fall back to cwd: the current directory may be outside the
             # workspace, and mounting it would leak host files into the container.
@@ -413,6 +414,7 @@ chmod +x "{script_path}"
                 worker_name=getattr(self, "worker_name", None) or current_worker_name(),
                 lifecycle_class=LIFECYCLE_EPHEMERAL,
                 heal_missing=True,
+                cpu_quota=self.cpu_quota,
             )
             # start() returns {"error": ...} (no "id") when the per-workspace
             # container limit is reached or any pre-create check fails -
@@ -443,6 +445,7 @@ chmod +x "{script_path}"
                     worker_name=getattr(self, "worker_name", None) or current_worker_name(),
                     lifecycle_class=LIFECYCLE_EPHEMERAL,
                     heal_missing=True,
+                    cpu_quota=self.cpu_quota,
                 )
             if "error" in info:
                 raise RuntimeError(info["error"])
@@ -467,7 +470,7 @@ chmod +x "{script_path}"
                     "success": False,
                     "status": "interrupted",
                     "interrupted": True,
-                    "exit_code": -3,
+                    "exit_code": None,
                     "reason": result.get("reason"),
                     "stdout": result.get("stdout", "") or "",
                     "stderr": result.get("stderr", "") or "",

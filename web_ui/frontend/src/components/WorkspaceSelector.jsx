@@ -249,7 +249,10 @@ export default function WorkspaceSelector() {
                   </div>
                   <p className="ws-card-desc">{ws.id}</p>
                   <div className="gms-card-stats">
-                    <span className="gms-stat">{ws.active_sessions_count ?? 0} sessions</span>
+                    <span className="gms-stat">{ws.active_sessions_count ?? 0} open sessions</span>
+                    {typeof ws.total_sessions_count === 'number' && (
+                      <span className="gms-stat">{ws.total_sessions_count} total sessions</span>
+                    )}
                     <span className="gms-stat">{ws.total_workers ?? 0} workers</span>
                   </div>
                   <div className="ws-card-details">

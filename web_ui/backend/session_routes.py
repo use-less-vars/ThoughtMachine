@@ -218,11 +218,14 @@ async def list_sessions(
         all_sessions = registry.get_all()
         sessions = list(all_sessions.values())
 
-        # Fall back to disk scan if registry is empty
+        # An empty registry is served as-is.  Rebuilding from disk here is
+        # intentionally NOT automatic: a broken disk scan must never be able
+        # to overwrite a populated registry (see
+        # SessionRegistry.rebuild_from_disk, which refuses an empty rebuild).
         if not sessions:
-            registry.rebuild_from_disk()
-            all_sessions = registry.get_all()
-            sessions = list(all_sessions.values())
+            log('WARNING', 'session_routes',
+                'Session registry is empty; serving an empty list '
+                '(automatic rebuild from disk is intentionally disabled)')
 
         # Filter by workspace if specified
         if workspace_id:

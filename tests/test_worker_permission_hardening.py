@@ -820,7 +820,9 @@ class TestIdlessFailClosed:
         assert "fail-closed" in result, result
         assert result == (
             "DENIED: could not resolve workspace_id for workspace_path=/tmp/"
-            "unresolvable-ws; tool execution denied (fail-closed)."
+            "unresolvable-ws; tool execution denied (fail-closed). No workspace "
+            "id resolved from the explicit workspace_id argument, the persisted "
+            "session record, or the configured workspace_path."
         ), result
 
     @staticmethod

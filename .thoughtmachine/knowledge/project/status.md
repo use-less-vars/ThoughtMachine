@@ -1,6 +1,16 @@
 # ThoughtMachine -- Status
 
-Updated: 2026-10-28, Gen 54 mid-session.
+Updated: Gen 61 close — Phase 9 CLOSED, W7/W8/W9 stabilization COMPLETE. See "Current state — Gen 61 close" below; this banner supersedes the Gen 60, Gen 54 and Gen 56 wording.
+
+## Current state — Gen 61 close: The Control Plane
+
+The event-driven state machine is live: the agent's run state (`ExecutionState.PAUSED` / `STOPPED`) is server-owned and reaches the UI as an event, so the operator's view is derived from the backend instead of being inferred by the frontend. The four Lego Pieces — Persistent State, Interrupt Signal, Tool Return Contract, Loop Gate — are implemented: state survives the turn, the interrupt reaches a blocked container wait within a poll slice, every tool call returns a paired result envelope, and the loop re-reads the flags at each checkpoint before dispatching work.
+
+The UI is deduplicated: a tool call and its result render as one bubble because both rows carry a `tool_call_id` and the store folds on it, including when a prepend delivers the call after the result. Docker interrupts mid-flight: a paused or stopped worker's in-flight container command comes back as an `interrupted` payload instead of running to completion, though the process inside the container is not killed — only the wait is abandoned.
+
+**Merge state:** C29 is in `dev`; C26, C27 and C28 are on `fix/gen61-control-plane-ui-cases` and await merge. **Next:** Phase 10 (EM-Solver / Resources).
+
+---
 
 **Gen 48 close-out snapshot (historical):** **dev HEAD:** `cf10c358` (merge of #189 — `fix/census-burn-down-no-tool-wrapping`:
   burn down census letters (b) and (c), add registry accessors, fix the guard's
@@ -38,6 +48,112 @@ after W4 merges." Status line for this wave, verbatim: "Credential
 injection plumbed for `host_run` callers; git path on `SandboxedExecution`;
 port migration filed as `design/host-port-git-authorization`."
 **Gen 49 housekeeping snapshot (2026-10-25) — read from git, not taken from the brief.** dev HEAD `e0670545` = #199 `feat/credential-w3-w4` (merge of W3b `54a302e2`, W3c `8fc3fbd8`, F-A `aacbbca0`). **PRs #190–#199 merged:** `d1fc8b82`, `b2a3cdf3`, `be0a5f87`, `476fc35f`, `7160f58b`, `10e4daf9`, `abcb80ee`, `e92f479f`, `7b4c2e96`, `e0670545`. **W4 code-complete; being committed in this PR:** 11 modified, 7 untracked (`git status`, 2026-10-25). The wave status line above — the block ending "port migration filed as `design/host-port-git-authorization`" — is re-affirmed verbatim and is **not** superseded by this note. Open state: "11 findings still awaiting a keep-or-delete ruling" (client claim); no-tool-wrapping census stands at 13 sites at park, 8 burned down in `cf10c358`, residual letter (a) recounted by nothing in CI.
+
+## Current state — Gen 61 close: Phase 9 CLOSED — W7/W8/W9 stabilization COMPLETE
+
+**Machine state: STABLE. The stabilization sprint is CLOSED — W7, W8 and W9 are all complete as of this block. No new feature work, no further audits, and no new code is starting from this close.** This section supersedes the Gen 60 close block immediately below; that block and every older `## Current state` block are kept as history, not as current truth.
+
+**Where this close sits in history:** this block was written when `dev` HEAD was `d28d8faa` and the Phase 9 fix was still in flight on `fix/phase9-registry-recovery`. Both facts have since been overtaken. **`dev` is now at `e88e067b`** (merge of PR #310). Phase 9 landed as PR #309 → merge commit `13fdba8c`, which contains the stack `527ae5a7` → `980af2df` → `fbc563d5`. The documentation close-out landed as PR #310 from `docs/gen60-final-close`, which was merged and its branch deleted. Both are checked by ancestry, not by report: `git merge-base --is-ancestor fbc563d5 dev` exits 0.
+
+### Phase 9 — the last open defect: "0 sessions" on a healthy registry
+
+**Symptom reported:** the UI showed "0 sessions", "idle", and "No active sessions." for workspaces that existed and worked. The standing hypothesis was that the session registry had been destroyed and needed a recovery pass.
+
+**Root cause — measured, not inferred.** `SessionRegistry.rebuild_from_disk()` (`session/session_registry.py`) hardcodes `is_open: False` on every entry produced by its disk scan, and on `dev` it ran **unconditionally at every startup**. Every restart therefore flattened the registry to all-closed; only sessions opened afterwards were re-marked open. The live registry at the time: **17,300 bytes, 50 entries, all 50 with a valid `workspace_id`, and only 4 with `is_open: true`** — 46 sessions silently closed by a restart.
+
+**Nothing was lost.** No session data was missing, corrupt, or unreachable. No recovery code exists in this repository and none should be written; the 15 empty workspace directories observed during the investigation are simply unused workspaces, not damage. The registry was lying about one boolean — and every UI surface labelled "sessions" (`active_sessions_count` in `global_routes._build_summary`, the `WorkspaceSelector` card, the `WorkspaceDetailPage` stats) was in fact counting **open** sessions only. The renderer was honest; the state layer was not.
+
+**The fix — `fbc563d5`, 12 files, +237/−21:**
+
+1. `rebuild_from_disk()` takes **one** `_load()` snapshot and reuses it both for the empty-scan guard and to carry `is_open` (plus a `workspace_id` the scan could not derive) over from the registry being replaced. A session the scan has never seen still defaults to closed. Both existing guards keep their exact prior behaviour: `_quarantine` on unparseable session files, and `RuntimeError` when a scan returns zero entries over a registry that still holds some — both still inside `_file_lock`.
+2. `total_sessions_count` added beside the open-only `active_sessions_count` in `_build_summary()` and in `GET /api/workspace/{id}/summary`. The UI now says "open sessions" explicitly and shows the total next to it, so an open-only number can never again be read as a workspace's session count.
+3. `tryGetResult()` → `sessionsError` in the frontend store: a **failed** session fetch is no longer collapsed to `[]` by `tryGet`'s `null` contract. The panel renders "Sessions could not be loaded" rather than "No sessions yet." when the backend is unreachable. A stale list that fails to refresh stays on screen instead of being replaced by a false empty state.
+
+**Verified, not taken on trust:** a worker's report was treated as a claim, checked against `git status` / `git diff` and re-run from a clean tree before the commit was signed. Summary lines verbatim: `17 passed` (registry + both summary suites), `300 passed, 5 xfailed` (backend), `Test Files 60 passed (60) / Tests 751 passed (751)` (frontend). `git diff --stat` at stage time: 12 files, +237/−21.
+
+### W7 / W8 / W9 — declared complete
+
+- **W7** — isolation wave: design and implementation landed (see the 2026-11-02 block below and the Gen 60 close above).
+- **W8** — the residual backlog filed at Gen 56b is closed; no W8 item is carried forward by this close.
+- **W9** — this phase. The session-registry truth fix plus the UI honesty pass above.
+
+These closures are declared by the infra engineer at Gen 61; the W9 specifics are the ones documented here and are the only part this seat verified end to end.
+
+### The pattern worth remembering (three instances in one session)
+
+Every "the machine is broken" report adjacent to Phase 9 had the same shape: **the state was fine and something in the middle was lying.** (a) A stale restart badge kept claiming a restart was pending after the restarts had happened. (b) "The guards were never committed" — the working tree was checked out on `dev`, so `git show` rendered pre-fix code and an agent confidently reported that hardening that existed was absent. (c) This one: a healthy 17,300-byte registry reporting 46 of its 50 sessions closed.
+
+The transferable rule: before believing any report about state, establish **which tree, which layer, and which boolean** the renderer is actually reading. `git read` the exact file on the exact branch first — cheapest check available, and it would have saved all three detours.
+
+### Handoff — where Gen 61 leaves the machine
+
+**The engine is safe, the state layer is honest, but the process seams need structural verification (see `vision_ledger.md` V1 and V2).**
+
+- `dev` @ `e88e067b` = PR #310, this documentation close-out. Phase 9 merged as PR #309 → `13fdba8c`, which contains `fbc563d5`. Verified by ancestry, not by report: `git merge-base --is-ancestor fbc563d5 dev` exits 0.
+- **Closed:** W7, W8 and W9. The session-registry truth fix (`fbc563d5`) and the state-honesty pass are in `dev`; `total_sessions_count` and `sessionsError` are the two surfaces that stop an open-only number from being read as a workspace's total.
+- **Open, and structural rather than cosmetic:** worker dispatch is not trustworthy in either direction (V1 — `context["meta"]` is dropped, long inline queries are truncated, and `status` / `telemetry` can contradict the content they arrive with). Every seam that crosses a process boundary needs an artifact check rather than a testimony check (V2 — worker git access is not uniform, worker `host_bash` fails closed, the vault is unreachable from workers).
+- **Standing mitigations that must not be quietly dropped:** park long worker payloads in a `WorkingDocument` and name the `doc_id` in the query; re-verify every claim with the orchestrator's own git tools before anything is committed; add the `.gitignore` negation in the same commit as any new KB file and confirm it with `git ls-tree`.
+- **Standing gap, deliberately not closed here:** `project/core.md` — the single home for pending core work, 39.6 kB, pointed at by `KB_MAP.md` and `INFRA_ONBOARDING.md` — is **untracked and gitignored**, so it does not survive a clone. Committing it is a tier ruling, not a housekeeping change, so this commit leaves it untouched and the Vision Ledger lives in its own tracked file with a non-colliding V namespace.
+- **Next seat's first three reads:** `vision_ledger.md` (V1–V5), then `MAIN_ONBOARDING.md` tier 1, then the newest block in this file. New documents since this close: `vision_ledger.md` (the Vision Ledger), `MAIN_ONBOARDING.md` (the entry point), `lessons_learned.md` ("Gen 60 — The Heat of the Moment").
+- **Do not re-litigate:** the registry was never wiped and no recovery code exists or should exist (Guards 1–3 all still hold); `vault_repair` does not delete directories; there is no `.githooks/pre-commit`; `core.md`'s C1–C9 are backlog items and are unrelated to the Vision Ledger's V1–V5.
+
+## Current state — Gen 60 close: stabilization sprint COMPLETE
+
+**Sprint status: CLOSED.** No new feature work is starting. For any question about current state, this section supersedes the Gen 56 close and every older `## Current state` block below; those are kept as history, not as current truth.
+
+`dev` HEAD at close: `27d19459` (merge of PR #304). If any number in this document disagrees with `git log dev`, believe `git log dev`.
+
+### The four stabilization defects — all fixed and merged
+
+| # | Defect | Fix | Landed as |
+|---|---|---|---|
+| 1 | Slow boot — the Vite build ran when it was not needed | build skipped when not required | fast-boot change |
+| 2 | Dirty worker spawns — a stale instance could survive and be reused | stale instance force-cleared before spawn | force-clear change |
+| 3 | Wrong workspace binding — the category gate resolved the enforced workspace from a deprecated config snapshot | precedence inverted (see below) | PR #304 / `9a4a606f` |
+| 4 | Slow session loading — session load fetched twice | duplicate fetch removed | PR #303 / `2e3e8d04` |
+
+### The "Gentle Wolf" root cause — the one that mattered
+
+The original report was: *a reused executor leaks a previous session's `workspace_path`, so the worker gets the wrong path and fails closed.*
+
+**That premise is false and was refuted by audit.** There is no executor reuse anywhere: one `ToolExecutor` per `Agent` (`agent/core/agent.py:497`), one `Agent` per bridge (`web_ui/backend/bridge.py:1708`), a fresh `WebAgentBridge` per session load (`web_ui/backend/server.py:1442/1744/2597/3309/3555`), and one executor per worker spawn (`tools/workspace/worker_thread.py:3704`). A test asserting cross-session leakage would have passed vacuously while the real defect survived.
+
+**The real defect was a precedence inversion** in the workspace gate inside `ToolExecutor._execute_single_tool`. The gate derived the workspace id it enforces from `self.config.workspace_path` *first*, and only fell back to the explicitly passed `workspace_id` or the persisted session record when no path was configured. But `AgentConfig.workspace_path` (`agent/config/models.py:179`) is deprecated, restart-required, construction-time only, defaults to `None`, and is omitted entirely by `agent/presenter/state_bridge.py:245`, `web_ui/backend/config_manager.py:508` and `agent/config/audit.py:176`. Worse, `Agent._hot_swap()` (`agent/core/agent.py:791-797`) replaces `self.config` wholesale — with a config carrying no `workspace_path` — without rebuilding the executor, so a live executor can end up with `workspace_path = None`.
+
+Consequence: the fail-closed branch denied **every** category-gated tool while a perfectly correct workspace id was already in hand. Not a leak — an ordering bug in which a deprecated snapshot outranked live state.
+
+New precedence, documented in the gate block because it decides *who* may run gated tools:
+
+1. the explicit `workspace_id` argument — the live session id, `agent/core/agent.py:1952`;
+2. the persisted session record — the `store.load_session_workspace_id` probe, then the legacy payload probe;
+3. `resolve_workspace_id(config.workspace_path)` — legacy fallback only.
+
+The fail-closed refusal is preserved, and its message now names all three sources so an "unresolvable workspace" denial stays distinguishable from a category denial. Separately, `_get_session_store()` caches one lazily-created session store on the executor, shared by the gate probe and `_resolve_workspace_id_from_session`, where previously each allocated a throwaway store per gated call.
+
+Test evidence: `TestWorkspaceIdResolutionPrecedence` covers session-record resolution with a pathless config, an explicit id beating a competing config path, the session record beating a competing config path, nothing-resolvable staying denied with the gate never consulted, and a hot-swap onto a `workspace_path`-less config. Assertions land on the id the gate actually receives, not on log text. Pre-fix RED was 5 failures; post-fix, 101 passed (`tests/test_tool_executor.py` plus `tests/test_worker_permission_hardening.py`), 556 passed and 28 skipped (`tests/security`), and 96 passed across six related permission and workspace suites. Those counts were reproduced by an independent clean-context verifier, not taken from the implementing worker's report.
+
+### Open follow-up tickets — audited, deliberately not fixed
+
+1. `tools/workspace/worker_thread.py:5255-5266` — the comment says "injected path wins", the code is `registry_ws or parent_ws` (registry-first). Comment and behaviour disagree.
+2. The injected `agent_config` dict omits `workspace_path` even though `tools/base.py:62-65` documents that it carries it.
+3. The worker spawn chain re-derives workspace identity four times. It needs one source of truth.
+4. `ToolExecutor._resolve_workspace_id_from_session` still full-parses the session payload on a cache miss and caches forever; it should delegate entirely to `load_session_workspace_id`.
+5. `AgentConfig.workspace_path` deprecation is unenforced. PR #304 removed its last security-relevant reader; nothing stops the next one. Remove the field or make reads loud.
+6. `Agent._hot_swap()` mutates `config` without re-deriving dependent state.
+
+### Known tooling gaps — agent-side, reported, not yet fixed
+
+- No fetch verb in either git tool: `git_read` has none, and `git_write` offers commit/init/clone/push/branch_create/checkout/stage/unstage/worktree/stash. Remote history the agent did not create is invisible to it.
+- `git_write push` is advertised but blocked by session policy (`network:banned`: "Tool requires network:outbound"). Publishing is the operator's job; an agent must never report a push it did not verify.
+- `git` is not installed in the `DockerCodeRunner` image (exit 127), so workers cannot produce diffs; they report line numbers and the agent must reconstruct from `git_read diff`.
+- `Worker spawn` and `Worker query` require an explicit `worker_name` despite the documented default.
+- `WorkingDocument create` ignores a supplied `doc_id`; later appends must reuse the returned id or they write to a new document.
+- `DockerCodeRunner` containers are fresh per invocation, so `/tmp` does not survive between tool calls.
+- `FileSearchTool` under-reported headings in this very file (one match for thirteen headings) — do not use it to outline documents.
+
+### Rule extracted for future generations
+
+Verify object lifecycle — *is the object actually reused?* — before hypothesising state leakage. And when a gate takes its authority from a config snapshot, audit that snapshot's provenance: deprecated plus construction-time plus hot-swappable is a three-way guarantee that it will eventually be stale.
 
 ## Current state — 2026-10-28, Gen 54 mid-session
 **Gen 56 close — 2026-11-02.** (Section content replaced in place; the heading above still carries the Gen 54 date.)

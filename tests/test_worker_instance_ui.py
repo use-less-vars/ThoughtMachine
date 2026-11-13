@@ -56,6 +56,7 @@ from tools.workspace.worker import (
     unregister_worker_event_bus,
 )
 
+from web_ui.backend import bridge as bridge_mod
 from web_ui.backend import workspace_routes
 from web_ui.backend.bridge import (
     WebAgentBridge,
@@ -237,7 +238,7 @@ def test_get_workers_name_filter(tmp_path, monkeypatch):
 
 
 def test_stop_worker_with_instance_id_targets_only_that_instance(tmp_path, monkeypatch):
-    """stop_worker(instance_id=2) writes command.json/status.json into the
+    """stop_worker(instance_id=2) writes the fenced command.json into the
     <name>#2 dir and fast-paths stop() only on the instance-2 thread."""
     _use_tmp_workspace(monkeypatch, tmp_path)
     with workspace_routes._registry_lock:
@@ -256,8 +257,9 @@ def test_stop_worker_with_instance_id_targets_only_that_instance(tmp_path, monke
     assert resp["instance_id"] == 2
     assert resp["instance_label"] == "default#2"
 
-    # PHASE 2.1a: the ``stop`` route DETACHES (termination moved to ``kill``),
-    # so the optimistic status.json vocabulary is "detached", not "completed".
+    # PHASE 2.1a: the ``stop`` route only DETACHES, and it does so by writing
+    # the fenced command alone -- it does not fabricate runtime state, so the
+    # seeded status.json is left exactly as it was.
     _assert_fenced_command(
         tmp_path / "workers" / "default#2",
         "stop",
@@ -267,7 +269,7 @@ def test_stop_worker_with_instance_id_targets_only_that_instance(tmp_path, monke
         epoch=11,
     )
     status = json.loads((tmp_path / "workers" / "default#2" / "status.json").read_text())
-    assert status["runtime_status"] == "detached"
+    assert status == {}
 
     t2.stop.assert_called_once()
     t1.stop.assert_not_called()
@@ -287,7 +289,7 @@ def test_pause_resume_bare_name_legacy_behavior(tmp_path, monkeypatch):
             ws_id="ws-1", name="default", request=_no_origin_request()
         )
     )
-    assert resp["status"] == "pausing"
+    assert resp["status"] == "accepted"
     assert resp["name"] == "default"
     assert "instance_id" not in resp
     assert "instance_label" not in resp
@@ -298,8 +300,9 @@ def test_pause_resume_bare_name_legacy_behavior(tmp_path, monkeypatch):
         worker_name="default",
         instance_id=1,
     )
-    status = json.loads((tmp_path / "workers" / "default" / "status.json").read_text())
-    assert status["runtime_status"] == "pausing"
+    # The route does not pre-stamp an optimistic "pausing" status: the worker
+    # owns its runtime status.
+    assert not (tmp_path / "workers" / "default" / "status.json").exists()
     t1.pause.assert_called_once()
 
     resp2 = asyncio.run(
@@ -345,7 +348,7 @@ def test_pause_with_instance_id_resolves_instance_dir(tmp_path, monkeypatch):
             ws_id="ws-1", name="default", instance_id=2, request=_no_origin_request()
         )
     )
-    assert resp["status"] == "pausing"
+    assert resp["status"] == "accepted"
     assert resp["name"] == "default"
     assert resp["instance_id"] == 2
     assert resp["instance_label"] == "default#2"
@@ -393,7 +396,7 @@ def test_real_thread_pause_resume_and_query_envelope(tmp_path, monkeypatch):
             ws_id="ws-1", name="w1", request=_no_origin_request()
         )
     )
-    assert resp["status"] == "pausing"
+    assert resp["status"] == "accepted"
     assert resp["name"] == "w1"
     # The route writes command.json synchronously (proven by the response
     # above; its content is covered deterministically by the fake-thread
@@ -685,20 +688,33 @@ def test_bridge_pause_reaches_every_worker_of_the_session():
     paused.pause.assert_called_once()
 
 
-def test_bridge_resume_resumes_only_paused_workers():
-    """bridge.resume() must only call thread.resume() on workers that are
-    actually paused (status == 'paused'); running/ready/error workers and
-    other sessions are left alone."""
+def test_bridge_resume_resumes_every_session_worker_and_leaves_foreign_ones_untouched(
+    monkeypatch,
+):
+    """bridge.resume() no longer filters on status: it asks EVERY worker of its
+    own session to resume (the worker itself decides whether there is anything
+    to release), never touches another session's workers, and a worker whose
+    ``resume()`` reports False (a stop already in flight) is not logged as a
+    resume that did not happen."""
+    logged = []
+    monkeypatch.setattr(
+        bridge_mod,
+        "log",
+        lambda level, category, message, *args, **kwargs: logged.append(message),
+    )
     paused_w = _fake_worker(status="paused")
     async_busy = _fake_worker(status="busy", query_id="job-1", reply_queue=None)
     ready = _fake_worker(status="ready")
     errored = _fake_worker(status="error")
+    refusing = _fake_worker(status="ready")
+    refusing.resume.return_value = False
     foreign_paused = _fake_worker(status="paused")
     threads = {
         (SESSION_T, "w1", 1): paused_w,
         (SESSION_T, "w1", 2): async_busy,
         (SESSION_T, "w2", 1): ready,
         (SESSION_T, "w3", 1): errored,
+        (SESSION_T, "w4", 1): refusing,
         ("other-session", "w9", 1): foreign_paused,
     }
     for key, t in threads.items():
@@ -713,11 +729,17 @@ def test_bridge_resume_resumes_only_paused_workers():
         except Exception:
             pass
 
+    # Every worker of THIS session is asked to resume, whatever its status.
     paused_w.resume.assert_called_once()
-    async_busy.resume.assert_not_called()
-    ready.resume.assert_not_called()
-    errored.resume.assert_not_called()
+    async_busy.resume.assert_called_once()
+    ready.resume.assert_called_once()
+    errored.resume.assert_called_once()
+    refusing.resume.assert_called_once()
+    # ... and no other session's worker is touched.
     foreign_paused.resume.assert_not_called()
+    # A refusal is reported as a refusal, never as a resume.
+    assert any("w4" in message and "refused to resume" in message for message in logged), logged
+    assert not any("Worker resumed: w4" in message for message in logged), logged
 
 
 # ── Label helpers ───────────────────────────────────────────────────────────
@@ -737,8 +759,8 @@ def test_instance_label_helpers():
 
 def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
     """stop_all_workers() stops every instance (legacy + session-scoped):
-    one per-worker result each, command.json/status.json written per
-    directory, and every matching in-memory thread fast-pathed.  A
+    one per-worker result each, a fenced command.json written per directory,
+    and every matching in-memory thread fast-pathed.  A
     session_id filter narrows the stop to that session only."""
     _use_tmp_workspace(monkeypatch, tmp_path)
     with workspace_routes._registry_lock:
@@ -778,9 +800,10 @@ def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
             worker_name=worker_name,
             instance_id=instance_id,
         )
-        status = json.loads((tmp_path / "workers" / sub / "status.json").read_text())
-        # PHASE 2.1a: stop_all detaches, so the optimistic vocabulary is "detached".
-        assert status["runtime_status"] == "detached"
+        # PHASE 2.1a: stop_all only detaches, and it does so via the command
+        # alone -- it does not fabricate runtime state, so the seeded
+        # status.json is left exactly as it was.
+        assert json.loads((tmp_path / "workers" / sub / "status.json").read_text()) == {}
     t1.stop.assert_called_once()
     t2.stop.assert_called_once()
     t3.stop.assert_called_once()

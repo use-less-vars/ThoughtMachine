@@ -178,6 +178,13 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const clearSessionDraft = useStore((s) => s.clearSessionDraft)
   const [localDraft, setLocalDraft] = useState(null)
   const draft = storeDraft ?? localDraft ?? getSafeDraft(config)
+  // Workspace precedence: the LIVE binding reported by session_loaded (null =
+  // explicitly unbound) wins when known; otherwise fall back to the config
+  // snapshot.  Never invent a path for an unbound session.
+  const liveWorkspacePath = useStore((s) => (sessionId ? s.sessionConfigs[sessionId]?.workspace_path : undefined))
+  const resolvedWorkspacePath = liveWorkspacePath !== undefined
+    ? liveWorkspacePath
+    : (draft.workspace_path || config?.workspace_path || null)
   const updateDraft = (next) => {
     if (sessionId) setSessionDraft(sessionId, next)
     else setLocalDraft(next)
@@ -669,7 +676,13 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     // save is never deferred behind the busy-queue ('Queued — applying…').
     const permissionsOnlyApply = Boolean(sessionPerms) && permsDirty && !isDirty && providerVersion === 0;
 
-    if (sessionId && sessionPerms) {
+    // Only a PENDING permission edit may write the session sidecar. A
+    // config-only Apply (temperature, max_turns, model, provider, ...) must
+    // never touch PUT /api/session/{id}/permissions: that write is what tells
+    // the live agent "Your permissions have been updated" (backend
+    // _notify_permissions_changed), so firing it on a config change reports a
+    // permission change that never happened.
+    if (sessionId && sessionPerms && permsDirty) {
       try {
         await putSessionPermissions(sessionPerms.raw ?? {})
       } catch (err) {
@@ -879,7 +892,6 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}>
               <strong>Workspace Path</strong>
-              <ConfigTierBadge field="workspace_path" tiers={configTiers} />
             </label>
             <div style={{
               marginTop: '0.3rem',
@@ -891,8 +903,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               fontFamily: 'monospace',
               wordBreak: 'break-all',
             }}>
-              {draft.workspace_path
-                ? draft.workspace_path
+              {resolvedWorkspacePath
+                ? resolvedWorkspacePath
                 : <span style={{ color: '#f38ba8', fontWeight: 'bold' }}>⚠️ No workspace — session is unbound. Set a workspace.</span>}
             </div>
           </div>
@@ -1388,7 +1400,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       {/* ── Container Tab ─────────────────────────────────────────────── */}
       {activeTab === 'container' && (
         <ContainerPanelContent
-          workspacePath={config?.workspace_path || ''}
+          workspacePath={resolvedWorkspacePath || ''}
           sendCommand={sendCommand}
           containerRebuildResult={containerRebuildResult}
           onClearRebuildResult={onClearRebuildResult}

@@ -6,63 +6,21 @@
  *
  * `ChatPanel` treats "the count is unchanged but the last message's text grew"
  * as an append (a streaming delta), so a reader parked at the bottom keeps
- * following the stream. That in-place-growth test looked at `content` only,
+ * following the stream. That in-place-growth case looked at `content` only,
  * while the thinking phase grows `reasoning_content` and leaves `content`
  * empty — so every reasoning frame looked like "nothing changed" and the effect
  * took its restore-scrollTop branch instead: the panel silently froze for the
  * whole reasoning phase and jumped only when the first answer chunk landed.
  *
- * jsdom performs no layout, so the container's scroll metrics are stubbed
- * (scrollHeight 1000 / clientHeight 300 / writable scrollTop) and rAF is
- * replaced by a 0ms timer to make the component's double-rAF deterministic.
+ * The cases themselves now live in the SHARED suite (scrollBehaviour.suite.jsx)
+ * so ChatPanel and WorkerOutputPanel are held to the same behaviour by the same
+ * code, and the reasoning-phase fixtures below are what ChatPanel feeds it.
  */
+import React from 'react'
+import ChatPanel from '../ChatPanel'
+import { registerScrollBehaviour } from './scrollBehaviour.suite.jsx'
 
-import React from 'react';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, cleanup, act } from '@testing-library/react';
-import '@testing-library/jest-dom/vitest';
-import ChatPanel from '../ChatPanel';
-
-const SCROLL_HEIGHT = 1000;
-const CLIENT_HEIGHT = 300;
-
-// jsdom lacks ResizeObserver; ChatPanel constructs one on mount.
-class MockResizeObserver {
-  constructor(callback) {
-    this.callback = callback;
-  }
-  observe() {}
-  unobserve() {}
-  disconnect() {}
-}
-
-/* Give the (layout-less) scroll container real-looking metrics. */
-function stubScrollMetrics(el) {
-  let scrollTop = 0;
-  Object.defineProperty(el, 'scrollHeight', { configurable: true, value: SCROLL_HEIGHT });
-  Object.defineProperty(el, 'clientHeight', { configurable: true, value: CLIENT_HEIGHT });
-  Object.defineProperty(el, 'scrollTop', {
-    configurable: true,
-    get: () => scrollTop,
-    set: (value) => {
-      scrollTop = value;
-    },
-  });
-  el.__getScrollTop = () => scrollTop;
-}
-
-/* Flush the component's nested requestAnimationFrame callbacks. */
-async function flushFrames() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  });
-}
-
-function panel() {
-  return document.querySelector('.chat-panel');
-}
-
-const USER = { role: 'user', content: 'why is the sky blue' };
+const USER = { role: 'user', content: 'why is the sky blue' }
 
 function assistant(reasoningContent) {
   return {
@@ -70,56 +28,26 @@ function assistant(reasoningContent) {
     content: '',
     reasoning_content: reasoningContent,
     is_streaming: true,
-  };
+  }
 }
 
-beforeEach(() => {
-  vi.stubGlobal('ResizeObserver', MockResizeObserver);
-  // Deterministic double-rAF: each frame is a 0ms macrotask.
-  vi.stubGlobal('requestAnimationFrame', (cb) => setTimeout(() => cb(0), 0));
-  vi.stubGlobal('cancelAnimationFrame', (id) => clearTimeout(id));
-});
+// Step 1 differs from step 0 ONLY by the reasoning text: same message count,
+// same empty `content`. The array identities are memoised because ChatPanel's
+// own append detector is keyed on the `messages` reference.
+const MESSAGES = [
+  [USER, assistant('step one')],
+  [USER, assistant('step one, step two')],
+]
 
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-  vi.restoreAllMocks();
-});
-
-describe('ChatPanel — auto-scroll during the reasoning phase', () => {
-  it('keeps the view pinned to the bottom while only reasoning_content grows', async () => {
-    const { rerender } = render(<ChatPanel messages={[USER, assistant('step one')]} />);
-    stubScrollMetrics(panel());
-
-    // Initial mount: the reader is at the bottom, so the panel pins itself there.
-    await flushFrames();
-    expect(panel().__getScrollTop()).toBe(SCROLL_HEIGHT);
-
-    // Same message count, same `content` (still empty) — only the reasoning
-    // text grew. This is an append in every way that matters to the reader.
-    rerender(<ChatPanel messages={[USER, assistant('step one, step two')]} />);
-    await flushFrames();
-
-    // Pre-fix this fell into the restore-scrollTop branch and reset to 0.
-    expect(panel().__getScrollTop()).toBe(SCROLL_HEIGHT);
-  });
-
-  it('still restores a scrolled-up reader position when only reasoning grows', async () => {
-    const { rerender } = render(<ChatPanel messages={[USER, assistant('step one')]} />);
-    const el = panel();
-    stubScrollMetrics(el);
-    await flushFrames();
-
-    // The user scrolls up to read earlier content.
-    act(() => {
-      el.scrollTop = 120;
-      el.dispatchEvent(new Event('scroll'));
-    });
-
-    rerender(<ChatPanel messages={[USER, assistant('step one, step two')]} />);
-    await flushFrames();
-
-    // Not pinned to the bottom, and not yanked back to the top either.
-    expect(el.__getScrollTop()).toBe(120);
-  });
-});
+registerScrollBehaviour({
+  name: 'ChatPanel',
+  element: (step) => <ChatPanel messages={MESSAGES[step]} />,
+  // memo(ChatPanel) shallow-compares: a fresh-but-equal array forces the
+  // post-stub commit the baseline measurement needs.
+  bumpElement: (step) => <ChatPanel messages={[...MESSAGES[step]]} />,
+  container: () => document.querySelector('.chat-panel'),
+  // Growth stays 0 on purpose: the panel-side reasoning detector is what these
+  // cases exist to protect, and a grown box would let the hook's per-commit
+  // glue hide a broken detector.
+  growthDelta: 0,
+})

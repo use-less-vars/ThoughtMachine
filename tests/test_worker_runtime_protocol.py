@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from tools.workspace.worker_runtime import (
+    DEFAULT_RUNTIME_MODE,
     MODE_PROCESS,
     MODE_THREAD,
     WORKER_RUNTIME_MODE_ENV,
@@ -834,8 +835,11 @@ def test_an_expected_fence_refuses_a_malformed_axis(worker, instance, epoch):
 # --------------------------------------------------------------------------
 
 
-def test_an_absent_flag_means_thread():
-    assert resolve_runtime_mode({}) == MODE_THREAD
+def test_an_absent_flag_means_the_default():
+    # Bound to the constant, never to a literal: what an unset flag resolves to
+    # IS :data:`DEFAULT_RUNTIME_MODE` by definition, so flipping the default
+    # (C62 did: ``thread`` -> ``process``) cannot silently invalidate this test.
+    assert resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE
 
 
 @pytest.mark.parametrize("value", [MODE_THREAD, MODE_PROCESS])
@@ -856,15 +860,20 @@ def test_anything_else_fails_closed(value):
 
 def test_the_default_reads_the_process_environment(monkeypatch):
     monkeypatch.delenv(WORKER_RUNTIME_MODE_ENV, raising=False)
+    # Unset -> the constant, whatever it is (never a hardcoded mode literal).
+    assert resolve_runtime_mode() == DEFAULT_RUNTIME_MODE
+    monkeypatch.setenv(WORKER_RUNTIME_MODE_ENV, MODE_THREAD)
     assert resolve_runtime_mode() == MODE_THREAD
     monkeypatch.setenv(WORKER_RUNTIME_MODE_ENV, MODE_PROCESS)
     assert resolve_runtime_mode() == MODE_PROCESS
 
 
 def test_the_flag_is_read_every_time_and_not_memoised():
-    assert resolve_runtime_mode({}) == MODE_THREAD
+    # The ORDER is the proof: alternating answers cannot come from a memoised
+    # resolver, and every value is still the one just asked for.
+    assert resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE
     assert resolve_runtime_mode({WORKER_RUNTIME_MODE_ENV: MODE_PROCESS}) == MODE_PROCESS
-    assert resolve_runtime_mode({}) == MODE_THREAD
+    assert resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE
 
 
 # --------------------------------------------------------------------------
@@ -897,7 +906,12 @@ class FakeWorker:
 
 def test_spawn_does_not_drive_the_worker():
     worker = FakeWorker()
-    handle = WorkerRuntimeHandle.spawn(worker, environ={})
+    # Thread mode pinned EXPLICITLY: this test asserts the seam does not drive
+    # the thread, so it must not depend on which mode the default picks (a
+    # process-mode handle would carry the call to a child instead).
+    handle = WorkerRuntimeHandle.spawn(
+        worker, environ={WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
+    )
     assert handle.mode == MODE_THREAD
     # Behaviour, not internals: the fake has no ``run``/``start``, so a handle
     # that tried to drive the thread itself (§3.3, D7) would have crashed.
@@ -910,7 +924,9 @@ def test_spawn_does_not_drive_the_worker():
 
 def test_dispatch_query_delegates_verbatim():
     worker = FakeWorker()
-    handle = WorkerRuntimeHandle.spawn(worker, environ={})
+    handle = WorkerRuntimeHandle.spawn(
+        worker, environ={WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
+    )
     assert handle.dispatch_query("hi") == "reply:hi"
     assert worker.calls == [("send_query", "hi", 120.0)]
     assert handle.dispatch_query("hey", timeout=5) == "reply:hey"
@@ -923,7 +939,12 @@ def test_cancel_accepted_when_busy():
     worker = FakeWorker()
     worker.status = "busy"
     worker._turn_cancel = threading.Event()
-    assert WorkerRuntimeHandle.spawn(worker, environ={}).cancel() == "accepted"
+    assert (
+        WorkerRuntimeHandle.spawn(
+            worker, environ={WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
+        ).cancel()
+        == "accepted"
+    )
     assert worker._turn_cancel.is_set() is True
     # Not a detach: parking the worker is ``stop``'s job, not ``cancel``'s.
     assert worker.calls == []
@@ -938,14 +959,23 @@ def test_cancel_refused_when_the_worker_is_terminal():
     worker = FakeWorker()
     worker.status = "killed"
     worker._turn_cancel = threading.Event()
-    assert WorkerRuntimeHandle.spawn(worker, environ={}).cancel() == "refused"
+    assert (
+        WorkerRuntimeHandle.spawn(
+            worker, environ={WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
+        ).cancel()
+        == "refused"
+    )
     assert worker._turn_cancel.is_set() is False
     assert worker.calls == []
 
 
 def test_state_mirrors_the_thread_in_the_worker_state_shape():
     worker = FakeWorker()
-    handle = WorkerRuntimeHandle.spawn(worker, environ={})
+    # Thread mode pinned explicitly: reading the thread's own attributes is the
+    # subject of this test, and process mode has no such attributes here.
+    handle = WorkerRuntimeHandle.spawn(
+        worker, environ={WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
+    )
     assert handle.state() == WorkerState(
         status="working",
         current_task="task-1",
@@ -974,7 +1004,8 @@ def test_spawn_reads_the_mode_from_the_process_environment(monkeypatch):
     finally:
         handle.close()
     monkeypatch.delenv(WORKER_RUNTIME_MODE_ENV)
-    assert WorkerRuntimeHandle.spawn(FakeWorker()).mode == MODE_THREAD
+    # Flag gone -> back to DEFAULT_RUNTIME_MODE (the constant, not a literal).
+    assert WorkerRuntimeHandle.spawn(FakeWorker()).mode == DEFAULT_RUNTIME_MODE
 
 
 def test_process_mode_is_accepted_in_s2():
@@ -1017,7 +1048,11 @@ def test_the_seam_holds_a_real_worker_thread_that_was_never_started(tmp_path):
         max_token_usage=None,
         max_runtime_s=None,
     )
-    handle = WorkerRuntimeHandle.spawn(worker, environ={})
+    # Thread mode pinned explicitly: this test observes the REAL thread the
+    # handle holds (its state, its liveness), which process mode cannot show.
+    handle = WorkerRuntimeHandle.spawn(
+        worker, environ={WORKER_RUNTIME_MODE_ENV: MODE_THREAD}
+    )
     assert worker.is_alive() is False
     assert handle.state() == WorkerState(
         status="ready",

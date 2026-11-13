@@ -37,9 +37,9 @@ child-side), where the stream actually is.
 
 Mode selection (§10, D11)
 -------------------------
-One flag, ``WORKER_RUNTIME_MODE`` ∈ ``{thread, process}``, default ``thread``
-through S4, read **at spawn time** so a single worker can be moved between
-modes without restarting the server (§10). The flag is therefore resolved on
+One flag, ``WORKER_RUNTIME_MODE`` ∈ ``{thread, process}``, default
+``process`` (:data:`DEFAULT_RUNTIME_MODE`, per C62), read **at
+spawn time** so a single worker can be moved between modes without restarting the server (§10). The flag is therefore resolved on
 every :meth:`WorkerRuntimeHandle.spawn` call and never cached at import time.
 
 Resolution fails closed: an unrecognised value is refused rather than
@@ -65,7 +65,7 @@ from tools.workspace.worker_runtime_protocol import Event, Heartbeat, WorkerStat
 #: The flag that selects the runtime mode (§10, D11).
 WORKER_RUNTIME_MODE_ENV = "WORKER_RUNTIME_MODE"
 
-#: Worker body runs in the supervisor's interpreter. The shipped default.
+#: Worker body runs in the supervisor's interpreter. Now opt-in only.
 MODE_THREAD = "thread"
 
 #: Worker body runs in its own OS process (S2: dispatch_query only).
@@ -73,6 +73,14 @@ MODE_PROCESS = "process"
 
 #: Exactly what the flag accepts. Nothing else is a mode.
 RUNTIME_MODES = (MODE_THREAD, MODE_PROCESS)
+
+#: What an ABSENT flag resolves to: ``process`` (C62). The production spawn
+#: site (``worker_thread._action_spawn``) leaves the mode unset, so a spawned
+#: worker is now served by a real child process; the child is started lazily
+#: by the handle at its first verb (``_ensure_process_runtime``).
+#: ``WORKER_RUNTIME_MODE=thread`` remains the explicit opt-in for the
+#: in-process body.
+DEFAULT_RUNTIME_MODE = MODE_PROCESS
 
 #: The worker statuses a cancel is REFUSED for (§5.4) -- and the single source
 #: of truth for cancel acceptability across BOTH modes.
@@ -306,20 +314,21 @@ def resolve_runtime_mode(environ: Optional[Mapping[str, str]] = None) -> str:
     affects the next spawn without a restart. ``environ`` is injectable so the
     resolution rule can be tested without mutating the process environment.
 
-    Absent -> ``thread``. Anything present that is not exactly
-    :data:`MODE_THREAD` or :data:`MODE_PROCESS` -> :class:`InvalidRuntimeModeError`
-    (fail closed: no trimming, no case folding, no empty-string-as-default).
+    Absent -> :data:`DEFAULT_RUNTIME_MODE` (``process``, per C62). Anything
+    present that is not exactly :data:`MODE_THREAD` or :data:`MODE_PROCESS` ->
+    :class:`InvalidRuntimeModeError` (fail closed: no trimming, no case folding,
+    no empty-string-as-default).
     """
     source: Mapping[str, str] = os.environ if environ is None else environ
     raw = source.get(WORKER_RUNTIME_MODE_ENV)
     if raw is None:
-        return MODE_THREAD
+        return DEFAULT_RUNTIME_MODE
     if raw in RUNTIME_MODES:
         return raw
     raise InvalidRuntimeModeError(
         f"{WORKER_RUNTIME_MODE_ENV}={raw!r} is not one of {RUNTIME_MODES}; "
         "refusing to guess a runtime mode (unset the variable to get the "
-        f"{MODE_THREAD!r} default)"
+        f"{DEFAULT_RUNTIME_MODE!r} default)"
     )
 
 
@@ -872,6 +881,53 @@ class WorkerRuntimeHandle:
             paused_manually=bool(worker._manual_only_pause),
         )
 
+    def substrate(self) -> Dict[str, Any]:
+        """What this handle is made of -- read-only, and never forks.
+
+        A self-check, not a control verb: it answers the six substrate
+        questions about a live worker WITHOUT driving it -- the mode the handle
+        was built in, whether a child runtime object exists, the child's pid,
+        whether that child is alive, this process's pid, and whether the child
+        turns out to be this very process (``same_process``).
+
+        Deliberately does NOT call :meth:`_ensure_process_runtime`: that forks
+        a child simply in order to describe one, and a self-check must never
+        change what it is measuring. A process-mode handle that has not been
+        dispatched into therefore reports ``child_exists=False`` -- the truthful
+        answer, not a missing one.
+
+        ``child_pid``, ``child_alive`` and ``same_process`` are ``None`` when
+        there is no child process to speak of (thread mode, always; process
+        mode, before the first dispatch): ``same_process`` is a comparison
+        against ``parent_pid``, and with no child there is nothing to compare.
+        """
+        parent_pid = os.getpid()
+        runtime = self._process_runtime
+        child_pid: Optional[int] = None
+        child_alive: Optional[bool] = None
+        if runtime is not None:
+            try:
+                child_pid = runtime.pid
+                child_alive = runtime.alive
+            except Exception as exc:  # noqa: BLE001 - a self-check never raises
+                _LOGGER.debug(
+                    "runtime substrate for (%r, %r) could not read the child "
+                    "process: %s; reporting it as unknown",
+                    self._session_id,
+                    self._worker_name,
+                    exc,
+                )
+                child_pid = None
+                child_alive = None
+        return {
+            "runtime_mode": self._mode,
+            "child_exists": runtime is not None,
+            "child_pid": child_pid,
+            "child_alive": child_alive,
+            "parent_pid": parent_pid,
+            "same_process": None if child_pid is None else child_pid == parent_pid,
+        }
+
     def on_frame(self, frame: Any) -> None:
         """Cache what the last frame told us about the worker (S4, D1).
 
@@ -1162,9 +1218,24 @@ class WorkerRuntimeHandle:
 
 
 def attach_thread_frame_sink(
-    worker: Any, *, mode: str = MODE_THREAD
+    worker: Any, *, mode: Optional[str] = None
 ) -> "WorkerRuntimeHandle":
     """Build a handle around *worker* and install its ``on_frame`` as the sink.
+
+    *mode* is resolved HERE when the caller does not name one: a call site that
+    omits ``mode=`` is asking for "the mode in force now", and that is
+    ``WORKER_RUNTIME_MODE`` -- not ``thread``. Resolving it on every call (never
+    memoised) is what makes §10's "read at spawn time" true for the production
+    spawn site (``worker_thread._action_spawn``) as well as for
+    :meth:`WorkerRuntimeHandle.spawn`, and it is fail closed for the same
+    reason: an unrecognised value raises :class:`InvalidRuntimeModeError` here,
+    before any worker starts, instead of silently running in-process. An
+    explicit ``mode=`` still wins, and with the flag unset the resolution is
+    :data:`DEFAULT_RUNTIME_MODE` -- ``process`` (C62): the production caller
+    passes no ``mode=``, so its worker is served by a real child process,
+    spawned lazily at the handle's first verb. Setting
+    ``WORKER_RUNTIME_MODE=thread`` (or passing ``mode=MODE_THREAD``) keeps the
+    in-process body.
 
     This is the S5 production construction site: the one place a real
     ``WorkerThread`` gets a :class:`WorkerRuntimeHandle` and the runtime ->
@@ -1192,7 +1263,8 @@ def attach_thread_frame_sink(
     needs, and nothing else has to remember to close a handle that owns no
     resource of its own in thread mode (``close`` is a no-op there).
     """
-    handle = WorkerRuntimeHandle(worker, mode=mode)
+    resolved_mode = resolve_runtime_mode() if mode is None else mode
+    handle = WorkerRuntimeHandle(worker, mode=resolved_mode)
     worker._frame_sink = handle.on_frame
     worker._runtime_handle = handle
     return handle

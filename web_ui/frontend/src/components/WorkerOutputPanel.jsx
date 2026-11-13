@@ -1,5 +1,6 @@
-import React, { memo, useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
+import React, { memo, useState, useEffect, useCallback, useRef } from 'react';
 import { MessageBubble } from './chat/MessageBubble';
+import { useStickToBottom } from '../hooks/useStickToBottom';
 import adaptWorkerEvent, { isWorkerEventRenderable, mergeToolMessages } from './chat/adaptWorkerEvent';
 
 const PANEL_MIN = 250;
@@ -578,91 +579,27 @@ function WorkerOutputPanel({
   const [events, setEvents] = useState([]);
   const [hasNewEvents, setHasNewEvents] = useState(false);
   const scrollRef = useRef(null);
-  const isAtBottomRef = useRef(true);
-  const programmaticScrollRef = useRef(false);
-  const prevCountRef = useRef(0);
   const eventsRef = useRef([]);
 
-  // ── Smart scroll ──────────────────────────────────────────────────────
-  // Track whether user is at bottom (suppressed during programmatic scroll)
-  const handleScroll = useCallback(() => {
-    if (programmaticScrollRef.current) {
-      // This scroll event was triggered by programmatic scroll;
-      // reset the guard and bail out.
-      programmaticScrollRef.current = false;
-      // Update isAtBottomRef so it reflects the user's actual scroll position
-      // even when this scroll event was triggered programmatically.
-      const el = scrollRef.current;
-      if (el) {
-        const threshold = 50;
-        isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
-        if (isAtBottomRef.current) setHasNewEvents(false);
-      }
-      return;
-    }
-    const el = scrollRef.current;
-    if (!el) return;
-    const threshold = 50;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
-    isAtBottomRef.current = atBottom;
-    if (atBottom) setHasNewEvents(false);
-  }, []);
-
-  // Auto-scroll on new events if user was at bottom.
-  // Use useLayoutEffect + double requestAnimationFrame to ensure DOM layout
-  // (async syntax highlighting) is fully settled before measuring scrollHeight.
-  // Only auto-scroll when event COUNT increases (append), not on array reference
-  // changes (e.g., during session restore or restructuring).
-  useLayoutEffect(() => {
-    const currentCount = events.length
-    const prevCount = prevCountRef.current
-    prevCountRef.current = currentCount
-
-    if (
-      !isAtBottomRef.current ||
-      !scrollRef.current ||
-      currentCount <= prevCount ||
-      currentCount === 0
-    ) {
-      return
-    }
-
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (scrollRef.current) {
-          programmaticScrollRef.current = true;
-          scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-        }
-      });
-    });
-  }, [events]);
-
-  // ResizeObserver — keep anchored at bottom during async expansion
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-
-    const observer = new ResizeObserver(() => {
-      if (isAtBottomRef.current && !programmaticScrollRef.current) {
-        if (el.scrollHeight - el.scrollTop - el.clientHeight > 1) {
-          programmaticScrollRef.current = true;
-          el.scrollTop = el.scrollHeight;
-        }
-      }
-    });
-
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-
-  const scrollToBottom = () => {
-    if (scrollRef.current) {
-      programmaticScrollRef.current = true;
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-    setHasNewEvents(false);
-    isAtBottomRef.current = true;
-  };
+  // ALL stick-to-bottom behaviour (at-bottom tracking, the programmatic-scroll
+  // guard, the ResizeObserver and the anchor restore used while the reader is
+  // scrolled up) comes from the shared hook — the same one ChatPanel uses, so
+  // the two panels cannot drift apart again.
+  //
+  // `enabled` mirrors the render gate below: while no worker is selected the
+  // component returns the "no selection" branch and the scroll div never
+  // exists, so the hook must detach instead of attaching to nothing.
+  const stick = useStickToBottom({
+    containerRef: scrollRef,
+    enabled: !!workerName,
+    // Keep the 50px window this panel always used (hook default is narrower) and
+    // match ChatPanel's AT_BOTTOM_THRESHOLD.
+    threshold: 50,
+    // Re-sourced badge clearing: the moment the view becomes pinned again the
+    // pending "new events" offer is pointless.  Nothing else clears it, and no
+    // scroll handler of our own sets it.
+    onPinnedChange: (isPinned) => { if (isPinned) setHasNewEvents(false) },
+  })
 
   // ── Stop handler (session-scoped control) ───────────────────────────────
   const handleStop = useCallback(async () => {
@@ -871,7 +808,7 @@ function WorkerOutputPanel({
         {/* ── Conversation stream ────────────────────────────────────── */}
         <div
           ref={scrollRef}
-          onScroll={handleScroll}
+          onScroll={stick.handleScroll}
           className="worker-output-scroll"
         >
           {events.length === 0 && (
@@ -932,14 +869,14 @@ function WorkerOutputPanel({
 
           {/* Floating "New events" button */}
           {hasNewEvents && (
-            <NewEventsButton onClick={scrollToBottom} />
+            <NewEventsButton onClick={() => stick.scrollToBottom(true)} />
           )}
 
           {/* Scroll navigation buttons */}
           <div className="worker-scroll-nav">
             <button
               className="scroll-bottom-btn"
-              onClick={scrollToBottom}
+              onClick={() => stick.scrollToBottom(true)}
               title="Scroll to bottom"
             >
               ↓

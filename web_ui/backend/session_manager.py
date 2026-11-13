@@ -608,7 +608,7 @@ class SessionManager:
         last_tool_call_name: Optional[str] = None
         pending_final_assistant = False
 
-        for msg in messages:
+        for msg_index, msg in enumerate(messages):
             role = msg.get("role", "")
             content = msg.get("content", "")
 
@@ -617,10 +617,19 @@ class SessionManager:
                 assistant_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
                 if assistant_msg.get("content") or msg.get("tool_calls"):
                     normalized.append(assistant_msg)
-                for tc in msg["tool_calls"]:
+                for tc_index, tc in enumerate(msg["tool_calls"]):
                     func = tc.get("function", {})
                     tool_name = func.get("name", "?")
                     args_str = func.get("arguments", "{}")
+                    # Call identity for this bubble: the provider id is
+                    # authoritative, otherwise a deterministic synthetic id
+                    # (never a false id) built from the stored position.
+                    _real_call_id = tc.get("id")
+                    tool_call_id = (
+                        _real_call_id
+                        if isinstance(_real_call_id, str) and _real_call_id
+                        else f"legacy:{msg_index}:{tc_index}:{tool_name}"
+                    )
                     try:
                         args_obj = json.loads(args_str)
                     except (json.JSONDecodeError, TypeError):
@@ -631,6 +640,7 @@ class SessionManager:
                             "name": tool_name,
                             "arguments": args_obj,
                         }),
+                        "tool_call_id": tool_call_id,
                         "is_final": False,
                         "is_system_notification": False,
                     })
@@ -650,6 +660,7 @@ class SessionManager:
                     normalized.append({
                         "role": "tool_call",
                         "content": json.dumps({"name": tool_name, "arguments": args_obj}),
+                        "tool_call_id": f"legacy:{msg_index}:0:{tool_name}",
                         "is_final": False,
                         "is_system_notification": False,
                     })
@@ -660,6 +671,16 @@ class SessionManager:
             if role == "tool":
                 new_msg = dict(msg)
                 new_msg["role"] = "tool_result"
+                # Propagate the call identity so the frontend can fold this
+                # result into the bubble its tool_call created.  A result with
+                # no id of its own gets a deterministic synthetic one so the
+                # field is always present (never a false pairing id).
+                _real_result_id = msg.get("tool_call_id")
+                new_msg["tool_call_id"] = (
+                    _real_result_id
+                    if isinstance(_real_result_id, str) and _real_result_id
+                    else f"legacy:result:{msg_index}"
+                )
                 if last_tool_call_name in ALL_RESPOND_NAMES:
                     new_msg["is_final"] = True
                     pending_final_assistant = True

@@ -173,6 +173,8 @@ class SandboxedExecution:
             # circular dependency.
             from security.security_gate import (
                 _ceiling_denial_note,
+                _denial_clause,
+                _is_refusal_grant,
                 _session_exceeds_ceiling_message,
             )
 
@@ -190,13 +192,17 @@ class SandboxedExecution:
                 )
                 if contradiction:
                     raise PermissionError(f"Permission denied: {contradiction}")
-            message = (
-                f"Permission denied: requires {required_category}, "
-                f"but session allows {category}:{allowed}"
+            # A refusal grant ("banned"/"none"/False) is never rendered as
+            # "session allows ...": the clause names the layer that actually
+            # denies the call (see ``security_gate._denial_clause``).
+            clause = _denial_clause(
+                category, allowed, self.session_permissions, note
             )
-            if note:
-                message += f" (workspace ceiling: {note})"
-            raise PermissionError(message)
+            if note and not _is_refusal_grant(allowed):
+                clause += f" (workspace ceiling: {note})"
+            raise PermissionError(
+                f"Permission denied: requires {required_category}, {clause}"
+            )
 
     def _reject_shell_metachars(self, command: List[str]) -> None:
         """Raise ``ValueError`` if any command string contains metacharacters."""

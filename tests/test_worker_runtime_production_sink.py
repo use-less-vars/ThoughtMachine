@@ -30,7 +30,7 @@ import tools.workspace.worker as worker_module
 import tools.workspace.worker_thread as worker_thread_module
 from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_runtime import (
-    MODE_THREAD,
+    MODE_PROCESS,
     WorkerRuntimeHandle,
     attach_thread_frame_sink,
 )
@@ -87,10 +87,11 @@ def test_attach_installs_the_handle_sink_on_the_worker():
     """S5-A: one handle, one sink, installed on the worker it describes."""
     worker = _fake_worker()
 
-    handle = attach_thread_frame_sink(worker)
+    handle = attach_thread_frame_sink(worker, mode=MODE_PROCESS)
 
     assert isinstance(handle, WorkerRuntimeHandle)
-    assert handle.mode == MODE_THREAD
+    # Explicit ``mode=``: the seam under test, independent of the default.
+    assert handle.mode == MODE_PROCESS
     assert callable(worker._frame_sink)
     # The SAME callable, not a copy: what the worker emits is what the handle
     # caches, which is the whole point of a single seam.
@@ -115,7 +116,7 @@ def test_attach_installs_the_handle_sink_on_the_worker():
 def test_heartbeat_tick_emits_a_heartbeat_frame_reaching_the_handle(tmp_path):
     """S5-A: the tick publishes to the bus AND emits a ``Heartbeat`` frame."""
     worker = _real_worker(tmp_path)
-    handle = attach_thread_frame_sink(worker)
+    handle = attach_thread_frame_sink(worker, mode=MODE_PROCESS)
     tap = _Tap(worker._frame_sink)
     worker._frame_sink = tap
 
@@ -159,7 +160,7 @@ def test_status_write_emits_worker_state_only_with_a_sink(tmp_path):
 
     # With the production sink: exactly one ``WorkerState``, field for field.
     live = _real_worker(tmp_path / "live")
-    handle = attach_thread_frame_sink(live)
+    handle = attach_thread_frame_sink(live, mode=MODE_PROCESS)
     tap = _Tap(live._frame_sink)
     live._frame_sink = tap
 

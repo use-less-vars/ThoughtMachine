@@ -41,17 +41,34 @@ class SessionRegistry:
                     cls._instance = cls()
         return cls._instance
 
+    def _quarantine(self, reason: str) -> None:
+        """Move an unusable registry file aside instead of silently losing it.
+
+        Never raises: a failed move is logged and the caller still proceeds
+        with an empty registry.
+        """
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = self._path.parent / "quarantine" / f"session_registry.corrupt-{stamp}.json"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(str(self._path), str(dest))
+            logger.error("Registry unusable (%s); moved aside to %s", reason, dest)
+        except OSError as exc:
+            logger.error(
+                "Registry unusable (%s); failed to move it to %s: %s", reason, dest, exc
+            )
+
     def _load(self) -> Dict[str, Any]:
         if not self._path.exists():
             return {}
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
-                logger.warning("Registry is not a dict; resetting.")
+                self._quarantine(f"payload is not a dict: {type(raw).__name__}")
                 return {}
             return raw
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to load registry: %s; resetting.", exc)
+            self._quarantine(f"failed to load registry: {exc}")
             return {}
 
     def _save(self, data: Dict[str, Any]) -> None:
@@ -137,6 +154,31 @@ class SessionRegistry:
                         self._read_session_file(f, ws_dir.name, registry)
 
         with self._file_lock:
+            # One snapshot of the persisted registry, reused by the guard below
+            # and by the is_open carry further down.
+            existing = self._load() if self._path.exists() else {}
+            # Refuse to overwrite a populated registry with an empty scan: a
+            # scan that finds nothing while the registry on disk still holds
+            # entries means the scan is broken (wrong HOME, unreadable dir,
+            # mid-migration layout), not that every session vanished.
+            if not registry and existing:
+                raise RuntimeError(
+                    f"Refusing to rebuild session registry: disk scan found 0 "
+                    f"sessions but the existing registry at {self._path} holds "
+                    f"{len(existing)} entries; rebuild aborted to avoid data loss."
+                )
+            # The disk scan hardcodes is_open=False and cannot know a session's
+            # workspace when the file itself does not record it, so carry both
+            # over from the registry we just replaced. Sessions the scan found
+            # that were not persisted before keep the scan defaults (closed).
+            if existing:
+                for sid, prior in existing.items():
+                    entry = registry.get(sid)
+                    if entry is None or not isinstance(prior, dict):
+                        continue
+                    entry["is_open"] = bool(prior.get("is_open", False))
+                    if not entry.get("workspace_id") and prior.get("workspace_id"):
+                        entry["workspace_id"] = prior["workspace_id"]
             self._save(registry)
         return len(registry)
 

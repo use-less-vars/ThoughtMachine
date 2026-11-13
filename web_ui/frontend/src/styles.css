@@ -1595,6 +1595,22 @@ body {
   color: var(--text-primary, #e0e0e0);
 }
 
+/* Host-shell DANGER badge: an ENABLED host_bash grant runs commands outside
+   the sandbox, so it reuses the Catppuccin danger colour used by the workspace
+   risk badge (WorkspaceSelector.css .ws-risk.high) and the delete button. */
+.session-header-host-bash-badge {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border-radius: 10px;
+  background: var(--danger, #f38ba8);
+  color: #1e1e2e;
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: help;
+}
+
 .session-header-spacer {
   flex: 1;
 }

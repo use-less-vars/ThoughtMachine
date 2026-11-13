@@ -528,3 +528,115 @@ Admission **refuses, it does not evict**: `infra/container_manager.py:1709-1719`
 1) **Sandbox verdict ≠ CI verdict — name the tests, run them by name.** A split/sharded run reporting "4522 + 299 passed" still missed the seeding invariant that CI caught. For every PR: `grep -rlnE '<the symbols you touched>|<the functions you touched>' --include='*.py' tests/ web_ui/backend/tests/`, then run those files EXPLICITLY (batches of ~5 per worker turn), and treat any `FAILED`/`ERROR` in a `.pytest-*.log` as CI's answer arriving early. Do not present shard counts as a suite verdict. Verify numbers from the log files (`grep -cE '^(FAILED|ERROR)'`, `tail -n 3`), never from a worker's summary table; and always re-run a "N skipped" batch with `-rs` — two "green" e2e files in PR 2 were pure `pytest.importorskip("playwright.sync_api")` no-ops with zero coverage.
 
 2) **Immutability-admits-one-exception is one-design + one-audited-call-site, enforced at review.** `Session.workspace_id` is immutable via `__setattr__` except through `Session.rebind_workspace()` (PR 2, commit `5b13ff9a`). The moment a second caller appears, the exception becomes the pattern and deny-by-default is gone. Its caller list is therefore a REVIEW invariant, not a comment: grep `rebind_workspace` on every PR that touches `session/` or `web_ui/backend/`, and refuse any new call site that is not the owning apply_config switch. Same test applies to any future "single escape hatch" API.
+
+## 2026-11-09 — Gen 61 TOOLING PROBLEMS (live, agent-observed — please fix o...
+
+Gen 61 TOOLING PROBLEMS (live, agent-observed — please fix or document):
+
+1. **Worker sandbox has NO Docker.** `docker` CLI absent (`shutil.which('docker') -> None`), `/var/run/docker.sock` absent, `docker` SDK 7.2.0 imports fine but `from_env().ping()` raises `DockerException ... FileNotFoundError(2)`. Consequence: any task requiring live container observation ("is the PID still there", "is the container still running") is IMPOSSIBLE from worker context and must be reported as inconclusive. For a project whose whole subject matter is container orchestration, that is a significant blind spot: workers can only test against fakes, never against the real daemon they are simulating.
+
+2. **Two interpreters, and the obvious one is broken for repo code.** `/workspace/.venv/bin/python` resolves to `/usr/bin/python3` (3.13.5) WITHOUT the project deps; repo code only runs under `/usr/local/bin/python3` (3.12.15) with `PYTHONPATH=/workspace/.venv/lib/python3.12/site-packages`. Symptom is `ModuleNotFoundError: pydantic` from a venv that appears to exist and be active. This burned a worker probe and will burn every new seat; either fix the venv shim or put the working invocation in `INFRA_ONBOARDING.md`.
+
+3. **DockerCodeRunner gives a FRESH EPHEMERAL CONTAINER per call.** `/tmp` writes and any filesystem state do NOT survive between tool calls. Any multi-step probe must be a single self-contained heredoc; a backup saved in one call is gone in the next. This silently breaks the standard mutate-test-restore workflow — the restore step must happen in the same call as the mutation, or identity must be proven by a recorded hash. Worth stating in the tool description rather than being discovered mid-mutation on a production file.
+
+4. **`ReadFile` truncates at 10000 tokens** on big files (`infra/container_manager.py`); workers must fall back to `sed -n` via DockerCodeRunner. Fine, but combined with the no-range-support in `show_file` it makes 3000-line files awkward.
+
+5. **`tail -40` of a `-v` pytest run is swallowed** by ~25 Pydantic/UserWarning blocks, so the per-test PASSED lines are invisible in exactly the window a brief tells the worker to paste. A `-p no:warnings` pass is needed to see test names — the brief should ask for that instead of `tail -40`.
+
+6. **`git_write` has no branch-delete.** An agent told to do branch hygiene can create and checkout a branch but cannot remove an abandoned one; it had to hand that back to the human. Minor, but it breaks "atomic cleanup" instructions.
+
+## 2026-11-09 — ## TESTING `tools/cancellation` — the STICKY FALLBACK trap (...
+
+## TESTING `tools/cancellation` — the STICKY FALLBACK trap (found live, Gen 61)
+
+`cancellation.is_interrupted()` can read `True` for reasons your test did not cause:
+
+- `bind_turn_cancel(event)` sets a **per-thread** binding (`tools/cancellation.py` is `threading.local`).
+- `interrupt(reason)` raises **whatever event is active**. If NOTHING is bound, that is a per-thread **FALLBACK event** — and it is **sticky**: `unbind()` does **not** clear it. Every later cancellation read on that same thread then returns `True` for the rest of the process.
+
+**Symptom it caused:** a new cancellation test poisoned a sibling. `tests/test_container_exec_interrupt.py::test_timeout_path_still_kills_and_drops` started failing with "DID NOT RAISE TimeoutError" *only when the new file ran first*, because the main thread entered the test already "cancelled".
+
+**Mandatory fixture for any test that raises a cancel token:**
+```python
+@pytest.fixture(autouse=True)
+def _clean_cancel_token():
+    cancellation.unbind()
+    cancellation.reset()      # clears the sticky fallback too — unbind() alone is NOT enough
+    yield
+    cancellation.unbind()
+    cancellation.reset()
+```
+And prefer raising the token you bound (`token.set()`) over `cancellation.interrupt()`; if you do call `interrupt()`, bind a real token FIRST so the fallback is never armed.
+
+**Existing files:** `tests/test_worker_thread_turn_cancel_binding.py` (C10) only ever calls `token.set()`, never `cancellation.interrupt()`, so it does not arm the fallback — but its fixture lacks `cancellation.reset()`, so it is *vulnerable* to an earlier test that does. Worth one line of hardening.
+`tests/test_docker_code_runner_cancel_cleanup.py` (C11) documents the trap in its fixture docstring and calls reset() on both sides.
+
+## 2026-11-09 — ## Worker sandbox — corrected tool facts (Gen 61, dispatch 3...
+
+## Worker sandbox — corrected tool facts (Gen 61, dispatch 3)
+
+Corrections to earlier notes, now tested live:
+
+- **`git_read` DOES work in the worker sandbox** (status/diff/ls_tree/cat_file, `execution_mode: containerized`). Only git *writes* are unavailable. Earlier guidance "workers have no git" was too strong — workers can be asked for `git status`/`git diff` as scope proof.
+- **Path roots differ per tool.** `FileEditor` resolves relative paths against the repo root `/home/jojo/PycharmProjects/ThoughtMachine-dev` and **rejects** absolute `/workspace/...`; `DockerCodeRunner` sees the same repo as `/workspace`. Do not hardcode either.
+- **`FilePreviewTool` `line_numbers` must be an ARRAY** — `[1540, 1600]`, not the string `"1540-1600"`.
+- **`DirectoryTreeTool` with `include_dirs=true` still lists only files.**
+- **`web_ui/frontend` has no `node_modules`** and there is no network, so vitest/vite cannot run. Frontend changes therefore ship **unverified by execution** — the only defence is checking every helper/import you use line-by-line against the existing test file. Say "NOT EXECUTED" explicitly rather than implying green.
+- **No Docker at all** in the worker sandbox (unchanged): no CLI, no socket, SDK ping `FileNotFoundError`. Any test needing a live container is unrunnable; report it as blocked, not as skipped.
+- Interpreter: `/workspace/.venv/bin/python` is broken (3.13.5, no deps). Use `PYTHONPATH=/workspace/.venv/lib/python3.12/site-packages /usr/local/bin/python3`, and always add `-p no:warnings`.
+
+## 2026-11-09 — ## Live tooling problems found by the agent while shipping C...
+
+## Live tooling problems found by the agent while shipping C11-prime (Gen 61, dispatch 5) — reproducible, each cost real time
+
+1. **`git_write` `branch_create` silently ignores any requested start point.** I passed `branch=fix/..., commit=8188a558` (the exact SHA I wanted) and the tool created the branch **at HEAD** (`a068dbe1`), answering: `Created branch 'fix/gen61-c11-prime-resource-cancel' at a068dbe1 (base: HEAD); working tree HEAD not moved`. No error, no hint that `commit`/`base` were dropped. Combined with item 2 there is then **no way to correct it** — the branch is permanently in the wrong place.
+   *Workaround used:* content transplant — read the accepted commit's diff with `git_read diff <base> <sha>`, hand the verbatim text to a worker, commit on the correct branch, then prove equivalence with `git_read diff <old-sha> <new-sha>` (only the unrelated docs delta showed up).
+
+2. **`git_write` has no branch-delete, no branch-move/rename, no cherry-pick, no rebase, no merge.** Operations are only: commit, init, clone, push, branch_create, checkout, stage, unstage, worktree_add/remove, stash_push/pop. Consequences: an agent cannot fix a mis-placed branch, cannot port a commit onto a new base (must re-apply the diff by hand, which is *worse* than cherry-pick for reviewability — the same change lands under a new SHA), and cannot tidy up the branch it abandoned. All of it goes back to the human.
+
+3. **`git_read diff` ignores untracked files.** `git_read diff commit1=<sha> file_path=<new file>` reports the file as *deleted* (`+++ /dev/null`, whole body with `-` prefixes) because a never-staged path is not in that tree. Reads like "the worker's new file is missing/destroyed" — a false alarm every time. Byte-equality for a NEW file can only be proven *after* committing it (`git_read diff <old> <new>` then shows nothing). A *modified* tracked file compares correctly, so a mixed new+modified change set gives a misleading asymmetry.
+
+4. **`Worker` `spawn` requires `worker_name` explicitly.** The tool description says "no `worker_name` needed; it defaults to the default worker", but omitting it fails with `{"error": "worker_name is required for action 'spawn'"}`. Pass `worker_name="default"`. Same for `action="query"`. Also: the success envelope still reports `"spawned": false` even though the worker ran to completion and returned a full result — the flag is meaningless, do not branch on it.
+
+5. **`tool_call_count` is useless as a flail signal.** Two well-behaved tasks this session reported 342 and 386 tool calls for ~100s and ~345s of work, both clean, no repeated work. Treat anything below ~400 as normal.
+
+6. **`/tmp` does not survive between worker tool calls** (fresh ephemeral container per call) — but a *single* self-contained shell call CAN write a backup to `/tmp`, mutate, test and restore within that one call. That is how the C11-prime mutation proof was done safely; conversely `cp backup.py /tmp/` in one call and `cp /tmp/backup.py back` in the next silently yields "No such file".
+
+7. **`KnowledgeBaseTool` append needs the payload in `entry` (and `mode` is mandatory)** — passing `content` returns `Error: entry parameter is required for append mode`; omitting `mode` returns a pydantic validation error listing the valid fields. The field names differ from every other tool's payload shape.
+
+## 2026-11-13 — ## Onboarding pipeline: the generator and the bundle builder...
+
+## Onboarding pipeline: the generator and the bundle builder are two different things
+
+Established by inspection while fixing the C61 prose (commit `14a4d605`, branch `docs/c61-defect-split`):
+
+- **`scripts/gen_handoff.py` writes the router** (`.thoughtmachine/knowledge/project/HANDOFF.md`). It shells out to `git` (via a local `sh()` → `subprocess.check_output`, line 86) for four inputs: repo root, `dev` sha, `dev` subject, and the five-commit `--oneline` block.
+- **`scripts/build_onboarding.sh` does NOT invoke the generator.** It is a pure *consumer*: `HANDOFF_FILE` (default `.thoughtmachine/knowledge/project/HANDOFF.md`) is parsed with `kb_entries` and concatenated into one bundle (`ONBOARDING_BUNDLE`, default `/tmp/onboarding_bundle.md`). So the correct order is **gen_handoff.py → build_onboarding.sh**. Any instruction of the form "rebuild the bundle to refresh HANDOFF.md" is wrong, and was wrong in a brief I received — two worker calls were lost to it.
+- **Git-less containers can still run the generator**, because every git-derived input has a documented CLI override: `--root`, `--dev-sha`, `--dev-subject`, `--recent-file`, plus `--stdout` for a dry run. Without them it dies at `root = pathlib.Path(sh("git", "rev-parse", "--show-toplevel"))` with `FileNotFoundError: [Errno 2] No such file or directory: 'git'` (line 258 → line 86).
+- **The right values to pass** are the ones already recorded in the committed `HANDOFF.md` (its header carries the dev sha/subject and the five-commit block). That keeps a prose edit a *one-hunk* diff instead of also moving the dev pointer.
+- **`tests/test_onboarding_bundle_contract.py::test_checked_in_handoff_matches_fresh_generation`** enforces that the checked-in router equals a fresh generation. On a host with `git` it regenerates by itself; in a git-less container it must be regenerated with the flags above or the test fails.
+- `--recent-file` must live under `/workspace/temp/`, **not `/tmp`** — `/tmp` does not survive between separate `DockerCodeRunner` calls, and the failure is a `FileNotFoundError` on a file you just wrote.
+- `DockerCodeRunner` wraps commands in `/bin/sh`, so bashisms (`${PIPESTATUS[0]}`, `[[ ]]`) produce `/bin/sh: 1: Bad substitution`. Capture `$?` directly instead.
+
+Sizes after the C61 split: HANDOFF.md 112 → 120 lines, 7,788 → 8,541 bytes (sha `f31954aa…`); onboarding bundle 203,175 → 203,928 bytes (+753).
+
+## 2026-11-13 — ## 2026-11-13 — C61 Defect 1: corrected map (supersedes seve...
+
+## 2026-11-13 — C61 Defect 1: corrected map (supersedes several earlier assumptions)
+
+Recon at `PRIORITIES.md:316-361` (not `:347-350`). **The fix is new capability, not wiring.** Five corrections to what I previously believed:
+
+1. **No absolute deadline object exists anywhere.** `thoughtmachine/timebudget.py` contains zero `time.monotonic()`/`time.time()` calls — `TimeBudget` (`:134-190`) is a *duration* (`requested/effective/cap/clamped/clamped_by/source`). There is nothing in the tree carrying "the instant this turn must be over", so "pass the deadline through" is not an available move.
+2. **The duration never reaches the kill.** `TimeBudget` stops at `worker_timeout.py:167` (`store_budget_on_thread` → `thread._time_budget`). `tools/docker_code_runner.py` and `infra/container_manager.py` are grep-clean for `budget`/`_time_budget` (the two `budget` hits in `container_manager.py:1075,2698` are *memory* prose). `agent/core/tool_executor.py` has no timeout logic at all. Duration lives in the worker thread; the only kill lives in the container manager; nothing joins them.
+3. **What actually governs a tool call today is the TOOL's own `timeout` field** — `docker_code_runner.py:141-144`, default 30, model-settable, passed straight through at `:457-462` to `manager.exec(..., timeout=self.timeout)`. So the measured 205.63 s run must have passed `timeout≈600` explicitly; a bare call would have died at 30 s. **The budget never enters the arithmetic.** Admission (`worker_thread.py:5588-5600` → `TimeBudget.resolve(..., strict=True)`) only decides whether to *start* the call.
+4. **The only timeout kill drops the container** — `container_manager.py:2633` (`_deadline = _wait_started + timeout`), `:2660` break, `:2662-2667` `container.kill()` **+ `self._drop_container(container_id)`** + `raise TimeoutError`. C61 criterion (3) "the container is still usable after the cancellation (a following `echo` succeeds)" is therefore contradicted by the sole kill path. The cancel path (`:2637-2647`) returns an `_interrupted_payload` (`:2619-2633`) instead of killing, but hardcodes `"stdout": ""`.
+5. **`cancelled_in_flight` does not exist in the codebase** — zero hits in `tools/ infra/ agent/ thoughtmachine/ web_ui/`. It exists only as a requirement in PRIORITIES. Same for `timeout_enforced`. And `timed_out = exit_code == -2` (`docker_code_runner.py:496`, `container_control.py:403`) is **unreachable dead code**: the manager raises `TimeoutError` and never returns `-2`.
+
+Also: `exec_run` returns **no handle** (`container_manager.py:2595-2597` documents this), so C61's "SIGTERM/SIGKILL the in-flight pid" needs a new channel (`exec_inspect` id capture, or a side `docker exec kill <pid>`).
+
+**Design options, ranked:** (A) clamp at the tool boundary — `min(self.timeout, remaining)` in `DockerCodeRunner.execute()` before `:457` + refuse at `remaining <= 0` reusing `TimeBudget.as_envelope_fields()`: one file, but the container still gets dropped. (B) add `deadline: float | None` to `container_manager.exec` (`:2506`) and `_deadline = min(_wait_started + timeout, deadline)` at `:2633`, splitting the kill branch so a *deadline* expiry kills the pid without dropping the container: reuses the existing 0.5 s slice (`:2590`) and the existing payload builder, unit-testable with a plain float. (C) extend `tools/cancellation.py` with `deadline_monotonic` next to its `threading.Event` (`:25-113`) and read it at `:2637`: covers turn-cancel and turn-deadline with one object, but `tools/cancellation.py` is imported by `tool_executor`/`container_manager`/worker paths — must not repeat the C12 sticky-fallback trap, `reset()`/`unbind()` must clear the deadline too.
+
+**Cheap red test (no 200 s sleep):** stub `client.containers.get` to a fake whose `exec_run` blocks 30 s and records `kill`/`_drop_container`; call `exec(..., timeout=30, deadline=time.monotonic()+0.3)`; assert it returns in ~1 s, `kill` called and `_drop_container` **not** called, elapsed `< 5`, and a second call with the same deadline is a no-op. For the envelope, patch `DockerCodeRunner.timeout = 1` and run `sleep 5`: ~7 s wall, and the "following `echo` still succeeds" assertion is a genuine red today because of `_drop_container` (`:2666`).
+
+**Note:** `+ QUERY_WAIT_GRACE_SECONDS` (`worker_timeout.py:99`) is *designed*, not accidental (module docstring `:5-6`: the caller must out-wait the worker's own envelope). PRIORITIES:340-341's "clamp the dispatch window" would delete that grace — do not do it before an in-flight kill exists.
+

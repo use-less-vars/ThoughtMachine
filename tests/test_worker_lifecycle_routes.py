@@ -136,9 +136,10 @@ def _fake_tool_loop(self, query):  # pragma: no cover - executed by the thread
 
 def test_kill_returns_200_and_writes_kill_artifacts(monkeypatch, tmp_path):
     """``POST .../kill`` is served at that exact URL with 200 and the
-    ``{"status": "ok", "name": ...}`` envelope, and it leaves the TERMINATING
-    artifacts on disk: command.json ``{"action": "kill"}`` plus the optimistic
-    ``runtime_status: "killed"`` status.json (not the detach pair)."""
+    ``{"status": "ok", "name": ...}`` envelope, and it leaves exactly ONE
+    artifact on disk: the fenced command.json ``{"action": "kill"}``.  The
+    route does not fabricate worker state -- no optimistic ``runtime_status``
+    status.json is pre-stamped; runtime status is the worker's own to report."""
     with _client(monkeypatch, tmp_path) as (client, ws_dir):
         worker_dir = _seed_worker_dir(ws_dir, "kw-kill")
         resp = client.post(_url("kw-kill", "kill"))
@@ -150,11 +151,8 @@ def test_kill_returns_200_and_writes_kill_artifacts(monkeypatch, tmp_path):
         worker_dir, "kill", session_id="", worker_name="kw-kill", instance_id=1
     )
 
-    status = _read_json(worker_dir / "status.json")
-    assert status["runtime_status"] == "killed"
-    assert status["current_task"] is None
-    assert status["error"] is None
-    assert isinstance(status["last_heartbeat"], str) and status["last_heartbeat"]
+    # Truth comes from the worker, not the route: nothing pre-stamped a status.
+    assert not (worker_dir / "status.json").exists()
 
 
 def test_kill_unknown_worker_returns_404(monkeypatch, tmp_path):
@@ -261,6 +259,85 @@ def test_resume_reports_refused_when_a_stop_is_in_flight(monkeypatch, tmp_path):
     assert dying.status == "detached"
 
 
+def test_resume_with_no_live_worker_is_not_reported_as_resumed(monkeypatch, tmp_path):
+    """A resume whose registry snapshot matches ZERO threads must NOT claim
+    "resumed" -- but it must not claim failure either.
+
+    The worker DIRECTORY exists (so the directory-not-found gate passes) but no
+    in-memory thread carries that name.  That is EXPECTED for a worker running
+    in another OS process: the resume travels over the fenced ``command.json``
+    channel (``tools/workspace/command_channel.py``, "for cross-process worker
+    control"), which that worker polls within ~2s, and the in-memory revive is
+    only a fast path.  So the route answers 200 ``queued`` -- delivery, honest
+    that nothing in this process revived -- never the ``resumed`` body that
+    would be byte-identical to a genuine revive, and never a 404 that would
+    report failure for an operation that legitimately succeeds.
+    """
+    with _client(monkeypatch, tmp_path) as (client, ws_dir):
+        worker_dir = _seed_worker_dir(ws_dir, "rw-nobody")
+
+        resp = client.post(_url("rw-nobody", "resume"))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert body["name"] == "rw-nobody"
+    # Distinguishable from a revive on every axis the caller can act on.
+    assert body["status"] != "resumed"
+    assert body["resumed_command_written"] is True
+    assert body["in_process"] is False
+    assert body != {"status": "resumed", "name": "rw-nobody"}
+
+    # The command file really was written -- that write is what the
+    # cross-process worker polls.
+    _assert_fenced_command(
+        worker_dir, "resume", session_id="", worker_name="rw-nobody", instance_id=1
+    )
+
+
+def test_resume_of_a_nonexistent_instance_is_not_reported_as_resumed(
+    monkeypatch, tmp_path
+):
+    """Instance targeting: a live instance 1 does not make instance 2 present.
+
+    ``instance_id=2`` filters the snapshot down to zero threads, so the request
+    is queued for cross-process delivery to instance 2 -- 200 ``queued``, never
+    ``resumed`` -- and the live instance 1 is left untouched."""
+    monkeypatch.setattr(WorkerThread, "_run_tool_loop", _fake_tool_loop)
+
+    with _client(monkeypatch, tmp_path) as (client, ws_dir):
+        _seed_worker_dir(ws_dir, "rw-one")
+        instance_two_dir = _seed_worker_dir(ws_dir, "rw-one#2")
+        thread = _spawn_worker(
+            tmp_path / "live-one",
+            monkeypatch,
+            name="rw-one",
+            session_id="sess-life",
+        )
+        thread.stop()
+        assert thread.status == "detached"
+
+        resp = client.post(_url("rw-one", "resume") + "?instance_id=2")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert body["status"] != "resumed"
+    assert body["resumed_command_written"] is True
+    assert body["in_process"] is False
+    assert body["instance_id"] == 2
+    assert body["instance_label"] == "rw-one#2"
+
+    # The command is fenced for the instance that was actually targeted ...
+    _assert_fenced_command(
+        instance_two_dir, "resume", session_id="", worker_name="rw-one", instance_id=2
+    )
+    # ... and the instance that DOES exist was not revived by a request for
+    # another one.
+    assert thread.status == "detached"
+    assert thread._detach_requested is True
+
+
 def test_resume_unknown_worker_returns_404(monkeypatch, tmp_path):
     """Same 404 contract as kill/stop: unknown worker name, HTTP 404, detail
     names the worker."""
@@ -277,9 +354,10 @@ def test_resume_unknown_worker_returns_404(monkeypatch, tmp_path):
 
 def test_stop_and_kill_are_distinguishable_over_http(monkeypatch, tmp_path):
     """The two verbs share a success envelope but are NOT interchangeable over
-    HTTP: ``stop`` writes command.json ``{"action": "stop"}`` with the
-    optimistic ``runtime_status: "detached"``, ``kill`` writes
-    ``{"action": "kill"}`` with ``"killed"``."""
+    HTTP: they land DIFFERENT ``command.json`` actions -- ``{"action": "stop"}``
+    vs ``{"action": "kill"}`` -- each with a complete fence.  That action is the
+    only difference the route boundary is responsible for; runtime status is the
+    worker's own to report, so neither verb pre-stamps a ``status.json``."""
     with _client(monkeypatch, tmp_path) as (client, ws_dir):
         stop_dir = _seed_worker_dir(ws_dir, "vw-stop")
         kill_dir = _seed_worker_dir(ws_dir, "vw-kill")
@@ -300,9 +378,6 @@ def test_stop_and_kill_are_distinguishable_over_http(monkeypatch, tmp_path):
     )
     # The two verbs stay distinguishable on disk, fence and all.
     assert _read_json(stop_dir / "command.json") != _read_json(kill_dir / "command.json")
-
-    assert _read_json(stop_dir / "status.json")["runtime_status"] == "detached"
-    assert _read_json(kill_dir / "status.json")["runtime_status"] == "killed"
 
 
 # ── the command fence helpers ────────────────────────────────────────────────

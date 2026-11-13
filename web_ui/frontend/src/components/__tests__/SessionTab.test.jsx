@@ -1089,3 +1089,89 @@ describe('SessionTab — reasoning_delta streaming', () => {
   });
 });
 
+// ────────────────────────────────────────────────────────────────────────────
+// Host-shell danger badge
+// An ENABLED host_bash grant runs commands on the HOST, outside the sandbox, so
+// the session header must never render it as just another permission: it
+// carries a danger badge for 'allow' (and the boolean true) only, and drops it
+// the moment the grant is revoked. Levels rank banned < ask < allow (mirrors
+// data/permissionVocab.js SESSION_RESOURCE_VOCAB.host_bash).
+// NOTE: added but NOT executed in the change that introduced the badge — this
+// checkout has no node_modules, so vitest could not be run.
+// ────────────────────────────────────────────────────────────────────────────
+describe('SessionTab — host_bash danger badge', () => {
+  const badge = () => document.querySelector('.session-header-host-bash-badge');
+
+  // Load sess-1 exactly like the server does on load_session: session_loaded
+  // first (it carries NO top-level permissions), then config_changed with the
+  // gate-resolved effective dict (config_manager.resolve_effective_permissions),
+  // which is what the store saves as sessionConfigs[id].permissions.
+  async function loadWithHostBash(hostBash) {
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-1',
+        session_name: 'S1',
+        config: { mode: 'custom' },
+      })
+    );
+    act(() =>
+      ws.receive({
+        type: 'config_changed',
+        session_id: 'sess-1',
+        config: { mode: 'custom' },
+        permissions: { container: false, filesystem: 'read', git: 'read', host_bash: hostBash },
+      })
+    );
+    await waitFor(() => {
+      expect(useStore.getState().sessionConfigs['sess-1']?.permissions?.host_bash).toBe(hostBash);
+    });
+    return ws;
+  }
+
+  it("flags an 'allow' grant as dangerous and drops the badge when it is revoked", async () => {
+    renderTab({ sessionId: 'sess-1' });
+    const ws = await loadWithHostBash('banned');
+    // The non-renaming header branch (the one that hosts the badge) is rendered,
+    // so the absence asserted here is a real "not flagged", not "nothing rendered".
+    expect(document.querySelector('.session-header-rename-btn')).not.toBeNull();
+    expect(badge()).toBeNull();
+
+    // The session grants itself host-shell access → the header flags it.
+    act(() =>
+      ws.receive({
+        type: 'config_changed',
+        session_id: 'sess-1',
+        config: { mode: 'custom', session_permissions: { host_bash: 'allow' } },
+        permissions: { host_bash: 'allow' },
+      })
+    );
+    await waitFor(() => {
+      expect(badge()).not.toBeNull();
+    });
+    expect(badge().textContent).toContain('host_bash');
+    // The danger is explained, not merely coloured.
+    expect(badge().getAttribute('title')).toMatch(/outside the sandbox/i);
+
+    // Revoking the grant removes the badge again.
+    act(() =>
+      ws.receive({
+        type: 'config_changed',
+        session_id: 'sess-1',
+        config: { mode: 'custom', session_permissions: { host_bash: 'banned' } },
+        permissions: { host_bash: 'banned' },
+      })
+    );
+    await waitFor(() => {
+      expect(badge()).toBeNull();
+    });
+  });
+
+  it("does not flag 'ask' — approval-gated access is not an open grant", async () => {
+    renderTab({ sessionId: 'sess-1' });
+    await loadWithHostBash('ask');
+    expect(document.querySelector('.session-header-rename-btn')).not.toBeNull();
+    expect(badge()).toBeNull();
+  });
+});

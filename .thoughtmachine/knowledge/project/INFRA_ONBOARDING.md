@@ -160,3 +160,22 @@ the matching section. The 4 largest (`personal/task_tracker.md`, `personal/lesso
   strand's provenance is unclear.
 - **`parking_lot.md`** (~150 KB) · Deferred ideas. Read before treating a
   "new" idea as new.
+
+---
+
+# THE FOUR THINGS (Read before touching code)
+
+**1. Container Types.**
+* **Ephemeral:** Fresh container per `exec` call. Destroyed after. `/tmp` does not persist.
+* **Persistent:** Workspace-level. Survives across exec calls.
+* **Resource:** Sidecars (e.g., Postgres, Redis). Long-lived, network-addressable.
+
+**2. Security vs. Trust Boundary.**
+* **Security Boundary:** "Can the agent reach the host?" (Bypassing Docker). This is the catastrophic failure mode (rogue agent, poisoned prompt). It is guarded by the `host_bash` kill switch and the Host Port. If `host_bash` is off, the blast radius is contained to Docker.
+* **Trust Boundary:** "Is the agent doing what the user allowed?" (e.g., writing files when the user set "read-only", or escaping the workspace directory). Failing closed here is a *success* of the permission system, not a security breach. 
+
+**3. The Threat Model.**
+Assume the agent is compromised (poisoned website, malicious prompt). It will try to exfiltrate secrets (vault, `.env`) or execute arbitrary code on the host. The engine's job is to make that impossible without an explicit operator override (the danger badge).
+
+**4. Red Teaming is Infrastructure.**
+Do not wait for a bug report. Periodically attack the boundary (DNS rebinding, SSRF, symlink escapes). The `test_isolation_boundary_e2e.py` suite is the automated version of this.

@@ -57,6 +57,25 @@ class RecordingFake:
         self.events.append(evt)
 
 
+class FakeMonotonic:
+    """Controllable stand-in for ``time.monotonic``.
+
+    Returns ONE explicit value for every call and never advances on its own.
+    Unlike ``mock.patch(..., side_effect=[...])``, which hands out one value per
+    call and raises StopIteration past the end, this is immune to extra clock
+    reads -- from the call under test, from a logging statement, or from a
+    worker thread leaked by another test module in the same session (the patch
+    target ``tools.workspace.worker.time`` IS the global ``time`` module, so the
+    patch is process-wide).
+    """
+
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
 class _RunSafetyPatches(unittest.TestCase):
     """Patches event plumbing; global bus is a RecordingFake."""
 
@@ -88,10 +107,11 @@ class TestIdleHeartbeat(_RunSafetyPatches):
             thread._last_heartbeat_monotonic = 0.0
             # Call 1: now=0.0 -> 0.0-0.0 < 30, no fire (throttle).
             # Call 2: now=31.0 -> 31.0-0.0 >= 30, fires.
-            with mock.patch("tools.workspace.worker.time.monotonic",
-                            side_effect=[0.0, 31.0]):
-                thread._heartbeat_tick()
-                thread._heartbeat_tick()
+            clock = FakeMonotonic(0.0)
+            with mock.patch("tools.workspace.worker.time.monotonic", clock):
+                thread._heartbeat_tick()      # now=0.0 -> throttled
+                clock.now = 31.0
+                thread._heartbeat_tick()      # now=31.0 -> fires
             hb_events = self.heartbeat_events()
             self.assertEqual(len(hb_events), 1)
             # In-memory heartbeat updated by the firing tick.
@@ -103,19 +123,20 @@ class TestIdleHeartbeat(_RunSafetyPatches):
             thread._last_heartbeat_monotonic = 0.0
             # Call 1: now=31.0 -> fires (sets monotonic to 31.0).
             # Call 2: now=32.0 -> 32.0-31.0 < 30, suppressed.
-            with mock.patch("tools.workspace.worker.time.monotonic",
-                            side_effect=[31.0, 32.0]):
-                thread._heartbeat_tick()
-                thread._heartbeat_tick()
+            clock = FakeMonotonic(31.0)
+            with mock.patch("tools.workspace.worker.time.monotonic", clock):
+                thread._heartbeat_tick()      # now=31.0 -> fires, stamps 31.0
+                clock.now = 32.0
+                thread._heartbeat_tick()      # now=32.0 -> suppressed
             self.assertEqual(len(self.heartbeat_events()), 1)
 
     def test_heartbeat_payload_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
             thread = make_thread(tmp, name="w-hb3")
             thread._last_heartbeat_monotonic = 0.0
-            with mock.patch("tools.workspace.worker.time.monotonic",
-                            side_effect=[31.0]):
-                thread._heartbeat_tick()
+            clock = FakeMonotonic(31.0)
+            with mock.patch("tools.workspace.worker.time.monotonic", clock):
+                thread._heartbeat_tick()      # now=31.0 -> fires
             # Select THIS test's own worker by name.  A heartbeat published
             # into the (patched) global bus by a worker thread leaked from
             # another test module in the same session can arrive first, and it
@@ -146,9 +167,17 @@ class TestPausedHeartbeat(_RunSafetyPatches):
             thread._last_heartbeat_monotonic = 0.0
             thread._park_event.set()
             thread.status = "paused"
-            with mock.patch("tools.workspace.worker.time.monotonic",
-                            side_effect=[31.0]):
-                thread._heartbeat_tick()
-            hb_events = self.heartbeat_events()
+            clock = FakeMonotonic(31.0)
+            with mock.patch("tools.workspace.worker.time.monotonic", clock):
+                thread._heartbeat_tick()      # now=31.0 -> fires
+            # Select THIS test's own worker by name, as in
+            # test_heartbeat_payload_shape (lines 119-127): a heartbeat published
+            # into the (patched) global bus by a worker thread leaked from
+            # another test module in the same session can arrive first, and it
+            # is not the payload under test.
+            hb_events = [
+                e for e in self.heartbeat_events()
+                if e.data.get("worker_name") == "w-hb-p"
+            ]
             self.assertEqual(len(hb_events), 1)
             self.assertEqual(hb_events[0].data["status"], "paused")

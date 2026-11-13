@@ -13,7 +13,13 @@ import queue
 import threading
 from datetime import datetime
 from typing import Optional
-from agent.events import EventBus, BaseEvent, EventType, global_event_bus
+from agent.events import (
+    EventBus,
+    BaseEvent,
+    EventType,
+    STREAM_ONLY_EVENT_TYPES,
+    global_event_bus,
+)
 from agent.logging.redaction import redact
 from agent._log_root import get_log_root
 
@@ -90,15 +96,29 @@ class EventLogger:
                 self._file = None
 
     def subscribe_all(self, bus: EventBus, prefix: str = "") -> None:
-        """Subscribe to ALL event types on the given bus."""
+        """Subscribe to every PERSISTED event type on the given bus.
+
+        Stream-only deltas (``agent.events.STREAM_ONLY_EVENT_TYPES``) are
+        skipped on purpose: they fire once per LLM chunk and are transport,
+        not history -- persisting them gives one JSONL line per streamed token
+        and pushes the real audit trail out of the 5 MB rotation window.
+        """
         for event_type in EventType:
+            if event_type in STREAM_ONLY_EVENT_TYPES:
+                continue
             bus.subscribe(event_type, self._on_event)
             self._subscriptions.append((bus, event_type))
 
     def attach_worker_bus(self, name: str, bus: EventBus) -> None:
-        """Attach and subscribe to a per-worker event bus."""
+        """Attach and subscribe to a per-worker event bus.
+
+        Same stream-only exclusion as :meth:`subscribe_all`: worker-bus deltas
+        reach this logger's single ``event_log.jsonl`` too.
+        """
         self._worker_buses[name] = bus
         for event_type in EventType:
+            if event_type in STREAM_ONLY_EVENT_TYPES:
+                continue
             bus.subscribe(event_type, self._on_event)
             self._subscriptions.append((bus, event_type))
 

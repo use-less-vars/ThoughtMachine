@@ -5,7 +5,27 @@ from dataclasses import dataclass, field
 import typing
 from agent import events as ev
 from agent.logging import log
-from thoughtmachine.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
+from thoughtmachine.timeout_constants import (
+    SOFT_BUDGET_FALLBACK_SECONDS,
+    TIMEOUT_WRITE_ESCAPE_TOOLS,
+)
+
+
+def describe_allowed_tools(allowed: List[str]) -> str:
+    """Render an allow-list as the sentence shown to the model.
+
+    The ONE place tool names are turned into prose. Every restriction warning
+    must go through here (and hand it ``get_allowed_tools()``), so the message
+    can never contradict the gate that actually refuses the call -- the
+    divergence bug this replaced hardcoded "Only the Respond tool is
+    available" and kept saying it long after the allow-list had changed.
+    """
+    if not allowed:
+        return 'No tools are available.'
+    if len(allowed) == 1:
+        return f'Only the {allowed[0]} tool is available.'
+    return f'Only the following tools are available: {", ".join(allowed)}.'
+
 
 class TokenState(enum.Enum):
     """Token usage state based on conversation token count."""
@@ -23,6 +43,8 @@ class ExecutionState(enum.Enum):
     """Unified execution state for agent and GUI."""
     RUNNING = 'running'
     PAUSING = 'pausing'
+    PAUSED = 'paused'
+    STOPPED = 'stopped'
     READY = 'ready'
 
 class TimeState(enum.Enum):
@@ -215,20 +237,25 @@ class AgentState:
                     f'Tool restrictions will be applied when the timeout is reached.'
                 )
             else:
+                # Set the restriction BEFORE composing the sentence, then
+                # DERIVE the sentence from get_allowed_tools(): the prose and
+                # the gate that refuses the call are then the same decision,
+                # so they cannot drift apart (no second hardcoded tool list).
+                self.restrictions_active = True
+                self.restrictions_pending = False
+                self.restriction_reason = 'timeout'
                 warning = (
                     f'**Time critical**: Agent has exceeded the timeout '
                     f'({timeout}s). Tool restrictions are now active. '
-                    f'Only the Respond tool is available. Please finish your work '
-                    f'and respond immediately.'
+                    f'{describe_allowed_tools(self.get_allowed_tools())} '
+                    f'Please finish your work and respond immediately.'
                 )
             self.last_time_warning = warning
             self.last_time_warning_count = int(elapsed_seconds)
             self.last_time_warning_state = new_state
 
-            if new_state == TimeState.CRITICAL:
-                self.restrictions_active = True
-                self.restrictions_pending = False
-                self.restriction_reason = 'timeout'
+            # The 'timeout' restriction itself was set just above, before the
+            # warning sentence was derived from it (single mutation site).
 
             if self.logger:
                 self.logger.log_time_warning(old_state.value, new_state.value, elapsed_seconds, warning)
@@ -416,6 +443,15 @@ class AgentState:
         self.restrictions_active = True
         self.restrictions_pending = False
         self.restriction_reason = reason
+        # Control-plane instrumentation (Gen 61 dispatch 13). Diagnostic only:
+        # logged so the mutation site's state identity can be compared with the
+        # identity seen by ToolExecutor's dispatch gate. Removed once the
+        # propagation question is answered. AgentState carries no session id;
+        # the join key is the id() stamped here.
+        log('INFO', '[CONTROL_PLANE_STATE]',
+            f'event=restriction-set reason={reason} state_id={id(self)} '
+            f'restrictions_active={self.restrictions_active} '
+            f'restriction_reason={self.restriction_reason}')
         return not already
 
     def clear_restriction(self, reason: Optional[str] = None) -> bool:
@@ -454,11 +490,22 @@ class AgentState:
         is True the allow-list is chosen strictly by restriction_reason:
 
         - 'turn': Only Respond is allowed (agent must finish immediately).
-        - 'timeout': Only Respond is allowed (agent exceeded runtime limit).
+        - 'timeout': Respond + SummarizeTool + TIMEOUT_WRITE_ESCAPE_TOOLS.
+          The timeout restriction is RESOURCE MANAGEMENT, not salvage: the
+          agent must yield and compact, so no read tool is granted (read
+          access would let it keep investigating). The single WRITE-only
+          escape hatch lets it dump verbatim working memory to disk first, so
+          the detail survives the summary.
         - 'pause': Only Respond is allowed (externally paused; wait it out).
         - 'token': Respond + SummarizeTool allowed (SummarizeTool needed to
           reduce context).
         - anything else (unknown, None, empty string): Only Respond.
+
+        Display-only: enforcement happens in ``is_tool_allowed()``, which
+        computes the same decision inline. The two MUST agree -- the
+        tool-rejection prose in ``agent/core/tool_executor.py`` renders the
+        ``Available tools:`` list directly from this method, so it has to name
+        the read-only set now that those tools are actually permitted.
 
         The final branch is a fail-safe: an unattributable reason must never
         grant a broader allow-list than the narrowest one, otherwise a
@@ -469,13 +516,42 @@ class AgentState:
         reason = getattr(self, 'restriction_reason', None)
         if reason == 'token':
             return ['Respond', 'SummarizeTool']
-        # 'timeout', 'turn', 'pause' and every unrecognised reason: fail safe
-        # to Respond-only rather than assuming the token allow-list.
+        if reason == 'timeout':
+            # Write-only escape hatch: dump the detail, then yield. Nothing
+            # here can be used to continue the investigation.
+            return ['Respond', 'SummarizeTool'] + sorted(TIMEOUT_WRITE_ESCAPE_TOOLS)
+        # 'turn', 'pause' and every unrecognised reason: fail safe to
+        # Respond-only rather than assuming the token allow-list.
         return ['Respond']
 
     def is_tool_allowed(self, tool_name: str) -> bool:
-        """Check if a specific tool is allowed in current state."""
-        allowed = self.get_allowed_tools()
-        if not allowed:
+        """Check if a specific tool is allowed in current state.
+
+        Fail-closed by construction (docs/CONTROL_PLANE.md 6.3 Option B):
+        the decision is computed here, inline, from `restrictions_active`
+        and `restriction_reason` -- never from an empty allow-list.
+        `get_allowed_tools()` remains display-only.
+
+        A missing `restrictions_active` attribute is treated as RESTRICTED
+        (Respond-only), not as unrestricted. The prior implementation read
+        `getattr(..., False)` through `get_allowed_tools()` and then treated
+        `[]` as "allow everything", so any object without the attribute --
+        an older pickled state, a stub, a state-class refactor, a mock --
+        silently became a fully-armed agent.
+        """
+        if not getattr(self, 'restrictions_active', True):
             return True
-        return tool_name in allowed
+        reason = getattr(self, 'restriction_reason', None)
+        if reason == 'token':
+            return tool_name in ('Respond', 'SummarizeTool')
+        if reason == 'timeout':
+            # Must agree EXACTLY with get_allowed_tools() for 'timeout' --
+            # same literal, same escape-hatch constant, same order.
+            return tool_name in (
+                ('Respond', 'SummarizeTool')
+                + tuple(sorted(TIMEOUT_WRITE_ESCAPE_TOOLS))
+            )
+        # 'turn', 'pause' and every unrecognised reason (including a missing
+        # `restriction_reason`): fail safe to Respond-only rather than assuming
+        # the token allow-list.
+        return tool_name == 'Respond'
