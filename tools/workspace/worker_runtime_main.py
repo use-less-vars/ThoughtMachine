@@ -330,8 +330,9 @@ def worker_runtime_main(
         worker._frame_sink = outbox.put
         _subscribe_child_events(worker, outbox)
         # C3-3: the child RUNS the epoch it was handed, or it does not run at
-        # all. Verified against the sidecar the supervisor's allocation wrote,
-        # not merely assumed: below this line the fence is law.
+        # all. Verified against the sidecar the supervisor's allocation wrote --
+        # as a floor (a higher recorded generation is a legitimate respawn from
+        # a stale spec), not merely assumed: below this line the fence is law.
         _verify_handed_epoch(worker, epoch)
         worker.start()
         outbox.put(
@@ -794,10 +795,13 @@ def _verify_handed_epoch(worker: Any, epoch: int) -> None:
       epoch + 1 and every fenced command would be refused; and
     * ``worker_dir/generation``, the sidecar ``_allocate_generation`` writes
       (``worker_thread.py:4748``) and the number every other part of the fence
-      logic compares against. A recorded value that disagrees with the spec
-      means this spec was built for a different incarnation (a force-spawn that
-      overtook this child), so the child refuses to run rather than thrash a
-      fence nobody owns.
+      logic compares against. INVARIANT: that sidecar is a FLOOR, not an
+      equality. The adoption protocol deliberately re-spawns from a STALE spec
+      epoch, so a legitimate new incarnation runs at a generation HIGHER than
+      the spec says -- adoption means "take over at least this epoch", not
+      "land on exactly this epoch". Only a ROLLBACK (recorded generation LOWER
+      than the handed epoch) is a spec this directory cannot honour, so only
+      that -- and an unreadable sidecar -- is refused.
 
     An ABSENT sidecar is not a mismatch: a hand-built spec has nothing to
     verify, and the supervisor's own allocation is what writes it. Stand-in
@@ -827,11 +831,16 @@ def _verify_handed_epoch(worker: Any, epoch: int) -> None:
         recorded = int(raw or 0)
     except ValueError:
         recorded = None
-    if recorded != int(epoch):
+    # Floor, not equality: ``recorded > epoch`` is a legitimate respawn from a
+    # stale spec (the adoption path), which must run; ``recorded < epoch`` is a
+    # rollback and ``recorded is None`` is a sidecar nobody can read -- both
+    # fail closed.
+    if recorded is None or recorded < int(epoch):
         raise RuntimeError(
             f"worker_dir/generation says {raw!r}, the spec says epoch "
-            f"{int(epoch)}: refusing to run at an epoch this directory does "
-            "not record (C3-3)"
+            f"{int(epoch)}: refusing to run BEHIND a generation this "
+            "directory already records (C3-3: the sidecar is a floor -- "
+            "higher is a legitimate respawn, lower is a rollback)"
         )
 
 
