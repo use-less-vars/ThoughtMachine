@@ -603,3 +603,19 @@ Corrections to earlier notes, now tested live:
 6. **`/tmp` does not survive between worker tool calls** (fresh ephemeral container per call) — but a *single* self-contained shell call CAN write a backup to `/tmp`, mutate, test and restore within that one call. That is how the C11-prime mutation proof was done safely; conversely `cp backup.py /tmp/` in one call and `cp /tmp/backup.py back` in the next silently yields "No such file".
 
 7. **`KnowledgeBaseTool` append needs the payload in `entry` (and `mode` is mandatory)** — passing `content` returns `Error: entry parameter is required for append mode`; omitting `mode` returns a pydantic validation error listing the valid fields. The field names differ from every other tool's payload shape.
+
+## 2026-11-13 — ## Onboarding pipeline: the generator and the bundle builder...
+
+## Onboarding pipeline: the generator and the bundle builder are two different things
+
+Established by inspection while fixing the C61 prose (commit `14a4d605`, branch `docs/c61-defect-split`):
+
+- **`scripts/gen_handoff.py` writes the router** (`.thoughtmachine/knowledge/project/HANDOFF.md`). It shells out to `git` (via a local `sh()` → `subprocess.check_output`, line 86) for four inputs: repo root, `dev` sha, `dev` subject, and the five-commit `--oneline` block.
+- **`scripts/build_onboarding.sh` does NOT invoke the generator.** It is a pure *consumer*: `HANDOFF_FILE` (default `.thoughtmachine/knowledge/project/HANDOFF.md`) is parsed with `kb_entries` and concatenated into one bundle (`ONBOARDING_BUNDLE`, default `/tmp/onboarding_bundle.md`). So the correct order is **gen_handoff.py → build_onboarding.sh**. Any instruction of the form "rebuild the bundle to refresh HANDOFF.md" is wrong, and was wrong in a brief I received — two worker calls were lost to it.
+- **Git-less containers can still run the generator**, because every git-derived input has a documented CLI override: `--root`, `--dev-sha`, `--dev-subject`, `--recent-file`, plus `--stdout` for a dry run. Without them it dies at `root = pathlib.Path(sh("git", "rev-parse", "--show-toplevel"))` with `FileNotFoundError: [Errno 2] No such file or directory: 'git'` (line 258 → line 86).
+- **The right values to pass** are the ones already recorded in the committed `HANDOFF.md` (its header carries the dev sha/subject and the five-commit block). That keeps a prose edit a *one-hunk* diff instead of also moving the dev pointer.
+- **`tests/test_onboarding_bundle_contract.py::test_checked_in_handoff_matches_fresh_generation`** enforces that the checked-in router equals a fresh generation. On a host with `git` it regenerates by itself; in a git-less container it must be regenerated with the flags above or the test fails.
+- `--recent-file` must live under `/workspace/temp/`, **not `/tmp`** — `/tmp` does not survive between separate `DockerCodeRunner` calls, and the failure is a `FileNotFoundError` on a file you just wrote.
+- `DockerCodeRunner` wraps commands in `/bin/sh`, so bashisms (`${PIPESTATUS[0]}`, `[[ ]]`) produce `/bin/sh: 1: Bad substitution`. Capture `$?` directly instead.
+
+Sizes after the C61 split: HANDOFF.md 112 → 120 lines, 7,788 → 8,541 bytes (sha `f31954aa…`); onboarding bundle 203,175 → 203,928 bytes (+753).
