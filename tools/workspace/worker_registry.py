@@ -11,10 +11,75 @@ from __future__ import annotations
 import atexit
 import logging
 import threading
+from pathlib import Path
 from typing import Any, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 from agent.logging.lifecycle import log_worker_event
+
+
+WORKERS_DIRNAME = "workers"
+"""Name of the on-disk directory holding every worker's own directory."""
+
+_UNSAFE_PATH_SEGMENTS = frozenset({".", "..", "/", "\\"})
+"""Values that are never usable as a single path segment."""
+
+
+_SAFE_LABEL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._#-"
+)
+"""Characters kept verbatim by :func:`_safe_label` (``#`` binds an instance id)."""
+
+_SAFE_LABEL_MAX_LEN = 64
+"""Upper bound on a sanitised label, well under any filesystem's NAME_MAX."""
+
+_SAFE_LABEL_FALLBACK = "worker"
+"""Label used when sanitising leaves nothing behind."""
+
+
+def _safe_label(value: Any) -> str:
+    """Sanitise *value* into exactly ONE safe directory name.
+
+    Unlike :func:`_is_safe_path_segment` this never rejects: it deterministically
+    rewrites an unusable value into a usable one, so a caller that has no good
+    fallback still gets a directory INSIDE ``workers/``.
+
+    The rule, applied in this order:
+
+    1. a non-``str`` (or ``None``) is treated as ``""``;
+    2. every character outside ``[A-Za-z0-9._#-]`` becomes ``_`` — this kills
+       ``/``, ``\\``, NUL and whitespace, so the result can never add a path
+       segment;
+    3. leading dots are stripped, so the result is never ``.``/``..`` nor a
+       hidden entry;
+    4. the result is truncated to 64 characters;
+    5. an empty result becomes ``"worker"``.
+
+    The transform is the identity for an already-safe name (``default``,
+    ``default#2``), so legacy directories keep their names.
+    """
+    if not isinstance(value, str):
+        value = ""
+    sanitised = "".join(ch if ch in _SAFE_LABEL_CHARS else "_" for ch in value)
+    sanitised = sanitised.lstrip(".")[:_SAFE_LABEL_MAX_LEN]
+    return sanitised or _SAFE_LABEL_FALLBACK
+
+
+def _is_safe_path_segment(value: Any) -> bool:
+    """True when *value* can be used as exactly ONE directory name.
+
+    The checks mirror ``bridge.py``'s ``_validate_workspace_id`` (non-empty
+    ``str``, not ``.``/``..``/a bare separator, no NUL) but reject an embedded
+    separator as well: a value such as ``a/b`` or ``../etc`` would change the
+    depth of the resulting path, which no caller of :meth:`worker_dir` wants.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if value in _UNSAFE_PATH_SEGMENTS:
+        return False
+    if "/" in value or "\\" in value or "\x00" in value:
+        return False
+    return True
 
 
 class _AllSessionsSentinel:
@@ -135,6 +200,41 @@ class WorkerRegistry:
         if instance_id is None or instance_id == 1:
             return worker_name
         return f"{worker_name}#{instance_id}"
+
+    @staticmethod
+    def worker_dir(workspace_dir: str | Path, session_id: str | None,
+                   worker_name: str, instance_id: int = 1) -> Path:
+        """On-disk directory of ONE worker instance.
+
+        THE single place that builds this path.  The result is
+        ``<workspace_dir>/workers/<session_id>/<instance_label>``, so two
+        sessions running a worker of the same name never share a transcript
+        (``context.json``), journal or attachments directory.
+
+        Degrades instead of raising: when the session id is not usable as a
+        single path segment (``None``/empty, ``.``/``..``, a separator, a NUL),
+        the LEGACY layout ``<workspace_dir>/workers/<label>`` is returned.  A
+        sessionless worker (an operator or test spawn with no session)
+        therefore keeps resolving to the directory it has always used.
+
+        The label is ALWAYS passed through :func:`_safe_label`, so neither the
+        session segment nor the worker name can make the result leave
+        ``<workspace_dir>/workers/``: an unsafe worker name is rewritten rather
+        than used verbatim (``a/b`` -> ``a_b``, ``../x`` -> ``_x``,
+        ``.``/``""`` -> ``worker``), and it never changes the SHAPE of the path
+        - a usable session still namespaces the worker.  Sanitising an
+        already-safe name is a no-op, so ``default`` and ``default#2`` keep
+        their historical directories.
+
+        Pure path maths: creating the directory is the caller's job.
+        """
+        root = Path(workspace_dir) / WORKERS_DIRNAME
+        label = _safe_label(
+            WorkerRegistry.instance_label(worker_name, instance_id)
+        )
+        if not _is_safe_path_segment(session_id):
+            return root / label
+        return root / session_id / label
 
     # -- Worker thread registry ----------------------------------------------
 

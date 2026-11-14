@@ -23,6 +23,7 @@ import pytest
 from agent.events import EventBus, EventType, create_event  # noqa: F401
 from tools.workspace import worker as worker_module
 from tools.workspace.worker import Worker, WorkerThread
+from tools.workspace.worker_registry import WorkerRegistry
 from web_ui.backend import workspace_routes
 
 from tests.test_worker_sync_query_timeout_containment import _spawn_worker, _wait_until
@@ -59,11 +60,15 @@ def _fake_tool_loop(self, query):
     return json.dumps({"response": "ok", "query": query})
 
 
-def _read_status(tmp_path, name, session_id=None):
-    if session_id is None:
-        path = tmp_path / "workers" / name / "status.json"
-    else:
-        path = tmp_path / "workers" / session_id / name / "status.json"
+def _read_status(tmp_path, name, session_id):
+    """status.json of the worker this session really spawned.
+
+    Built by ``WorkerRegistry.worker_dir`` — the one production builder — so the
+    assertion cannot drift from the layout the thread writes to.  The session id
+    MUST be the one passed to ``_spawn_worker``: workers are namespaced by
+    session, so reading ``workers/<name>`` looks at a directory nothing writes.
+    """
+    path = WorkerRegistry.worker_dir(tmp_path, session_id, name) / "status.json"
     # run() flips status to "ready" BEFORE _write_status_file() lands the
     # file (atomic os.replace), so wait for existence instead of racing.
     assert _wait_until(lambda: path.exists()), f"status.json never appeared: {path}"
@@ -78,7 +83,7 @@ def test_started_at_set_when_worker_starts(tmp_path, monkeypatch):
     age = (datetime.now(timezone.utc) - started).total_seconds()
     assert 0.0 <= age <= 60.0
 
-    status = _read_status(tmp_path, "w1")
+    status = _read_status(tmp_path, "w1", "sess-start")
     assert status["started_at"] == thread.started_at
     assert status["last_query_at"] is None
     assert status["paused_manually"] is False
@@ -108,7 +113,7 @@ def test_last_query_at_updates_after_query(tmp_path, monkeypatch):
     assert second is not None
     assert datetime.fromisoformat(second) >= datetime.fromisoformat(first)
 
-    status = _read_status(tmp_path, "w1")
+    status = _read_status(tmp_path, "w1", "sess-q")
     assert status["last_query_at"] == second
 
 
@@ -117,7 +122,7 @@ def test_paused_manually_true_only_for_manual_only_pause(tmp_path, monkeypatch):
     thread._save_context = lambda: None
 
     def _status():
-        path = tmp_path / "workers" / "w1" / "status.json"
+        path = WorkerRegistry.worker_dir(tmp_path, "sess-pm", "w1") / "status.json"
         # _wait_until does not swallow predicate exceptions: wait for the
         # file here (run() sets status="ready" before the atomic replace).
         assert _wait_until(lambda: path.exists()), f"status.json never appeared: {path}"

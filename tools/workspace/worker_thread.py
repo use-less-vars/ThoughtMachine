@@ -450,10 +450,14 @@ class WorkerBusAdapter:
     but publishes events to the worker's EventBus instead of emitting Qt signals.
     """
 
-    def __init__(self, event_bus, worker_name: str, state_bridge=None):
+    def __init__(self, event_bus, worker_name: str, state_bridge=None,
+                 session_id: str | None = None):
         self._event_bus = event_bus
         self.worker_name = worker_name
         self._state_bridge = state_bridge
+        # Session that owns this worker.  Stamped onto published events so the
+        # bridge can tell two same-named workers in different sessions apart.
+        self.session_id = session_id
         self._state = ExecutionState.READY if ExecutionState else None
 
     @property
@@ -467,15 +471,20 @@ class WorkerBusAdapter:
             self._state = new_state
             if self._event_bus is not None and create_event is not None and EventType is not None:
                 try:
+                    status_data = {
+                        "worker_name": self.worker_name,
+                        "execution_state": new_state.value if hasattr(new_state, 'value') else str(new_state),
+                        "old_execution_state": old_state.value if hasattr(old_state, 'value') else str(old_state),
+                    }
+                    # Session attribution must also live in the payload, not only in
+                    # the metadata (see WorkerBusAdapter._publish).
+                    if self.session_id:
+                        status_data["session_id"] = self.session_id
                     evt = create_event(
                         EventType.WORKER_STATUS,
-                        data={
-                            "worker_name": self.worker_name,
-                            "execution_state": new_state.value if hasattr(new_state, 'value') else str(new_state),
-                            "old_execution_state": old_state.value if hasattr(old_state, 'value') else str(old_state),
-                        },
+                        data=status_data,
                         source="worker",
-                        session_id="",
+                        session_id=self.session_id or "",
                     )
                     self._event_bus.publish(evt)
                 except Exception:
@@ -695,10 +704,20 @@ class WorkerBusAdapter:
         try:
             from agent.events import BaseEvent, EventMetadata
             evt = EventType(event_type) if isinstance(event_type, str) else event_type
+            # Session attribution is stamped on BOTH the envelope data and the
+            # metadata.  Metadata alone is not enough: legacy-dict converters
+            # (BaseEvent.from_dict) move data["session_id"] into metadata, so a
+            # consumer that only inspects data cannot see it; and the web_ui
+            # bridge denies by default on data["session_id"].  An explicit
+            # session_id already present in the payload wins.
+            session_id = data.get("session_id") or self.session_id or ""
+            payload = {**data, "worker_name": self.worker_name}
+            if session_id:
+                payload["session_id"] = session_id
             event = BaseEvent(
                 type=evt,
-                metadata=EventMetadata(source="worker", session_id=""),
-                data={**data, "worker_name": self.worker_name},
+                metadata=EventMetadata(source="worker", session_id=session_id),
+                data=payload,
             )
             self._event_bus.publish(event)
             log('DEBUG', 'pipeline.worker_bus',
@@ -1550,7 +1569,13 @@ class WorkerThread(threading.Thread):
         # caller -- thread, child and test -- gets the same Path maths.
         if not isinstance(workspace_dir, Path):
             workspace_dir = Path(workspace_dir)
-        self._worker_dir = workspace_dir / "workers" / instance_label
+        # One source of truth for the on-disk layout: the helper also gives a
+        # session its own segment, so two sessions running a worker of the same
+        # name (and instance) never share a transcript. A sessionless worker
+        # keeps the legacy ``workers/<label>`` path (see the helper's docstring).
+        self._worker_dir = _WorkerRegistry.worker_dir(
+            workspace_dir, session_id, name, instance_id,
+        )
         self._worker_dir.mkdir(parents=True, exist_ok=True)
         # The workspace root under its own name (as passed, not re-derived by
         # walking back out of ``workers/<label>/``): process mode rebuilds this
@@ -3423,7 +3448,11 @@ class WorkerThread(threading.Thread):
                     f"Lazy-init presenter [worker={self.worker_name}]: creating WorkerBusAdapter "
                     f"with event_bus={'SET' if self._event_bus else 'NONE'}")
                 self._state_bridge = StateBridge(config_path=None)
-                bus_adapter = WorkerBusAdapter(self._event_bus, self.worker_name, state_bridge=self._state_bridge)
+                bus_adapter = WorkerBusAdapter(
+                    self._event_bus, self.worker_name,
+                    state_bridge=self._state_bridge,
+                    session_id=self.session_id,
+                )
                 self._worker_bus_adapter = bus_adapter
                 session_lifecycle = WorkerSessionLifecycle()
                 self._event_processor = EventProcessor(
@@ -7019,19 +7048,17 @@ class Worker(ToolBase):
         # so ``_load_context()`` in run() finds nothing and the worker builds a
         # fresh WorkerContext.  (Before this, a forced spawn restored the old
         # transcript, so a freshly spawned worker came up already consuming
-        # ~92k of its own token budget.)  The path deliberately mirrors
-        # ``WorkerThread.__init__``'s ``self._worker_dir``.  A NON-forced spawn
-        # never reaches this block: conversation continuity across spawn/query
-        # boundaries stays the default for it.
+        # ~92k of its own token budget.)  The path comes from
+        # ``WorkerRegistry.worker_dir`` -- the same helper that builds
+        # ``self._worker_dir`` -- so the two cannot drift apart.  A NON-forced
+        # spawn never reaches this block: conversation continuity across
+        # spawn/query boundaries stays the default for it.
         # No resolved workspace dir ⇒ nothing to unlink, and building the path
         # must not raise TypeError (only OSError is caught below).
         if self.force and ws_dir is not None:
-            _stale_context = (
-                ws_dir
-                / "workers"
-                / _WorkerRegistry.instance_label(self.worker_name, spawn_iid)
-                / "context.json"
-            )
+            _stale_context = _WorkerRegistry.worker_dir(
+                ws_dir, self.session_id, self.worker_name, spawn_iid,
+            ) / "context.json"
             try:
                 _stale_context.unlink(missing_ok=True)
             except OSError as exc:
