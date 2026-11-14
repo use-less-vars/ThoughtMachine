@@ -444,3 +444,4 @@ web_ui/frontend/.dist-build-stamp
 # with the repo. `docs/*` above is a catch-all, so the negation is required or
 # the file is never versioned and vanishes on the next clone.
 !docs/design-worker-process-substrate.md
+!docs/security-audit-gen64.md
