@@ -802,8 +802,64 @@ class ToolExecutor:
                                 match = _PLACEHOLDER_RE.fullmatch(value)
                                 if match:
                                     credential_names.append(match.group(1))
-                        injector = CredentialInjector(ws_id)
-                        tool_args = injector.inject(tool_args)
+
+                        # SECURITY (D1): a ``{{credential:<name>}}`` placeholder
+                        # is a request to READ A SECRET, so it is gated by the
+                        # ``credential`` grain at its ``use`` level -- the level
+                        # ``RESOURCE_CATALOG`` / ``SessionPermissions`` already
+                        # declare for exactly this purpose.
+                        #
+                        # The check keys off the placeholder just collected, NOT
+                        # off ``required_categories``: the declaration-based gate
+                        # upstream (``check_required_categories`` at the dispatch
+                        # site) can only judge what a tool ASKS for, and every
+                        # tool that declares nothing is permitted through it --
+                        # which is how values reached tools that never asked.
+                        # A call with no placeholder has nothing to gate.
+                        if credential_names:
+                            if (
+                                GATE_AVAILABLE
+                                and check_required_categories is not None
+                                and isinstance(effective, dict)
+                            ):
+                                ok_cred, err_cred = check_required_categories(
+                                    ['credential:use'],
+                                    effective,
+                                    tool_name=tool_name,
+                                    tool_args=arguments,
+                                    description=getattr(tool_class, 'describe_action', lambda a: '')(arguments),
+                                    event_bus=self._event_bus or global_event_bus,
+                                    session_id=session_id,
+                                    is_worker_context=self._is_worker_context,
+                                )
+                            else:
+                                # Fail closed: a placeholder with no gate able to
+                                # judge it is a DENIAL, not an allow.  An
+                                # unavailable gate or an unresolved (None)
+                                # permission profile must never hand out a
+                                # secret, so no ``.get()`` on a possibly-None
+                                # profile happens here.
+                                ok_cred = False
+                                err_cred = (
+                                    "Permission denied: Tool requires credential:use, "
+                                    "but the security gate is unavailable, so credential "
+                                    "injection is refused."
+                                )
+                            if not ok_cred:
+                                return {
+                                    'result': err_cred,
+                                    'tool_type': 'normal',
+                                    'success': False,
+                                }
+
+                            # Only a call that actually carries a placeholder
+                            # needs the injector: `inject()` resolves exactly the
+                            # values collected above, so a placeholder-free call
+                            # would be a deep-copy no-op.  Keeping the two
+                            # together means the injector is never constructed on
+                            # a refusal path either.
+                            injector = CredentialInjector(ws_id)
+                            tool_args = injector.inject(tool_args)
                 except Exception as exc:
                     log('ERROR', 'core.credentials', "Credential injection failed for tool '%s': %s", tool_name, exc)
                     return {'result': f"Credential injection failed: {exc}", 'tool_type': 'normal', 'success': False}
