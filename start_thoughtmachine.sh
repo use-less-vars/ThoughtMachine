@@ -7,7 +7,14 @@
 #    * default (prod): production mode, single process -- backend serves the
 #                      built frontend from web_ui/frontend/dist on
 #                      TM_BACKEND_PORT (default 8000). Fast. For daily use.
-#                      Auto-builds dist/ on first run if missing.
+#                      The bundle is rebuilt ONLY when the frontend inputs
+#                      changed: scripts/frontend_build_gate.py hashes them
+#                      (content, never mtimes) and remembers the hash in
+#                      web_ui/frontend/.dist-build-stamp. No stamp, changed
+#                      hash, or a missing/empty dist/ all mean "build"; a
+#                      matching stamp plus a real dist/ means "skip".
+#                      Force a rebuild with --rebuild-frontend or
+#                      TM_FORCE_FRONTEND_BUILD=1.
 #    * --dev / -d:     development mode -- vite dev server on TM_FRONTEND_PORT
 #                      (default 5173) in the background, plus the backend.
 #                      Slow (unbundled modules, HMR, dev React). For editing
@@ -39,6 +46,7 @@ DOCTOR="$SCRIPT_DIR/scripts/doctor_checks.py"
 DEV_MODE=false
 CHECK_ONLY=false
 DOCTOR_MODE=false
+FORCE_FRONTEND_BUILD=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -46,18 +54,22 @@ for arg in "$@"; do
         --prod|-p)          DEV_MODE=false ;;   # legacy alias; prod is now default
         --check-only)       CHECK_ONLY=true ;;
         --doctor)           DOCTOR_MODE=true ;;
+        --rebuild-frontend) FORCE_FRONTEND_BUILD=true ;;   # ignore the stamp
         --help|-h)
-            echo "Usage: $0 [--dev] [--check-only] [--doctor]"
+            echo "Usage: $0 [--dev] [--check-only] [--doctor] [--rebuild-frontend]"
             echo "  (default)     production: backend serves the built frontend on one port"
             echo "  --dev / -d    development: vite dev server on TM_FRONTEND_PORT (slow, HMR)"
             echo "  --check-only  run preflight checks only, then exit 0"
+            echo "  --rebuild-frontend"
+            echo "                rebuild the production bundle even if the inputs are"
+            echo "                unchanged (same as TM_FORCE_FRONTEND_BUILD=1)"
             echo "  --doctor      preflight (Docker problems only warn) + start the backend,"
             echo "                verify /api/health, print BACKEND-HEALTHY and keep running"
             exit 0
             ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: $0 [--dev] [--check-only] [--doctor]"
+            echo "Usage: $0 [--dev] [--check-only] [--doctor] [--rebuild-frontend]"
             exit 1
             ;;
     esac
@@ -420,11 +432,38 @@ fi
 
 if ! $DEV_MODE; then
     FRONTEND_DIR="$SCRIPT_DIR/web_ui/frontend"
-    DIST_DIR="$FRONTEND_DIR/dist"
+    # dist/ is inspected by scripts/frontend_build_gate.py, not here.
     VITE_BIN="$FRONTEND_DIR/node_modules/.bin/vite"
-    if [ ! -f "$DIST_DIR/index.html" ]; then
+    # Stale-bundle gate: rebuild only when the frontend sources changed (a
+    # change of BUILD TOOLING is tracked by bumping SCHEMA in the gate script,
+    # not by the hash), when dist/ is missing/empty, or when forced.  See
+    # scripts/frontend_build_gate.py for the exact input set and stamp format.
+    GATE="$SCRIPT_DIR/scripts/frontend_build_gate.py"
+    if [ -x "$VITE_BIN" ]; then BUILD_CMD="vite build"; else BUILD_CMD="npm run build"; fi
+    FORCE_ARG=""
+    if $FORCE_FRONTEND_BUILD || [ -n "${TM_FORCE_FRONTEND_BUILD:-}" ]; then
+        FORCE_ARG="--force"
+    fi
+    NEED_BUILD=true
+    if [ -f "$GATE" ] && command -v python3 >/dev/null 2>&1; then
+        GATE_LINE="$(python3 "$GATE" check --frontend-dir "$FRONTEND_DIR" --build-cmd "$BUILD_CMD" $FORCE_ARG)"
+        GATE_HASH="$(printf '%s\n' "$GATE_LINE" | sed -n 's/.*hash=\([^ ]*\).*/\1/p')"
+        case "$GATE_LINE" in
+            *DECISION=skip*)
+                echo "  frontend up to date (hash ${GATE_HASH:-unknown}), skipping build."
+                NEED_BUILD=false ;;
+            *DECISION=build*)
+                NEED_BUILD=true ;;
+            *)
+                echo "  WARNING: frontend build gate produced no decision - building to be safe."
+                NEED_BUILD=true ;;
+        esac
+    else
+        echo "  WARNING: frontend build gate unavailable - cannot tell whether dist/ is stale."
+    fi
+    if $NEED_BUILD; then
         echo "============================================"
-        echo "  ThoughtMachine - first-run setup"
+        echo "  ThoughtMachine - frontend build"
         echo "  Building the production frontend bundle ..."
         echo "============================================"
         echo ""
@@ -434,6 +473,10 @@ if ! $DEV_MODE; then
         else
             (cd "$FRONTEND_DIR" && npm run build) || {
                 echo ""; echo "  FAILED: production build failed."; exit 1; }
+        fi
+        if [ -f "$GATE" ]; then
+            python3 "$GATE" stamp --frontend-dir "$FRONTEND_DIR" --build-cmd "$BUILD_CMD" >/dev/null || \
+                echo "  WARNING: could not write the frontend build stamp; the next run will rebuild."
         fi
         echo ""
     fi
