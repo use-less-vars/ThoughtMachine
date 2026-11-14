@@ -79,8 +79,12 @@ class RefactorTool(ToolBase):
     def _get_file_paths(self) -> List[Path]:
         """Return list of Path objects for files to edit based on file_pattern."""
         pattern = self.file_pattern
-        # Determine base directory for globbing
-        ws_path = self._resolve_registry_workspace()
+        # Determine base directory for globbing.  ``_resolve_workspace_root()``
+        # (tools/base.py:356) is the worktree-aware root: the session's
+        # worktree when one is bound, else the registered workspace root.  The
+        # registry root alone is the WIDER root, so a bound session matched
+        # files that ``_validate_path`` then refused -- and processed none.
+        ws_path = self._resolve_workspace_root()
         if ws_path:
             base_dir = Path(ws_path)
         else:
