@@ -68,6 +68,42 @@ import scripts.prove_worker_pid as prove  # noqa: E402 - path fixed above
 _IMPOSSIBLE_PID = 2**31 - 1
 
 
+#: Bound on the join of the parent-side thread in ``_quiesce`` -- see there.
+_JOIN_TIMEOUT_S = 10.0
+
+
+def _quiesce(result) -> None:
+    """Stop and JOIN the layer's parent-side ``WorkerThread``.
+
+    Registered as a cleanup *after* ``_fresh_workspace``, so -- cleanups being
+    LIFO -- this runs BEFORE the temp workspace is removed.  That order is the
+    whole point: a live ``WorkerThread`` keeps waking to persist its context
+    (``_save_context``), and a write into a deleted tree is a
+    ``FileNotFoundError`` raised inside a thread nobody awaits.  Joining with a
+    bound first is what makes the removal safe instead of lucky.
+    """
+    worker = getattr(result, "worker", None)
+    if worker is None:
+        return
+    for verb in ("kill", "stop"):
+        try:
+            getattr(worker, verb)()
+            break
+        except Exception:  # noqa: BLE001 - best effort, joining is what matters
+            continue
+    try:
+        worker.join(timeout=_JOIN_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 - a join that cannot run must not mask
+        pass
+
+
+def _run_layer(test: unittest.TestCase, name: str, mode=None) -> "prove.LayerResult":
+    """One layer on a throwaway workspace, with its thread joined before exit."""
+    result = prove.run_layer(name, mode, _fresh_workspace(test))
+    test.addCleanup(_quiesce, result)
+    return result
+
+
 def _fresh_workspace(test: unittest.TestCase) -> Path:
     """A throwaway workspace the script's workers may write into.
 
@@ -192,23 +228,21 @@ class TestNoStandInWorkerIsEverInstalled(unittest.TestCase):
     """The child must build the real WorkerThread, never a canned-reply puppet."""
 
     def test_the_object_the_child_would_build_is_a_real_worker_thread(self):
-        with tempfile.TemporaryDirectory() as td:
-            worker = prove.build_real_worker(Path(td))
-            self.assertEqual(type(worker).__name__, "WorkerThread")
-            self.assertIsNone(
-                prove.spec_from_worker(worker).get("worker_factory"),
-                "a worker factory is installed again; the child would build a stand-in",
-            )
-            self.assertFalse(hasattr(worker, "_runtime_worker_factory"))
-            lines = prove.assert_no_factory(worker)  # raises if either is back
-            self.assertTrue(
-                any("worker_factory'] = None" in line for line in lines), lines
-            )
-            self.assertIsInstance(worker.workspace_dir, Path)
+        worker = prove.build_real_worker(_fresh_workspace(self))
+        self.assertEqual(type(worker).__name__, "WorkerThread")
+        self.assertIsNone(
+            prove.spec_from_worker(worker).get("worker_factory"),
+            "a worker factory is installed again; the child would build a stand-in",
+        )
+        self.assertFalse(hasattr(worker, "_runtime_worker_factory"))
+        lines = prove.assert_no_factory(worker)  # raises if either is back
+        self.assertTrue(
+            any("worker_factory'] = None" in line for line in lines), lines
+        )
+        self.assertIsInstance(worker.workspace_dir, Path)
 
     def test_the_real_constructor_coerces_a_str_workspace_dir(self):
-        with tempfile.TemporaryDirectory() as td:
-            lines = prove.assert_str_workspace_dir_coercion(Path(td))
+        lines = prove.assert_str_workspace_dir_coercion(_fresh_workspace(self))
         self.assertTrue(any("pathlib.Path: True" in line for line in lines), lines)
 
 
@@ -223,7 +257,7 @@ class TestTheProofIsDrivenAndCannotPassVacuously(unittest.TestCase):
     def test_thread_layer_reports_no_child_rather_than_a_pid(self):
         """The shipped thread mode is measured, and it is *not* a proof."""
         with mock.patch.multiple(prove, **_isolated_identity(self)):
-            result = prove.run_layer("thread", prove.MODE_THREAD, _fresh_workspace(self))
+            result = _run_layer(self, "thread", prove.MODE_THREAD)
         text = "\n".join(result.lines)
         self.assertEqual(result.exit_code, prove.EXIT_SAME_PROCESS, text)
         self.assertIn("child_exists = False", text)
@@ -233,7 +267,7 @@ class TestTheProofIsDrivenAndCannotPassVacuously(unittest.TestCase):
     def test_process_layer_proves_a_different_live_child(self):
         """A real OS child answers, and the child-computed pid corroborates it."""
         with mock.patch.multiple(prove, **_isolated_identity(self)):
-            result = prove.run_layer("process", prove.MODE_PROCESS, _fresh_workspace(self))
+            result = _run_layer(self, "process", prove.MODE_PROCESS)
         text = "\n".join(result.lines)
         self.assertEqual(result.exit_code, prove.EXIT_PROVEN, text)
         self.assertIn("finding: PROVEN", text)
@@ -273,7 +307,7 @@ class TestTheProofIsDrivenAndCannotPassVacuously(unittest.TestCase):
                 mock.patch.object(prove, "hello_pid", lambda handle: unmeasured), \
                 mock.patch.object(prove, "multiprocessing_pid", lambda handle: unmeasured), \
                 mock.patch.object(prove, "inspect_reading", lambda w, h: unmeasured):
-            result = prove.run_layer("process", prove.MODE_PROCESS, _fresh_workspace(self))
+            result = _run_layer(self, "process", prove.MODE_PROCESS)
 
         text = "\n".join(result.lines)
         self.assertEqual(
@@ -299,7 +333,7 @@ class TestTheProofIsDrivenAndCannotPassVacuously(unittest.TestCase):
 
         with mock.patch.multiple(prove, **_isolated_identity(self)), \
                 mock.patch.object(prove, "attach_thread_frame_sink", _attach):
-            result = prove.run_layer("process", prove.MODE_PROCESS, _fresh_workspace(self))
+            result = _run_layer(self, "process", prove.MODE_PROCESS)
 
         text = "\n".join(result.lines)
         self.assertIn("child_exists = True", text, text)

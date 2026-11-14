@@ -356,11 +356,20 @@ def inspect_reading(worker: Any, handle: Any) -> Tuple[Optional[Dict[str, Any]],
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+#: Bound on the join of the parent-side ``WorkerThread`` in ``_cleanup``.
+#: A caller may delete the workspace the moment a layer returns, so the thread
+#: must be gone first; a bounded join keeps a wedged thread from hanging the run.
+JOIN_TIMEOUT_S = 10.0
+
+
 @dataclass
 class LayerResult:
     name: str
     exit_code: int
     lines: List[str] = field(default_factory=list)
+    #: The parent-side ``WorkerThread`` this layer started, so a caller (the
+    #: test suite) can quiesce and JOIN it before deleting its workspace.
+    worker: Any = None
 
 
 def _emit(ws: Path) -> List[Path]:
@@ -376,6 +385,7 @@ def run_layer(name: str, mode: Optional[str], workspace_dir: Path) -> LayerResul
     lines = out.lines
 
     worker = build_real_worker(workspace_dir)
+    out.worker = worker
     lines.append(f"layer: {name} (requested mode: {mode or 'environment default'})")
     lines.extend("  " + l for l in assert_no_factory(worker))
 
@@ -408,6 +418,11 @@ def run_layer(name: str, mode: Optional[str], workspace_dir: Path) -> LayerResul
     if mode is not None and effective != mode:
         lines.append(f"  MISMATCH: asked for {mode!r}, handle reports {effective!r}")
         out.exit_code = EXIT_UNMEASURED
+        # Every path that started the parent-side thread must tear it down:
+        # returning here used to leave a live WorkerThread behind, and the
+        # caller's temp workspace then vanished under it (FileNotFoundError
+        # from ``_save_context`` inside the thread -- the CI flake).
+        _cleanup(handle, workspace_dir, set(_emit(workspace_dir)), lines, worker)
         return out
 
     before = set(_emit(workspace_dir))
@@ -582,6 +597,20 @@ def _cleanup(
                 break
             except Exception as exc:
                 lines.append(f"  cleanup: WorkerThread.{verb}() raised {exc!r}")
+        # The workspace directory may be removed the moment this returns, so the
+        # thread must be GONE first: a live WorkerThread keeps waking to persist
+        # its context (``_save_context``), and a write into a deleted tree is a
+        # FileNotFoundError raised inside a thread nobody awaits.  Join with a
+        # bound and SAY which of the two happened rather than pretending.
+        worker.join(timeout=JOIN_TIMEOUT_S)
+        if worker.is_alive():
+            lines.append(
+                f"  cleanup: parent-side WorkerThread STILL ALIVE after a "
+                f"{JOIN_TIMEOUT_S:.1f}s join -- its workspace must not be "
+                f"removed yet"
+            )
+        else:
+            lines.append("  cleanup: parent-side WorkerThread joined")
     residue = sorted(set(_emit(workspace_dir)) - before)
     if residue:
         lines.append(f"  cleanup: child left {len(residue)} file(s) in the temp workspace")

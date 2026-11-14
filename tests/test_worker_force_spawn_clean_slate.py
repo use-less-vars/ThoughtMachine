@@ -124,7 +124,19 @@ class TestForceSpawnCleanSlate(unittest.TestCase):
             self._registry._worker_event_bus_registry.update(self._old_buses)
 
     def _context_path(self, worker_name: str) -> Path:
-        return self._ws / "workers" / worker_name / "context.json"
+        """The transcript path the REAL save/load path uses for this worker.
+
+        Built by ``WorkerRegistry.worker_dir`` — the single production builder —
+        because the layout is ``workers/<session_id>/<label>``: a hand-written
+        ``workers/<name>/context.json`` is a directory no worker writes to, which
+        made this fixture assert against an empty path.
+        """
+        from tools.workspace.worker_registry import WorkerRegistry
+
+        return (
+            WorkerRegistry.worker_dir(self._ws, SESSION, worker_name)
+            / "context.json"
+        )
 
     def _plant_transcript(self, worker_name: str) -> Path:
         """Leave behind a previous incarnation's transcript via the REAL save path.

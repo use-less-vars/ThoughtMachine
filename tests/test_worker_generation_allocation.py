@@ -43,13 +43,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from session.lock import FileLockTimeoutError  # noqa: E402
 from tools.workspace import worker_thread as worker_thread_mod  # noqa: E402
+from tools.workspace.worker_registry import WorkerRegistry  # noqa: E402
 from tools.workspace.worker_thread import WorkerThread  # noqa: E402
 
 SYS_PROMPT = "You are a test worker."
 WORKER_NAME = "w-gen"
+SESSION_ID = "sess-generation"
 
 
-def _make_thread(tmp_path, name=WORKER_NAME, session_id="sess-generation"):
+def _make_thread(tmp_path, name=WORKER_NAME, session_id=SESSION_ID):
     """A REAL ``WorkerThread`` (never ``start()``ed) whose epoch is already
     allocated by ``__init__`` — the production spawn path."""
     return WorkerThread(
@@ -65,10 +67,16 @@ def _make_thread(tmp_path, name=WORKER_NAME, session_id="sess-generation"):
     )
 
 
-def _worker_dir(tmp_path, name=WORKER_NAME) -> Path:
-    """``<workspace>/workers/<instance_label>`` — instance 1 keeps the bare
-    name (tools/workspace/worker_registry.py:84-92)."""
-    return tmp_path / "workers" / worker_thread_mod._WorkerRegistry.instance_label(name, 1)
+def _worker_dir(tmp_path, name=WORKER_NAME, session_id=SESSION_ID) -> Path:
+    """The worker directory this workspace/session/name really resolves to.
+
+    Delegates to the production builder ``WorkerRegistry.worker_dir``
+    (``workers/<session_id>/<instance_label>``) rather than re-deriving the
+    layout here: the private copy this replaced kept pointing at the legacy
+    ``workers/<label>`` path after production grew the session segment, so
+    every assertion looked at a directory the worker never used.
+    """
+    return WorkerRegistry.worker_dir(tmp_path, session_id, name, 1)
 
 
 def _sidecar(tmp_path, name=WORKER_NAME) -> Path:

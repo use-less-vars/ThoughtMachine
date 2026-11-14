@@ -1,0 +1,31 @@
+#!/bin/sh
+# Repository pre-commit hook (tracked at resources/githooks/pre-commit).
+# Install:  bash scripts/install_git_hooks.sh
+#
+# The gate runs the test suite, so it needs an interpreter that actually has
+# the dependencies.  Candidates, in order:
+#   1. ./.venv/bin/python   -- the project's own environment
+#   2. python3 on PATH      -- the ambient interpreter
+#   3. python  on PATH
+# The first one that can import pydantic AND pytest runs the gate.  If none
+# can, we print ONE line naming the interpreters tried and exit 1 -- never a
+# raw ModuleNotFoundError traceback, and never a silent pass.
+set -u
+
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+cd "$repo_root" || exit 1
+
+tried=""
+for py in "$repo_root/.venv/bin/python" "$(command -v python3 || true)" "$(command -v python || true)"; do
+    [ -n "$py" ] || continue
+    [ -x "$py" ] || continue
+    case " $tried " in *" $py "*) continue ;; esac
+    tried="$tried $py"
+    if "$py" -c 'import pydantic, pytest' >/dev/null 2>&1; then
+        echo "pre-commit: using $py"
+        exec "$py" -m pytest tests/ -q --tb=short -x
+    fi
+done
+
+echo "pre-commit: REFUSED -- no interpreter with pydantic+pytest (tried:${tried:- none}); install the deps or run the gate with an interpreter that has them" >&2
+exit 1

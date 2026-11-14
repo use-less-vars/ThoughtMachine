@@ -55,6 +55,7 @@ from tools.workspace.worker import (
     register_worker_event_bus,
     unregister_worker_event_bus,
 )
+from tools.workspace.worker_registry import WorkerRegistry
 
 from web_ui.backend import bridge as bridge_mod
 from web_ui.backend import workspace_routes
@@ -406,11 +407,14 @@ def test_real_thread_pause_resume_and_query_envelope(tmp_path, monkeypatch):
     # poll briefly for the pausing/paused write instead of reading it once
     # (the registry fast-path may let the thread advance between the route
     # write and this read on a loaded runner).
+    # The live thread is namespaced by its session, so read the status file at
+    # the production location (``workers/<session>/<label>``) — built by the
+    # registry helper, never hand-assembled here.
+    status_path = WorkerRegistry.worker_dir(tmp_path, "sess-7", "w1") / "status.json"
+
     def _pause_visible():
         try:
-            payload = json.loads(
-                (tmp_path / "workers" / "w1" / "status.json").read_text()
-            )
+            payload = json.loads(status_path.read_text())
         except (OSError, json.JSONDecodeError):
             return False
         return payload.get("runtime_status") in ("pausing", "paused")
@@ -535,9 +539,9 @@ def test_bridge_subscribes_per_instance_bus_and_stamps_events():
         )
         bridge._on_worker_spawned(evt)
 
-        assert "w2#2" in bridge._worker_bus_subs, (
-            f"expected per-instance subscription under 'w2#2', got "
-            f"{sorted(bridge._worker_bus_subs.keys())}"
+        assert "test-session-123:w2#2" in bridge._worker_bus_subs, (
+            f"expected per-instance subscription under 'w2#2' for this "
+            f"session, got {sorted(bridge._worker_bus_subs.keys())}"
         )
         assert any(
             e.get("type") == "worker:worker_spawned"
