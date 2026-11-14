@@ -4388,11 +4388,45 @@ class WorkerThread(threading.Thread):
 
                     # Publish WORKER_SPAWNED is now handled earlier in run() —
                     # no need for a duplicate lazy publish here.
-                    self._agent = Agent(
-                        config=agent_cfg,
-                        session=self._worker_ctx,
-                        event_bus=self._event_bus,
-                    )
+                    #
+                    # An exception escaping Agent construction would kill this
+                    # worker thread with a stack trace and leave the caller
+                    # waiting until its spawn timeout, so every failure here
+                    # becomes a clean error reply for the current query.
+                    # ``InvalidConfigError`` (missing provider key, raised by
+                    # ProviderFactory) is matched by class NAME to avoid
+                    # importing the LLM layer into this module.
+                    try:
+                        self._agent = Agent(
+                            config=agent_cfg,
+                            session=self._worker_ctx,
+                            event_bus=self._event_bus,
+                        )
+                    except Exception as exc:
+                        _type_name = type(exc).__name__
+                        _exc_text = str(exc)
+                        if _type_name == 'InvalidConfigError' or 'No API key' in _exc_text:
+                            # ``_build_agent_config`` returns an AgentConfig
+                            # instance (not a dict), so read the provider off
+                            # the model instead of mapping-style access.
+                            _provider = getattr(agent_cfg, 'provider_type', None) or 'unknown'
+                            _error = (
+                                f"Cannot create Agent: no API key available for "
+                                f"provider '{_provider}'. The parent agent did not "
+                                f"inherit its provider key to this worker; an "
+                                f"operator can make one available by setting "
+                                f"{str(_provider).upper()}_API_KEY in the "
+                                f"environment."
+                            )
+                        else:
+                            _error = f"Cannot create Agent: {_type_name}: {_exc_text}"
+                        reply = json.dumps({
+                            "error": _error,
+                            **({"query_id": self._current_query_id}
+                               if self._current_query_id is not None else {}),
+                        })
+                        self._emit_reply(reply)
+                        break
 
                 # ── Fix 1.2: Set busy before processing query ───────────
                 self.status = "busy"
@@ -5526,6 +5560,10 @@ class Worker(ToolBase):
     # :85), i.e. a worker that belongs to nobody.
     requires_authenticated_session: ClassVar[bool] = True
 
+    # The Worker builds a child Agent in this session's trust domain, so it is
+    # the one tool that receives the parent's live provider api key.
+    inherits_parent_api_key: ClassVar[bool] = True
+
     action: str = Field(
         description="Action: list, spawn, check, query, stop, submit_query, job_status, "
         "join, wait_for_job, pause, reset, inspect. "
@@ -6204,10 +6242,17 @@ class Worker(ToolBase):
         """
         Build an agent config dict from the tool's injected agent_config.
 
-        Returns a dict with provider, model, api_key, base_url, temperature
-        and any other fields present in ``self.agent_config`` (injected by
-        ToolExecutor).  This dict is passed to WorkerThread so it can create
-        an ``AgentConfig`` at runtime.
+        Returns a dict with provider, model, base_url, temperature and every
+        other field present in ``self.agent_config`` (injected by ToolExecutor).
+        This dict is passed to WorkerThread so it can create an ``AgentConfig``
+        at runtime.
+
+        ``api_key`` is present ONLY when the parent agent inherited its provider
+        key to this tool (``Worker.inherits_parent_api_key``); every other field
+        is injected unconditionally.  When the key is absent, the worker's
+        ``Agent`` construction fails with a clean error reply that names the
+        provider and the ``<PROVIDER>_API_KEY`` environment variable an operator
+        can set.
 
         Also injects ``workspace_path`` from the parent tool's workspace_path
         so that the worker's AgentConfig has it set, which in turn lets the
