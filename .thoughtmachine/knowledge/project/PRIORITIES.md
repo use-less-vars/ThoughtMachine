@@ -363,6 +363,27 @@ different file, different name. Never rename one to the other.
   The numbers above are a dated snapshot measured on this branch — re-measure before
   fixing.
 
+- **C68: Fail-closed worker session identity; injected fields off the schema.**
+  **Done** `ab102eab` (fail-closed session identity) + `ff9ce1e0` (injected-field schema
+  leak). A worker whose session identity cannot be established now refuses the dispatch
+  instead of running under an ambient default, so a dispatch can neither widen nor inherit
+  an identity it was not given. Separately, the executor-injected fields
+  (`session_permissions`, `effective_permissions`, `agent_config`, `is_worker_context`,
+  `session_id`) are declared `pydantic.json_schema.SkipJsonSchema` on the tool base model:
+  they still validate and stay usable at runtime, but no longer appear in
+  `model_json_schema()` or in the `model_to_openai_tool()` parameters, so a model can
+  neither see nor forge them. Pinned by `tests/tools/test_tool_schemas.py`.
+
+- **C69: Replay Resistance via Spec Nonce.** **Open** — filed by the agent during the C68
+  work; scope only, nothing designed. A dispatch that is replayed or duplicated (a resend,
+  a retry, or a second reader of the same envelope) can be executed more than once today,
+  and the repeat runs under whatever identity is current rather than the identity the
+  dispatch was issued under. Scope: mint a nonce into the worker spec at dispatch and echo
+  it in the envelope, so the runtime refuses a nonce it has already executed and a stale
+  nonce is rejected instead of replayed under a newer identity. First task is to decide
+  where the nonce is minted and for how long it is remembered — do not infer a design
+  from this line.
+
 ## Numbering (Gen 63 housekeeping)
 
 - **The Archived block reuses two live IDs.** It holds a **C35** ("Prove the Host Port is

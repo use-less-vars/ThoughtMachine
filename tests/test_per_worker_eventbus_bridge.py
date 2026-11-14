@@ -208,8 +208,11 @@ def test_completed_event_from_foreign_session_preserves_subscriptions():
     bridge_b, bus_b = _bridge_with_worker(session_b, worker_name, received_b)
     try:
         # Precondition: both bridges hold a subscription for worker 'default'.
-        assert worker_name in bridge_a._worker_bus_subs, bridge_a._worker_bus_subs
-        assert worker_name in bridge_b._worker_bus_subs, bridge_b._worker_bus_subs
+        # Keys are session-qualified: both sessions use the label 'default'.
+        assert f"{session_a}:{worker_name}" in bridge_a._worker_bus_subs, \
+            bridge_a._worker_bus_subs
+        assert f"{session_b}:{worker_name}" in bridge_b._worker_bus_subs, \
+            bridge_b._worker_bus_subs
         assert bus_a is not bus_b
 
         # Session A's worker completes -> published on the shared global bus.
@@ -226,11 +229,11 @@ def test_completed_event_from_foreign_session_preserves_subscriptions():
         time.sleep(0.05)
 
         # The owning bridge MUST drop its own subscription ...
-        assert worker_name not in bridge_a._worker_bus_subs, (
+        assert f"{session_a}:{worker_name}" not in bridge_a._worker_bus_subs, (
             "bridge A did not unsubscribe its own completed worker"
         )
         # ... and the foreign bridge MUST keep it.
-        assert worker_name in bridge_b._worker_bus_subs, (
+        assert f"{session_b}:{worker_name}" in bridge_b._worker_bus_subs, (
             "a WORKER_COMPLETED from another session unsubscribed this "
             "bridge's per-worker bus"
         )

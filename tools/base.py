@@ -1,5 +1,6 @@
 # tools/base.py
 from pydantic import BaseModel, Field, ConfigDict
+from pydantic.json_schema import SkipJsonSchema
 
 from typing import Literal, Any, Optional, ClassVar, List, Dict
 
@@ -56,14 +57,14 @@ class ToolBase(BaseModel):
 
     # Session permissions profile injected by ToolExecutor before execute()
     # Controls container network, filesystem mode, etc.
-    session_permissions: Optional[Dict[str, Any]] = Field(
+    session_permissions: SkipJsonSchema[Optional[Dict[str, Any]]] = Field(
         default=None,
         description='Session permissions dict injected by ToolExecutor.',
     )
 
     # Effective merged permissions injected by ToolExecutor for in-tool atomic re-checks.
     # Computed as session_permissions × workspace_capabilities.
-    effective_permissions: Optional[Dict[str, Any]] = Field(
+    effective_permissions: SkipJsonSchema[Optional[Dict[str, Any]]] = Field(
         default=None,
         description='Effective merged permissions (session × workspace) for atomic checks.',
     )
@@ -71,16 +72,26 @@ class ToolBase(BaseModel):
     # Agent config dict injected by ToolExecutor before execute().
     # Contains runtime-observable settings such as temperature, max_turns,
     # provider, model, tool_output_token_limit, and workspace_path.
-    agent_config: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
+    agent_config: SkipJsonSchema[Optional[Dict[str, Any]]] = Field(default=None, exclude=True)
 
     # Session ID injected by ToolExecutor. Set only for tools that
     # declare this field; inherited by all tools that extend ToolBase.
-    session_id: Optional[str] = Field(default=None, description="Session ID injected by ToolExecutor")
+    # SECURITY (C68): the model must not be told it may supply a session id.
+    # ``SkipJsonSchema`` removes the field from every generated JSON schema
+    # (``model_json_schema()`` and therefore ``model_to_openai_tool``); plain
+    # ``exclude=True`` alone only affects ``model_dump``. The value is an
+    # AUTHORITY FACT injected by ToolExecutor (it is popped out of the caller's
+    # arguments before validation), never an argument.
+    session_id: SkipJsonSchema[Optional[str]] = Field(
+        default=None,
+        exclude=True,
+        description="Session ID injected by ToolExecutor",
+    )
 
     # Worker-context flag injected by ToolExecutor before execute(). True when
     # the tool runs inside a worker sub-agent with no interactive user; tools
     # that self-gate on the 'ask' grain must deny instead of prompting.
-    is_worker_context: bool = Field(default=False, description="Whether tool runs in worker context (no interactive user); injected by ToolExecutor.")
+    is_worker_context: SkipJsonSchema[bool] = Field(default=False, description="Whether tool runs in worker context (no interactive user); injected by ToolExecutor.")
 
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = []
@@ -88,6 +99,13 @@ class ToolBase(BaseModel):
     # Permission categories required by this tool (e.g., ['container:true'])
     # Empty list means no special permissions needed.
     required_categories: ClassVar[List[str]] = []
+
+    # SECURITY (C68): True for tools whose actions reach a SESSION-SCOPED
+    # resource (worker spawn/park/journal). ToolExecutor REFUSES such a call
+    # when it has no authenticated session id, instead of injecting ``''`` --
+    # an empty id is not "no session needed", it is "no owner", and the worker
+    # layer would silently degrade it to the shared '<no-session>' scope.
+    requires_authenticated_session: ClassVar[bool] = False
 
     # Name of the hidden resource (see agent/config/defaults.RESOURCE_REGISTRY)
     # this tool must execute inside, or None for tools that need no resource

@@ -127,9 +127,19 @@ def _make_stub_worker(tmp_path):
     """A ``WorkerThread`` with only the attributes detach() touches.
 
     ``detach()`` writes a FENCED stop command, so the stub needs the identity a
-    real incarnation has: ``_fence()`` reads ``session_id`` / ``worker_name`` /
-    ``instance_id`` / ``_generation``.  Values are realistic rather than empty
-    so a fence assertion in a test means something.
+    real incarnation has.  ``_fence()`` (worker_thread.py:2771-2792) reads
+    ``session_id`` / ``worker_name`` / ``instance_id`` / ``_fence_epoch``, so
+    the stub sets the SAME two numbers ``__init__`` sets and keeps them
+    DISTINCT:
+
+    * ``_generation`` (worker_thread.py:1564) -- the journal generation, which
+      advances per incarnation;
+    * ``_fence_epoch`` (worker_thread.py:1572-1574) -- the supervisor-handed
+      epoch, fixed for the lifetime of the conversation.
+
+    The values differ (1 vs 3) on purpose: the asserted ``epoch`` below is 3,
+    so the test fails if ``_fence()`` ever reverts to reading the moving
+    ``_generation`` instead of the fixed ``_fence_epoch``.
     """
     from tools.workspace.worker_thread import WorkerThread
 
@@ -138,6 +148,7 @@ def _make_stub_worker(tmp_path):
     worker.worker_name = "stub-worker"
     worker.instance_id = 1
     worker._generation = 1
+    worker._fence_epoch = 3
     worker._turn_cancel = threading.Event()
     worker._stop_event = threading.Event()
     worker._park_event = threading.Event()
@@ -213,12 +224,14 @@ def test_detach_cancels_an_in_flight_sleep(tmp_path):
     # or mis-fenced payload is quarantined by the consumer, so the fence is the
     # signal rather than bookkeeping.
     command = json.loads((tmp_path / "command.json").read_text())
+    # ``epoch`` is ``_fence_epoch`` (3), NOT ``_generation`` (1): the stub keeps
+    # the two apart so this assertion pins WHICH number the fence carries.
     assert command == {
         "action": "stop",
         "session_id": "sess-stub",
         "worker_name": "stub-worker",
         "instance_id": 1,
-        "epoch": 1,
+        "epoch": 3,
     }, command
 
 

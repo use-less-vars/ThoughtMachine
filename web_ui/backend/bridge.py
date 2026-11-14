@@ -584,8 +584,10 @@ class WebAgentBridge:
         self._worker_partial_result_sub = None
         self._worker_token_warning_sub = None
         self._worker_message_sub = None
-        # Per-worker EventBus subscriptions, keyed by instance label:
-        #   worker_label -> {
+        # Per-worker EventBus subscriptions, keyed by SESSION-QUALIFIED instance
+        # label (see ``_bus_key``): an instance label is only unique *within* a
+        # session, so the real key is "<session_id>:<instance_label>":
+        #   "<session_id>:<worker_label>" -> {
         #       'bus': <the EventBus object the handlers were registered on>,
         #       'session_id': <session id used at subscribe time>,
         #       'instance_id': <int>,
@@ -745,17 +747,19 @@ class WebAgentBridge:
                     f"worker_name={data.get('worker_name', '?')}, "
                     f"session_id={data.get('session_id', '?')}, "
                     f"bridge_session_id={self._session_id}")
-                # Only forward events for this bridge's session
-                if data.get('session_id') and data['session_id'] != self._session_id:
+                # Only forward events that provably belong to this bridge's session
+                if not self._event_belongs_to_this_session(data):
                     log('DEBUG', 'pipeline.bridge',
-                        f"Global bus handler: SKIPPING event for different session "
-                        f"(event={data.get('session_id')}, bridge={self._session_id})")
+                        f"Global bus handler: SKIPPING event that does not belong "
+                        f"to this session (event={data.get('session_id')!r}, "
+                        f"bridge={self._session_id!r})")
                     return
                 event_dict = {
                     'type': f'worker:{event.type.value}',
                     'worker_name': data.get('worker_name', ''),
                     'instance_id': data.get('instance_id'),
                     'instance_label': data.get('instance_label'),
+                    'session_id': data.get('session_id') or self._session_id or '',
                     'timestamp': event.metadata.timestamp.isoformat(),
                     'data': data,
                 }
@@ -834,14 +838,35 @@ class WebAgentBridge:
             return False
         return entry.get('bus') is not current_bus
 
-    def _worker_bus_is_stale(self, worker_label: str) -> bool:
+    @staticmethod
+    def _bus_key(worker_label: str, session_id: Optional[str]) -> str:
+        """Session-qualified key for ``_worker_bus_subs``.
+
+        Worker instance labels (``<name>`` or ``<name>#<N>``) are only unique
+        inside one session: two sessions can each own a worker instance called
+        ``default``.  Qualifying the key by session keeps those two
+        subscriptions (and their unsubscribes) from colliding.
+        """
+        return f"{session_id or ''}:{worker_label}"
+
+    @staticmethod
+    def _bus_key_parts(key: str) -> tuple:
+        """Inverse of :meth:`_bus_key` \u2014 ``(session_id, worker_label)``."""
+        session_id, _, worker_label = key.partition(':')
+        return session_id, worker_label
+
+    def _worker_bus_is_stale(self, worker_label: str,
+                             session_id: Optional[str] = None) -> bool:
         """True when the registry now holds a *different* bus for this worker.
 
         Only a positive mismatch (the registry has a bus object that is not the
         one we subscribed on) counts as stale; if the registry has no bus at all
         we cannot tell, so the existing subscription is kept as-is.
+
+        *session_id* defaults to this bridge's session \u2014 the only session
+        whose workers it subscribes to \u2014 and selects the session-qualified key.
         """
-        entry = self._worker_bus_subs.get(worker_label)
+        entry = self._worker_bus_subs.get(self._bus_key(worker_label, session_id))
         if not isinstance(entry, dict) or 'bus' not in entry:
             return False
         if not (WORKER_BUS_AVAILABLE and get_worker_event_bus is not None):
@@ -872,7 +897,9 @@ class WebAgentBridge:
             from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
             buses = _WorkerRegistry.get_instance().get_event_buses_for_session(session_id)
             for worker_label, bus in buses.items():
-                stored_entry = self._worker_bus_subs.get(worker_label)
+                stored_entry = self._worker_bus_subs.get(
+                    self._bus_key(worker_label, session_id)
+                )
                 if stored_entry is not None:
                     if not self._stored_entry_is_stale(stored_entry, bus):
                         log('DEBUG', 'pipeline.bridge',
@@ -883,7 +910,7 @@ class WebAgentBridge:
                     log('INFO', 'server.bridge',
                         f"[DISCOVERY] Per-worker bus for {worker_label} was replaced "
                         f"\u2014 re-binding to the current bus")
-                    self._unsubscribe_worker_bus(worker_label)
+                    self._unsubscribe_worker_bus(worker_label, session_id=session_id)
                 log('INFO', 'server.bridge',
                     f"[DISCOVERY] Found existing worker: {worker_label} \u2014 subscribing to per-worker bus")
                 self._subscribe_to_worker_bus(
@@ -914,14 +941,26 @@ class WebAgentBridge:
         if source == "worker":
             return  # worker-sourced → already forwarded via per-worker bus
         data = event.data or {}
-        # Only forward events for this bridge's session
-        if data.get('session_id') and data['session_id'] != self._session_id:
+        # Only forward events for this bridge's session.  Deny-by-default: the
+        # global event bus is process-wide, so a token warning that cannot be
+        # attributed to this bridge's session is dropped rather than shown to
+        # every connected tab.  The session id lives in the payload when a
+        # worker stamps it, but the main agent publishes through
+        # convert_from_legacy_format(), which moves data['session_id'] into the
+        # event metadata -- so both places have to be consulted.
+        event_session_id = data.get('session_id') or (
+            event.metadata.session_id if event.metadata else ''
+        )
+        if not event_session_id or event_session_id != self._session_id:
+            log('DEBUG', 'core.token',
+                f"Bridge SKIP token_warning for unattributed/foreign session "
+                f"(event={event_session_id!r}, bridge={self._session_id!r})")
             return
         log('DEBUG', 'core.token', f"Bridge forward: worker={event.data.get('worker_name','?') if event.data else '?'} tokens={event.data.get('token_count','?') if event.data else '?'}")
         event_dict = {
             'type': 'worker:system_notification',
             'worker_name': data.get('worker_name', ''),
-            'session_id': event.metadata.session_id if event.metadata else None,
+            'session_id': event_session_id,
             'timestamp': datetime.datetime.now().isoformat(),
             'response': {
                 'type': 'token_warning',
@@ -975,9 +1014,11 @@ class WebAgentBridge:
                     pass
                 setattr(self, attr_name, None)
 
-        # Clean up all per-worker bus subscriptions (keyed by instance label)
-        for worker_label in list(self._worker_bus_subs.keys()):
-            self._unsubscribe_worker_bus(worker_label)
+        # Clean up all per-worker bus subscriptions.  Keys are session-qualified
+        # (see ``_bus_key``), so recover the instance label before unsubscribing.
+        for bus_key in list(self._worker_bus_subs.keys()):
+            bus_session_id, bus_worker_label = self._bus_key_parts(bus_key)
+            self._unsubscribe_worker_bus(bus_worker_label, session_id=bus_session_id)
         self._worker_bus_subs.clear()
 
     # ── Per-worker EventBus subscription management ───────────────────────────
@@ -1013,24 +1054,25 @@ class WebAgentBridge:
             f"n_callbacks={n_callbacks}, "
             f"WORKER_BUS_AVAILABLE={WORKER_BUS_AVAILABLE}, "
             f"get_worker_event_bus={'SET' if get_worker_event_bus is not None else 'NONE'}")
-        if data.get('session_id') and data['session_id'] != self._session_id:
+        if not self._event_belongs_to_this_session(data):
             log('DEBUG', 'pipeline.bridge',
-                f"_on_worker_spawned: SKIPPING (session mismatch)")
+                f"_on_worker_spawned: SKIPPING (session mismatch or missing "
+                f"session id)")
             return
 
         # A respawned worker gets a brand-new per-worker EventBus, while our
         # stored subscriptions still live on the dead one.  Detect that and
         # detach (from the stored bus, never the registry's new one) before the
         # duplicate-subscription guard below, so we re-bind to the current bus.
-        if self._worker_bus_is_stale(worker_label):
+        if self._worker_bus_is_stale(worker_label, session_id):
             log('INFO', 'server.bridge',
                 f"_on_worker_spawned: per-worker bus for {worker_label} was replaced "
                 f"— re-binding to the current bus")
-            self._unsubscribe_worker_bus(worker_label)
+            self._unsubscribe_worker_bus(worker_label, session_id=session_id)
 
         # Guard against duplicate subscriptions — if already subscribed for this
         # worker, skip re-subscribing to avoid duplicate events on the frontend.
-        if worker_label in self._worker_bus_subs:
+        if self._bus_key(worker_label, session_id) in self._worker_bus_subs:
             log('DEBUG', 'pipeline.bridge',
                 f"_on_worker_spawned: already subscribed for {worker_label}, "
                 f"skipping duplicate subscription")
@@ -1264,7 +1306,7 @@ class WebAgentBridge:
             session_id = self._session_id or ''
         if instance_id is None:
             instance_id = _worker_instance_parts(worker_label)[1]
-        self._worker_bus_subs[worker_label] = {
+        self._worker_bus_subs[self._bus_key(worker_label, session_id)] = {
             'bus': worker_bus,
             'session_id': session_id,
             'instance_id': instance_id,
@@ -1282,14 +1324,19 @@ class WebAgentBridge:
                 f"_subscribe_to_worker_bus [worker={worker_label}]: "
                 f"FAILED to subscribe to: {missing}")
 
-    def _unsubscribe_worker_bus(self, worker_label: str) -> None:
+    def _unsubscribe_worker_bus(self, worker_label: str,
+                                session_id: Optional[str] = None) -> None:
         """Unsubscribe all per-worker bus subscriptions for a worker instance.
 
         *worker_label* is the instance label (``<name>`` or ``<name>#<N>``) that
-        ``_subscribe_to_worker_bus`` keyed the subscriptions under.
+        ``_subscribe_to_worker_bus`` keyed the subscriptions under, together
+        with *session_id* (defaulting to this bridge's session) which completes
+        the session-qualified key.
         """
-        entry = self._worker_bus_subs.pop(worker_label, None)
-        # Clean up context_updated dedup tracking
+        entry = self._worker_bus_subs.pop(
+            self._bus_key(worker_label, session_id), None
+        )
+        # Clean up context_updated dedup tracking (keyed by instance label)
         self._last_context_updated.pop(worker_label, None)
         if not entry:
             return
@@ -1404,12 +1451,13 @@ class WebAgentBridge:
         data = event.data or {}
         # The global bus is process-global: only tear down per-worker
         # subscriptions for a worker belonging to THIS bridge's session.
-        if data.get('session_id') and data['session_id'] != self._session_id:
+        if not self._event_belongs_to_this_session(data):
             return
         worker_name = data.get('worker_name', '')
         if worker_name:
             self._unsubscribe_worker_bus(
-                _worker_instance_label(worker_name, data.get('instance_id') or 1)
+                _worker_instance_label(worker_name, data.get('instance_id') or 1),
+                session_id=data.get('session_id'),
             )
 
     def _on_worker_error(self, event: WorkerErrorEvent) -> None:
@@ -1421,13 +1469,30 @@ class WebAgentBridge:
         data = event.data or {}
         # The global bus is process-global: only tear down per-worker
         # subscriptions for a worker belonging to THIS bridge's session.
-        if data.get('session_id') and data['session_id'] != self._session_id:
+        if not self._event_belongs_to_this_session(data):
             return
         worker_name = data.get('worker_name', '')
         if worker_name:
             self._unsubscribe_worker_bus(
-                _worker_instance_label(worker_name, data.get('instance_id') or 1)
+                _worker_instance_label(worker_name, data.get('instance_id') or 1),
+                session_id=data.get('session_id'),
             )
+
+    def _event_belongs_to_this_session(self, data: Any) -> bool:
+        """True only for events that provably belong to this bridge's session.
+
+        Deny-by-default: the event must carry a NON-EMPTY ``session_id`` that
+        equals this bridge's session.  The event bus is process-wide and worker
+        instance labels are only unique per session, so an event with no session
+        id cannot be attributed to this bridge and is dropped rather than
+        forwarded to a tab that does not own it.
+        """
+        if not isinstance(data, dict):
+            return False
+        event_session_id = data.get('session_id')
+        if not event_session_id:
+            return False
+        return event_session_id == self._session_id
 
     def _forward_worker_event(self, event: Any) -> None:
         """Forward a worker lifecycle event to frontend (shared handler logic)."""
@@ -1438,17 +1503,19 @@ class WebAgentBridge:
             f"event_session_id={data.get('session_id', '?')}, "
             f"bridge_session_id={self._session_id}, "
             f"n_callbacks={len(self._forwarder._callbacks)}")
-        # Only forward events for this bridge's session
-        if data.get('session_id') and data['session_id'] != self._session_id:
+        # Only forward events that provably belong to this bridge's session
+        if not self._event_belongs_to_this_session(data):
             log('DEBUG', 'pipeline.bridge',
-                f"_forward_worker_event: SKIPPING event for different session "
-                f"(event={data.get('session_id')}, bridge={self._session_id})")
+                f"_forward_worker_event: SKIPPING event that does not belong to "
+                f"this session (event={data.get('session_id')!r}, "
+                f"bridge={self._session_id!r})")
             return
         event_dict = {
             'type': f'worker:{event.type.value}',
             'worker_name': data.get('worker_name', ''),
             'instance_id': data.get('instance_id'),
             'instance_label': data.get('instance_label'),
+            'session_id': data.get('session_id') or self._session_id or '',
             'timestamp': event.metadata.timestamp.isoformat(),
             'data': data,
         }
@@ -3025,6 +3092,15 @@ class WebAgentBridge:
 
         Called from ``load_session()`` after the session is loaded so that
         the bridge knows about idle workers that can be resumed.
+
+        Scoping: ``_persisted_workers`` is keyed by BARE worker name (the
+        ``resume_worker()`` / Worker-tool contract), so a worker owned by a
+        different session must never be loaded -- it would be handed out
+        here under the same key.  Only THIS session's directory
+        (``workers/<session_id>/<name>/``) plus the legacy sessionless
+        layout (``workers/<name>/``) is read; with no resolvable session
+        id only the legacy layout is read.  When a label exists in both
+        (an in-place upgrade), this session's transcript wins.
         """
         if not self._workspace_id:
             return
@@ -3045,22 +3121,60 @@ class WebAgentBridge:
             return
 
         loaded = 0
-        for subdir in workers_dir.iterdir():
-            if not subdir.is_dir():
-                continue
-            name = subdir.name
-            context_path = subdir / "context.json"
+
+        def _load_context(worker_dir: Path) -> None:
+            """Load a single worker directory's context.json into the cache."""
+            nonlocal loaded
+            context_path = worker_dir / "context.json"
             if not context_path.exists():
-                continue
+                return
             try:
                 context = json.loads(context_path.read_text(encoding="utf-8"))
-                self._persisted_workers[name] = {
-                    "name": name,
-                    "context": context,
-                }
-                loaded += 1
             except (json.JSONDecodeError, OSError):
-                continue
+                return
+            self._persisted_workers[worker_dir.name] = {
+                "name": worker_dir.name,
+                "context": context,
+            }
+            loaded += 1
+
+        # ``getattr``: partially-constructed bridges (``__new__`` in tests,
+        # early load) may not carry the attribute yet -- fail closed to
+        # "no session" (legacy layout only) rather than raising.
+        own_session_id = getattr(self, "_session_id", None) or ""
+
+        entries = [e for e in workers_dir.iterdir() if e.is_dir()]
+
+        # BOTH shipped layouts: legacy ``workers/<name>/context.json`` and
+        # session-scoped ``workers/<session_id>/<name>/context.json``.  A
+        # session directory carries no context.json of its own, so an entry
+        # without one is a session directory and is descended exactly one
+        # level.
+        #
+        # TWO deterministic passes, not one walk: an in-place upgrade leaves
+        # the pre-ticket legacy ``workers/<label>/`` in place while this
+        # session starts writing ``workers/<session_id>/<label>/``, so the
+        # same label exists twice and both map to the same bare cache key.
+        # Legacy first, own session second -> the current session's
+        # transcript wins deterministically instead of by directory order.
+        for entry in entries:
+            if (entry / "context.json").exists():
+                # Legacy sessionless layout -- owned by no session.
+                _load_context(entry)
+
+        if own_session_id:
+            # Session-scoped layout.  Load ONLY our own session: the cache key
+            # is the bare worker name, so another session's same-named worker
+            # would otherwise be resumed into this session.
+            for entry in entries:
+                if entry.name != own_session_id:
+                    continue
+                try:
+                    candidates = sorted(p for p in entry.iterdir() if p.is_dir())
+                except OSError:
+                    continue
+                for candidate in candidates:
+                    _load_context(candidate)
 
         if loaded:
             log('INFO', 'server.bridge',
