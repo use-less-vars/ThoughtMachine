@@ -57,14 +57,14 @@ class ToolBase(BaseModel):
 
     # Session permissions profile injected by ToolExecutor before execute()
     # Controls container network, filesystem mode, etc.
-    session_permissions: Optional[Dict[str, Any]] = Field(
+    session_permissions: SkipJsonSchema[Optional[Dict[str, Any]]] = Field(
         default=None,
         description='Session permissions dict injected by ToolExecutor.',
     )
 
     # Effective merged permissions injected by ToolExecutor for in-tool atomic re-checks.
     # Computed as session_permissions × workspace_capabilities.
-    effective_permissions: Optional[Dict[str, Any]] = Field(
+    effective_permissions: SkipJsonSchema[Optional[Dict[str, Any]]] = Field(
         default=None,
         description='Effective merged permissions (session × workspace) for atomic checks.',
     )
@@ -72,7 +72,7 @@ class ToolBase(BaseModel):
     # Agent config dict injected by ToolExecutor before execute().
     # Contains runtime-observable settings such as temperature, max_turns,
     # provider, model, tool_output_token_limit, and workspace_path.
-    agent_config: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
+    agent_config: SkipJsonSchema[Optional[Dict[str, Any]]] = Field(default=None, exclude=True)
 
     # Session ID injected by ToolExecutor. Set only for tools that
     # declare this field; inherited by all tools that extend ToolBase.
@@ -91,7 +91,7 @@ class ToolBase(BaseModel):
     # Worker-context flag injected by ToolExecutor before execute(). True when
     # the tool runs inside a worker sub-agent with no interactive user; tools
     # that self-gate on the 'ask' grain must deny instead of prompting.
-    is_worker_context: bool = Field(default=False, description="Whether tool runs in worker context (no interactive user); injected by ToolExecutor.")
+    is_worker_context: SkipJsonSchema[bool] = Field(default=False, description="Whether tool runs in worker context (no interactive user); injected by ToolExecutor.")
 
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = []
