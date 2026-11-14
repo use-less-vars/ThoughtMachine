@@ -1,4 +1,5 @@
 from .base import ToolBase
+from .utils import DEFAULT_EXCLUDE_DIRS
 import os
 import re
 import fnmatch
@@ -32,7 +33,7 @@ class FileSearchTool(ToolBase):
     case_sensitive: bool = Field(default=False, description="If True, perform case-sensitive search (default False).")
     max_results: int = Field(default=50, description="Maximum number of matches to return.")
     exclude_dirs: List[str] = Field(
-        default_factory=lambda: ["__pycache__", ".git", ".svn", ".hg", "node_modules", ".idea", ".vscode", ".pytest_cache", "build", "dist", "*.egg-info", "venv", "env", ".venv"],
+        default_factory=lambda: list(DEFAULT_EXCLUDE_DIRS),
         description="Directory names to exclude from search (exact match or glob patterns)"
     )
     
