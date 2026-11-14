@@ -126,6 +126,26 @@ class WorkerJobRegistry:
         if not job_id:
             return None
         with self._lock:
+            # Registering a job that already ENDED must not resurrect it. The
+            # submission paths enqueue first and register second (all-or-nothing),
+            # so a body that answers very quickly -- or a process-mode child whose
+            # reply beats the supervisor's next statement -- can complete the
+            # record before this line runs. Overwriting "completed" with
+            # "submitted" here would leave that job looking forever in flight to
+            # every later job_status / join.
+            existing = self._jobs.get(job_id)
+            if existing is not None and existing.get("status") in TERMINAL_STATUSES:
+                # ...but adopt the identity this call brings: a record created
+                # on demand by complete()/terminalize() carries no worker
+                # attribution, and jobs() filters on worker_name/instance_id.
+                for key, value in (
+                    ("worker_name", worker_name),
+                    ("session_id", session_id or ""),
+                    ("instance_id", instance_id),
+                ):
+                    if not existing.get(key) and value:
+                        existing[key] = value
+                return copy.deepcopy(existing)
             self._evict_if_needed_locked()
             now = _now_iso()
             record = {
