@@ -237,12 +237,20 @@ class ApplyEdits(ToolBase):
                     raise ValueError(f"File '{f}' is outside workspace: {e}")
             return validated_paths
         elif self.file_pattern:
+            # Anchor the glob at the SAME root every path in this tool is
+            # validated against: ``_resolve_workspace_root()`` (tools/base.py:356)
+            # -- the session's worktree when one is bound, else the registered
+            # workspace root.  ``Path('.')`` was the process CWD, which is not a
+            # root at all: the pattern matched one tree while ``_validate_path``
+            # resolved against another, so a bound session edited (or silently
+            # skipped) files its caller was not looking at.
+            base_dir = Path(self._resolve_workspace_root())
             # Use glob recursively if pattern contains **
             pattern = self.file_pattern
             if '**' in pattern:
-                raw_paths = list(Path('.').glob(pattern))
+                raw_paths = list(base_dir.glob(pattern))
             else:
-                raw_paths = list(Path('.').glob(pattern))
+                raw_paths = list(base_dir.glob(pattern))
             validated_paths = []
             for p in raw_paths:
                 try:
