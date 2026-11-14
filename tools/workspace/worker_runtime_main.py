@@ -284,6 +284,11 @@ def worker_runtime_main(
     worker_name = spec["worker"]
     instance = int(spec["instance"])
     epoch = int(spec["epoch"])
+    # Replay resistance (§4.7): the supervisor's per-spawn nonce, echoed back
+    # VERBATIM. Never minted here -- a nonce this side invented would be
+    # evidence of nothing, since the whole point is that only the process the
+    # supervisor spawned could have read it out of the spec it handed over.
+    incarnation = str(spec.get("incarnation_id") or "")
     outbox: Optional[_Outbox] = None
     try:
         factory = worker_factory
@@ -360,6 +365,7 @@ def worker_runtime_main(
                 started_at=datetime.now(timezone.utc).isoformat(),
                 runtime_version=RUNTIME_VERSION,
                 epoch_seen=epoch,
+                incarnation_id=incarnation,
                 # W9: announce the frames this build can serve. A supervisor that
                 # does not see ``config_update`` here must not send it -- this
                 # build would answer nothing, and silence is indistinguishable

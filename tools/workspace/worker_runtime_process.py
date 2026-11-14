@@ -186,6 +186,49 @@ def _briefing_only(
     return briefing
 
 
+def _new_incarnation_id() -> str:
+    """Mint the nonce that ties one spawn to the hello answering it (§4.7).
+
+    A ``uuid4`` rather than a counter: the value is read back by the child, so
+    the only property that makes it evidence of *this* spawn is that it could
+    not have been guessed -- and this module already ships a guessable
+    sequence (``_generation``) on the very same spec.
+    """
+    return uuid.uuid4().hex
+
+
+def _short_incarnation(value: Any) -> str:
+    """Render an incarnation nonce short enough for a log line (§4.7).
+
+    A mismatch report has to name both sides to be actionable and must not
+    spray unbounded ids into a log; eight hex characters separate two uuids as
+    reliably as the full 32 for a human reading one line.
+    """
+    text = str(value or "")
+    if not text:
+        return "<missing>"
+    return text[:8] + "..."
+
+
+def _audit_incarnation_mismatch(*, worker: str, expected: str, received: str) -> None:
+    """Record a refused replay attempt and never raise (§4.7).
+
+    Observability only: the refusal itself is the exception the caller gets, and
+    an audit backend that is unavailable must not turn a protocol violation into
+    a different failure.
+    """
+    try:
+        from thoughtmachine.audit_logger import audit_event
+
+        audit_event(
+            "WORKER_INCARNATION_MISMATCH",
+            f"worker={worker} expected={_short_incarnation(expected)} "
+            f"received={_short_incarnation(received)}",
+        )
+    except Exception:  # pragma: no cover - observability only
+        pass
+
+
 def spec_from_worker(worker: Any, *, epoch: Optional[int] = None) -> Dict[str, Any]:
     """Describe *worker* as the picklable dict the runtime side reconstructs.
 
@@ -199,6 +242,13 @@ def spec_from_worker(worker: Any, *, epoch: Optional[int] = None) -> Dict[str, A
     *epoch* defaults to the worker's own generation counter, because that is
     the value the command channel already fences this incarnation by; passing it
     explicitly keeps the spec deterministic in tests.
+
+    ``incarnation_id`` is the one axis that is deliberately NOT deterministic:
+    it is minted fresh on every call (§4.7). The fence axes are reused across a
+    respawn from a stale spec by design, so none of them can prove that the
+    greeting the supervisor receives came from the process it just spawned
+    rather than from a replayed frame; a per-spawn nonce can, and it is worth
+    the one value tests cannot pin.
     """
     for attribute in ("worker_name", "instance_id", "definition", "workspace_dir"):
         if not hasattr(worker, attribute):
@@ -238,6 +288,7 @@ def spec_from_worker(worker: Any, *, epoch: Optional[int] = None) -> Dict[str, A
         "worker": str(worker.worker_name),
         "instance": int(worker.instance_id),
         "epoch": int(epoch if epoch is not None else getattr(worker, "_generation", 0) or 0),
+        "incarnation_id": _new_incarnation_id(),
         "worker_factory": getattr(worker, "_runtime_worker_factory", None),
         "worker_kwargs": kwargs,
     }
@@ -351,6 +402,13 @@ class ProcessWorkerRuntime:
         on_frame: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self._spec = dict(spec)
+        # Replay resistance (§4.7): defaulted here and NOT in ``start``. The
+        # child reads the nonce out of this same dict, so a value minted after
+        # the spawn could never be echoed back -- it has to exist before the
+        # process is created. A hand-built spec (tests, adoption paths) still
+        # handshakes; only a hello that fails to echo THIS value is refused.
+        if not self._spec.get("incarnation_id"):
+            self._spec["incarnation_id"] = _new_incarnation_id()
         self._worker_factory = worker_factory
         self._start_method = start_method
         #: Sink for the frames this stage routes instead of consuming --
@@ -469,6 +527,29 @@ class ProcessWorkerRuntime:
                 f"{self._spec['epoch']}: the runtime is not the incarnation we "
                 "asked for (§4.7)",
                 reply=_terminal_reply("", "epoch_mismatch"),
+            )
+        expected_incarnation = self._spec["incarnation_id"]
+        if hello.incarnation_id != expected_incarnation:
+            # Loud before raising: a refused replay is a security event, and the
+            # caller only sees an exception it may well swallow (§4.7).
+            print(
+                "worker_runtime_process: REFUSING the runtime for "
+                f"{self._spec['worker']!r}: it greeted us as incarnation "
+                f"{_short_incarnation(hello.incarnation_id)}, but this spawn was "
+                f"issued as {_short_incarnation(expected_incarnation)} (§4.7)",
+                file=sys.stderr,
+            )
+            _audit_incarnation_mismatch(
+                worker=str(self._spec["worker"]),
+                expected=expected_incarnation,
+                received=hello.incarnation_id,
+            )
+            raise WorkerRuntimeLost(
+                f"hello carries incarnation "
+                f"{_short_incarnation(hello.incarnation_id)}, expected "
+                f"{_short_incarnation(expected_incarnation)}: the runtime is not "
+                "the incarnation we asked for (§4.7)",
+                reply=_terminal_reply("", "incarnation_mismatch"),
             )
         return hello
 
