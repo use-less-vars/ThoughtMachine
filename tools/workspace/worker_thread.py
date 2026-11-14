@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Union
 
 from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from tools.base import ToolBase
 from tools.workspace.command_channel import (
@@ -5370,6 +5371,14 @@ class Worker(ToolBase):
     # is decoupled from the 'execution' session permission (2026-08-03).
     required_categories: ClassVar[List[str]] = []
 
+    # SECURITY (C68): every Worker action reaches a SESSION-SCOPED resource (a
+    # spawn parks a thread, a query drives one, the journal is filed under the
+    # owning session).  ToolExecutor therefore REFUSES the call outright when
+    # it has no authenticated session id, rather than injecting ``''`` -- which
+    # this module degrades to the shared '<no-session>' scope (_NO_SESSION_KEY,
+    # :85), i.e. a worker that belongs to nobody.
+    requires_authenticated_session: ClassVar[bool] = True
+
     action: str = Field(
         description="Action: list, spawn, check, query, stop, submit_query, job_status, "
         "join, wait_for_job, pause, reset, inspect. "
@@ -5447,8 +5456,13 @@ class Worker(ToolBase):
                       "If not set, the worker definition's timeout is used.",
     )
 
-    session_id: Optional[str] = Field(
+    # SECURITY (C68): an AUTHORITY FACT, not an argument. ``SkipJsonSchema``
+    # keeps it out of every generated JSON schema (the model must not be told
+    # it may supply a session id); ToolExecutor pops any caller-supplied value
+    # before validation and injects its own authenticated id.
+    session_id: SkipJsonSchema[Optional[str]] = Field(
         default=None,
+        exclude=True,
         description="Session ID that spawned this worker (injected by ToolExecutor)",
     )
 

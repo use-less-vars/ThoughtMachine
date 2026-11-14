@@ -472,6 +472,40 @@ class ToolExecutor:
             for extra_key in list(tool_args.keys()):
                 if extra_key not in valid_field_names:
                     tool_args.pop(extra_key)
+
+            # SECURITY (C68): the authenticated session is an AUTHORITY FACT,
+            # never an argument.  A caller-supplied ``session_id`` is dropped
+            # HERE -- before validation -- so it can never reach the args model
+            # at all: a hallucinated or wrongly-typed value is ignored rather
+            # than rejected, and it can never win.  The authoritative value is
+            # injected below from this executor's own ``session_id``.
+            tool_args.pop('session_id', None)
+
+            # SECURITY (C68): fail CLOSED when a tool whose actions reach a
+            # session-scoped resource (worker spawn/park/journal) declares that
+            # it needs an authenticated session and the executor has none.
+            # ``''`` must never be injected: the worker layer degrades it to the
+            # shared ``'<no-session>'`` scope, which lets a sessionless call
+            # touch resources that belong to nobody.  Refusing is the only
+            # alternative to inventing an owner, and the caller's own value was
+            # just dropped, so there is nothing to fall back TO.
+            if (
+                getattr(tool_class, 'requires_authenticated_session', False)
+                and not session_id
+            ):
+                _refused_tool = (
+                    getattr(tool_class, 'name', '') or tool_class.__name__
+                )
+                return {
+                    'result': (
+                        "Refused: '%s' requires an AUTHENTICATED session and this "
+                        "executor has none. The session is an authority fact, not "
+                        "an argument -- a caller-supplied session_id is never "
+                        "used. Nothing was executed." % _refused_tool
+                    ),
+                    'tool_type': 'normal',
+                    'success': False,
+                }
             try:
                 tool_class.model_validate(tool_args)
             except ValidationError as e:
