@@ -19,8 +19,18 @@ The journal reuses :class:`tools.workspace.command_channel.CommandFence` and
 :func:`tools.workspace.command_channel.fence_rejection_reason` rather than
 inventing a second fencing scheme. The same four axes
 (``session_id`` / ``worker_name`` / ``instance_id`` / ``epoch``) that address a
-command address a journal record, and ``epoch`` is again the worker's real
-generation counter -- there is still exactly ONE source for it.
+command address a journal record, and ``epoch`` has exactly ONE source: the
+fence epoch the supervisor hands down.
+
+Two numbers, never one (C63-4). ``epoch`` is the CONVERSATION's identity: it is
+fixed for the life of the conversation and inherited verbatim by every
+incarnation of it, so it can never tell one incarnation from another. The
+INCARNATION's identity is the record's own ``generation`` -- a fifth,
+payload-level number (not a fence axis) that ADVANCES on every spawn, so a
+successor always writes a strictly higher one than the record it inherits.
+OWNERSHIP of an in-flight turn is decided by ``generation`` (see
+:func:`record_incarnation`); ``epoch`` remains the AUTHORIZATION/FRAMING axis
+and nothing more.
 
 That reuse is the whole argument against a new high-water map: **a record
 written by a dead incarnation is quarantined by ``fence_rejection_reason``
@@ -36,8 +46,9 @@ point:
   points, the park flip and the terminal clear all use it, and a foreign fence
   there is a quarantine.
 * :func:`read_inflight_unfenced` is the ADOPTION reader. Adoption is
-  CROSS-EPOCH BY DEFINITION -- a successor instance 1 (new epoch) must take
-  over the record a killed incarnation (old epoch) left behind -- so that one
+  CROSS-INCARNATION BY DEFINITION -- a successor instance 1 (new generation,
+  same fence epoch) must take over the record a killed incarnation (lower
+  generation) left behind -- so that one
   path needs a reader that does not consult the fence at all. It is a
   SEPARATE, explicitly named function rather than a bypass flag on the fenced
   reader, because the name is the safety property: a same-incarnation caller
@@ -53,8 +64,8 @@ file at a time: the writer is the thread that owns the directory.
 The directory is per instance (``_WorkerRegistry.instance_label``:
 ``architect`` for instance 1, ``architect#2`` for instance 2), so two instances
 of one name do not share a journal. Instance 1 keeps the bare name, so a
-SUCCESSOR instance 1 does reuse the directory -- with a new generation, i.e. a
-new ``epoch``.
+SUCCESSOR instance 1 does reuse the directory -- with a new ``generation`` (a
+new incarnation), while the fence ``epoch`` it writes stays the conversation's.
 
 Displacement is therefore a POLICY, never an accident:
 
@@ -156,6 +167,15 @@ _MALFORMED_REASON = "malformed inflight record"
 #: log grep matches either the policy or the axes.
 _REFUSAL_PREFIX = "refused: record for another incarnation is work in progress"
 
+#: Reason :func:`write_inflight` reports when the record on disk is addressed to
+#: the SAME fence but a DIFFERENT INDEPENDENT incarnation (C63-4). Distinct from
+#: :data:`_REFUSAL_PREFIX` on purpose: the log then says which case fired -- a
+#: work-in-progress record named by the fence, or a generation mismatch that the
+#: (now conversation-wide, hence non-discriminating) fence can no longer see.
+_REFUSAL_OTHER_INCARNATION_REASON = (
+    "refused: record belongs to another incarnation (generation %r != %r)"
+)
+
 #: Reasons :func:`adopt_inflight` reports. Stable, greppable strings: the caller
 #: logs them and moves on, and dropping a job because of one is a bug.
 _ADOPT_NOTHING_REASON = "refused: nothing to adopt (no inflight record)"
@@ -164,6 +184,7 @@ _ADOPT_CANCELLED_REASON = (
 )
 _ADOPT_ALREADY_REASON = "refused: record is already adopted (a successor took it over)"
 _ADOPT_OWN_REASON = "refused: record already belongs to this incarnation"
+_ADOPT_FUTURE_REASON = "refused: record belongs to a newer incarnation"
 _ADOPT_UNUSABLE_REASON = "refused: cannot adopt an unusable inflight journal: %s"
 _ADOPT_ATTEMPTS_REASON = "refused: attempts %r does not follow on from %r"
 
@@ -222,6 +243,13 @@ class InflightRecord:
     updated_at: str
     last_tool: Optional[Dict[str, str]] = None
     reason: Optional[str] = None
+    #: The INCARNATION that wrote this record (C63-4). Advances on every spawn
+    #: and is how ownership is decided (:func:`record_incarnation`); ``None``
+    #: means "written before the epoch/generation split", which is answered by
+    #: the legacy rule there. Deliberately NOT a fence axis: the fence's
+    #: ``epoch`` is the conversation's identity, inherited by every incarnation,
+    #: so it cannot carry this number.
+    generation: Optional[int] = None
     schema: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -246,6 +274,8 @@ class InflightRecord:
                 raise ValueError("%s must be a str" % name)
         if self.reason is not None and not isinstance(self.reason, str):
             raise ValueError("reason must be a str or None")
+        if self.generation is not None and type(self.generation) is not int:
+            raise ValueError("generation must be an int or None")
         if self.last_tool is not None:
             last_tool = self.last_tool
             if not isinstance(last_tool, dict):
@@ -271,6 +301,11 @@ class InflightRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.generation is not None:
+            # Only when this incarnation stamped one, so a record with no number
+            # stays BYTE-LEGACY and ``from_payload``'s "absent" branch keeps
+            # meaning exactly what it says.
+            payload["generation"] = self.generation
         payload.update(fence.to_payload())
         return payload
 
@@ -301,6 +336,14 @@ class InflightRecord:
         reason = data.get("reason")
         if reason is not None and not isinstance(reason, str):
             return None
+        # Absent is LEGACY, not malformed: that record was written pre-split, so
+        # the incarnation lives in its ``epoch`` axis and is resolved by
+        # :func:`record_incarnation`. Present but not an int (a bool is not one)
+        # is malformed, and a record whose owner cannot be established must not
+        # be adopted.
+        generation = data.get("generation")
+        if generation is not None and type(generation) is not int:
+            return None
         last_tool = data.get("last_tool")
         if last_tool is not None:
             if not isinstance(last_tool, dict):
@@ -324,9 +367,38 @@ class InflightRecord:
                 updated_at=data["updated_at"],
                 last_tool=last_tool,
                 reason=reason,
+                generation=generation,
             )
         except (ValueError, TypeError):
             return None
+
+
+def record_incarnation(
+    record: Optional[InflightRecord],
+    axes: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    """Which INCARNATION wrote *record*, or ``None`` when that cannot be known.
+
+    The record's own ``generation`` when it carries one. LEGACY RULE for a
+    payload that has none: it was written BEFORE the epoch/generation split, and
+    pre-split code stored the author's generation IN THE ``epoch`` AXIS -- so for
+    such a record the recorded ``epoch`` IS its incarnation,
+    ``generation = <record epoch>``. Never "unknown", never 0: a 0 would read
+    as "older than everything" and make every pre-split record adoptable by
+    anybody, and an unknown would make them all unadoptable (and a live
+    predecessor's record silently overwritten by the next write instead).
+
+    *axes* is the RAW fence-axes mapping an unfenced read returned
+    (:func:`read_inflight_unfenced`), because ``epoch`` lives on the payload's
+    fence rather than on the record object. ``None`` comes back when no number
+    can be established at all -- no record, no axes, or a non-int axis -- and
+    the caller must then decide ownership the pre-split way (by the fence) and
+    say so.
+    """
+    if record is not None and record.generation is not None:
+        return record.generation
+    epoch = (axes or {}).get("epoch")
+    return epoch if type(epoch) is int else None
 
 
 def journal_path(worker_dir: Path) -> Path:
@@ -420,15 +492,22 @@ def _atomic_write_json(
                 pass
 
 
-def _refusal_for_existing(target: Path, fence: CommandFence) -> Optional[str]:
+def _refusal_for_existing(
+    target: Path,
+    fence: CommandFence,
+    record: Optional[InflightRecord] = None,
+) -> Optional[str]:
     """Why the record at *target* must not be written over, or ``None``.
 
     The displacement policy lives in ONE place so both writers read it the same
     way. Allowed (``None``), with the warning the old unconditional write
-    already emitted: no file, an unusable file, a record fenced to *fence*
-    itself, and a foreign ``cancelled`` husk. Refused: a foreign record that is
-    work in progress, reported as ``<prefix>, status=<status> (<fence reason>)``
-    so a log grep matches the prefix or the fence vocabulary.
+    already emitted: no file, an unusable file, a record of THIS incarnation, and
+    a foreign ``cancelled`` husk. Refused: a record of ANOTHER incarnation of
+    this conversation, reported as
+    ``<other-incarnation prefix> (generation A != B)``; otherwise a foreign
+    record that is work in progress, reported as
+    ``<prefix>, status=<status> (<fence reason>)`` -- so a log grep matches the
+    prefix or the fence vocabulary, and the two cases never look alike.
 
     ``inflight`` counts as work in progress even though the ruling named only
     ``recoverable`` and ``adopted``: a HARD-KILLED incarnation never reached
@@ -436,6 +515,20 @@ def _refusal_for_existing(target: Path, fence: CommandFence) -> Optional[str]:
     Displacing that silently is the same work loss, so the refusal covers every
     status except ``cancelled`` -- including an unknown one, which cannot be
     shown to be safe to overwrite.
+
+    WHOSE RECORD IS IT comes FIRST, and on the GENERATION axis (C63-4). The
+    fence epoch is the CONVERSATION's identity: it is identical on a
+    predecessor's record and on ours, so ``fence_rejection_reason`` alone now
+    reads a dead predecessor's record as "my own record, an ordinary update"
+    and would let a fresh incarnation silently overwrite the turn a crash left
+    behind -- precisely the evidence ``adopt_inflight`` exists to recover. So a
+    stored record whose incarnation (``record_incarnation``: its own
+    ``generation``, or its ``epoch`` axis for a pre-split record) differs from
+    the WRITER's ``generation`` is FOREIGN and is refused, whatever the refusal
+    reason elsewhere: a successor never writes over an older incarnation's
+    record, and an older incarnation never writes over a newer one's. The fence
+    keeps its own job -- whether this worker may touch this directory and
+    whether the stored bytes are addressed to it at all.
     """
     existing, existing_reason = _read_payload(target)
     if existing is None:
@@ -447,6 +540,25 @@ def _refusal_for_existing(target: Path, fence: CommandFence) -> Optional[str]:
                 % (fence.worker_name, fence.instance_id, fence.epoch, existing_reason)
             )
         return None
+
+    mine = record.generation if record is not None else None
+    stored = InflightRecord.from_payload(existing)
+    if mine is not None and stored is not None:
+        author = record_incarnation(stored, _raw_fence_axes(existing))
+        if author is not None and author != mine:
+            _warn(
+                "Refused to replace an inflight journal record belonging to "
+                "another incarnation (worker '%s', instance_id=%s, "
+                "generation %s != %s, status=%r)"
+                % (
+                    fence.worker_name,
+                    fence.instance_id,
+                    author,
+                    mine,
+                    existing.get("status"),
+                )
+            )
+            return _REFUSAL_OTHER_INCARNATION_REASON % (author, mine)
 
     displaced = fence_rejection_reason(fence, existing)
     if displaced is None:
@@ -486,7 +598,10 @@ def write_inflight(
 
     The write is fenced in the sense that matters most here: the record is
     STAMPED with the caller's four fence axes, so a dead incarnation cannot
-    write a record that claims to belong to a live one.
+    write a record that claims to belong to a live one -- and, on top of that,
+    the record carries the WRITER's incarnation ``generation``, because the
+    fence epoch is the conversation's and is shared by every incarnation of it
+    (see :func:`record_incarnation` and :func:`_refusal_for_existing`).
 
     FAIL CLOSED on displacement. A record already on disk that is
     foreign-fenced (per :func:`fence_rejection_reason`) and still WORK IN
@@ -515,7 +630,7 @@ def write_inflight(
     except OSError as exc:
         return "cannot create worker dir: %s" % exc
 
-    refusal = _refusal_for_existing(target, fence)
+    refusal = _refusal_for_existing(target, fence, record)
     if refusal is not None:
         return refusal
 
@@ -526,6 +641,8 @@ def adopt_inflight(
     worker_dir: Path,
     fence: CommandFence,
     record: InflightRecord,
+    *,
+    generation: Optional[int] = None,
 ) -> Tuple[Optional[InflightRecord], Optional[str]]:
     """Take over a foreign-fenced record: the ONE displacing writer.
 
@@ -542,13 +659,24 @@ def adopt_inflight(
     cross-epoch record by definition, and a caller that has already read the
     file is not trusted to hand it back.
 
+    WHOSE RECORD IS IT: decided by GENERATION, not by the fence (C63-4).
+    *generation* is the ADOPTER's incarnation number, defaulting to
+    ``record.generation`` (the bumped record the caller built is stamped with
+    its own). A stored record at the SAME generation is this incarnation's own
+    (a same-incarnation adoption is a caller bug), one at a HIGHER generation
+    belongs to a later incarnation and is never displaced; only a LOWER one is
+    a dead predecessor's, which is the one case this writer exists for. The
+    stored number comes from :func:`record_incarnation`, whose legacy rule
+    reads a pre-split record's ``epoch`` axis. When neither side carries a
+    number at all, ownership falls back to the fence, exactly as pre-split code
+    judged it.
+
     Refuses, writing nothing and leaving the file byte-identical, when: there
     is nothing to adopt; the file is unusable; the record is ``cancelled``
     (R3/R6 -- a killed job is never resurrected); the record is already
     ``adopted`` (somebody else took it; do not double-adopt); the record
-    already belongs to *fence* (nothing to adopt, and a same-incarnation
-    adoption is a caller bug); or the ATTEMPT COUNT does not follow on from
-    the stored one.
+    already belongs to this incarnation; the record belongs to a NEWER one; or
+    the ATTEMPT COUNT does not follow on from the stored one.
 
     ATTEMPTS: the CALLER counts -- it owns the R3 policy -- so *record* must
     arrive with the count already bumped. This primitive only VERIFIES
@@ -595,7 +723,40 @@ def adopt_inflight(
         )
         return None, _ADOPT_ALREADY_REASON
 
-    if axes is not None and fence_rejection_reason(fence, axes) is None:
+    # WHO WROTE THIS RECORD? -- and the INVARIANT that makes the answer usable:
+    # ``epoch`` is the CONVERSATION's identity (fixed for the conversation's
+    # life, inherited verbatim by every incarnation, so two incarnations carry
+    # the SAME epoch and comparing epochs can never separate them); ``generation``
+    # is the INCARNATION's identity (advanced on every spawn). OWNERSHIP is
+    # decided by GENERATION alone; ``epoch`` keeps its job as the AUTHORIZATION
+    # axis -- the fence reason above and the roster decide whether this worker
+    # may touch this directory at all, never whose turn it is.
+    mine = generation if generation is not None else record.generation
+    if mine is not None:
+        author = record_incarnation(existing, axes)
+        if author is not None and author == mine:
+            # MINE: a same-incarnation adoption is a caller bug, and
+            # ``write_inflight`` already updates our own record.
+            _warn(
+                "Refused to adopt an inflight journal record this incarnation "
+                "already owns at '%s' (instance_id=%s, generation=%s)"
+                % (target, fence.instance_id, mine)
+            )
+            return None, _ADOPT_OWN_REASON
+        if author is not None and author > mine:
+            # A LATER incarnation's record: not ours to displace.
+            _warn(
+                "Refused to adopt an inflight journal record belonging to a "
+                "newer incarnation at '%s' (instance_id=%s, generation=%s < %s)"
+                % (target, fence.instance_id, mine, author)
+            )
+            return None, _ADOPT_FUTURE_REASON
+        # ``author`` is None or LOWER: a dead predecessor's record, which is the
+        # one case this writer exists for. Fall through and adopt.
+    elif axes is not None and fence_rejection_reason(fence, axes) is None:
+        # No incarnation number on EITHER side (a pre-split caller handing an
+        # unstamped record): ownership can only be judged by the fence, which IS
+        # how pre-split code judged it -- same four axes, same function.
         _warn(
             "Refused to adopt an inflight journal record this incarnation "
             "already owns at '%s' (instance_id=%s, epoch=%s)"

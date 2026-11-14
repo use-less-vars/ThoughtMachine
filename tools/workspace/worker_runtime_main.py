@@ -290,7 +290,35 @@ def worker_runtime_main(
         if factory is None:
             factory = _resolve_factory(spec.get("worker_factory"))
         kwargs = dict(spec.get("worker_kwargs") or {})
+        # C3-3: the child adopts the supervisor's epoch instead of allocating a
+        # second one at construction -- that second allocation is what made the
+        # child run at ``supervisor_epoch + 1``. A stand-in factory with a
+        # narrower signature is still built, just without the keyword.
+        if factory is None or _accepts_epoch(factory):
+            kwargs.setdefault("epoch", epoch)
         worker = _build_worker(factory, kwargs)
+        # C3-1: THIS interpreter is the body. Say so before ``start()``, which
+        # refuses to run a body for an object that is only a supervisor-side
+        # handle under process mode.
+        try:
+            worker.is_runtime_child = True
+        except (AttributeError, TypeError):  # a read-only stand-in
+            pass
+        # C63-4: the FENCE epoch is the handed epoch, whatever the factory did
+        # with the keyword. ``kwargs.setdefault("epoch", epoch)`` above only
+        # lands if the factory forwards it; one with a ``**kwargs`` stand-in
+        # signature (or a narrower one, e.g. a test puppet that builds a real
+        # WorkerThread and drops the argument) leaves the fence derived from a
+        # freshly allocated ``_generation`` -- a number that legitimately runs
+        # ABOVE the spec on every adoption spawn. Stamping the handed epoch on
+        # the object ``_fence()`` reads is what makes the child fence at the
+        # conversation's epoch rather than at its own journal's, and it is why
+        # every fenced command the supervisor sends is judged against the same
+        # number on both sides.
+        try:
+            worker._fence_epoch = int(epoch)
+        except (AttributeError, TypeError):  # a read-only stand-in
+            pass
         # The outbox exists BEFORE the worker starts (§4.6). ``start`` runs the
         # turn loop on its own thread and publishes ``worker_spawned`` on the
         # way in, so an outbox built after ``start`` returned would drop -- or,
@@ -316,6 +344,15 @@ def worker_runtime_main(
         # never blocks, so a tick never waits on the socket.
         worker._frame_sink = outbox.put
         _subscribe_child_events(worker, outbox)
+        # C3-3: the child RUNS the epoch it was handed, or it does not run at
+        # all. Verified against the sidecar the supervisor's allocation wrote --
+        # as a floor (a higher recorded generation is a legitimate respawn from
+        # a stale spec), not merely assumed: below this line the fence is law.
+        # C63-4: and verified on the FENCE axis, not just the in-memory one.
+        # ``_generation`` is the journal of this incarnation and legitimately
+        # runs AHEAD of the spec; the number every fenced command is judged
+        # against is ``_fence().epoch``, so that is what must equal the spec.
+        _verify_handed_epoch(worker, epoch)
         worker.start()
         outbox.put(
             Hello(
@@ -743,6 +780,117 @@ def _resolve_factory(ref: Optional[str]) -> Optional[Callable[..., Any]]:
         )
     module = importlib.import_module(module_name)
     return getattr(module, attribute)
+
+
+def _accepts_epoch(factory: Any) -> bool:
+    """Does *factory* take the ``epoch`` keyword (or ``**kwargs``)?
+
+    The child hands the supervisor's epoch to the worker it builds (C3-3). A
+    factory that cannot take it -- a test stand-in with a fixed signature --
+    must not be built twice, nor made to fail the spawn, so the keyword is
+    offered only where it will be accepted.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return False
+    if "epoch" in params:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _verify_handed_epoch(worker: Any, epoch: int) -> None:
+    """Fail closed unless *worker* really is running *epoch* (C3-3).
+
+    Adopting the handed-in epoch is not the same as being entitled to it, so
+    the child checks the three things it can see:
+
+    * the epoch on the FENCE axis (``worker._fence().epoch``) -- the C63-4
+      number the poller's ``fence_rejection_reason`` judges every command
+      against and every outbound command stamps. If that does not equal the
+      handed-in epoch, every fenced command is refused (or, worse, accepted
+      against the wrong conversation), so it must match exactly. This is the
+      authoritative check: it is the durable value, not a process-local
+      counter. A worker that cannot produce a fence is checked on the
+      in-memory axis only; and
+    * the epoch the worker reports for itself (``_generation``) -- under
+      C63-4 that journal legitimately runs AHEAD of the handed epoch (each
+      incarnation advances it), so only a value BELOW the handed epoch is a
+      fault: it means the adoption did not take and the child would run behind
+      the conversation it was spawned for; and
+    * ``worker_dir/generation``, the sidecar ``_allocate_generation`` writes
+      (``worker_thread.py:4748``) and the number every other part of the fence
+      logic compares against. INVARIANT: that sidecar is a FLOOR, not an
+      equality. The adoption protocol deliberately re-spawns from a STALE spec
+      epoch, so a legitimate new incarnation runs at a generation HIGHER than
+      the spec says -- adoption means "take over at least this epoch", not
+      "land on exactly this epoch". Only a ROLLBACK (recorded generation LOWER
+      than the handed epoch) is a spec this directory cannot honour, so only
+      that -- and an unreadable sidecar -- is refused.
+
+    An ABSENT sidecar is not a mismatch: a hand-built spec has nothing to
+    verify, and the supervisor's own allocation is what writes it. Stand-in
+    workers own no directory and no epoch, and are left alone.
+
+    Raising here is the fail-closed edge: ``worker_runtime_main`` turns it into
+    a ``Fatal`` frame and exit code 1, which is what the supervisor already
+    treats as "the child is gone" -- never as a live worker at the wrong epoch.
+    """
+    # C63-4: the fence axis first -- this is the number commands are judged
+    # against. The runtime stamped the handed epoch on this object, so a
+    # mismatch here means ``_fence()`` is deriving its epoch from something
+    # else (the moving generation journal), which is exactly the confusion the
+    # split exists to prevent.
+    try:
+        fence = worker._fence()
+    except Exception:  # pragma: no cover - a worker that cannot fence
+        fence = None
+    fence_epoch = getattr(fence, "epoch", None)
+    if isinstance(fence_epoch, int) and not isinstance(fence_epoch, bool):
+        if fence_epoch != int(epoch):
+            raise RuntimeError(
+                f"child fence epoch {fence_epoch} != handed-in epoch "
+                f"{int(epoch)}: the worker did not adopt the supervisor's "
+                "epoch (C3-3/C63-4)"
+            )
+    # In-memory sanity on the generation journal: it may run ahead (it is this
+    # incarnation's journal) but it may never run BEHIND the conversation it
+    # was spawned to serve.
+    adopted = getattr(worker, "_generation", None)
+    if isinstance(adopted, int) and not isinstance(adopted, bool):
+        if adopted < int(epoch):
+            raise RuntimeError(
+                f"child generation {adopted} < handed-in epoch {int(epoch)}: "
+                "the worker did not adopt the supervisor's epoch (C3-3)"
+            )
+    worker_dir = getattr(worker, "_worker_dir", None)
+    if worker_dir is None:
+        return
+    gen_file = os.path.join(str(worker_dir), "generation")
+    try:
+        with open(gen_file, "r", encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except FileNotFoundError:
+        return
+    try:
+        recorded = int(raw or 0)
+    except ValueError:
+        recorded = None
+    # Floor, not equality: ``recorded > epoch`` is a legitimate respawn from a
+    # stale spec (the adoption path), which must run; ``recorded < epoch`` is a
+    # rollback and ``recorded is None`` is a sidecar nobody can read -- both
+    # fail closed.
+    if recorded is None or recorded < int(epoch):
+        raise RuntimeError(
+            f"worker_dir/generation says {raw!r}, the spec says epoch "
+            f"{int(epoch)}: refusing to run BEHIND a generation this "
+            "directory already records (C3-3: the sidecar is a floor -- "
+            "higher is a legitimate respawn, lower is a rollback)"
+        )
 
 
 def _build_worker(
