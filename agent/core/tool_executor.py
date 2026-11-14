@@ -746,7 +746,6 @@ class ToolExecutor:
                     'temperature': getattr(self.config, 'temperature', None),
                     'max_turns': getattr(self.config, 'max_turns', None),
                     'provider': getattr(self.config, 'provider_type', None),
-                    'api_key': getattr(self.config, 'api_key', None),
                     'base_url': getattr(self.config, 'base_url', None),
                     'model': getattr(self.config, 'model', None),
                     'tool_output_token_limit': getattr(self.config, 'tool_output_token_limit', None),
@@ -758,6 +757,34 @@ class ToolExecutor:
                     'worker_timeout_seconds': getattr(self.config, 'worker_timeout_seconds', None),
                     'worker_max_retries': getattr(self.config, 'worker_max_retries', None),
                 }
+
+                # Credential handover: only tools that declare
+                # ``inherits_parent_api_key`` (they build a child agent in the
+                # same session trust domain) receive the live provider key.
+                # Every handover is recorded as a CREDENTIAL_USE event; the
+                # event carries the credential NAME only, never the value.
+                if getattr(tool_class, 'inherits_parent_api_key', False):
+                    tool_args['agent_config']['api_key'] = getattr(
+                        self.config, 'api_key', None
+                    )
+                    if _EVENT_SYSTEM_AVAILABLE:
+                        try:
+                            event_bus = self._event_bus or global_event_bus
+                            if event_bus is not None:
+                                event_bus.publish(
+                                    create_event(
+                                        EventType.CREDENTIAL_USE,
+                                        {
+                                            'credential_name': 'parent_api_key',
+                                            'tool_name': tool_name,
+                                            'session_id': session_id,
+                                        },
+                                        source='tool_executor',
+                                        session_id=session_id or None,
+                                    )
+                                )
+                        except Exception as exc:
+                            log('ERROR', 'core.credentials', "Credential audit event failed for tool '%s': %s", tool_name, exc)
             else:
                 tool_args['agent_config'] = None
 
