@@ -47,6 +47,7 @@ from tools.workspace.inflight_journal import (
     clear_inflight,
     read_inflight,
     read_inflight_unfenced,
+    record_incarnation,
     utcnow_iso,
     write_inflight,
 )
@@ -1343,9 +1344,9 @@ def _adopt_predecessor_journal(
     ``workers/<name>`` -- the very directory the dead incarnation used.  (An
     earlier design note wrongly assumed the successor got a fresh directory and
     would need a label change; it does not, and none was made.)  So the
-    predecessor's record is HERE, and it is addressed to a LOWER epoch --
-    ``_generation`` is allocated per worker directory, monotonically
-    (``_allocate_generation``).
+    predecessor's record is HERE, and it carries a LOWER incarnation number --
+    ``_generation`` advances on every spawn (``_next_generation``) -- while the
+    fence epoch it was written with is the ONE the whole conversation shares.
 
     The LOOK is ``read_inflight_unfenced`` because this incarnation's fence can
     never match a predecessor's epoch by definition; the TAKE is
@@ -1363,11 +1364,16 @@ def _adopt_predecessor_journal(
       ask.
     * ``adopted`` -- somebody else already took it; do not double-adopt.
 
-    ...and only when the record's on-disk epoch is STRICTLY LOWER than
-    *generation*: a record at this epoch or a later one is not a dead
-    predecessor's, and this same check is what makes adoption ONCE -- the
-    adoption write restamps the record to THIS fence, so every later turn's
-    look sees its own epoch and declines.
+    ...and only when the record's INCARNATION is STRICTLY LOWER than
+    *generation* (``record_incarnation``: its own ``generation``, or its
+    ``epoch`` axis for a pre-split record). NOT the epoch: the fence epoch is
+    the CONVERSATION's identity, identical on our own record and on the
+    predecessor's, so ``epoch >= generation`` compared two unrelated numbers and
+    let this path adopt its OWN record -- a successor then refused the
+    predecessor's turn as "already mine" and the dead turn was lost. The
+    generation check is also what makes adoption ONCE: the adoption write
+    restamps the record with THIS generation, so every later turn's look sees
+    its own number and declines.
 
     ATTEMPTS: the caller owns R3, and ``adopt_inflight`` only VERIFIES that the
     handed-in count follows on, so the bumped record is built here. A record
@@ -1391,10 +1397,13 @@ def _adopt_predecessor_journal(
             # ``recoverable`` belongs to the RESUME path (the detach park left
             # it for replay), ``cancelled`` is terminal, ``adopted`` is taken.
             return None
-        epoch = (axes or {}).get("epoch")
-        if type(epoch) is not int or epoch >= generation:
+        author = record_incarnation(existing, axes)
+        if type(author) is not int or author >= generation:
             # Not a DEAD predecessor's record -- either our own (already
-            # adopted, or written by this turn) or a newer incarnation's.
+            # adopted, or written by this turn) or a NEWER incarnation's. The
+            # compared axis is the INCARNATION number, never the epoch: the
+            # epoch is constant across incarnations of one conversation (see
+            # ``_next_generation``) and cannot separate them.
             return None
         if existing.attempts + 1 > MAX_ATTEMPTS:
             # R3 territory: the caller must terminalize as ``interrupted``.
@@ -1409,8 +1418,11 @@ def _adopt_predecessor_journal(
             updated_at=utcnow_iso(),
             last_tool=existing.last_tool,
             reason=existing.reason,
+            generation=generation,
         )
-        adopted, _refusal = adopt_inflight(worker_dir, fence, bumped)
+        adopted, _refusal = adopt_inflight(
+            worker_dir, fence, bumped, generation=generation
+        )
         return adopted
     except Exception as exc:  # bookkeeping must never fail a turn
         log("WARNING", "tools.worker",
@@ -1509,11 +1521,18 @@ class WorkerThread(threading.Thread):
         max_runtime_s: Optional[float] = None,
         frame_sink: Optional[Callable[[Any], None]] = None,
         initial_context: Optional[Dict[str, Any]] = None,
+        epoch: Optional[int] = None,
     ) -> None:
         # S4a: assigned before anything else -- every other attribute below can
         # reach a helper that calls _write_status_file, so the sink is set
         # first rather than left to a getattr() default.
         self._frame_sink = frame_sink
+        # C3-1: is THIS object the body, or the supervisor's handle for a body
+        # that lives in a child interpreter? Default False ("I am only a
+        # handle") is the safe answer: ``start()`` refuses to run a body for an
+        # object that is not the child, and the spawned child sets it True in
+        # ``worker_runtime_main`` -- the one interpreter that IS the body.
+        self.is_runtime_child: bool = False
         self.instance_id = instance_id
         instance_label = _WorkerRegistry.instance_label(name, instance_id)
         super().__init__(daemon=True, name=f"worker-{instance_label}")
@@ -1542,7 +1561,17 @@ class WorkerThread(threading.Thread):
         # F2: generation token — a monotonic per-worker counter that guards
         # context.json against stale-thread overwrites after a force-spawn
         # (a still-alive old thread must not clobber the replacement's file).
-        self._generation: int = self._allocate_generation()
+        self._generation: int = self._next_generation(epoch)
+        # C63-4: the FENCE epoch is a DIFFERENT number from the journal
+        # generation. The journal generation advances per incarnation (so a
+        # successor never shares the predecessor's journal row); the fence epoch
+        # is the supervisor's handed epoch and stays FIXED for the lifetime of
+        # the conversation, so the supervisor's own fenced commands keep being
+        # accepted by the child it spawned. Thread mode hands nothing and the
+        # two coincide, exactly as before.
+        self._fence_epoch: int = (
+            int(epoch) if epoch is not None else self._generation
+        )
 
         # Tool classes available to this worker (name -> class)
         self._tool_classes: Dict[str, type[ToolBase]] = tool_classes or {}
@@ -2597,6 +2626,83 @@ class WorkerThread(threading.Thread):
             pass
         return job_ids
 
+    # ── C3: who owns the body, and who owns command.json ─────────────
+
+    def _next_generation(self, epoch: Optional[int] = None) -> int:
+        """The JOURNAL generation this incarnation owns (C63-4).
+
+        INVARIANT (two numbers, never one):
+
+        * a dir never runs BEHIND the generation it records -- no rollback; and
+        * each incarnation ADVANCES the journal -- two incarnations never share
+          a journal row, which is what lets a successor tell a crashed
+          predecessor's record from its own and adopt it;
+        * while the FENCE epoch (``self._fence_epoch``) stays fixed for the
+          lifetime of the conversation.
+
+        A supervisor allocates its own generation. A spawned child is HANDED
+        the supervisor's epoch and runs its JOURNAL at ``max(epoch, recorded +
+        1)``: on a fresh directory that is the handed epoch, and on a directory
+        an earlier incarnation already stamped it is one past what is on disk,
+        so a respawn always advances. The naive "adopt the handed epoch
+        verbatim" pinned every incarnation to the spec value, which is why a
+        successor could not out-rank its predecessor's journal record.
+        """
+        if epoch is None:
+            return self._allocate_generation()
+        recorded = 0
+        try:
+            raw = (self._worker_dir / "generation").read_text(encoding="utf-8").strip()
+            recorded = int(raw or 0)
+        except (OSError, ValueError):
+            # Absent or unreadable sidecar is 0: a fresh dir has nothing to
+            # out-rank, and an unreadable one must not block a spawn (the fence
+            # floor in ``worker_runtime_main`` is the check that fails closed).
+            recorded = 0
+        return max(int(epoch), recorded + 1)
+
+    def polls_command(self) -> bool:
+        """Does THIS body read ``command.json``? (C3-2)
+
+        Exactly one body may claim a command from the channel. Under the
+        process substrate the child is the only body that runs, so it claims
+        and the supervisor-side handle must not race it for the same file.
+        Thread mode keeps its single in-process body, polling as it always has.
+        """
+        from tools.workspace.worker_runtime import MODE_THREAD
+
+        if getattr(self, "is_runtime_child", False):
+            return True
+        return getattr(self, "_runtime_mode", MODE_THREAD) == MODE_THREAD
+
+    def start(self) -> None:
+        """Start the body -- unless this object is only a supervisor's handle.
+
+        C3-1: under the process substrate the body lives in a child
+        interpreter, so an object whose ``runtime_mode`` is ``process`` must not
+        run a second turn loop beside it: the handle registered at spawn wraps a
+        body that is never started here. The child itself does start -- it IS the
+        body -- and says so with ``is_runtime_child``, which
+        ``worker_runtime_main`` sets before it calls this. The mode is read from
+        the marker the runtime handle stamps, never inferred from a pid, and an
+        unmarked worker keeps the legacy in-process behaviour.
+        """
+        from tools.workspace.worker_runtime import MODE_THREAD
+
+        runtime_mode = getattr(self, "_runtime_mode", MODE_THREAD)
+        if runtime_mode != MODE_THREAD and not getattr(
+            self, "is_runtime_child", False
+        ):
+            logger.debug(
+                "Worker '%s' instance %r: %s runtime mode -- not starting an "
+                "in-process body; the body lives in the child process",
+                getattr(self, "worker_name", self.name),
+                getattr(self, "instance_id", None),
+                runtime_mode,
+            )
+            return
+        super().start()
+
     def reset(self) -> Dict[str, Any]:
         """Reset per-query and persisted context state; the thread stays alive.
 
@@ -2670,15 +2776,19 @@ class WorkerThread(threading.Thread):
         (``_reset_for_new_generation``), so a cached fence would reject this
         worker's own commands after the first reset.
 
-        ``epoch`` is ``_generation`` -- deliberately NOT a second counter. The
-        fence epoch has to BE the worker's real incarnation number, or commands
-        written by this very worker would be rejected by its own consumer.
+        ``epoch`` is ``_fence_epoch``, NOT ``_generation`` (C63-4). The two are
+        deliberately separate numbers: the journal generation advances on every
+        incarnation, while the fence epoch stays FIXED for the lifetime of the
+        conversation. Using the moving number here would make a respawn reject
+        the commands of the supervisor that spawned it; using the fixed number
+        here and the moving one for the journal is what lets a successor adopt a
+        dead predecessor's turn AND still obey its own supervisor.
         """
         return CommandFence(
             session_id=self.session_id or "",
             worker_name=self.worker_name,
             instance_id=self.instance_id,
-            epoch=self._generation,
+            epoch=self._fence_epoch,
         )
 
     # ── inflight journal write points (S7b-2b) ──────────────────────────────
@@ -2720,11 +2830,19 @@ class WorkerThread(threading.Thread):
         not -- in that case the journal's ``query_id`` is synthetic and no job
         exists to terminalize.
         """
+        # The record carries THIS incarnation's journal generation (C63-4). It
+        # is the only thing that lets a successor tell this record from its own
+        # -- the fence epoch is the conversation's and is identical on both. A
+        # duck-typed/mocked ``_generation`` degrades to unstamped rather than
+        # failing the write, the same tolerance the rest of the class keeps for
+        # its generation.
+        generation = getattr(self, "_generation", None)
         record = InflightRecord(
             query_id=query_id,
             query=query,
             status=status,
             attempts=attempts,
+            generation=generation if type(generation) is int else None,
             requested_by=(
                 "send_query" if self._current_query_id is not None
                 else "worker_queue"
@@ -3367,8 +3485,8 @@ class WorkerThread(threading.Thread):
         # REFUSED by it: ``write_inflight`` fails closed on foreign work in
         # progress. Adoption is the one deliberate takeover, so it happens here,
         # at turn start, before the write, and at most once per incarnation
-        # (``_journal_adopted``); every later turn finds its own epoch on disk
-        # and adopts nothing. A journal that is absent, corrupt or somebody
+        # (``_journal_adopted``); every later turn finds its own GENERATION on
+        # disk and adopts nothing. A journal that is absent, corrupt or somebody
         # else's business is a silent no-op -- a predecessor's leftovers must
         # never fail or noise up this turn.
         if self._journal_adopted is None:
