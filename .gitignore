@@ -438,3 +438,9 @@ web_ui/frontend/.npmrc
 # Gen 63 housekeeping: the frontend dist build stamp is a local build artifact --
 # regenerated on every build, never versioned, so plain ignore is right here.
 web_ui/frontend/.dist-build-stamp
+
+# Gen 68 design pass (2026-11): the worker process substrate contract -- the
+# shipped-code revision of the P3 runtime-process design. Public tier, ships
+# with the repo. `docs/*` above is a catch-all, so the negation is required or
+# the file is never versioned and vanishes on the next clone.
+!docs/design-worker-process-substrate.md
