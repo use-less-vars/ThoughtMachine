@@ -160,6 +160,8 @@ docs/*
 !docs/container_registry_design.md
 !docs/container_record_design.md
 !docs/container_aggregate_envelope.md
+# The four laws that survived the Gen 64 migration (public tier).
+!docs/gen64-laws.md
 
 # Root-only Dockerfile pattern: ignores the repo-root Dockerfile (a stray
 # build artifact) but NOT resources/resource_dockerfile.txt — the tracked seed
