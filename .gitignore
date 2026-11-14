@@ -233,10 +233,6 @@ venv*
 .thoughtmachine/gate_log.txt
 web_ui/frontend/.npmrc
 web_ui/frontend/.npmrc
-# Frontend build-gate artefact: a LOCAL stamp (content hash of the built dist/),
-# never a source file -- the same directory whose .npmrc/dist/.vite are already
-# ignored here and in web_ui/frontend/.gitignore.
-web_ui/frontend/.dist-build-stamp
 
 # --- KB onboarding contract (Gen 48, 2026-10-23) --------------------------
 # KB_POLICY says "all KB is gitignored". That left MANDATORY_STOP.md -- the
@@ -439,8 +435,6 @@ web_ui/frontend/.dist-build-stamp
 # versioned and vanishes on the next clone.
 !docs/design_c13_timeout_self_healing.md
 
-# Gen 68 design pass (2026-11): the worker process substrate contract -- the
-# shipped-code revision of the P3 runtime-process design. Public tier, ships
-# with the repo. `docs/*` above is a catch-all, so the negation is required or
-# the file is never versioned and vanishes on the next clone.
-!docs/design-worker-process-substrate.md
+# Gen 63 housekeeping: the frontend dist build stamp is a local build artifact --
+# regenerated on every build, never versioned, so plain ignore is right here.
+web_ui/frontend/.dist-build-stamp

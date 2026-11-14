@@ -551,6 +551,15 @@ class WorkerRuntimeHandle:
             )
         self._worker = worker
         self._mode = mode
+        # C3-1: stamp the mode on the object this handle speaks for. A process
+        # mode handle is the supervisor of a body that lives in a child
+        # interpreter, so ``WorkerThread.start`` must not run a second body next
+        # to it; the child carries ``is_runtime_child`` and starts regardless.
+        # Thread mode is stamped too and still starts its one in-process body.
+        try:
+            worker._runtime_mode = mode
+        except (AttributeError, TypeError):  # a read-only stand-in
+            pass
         # S7a-2: the incarnation this handle speaks for, captured ONCE here.
         # A handle is the supervisor's memory of one incarnation, so re-reading
         # the live attributes on every dispatch would let it silently become
