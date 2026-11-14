@@ -480,6 +480,7 @@ def test_spec_from_worker_describes_a_picklable_worker():
         "worker",
         "instance",
         "epoch",
+        "incarnation_id",
         "worker_factory",
         "worker_kwargs",
     }
