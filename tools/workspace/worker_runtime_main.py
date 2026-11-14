@@ -304,6 +304,21 @@ def worker_runtime_main(
             worker.is_runtime_child = True
         except (AttributeError, TypeError):  # a read-only stand-in
             pass
+        # C63-4: the FENCE epoch is the handed epoch, whatever the factory did
+        # with the keyword. ``kwargs.setdefault("epoch", epoch)`` above only
+        # lands if the factory forwards it; one with a ``**kwargs`` stand-in
+        # signature (or a narrower one, e.g. a test puppet that builds a real
+        # WorkerThread and drops the argument) leaves the fence derived from a
+        # freshly allocated ``_generation`` -- a number that legitimately runs
+        # ABOVE the spec on every adoption spawn. Stamping the handed epoch on
+        # the object ``_fence()`` reads is what makes the child fence at the
+        # conversation's epoch rather than at its own journal's, and it is why
+        # every fenced command the supervisor sends is judged against the same
+        # number on both sides.
+        try:
+            worker._fence_epoch = int(epoch)
+        except (AttributeError, TypeError):  # a read-only stand-in
+            pass
         # The outbox exists BEFORE the worker starts (§4.6). ``start`` runs the
         # turn loop on its own thread and publishes ``worker_spawned`` on the
         # way in, so an outbox built after ``start`` returned would drop -- or,
@@ -333,6 +348,10 @@ def worker_runtime_main(
         # all. Verified against the sidecar the supervisor's allocation wrote --
         # as a floor (a higher recorded generation is a legitimate respawn from
         # a stale spec), not merely assumed: below this line the fence is law.
+        # C63-4: and verified on the FENCE axis, not just the in-memory one.
+        # ``_generation`` is the journal of this incarnation and legitimately
+        # runs AHEAD of the spec; the number every fenced command is judged
+        # against is ``_fence().epoch``, so that is what must equal the spec.
         _verify_handed_epoch(worker, epoch)
         worker.start()
         outbox.put(
@@ -788,11 +807,21 @@ def _verify_handed_epoch(worker: Any, epoch: int) -> None:
     """Fail closed unless *worker* really is running *epoch* (C3-3).
 
     Adopting the handed-in epoch is not the same as being entitled to it, so
-    the child checks the two things it can see:
+    the child checks the three things it can see:
 
-    * the epoch the worker reports for itself (``_generation``) -- an adoption
-      that silently did not happen would leave the child at the supervisor's
-      epoch + 1 and every fenced command would be refused; and
+    * the epoch on the FENCE axis (``worker._fence().epoch``) -- the C63-4
+      number the poller's ``fence_rejection_reason`` judges every command
+      against and every outbound command stamps. If that does not equal the
+      handed-in epoch, every fenced command is refused (or, worse, accepted
+      against the wrong conversation), so it must match exactly. This is the
+      authoritative check: it is the durable value, not a process-local
+      counter. A worker that cannot produce a fence is checked on the
+      in-memory axis only; and
+    * the epoch the worker reports for itself (``_generation``) -- under
+      C63-4 that journal legitimately runs AHEAD of the handed epoch (each
+      incarnation advances it), so only a value BELOW the handed epoch is a
+      fault: it means the adoption did not take and the child would run behind
+      the conversation it was spawned for; and
     * ``worker_dir/generation``, the sidecar ``_allocate_generation`` writes
       (``worker_thread.py:4748``) and the number every other part of the fence
       logic compares against. INVARIANT: that sidecar is a FLOOR, not an
@@ -811,12 +840,32 @@ def _verify_handed_epoch(worker: Any, epoch: int) -> None:
     a ``Fatal`` frame and exit code 1, which is what the supervisor already
     treats as "the child is gone" -- never as a live worker at the wrong epoch.
     """
+    # C63-4: the fence axis first -- this is the number commands are judged
+    # against. The runtime stamped the handed epoch on this object, so a
+    # mismatch here means ``_fence()`` is deriving its epoch from something
+    # else (the moving generation journal), which is exactly the confusion the
+    # split exists to prevent.
+    try:
+        fence = worker._fence()
+    except Exception:  # pragma: no cover - a worker that cannot fence
+        fence = None
+    fence_epoch = getattr(fence, "epoch", None)
+    if isinstance(fence_epoch, int) and not isinstance(fence_epoch, bool):
+        if fence_epoch != int(epoch):
+            raise RuntimeError(
+                f"child fence epoch {fence_epoch} != handed-in epoch "
+                f"{int(epoch)}: the worker did not adopt the supervisor's "
+                "epoch (C3-3/C63-4)"
+            )
+    # In-memory sanity on the generation journal: it may run ahead (it is this
+    # incarnation's journal) but it may never run BEHIND the conversation it
+    # was spawned to serve.
     adopted = getattr(worker, "_generation", None)
     if isinstance(adopted, int) and not isinstance(adopted, bool):
-        if adopted != int(epoch):
+        if adopted < int(epoch):
             raise RuntimeError(
-                f"child epoch {adopted} != handed-in epoch {int(epoch)}: the "
-                "worker did not adopt the supervisor's epoch (C3-3)"
+                f"child generation {adopted} < handed-in epoch {int(epoch)}: "
+                "the worker did not adopt the supervisor's epoch (C3-3)"
             )
     worker_dir = getattr(worker, "_worker_dir", None)
     if worker_dir is None:

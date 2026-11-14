@@ -13,7 +13,9 @@ the successor really takes the crashed turn over and drives it to terminal:
   higher and its own WRITE POINT 1 would be refused by the leftover record.
   It ADOPTS it instead (``attempts`` 0 -> 1) and starts the replay turn; it is
   ``SIGKILL``ed during that replay.  On disk: the ORIGINAL ``query_id``,
-  ``attempts == 1``, ``inflight``, epoch of P2.
+  ``attempts == 1``, ``inflight``, ``generation`` of P2 (the ``epoch`` axis
+  stays the conversation's, so it is unchanged -- the two numbers are not the
+  same thing).
 * P3 is spawned over the same directory, ADOPTS again (``attempts`` 1 -> 2),
   and COMPLETES the job: the journal file is cleared (WRITE POINT 3) and the
   turn that completed carries the ORIGINAL ``query_id`` -- the work the first
@@ -80,6 +82,7 @@ from tools.workspace.inflight_journal import (
     InflightRecord,
     journal_path,
     read_inflight_unfenced,
+    record_incarnation,
     utcnow_iso,
     write_inflight,
 )
@@ -265,9 +268,10 @@ def _poll(predicate, *, what: str, timeout: float = WAIT_S):
 def _read(worker_dir: Path):
     """``(record, fence_axes)`` from the ADOPTION-ONLY reader.
 
-    ``read_inflight_unfenced`` returns ``(record, axes, reason)``; the axes are
-    where the writing incarnation's epoch lives, which is what a successor
-    compares against its own generation.
+    ``read_inflight_unfenced`` returns ``(record, axes, reason)``.  The axes carry
+    the CONVERSATION epoch; the writing INCARNATION is the record's ``generation``
+    field, which is what a successor compares against its own generation (the
+    axes epoch is only the legacy fallback for records written before the split).
     """
     record, axes, _reason = read_inflight_unfenced(worker_dir)
     return record, axes
@@ -395,7 +399,8 @@ def test_three_process_chain_adopts_a_sigkilled_turn_to_terminal(
         ),
         what="P1's turn to actually start",
     )
-    epoch1 = axes1.get("epoch")
+    gen1 = record_incarnation(rec1, axes1)
+    assert gen1 is not None, (rec1.generation, axes1)
     _hard_kill(p1)
 
     # The crash leaves the record exactly where it was: inflight, unattempted.
@@ -430,9 +435,13 @@ def test_three_process_chain_adopts_a_sigkilled_turn_to_terminal(
     assert on_disk2.query_id == original_query_id, on_disk2.query_id
     assert on_disk2.attempts == 1, f"attempts {on_disk2.attempts} != 1"
     assert on_disk2.status == STATUS_INFLIGHT, on_disk2.status
-    epoch2 = axes2.get("epoch")
-    if epoch1 is not None:
-        assert epoch2 > epoch1, (epoch2, epoch1)
+    # The two numbers are separate: ``epoch`` identifies the CONVERSATION and is
+    # constant across incarnations of one worker directory, while ``generation``
+    # identifies the INCARNATION and must strictly advance here -- that advance
+    # is exactly what entitles P2 to adopt P1's record.
+    gen2 = record_incarnation(on_disk2, axes2)
+    assert gen2 > gen1, (gen2, gen1)
+    assert axes2.get("epoch") == axes1.get("epoch"), (axes2, axes1)
     _hard_kill(p2)
 
     # Killed mid-replay: still inflight, still attempt 1, still the same job.
