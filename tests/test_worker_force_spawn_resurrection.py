@@ -57,6 +57,7 @@ with its I/O edges patched for cases 5-6.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shutil
 import tempfile
@@ -99,6 +100,24 @@ class TestForceSpawnResurrection(unittest.TestCase):
             self._old_buses = dict(self._registry._worker_event_bus_registry)
             self._registry._worker_event_bus_registry.clear()
         self.addCleanup(self._restore_registry)
+
+        # ── Declare the in-process substrate these doubles model ────────────
+        # The thread class below is replaced by a MagicMock factory, so the
+        # "worker" in every case here is a double whose body can only live in
+        # this interpreter: its start() is a mock and it answers from a mock
+        # output queue.  The runtime mode is a SPAWN-TIME property read from
+        # WORKER_RUNTIME_MODE (default "process", C62), and a MagicMock cannot
+        # be carried across a process boundary -- a process-mode spawn
+        # serialises the worker spec, raises PicklingError and reports that
+        # instead of the fresh run under test.  Pinning thread mode makes the
+        # double coherent with what it claims to be; it is not a way around the
+        # process substrate, which is covered for real (real WorkerThread, real
+        # child) in tests/test_worker_process_e2e.py.
+        self._p_runtime_mode = mock.patch.dict(
+            os.environ, {"WORKER_RUNTIME_MODE": "thread"}
+        )
+        self._p_runtime_mode.start()
+        self.addCleanup(self._p_runtime_mode.stop)
 
         # ── Patch workspace plumbing so _action_spawn reaches the logic ──
         self._current_ws = WORKSPACE_A

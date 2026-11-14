@@ -1516,6 +1516,39 @@ class WorkerQueryTransportMissing(RuntimeError):
     """
 
 
+def declared_runtime_mode(worker: Any) -> Optional[str]:
+    """The runtime mode *worker* really declares, or ``None`` if it declares none.
+
+    ``_runtime_mode`` is a STAMP, not a hint: only
+    ``WorkerRuntimeHandle.__init__`` writes it, and the only legal values are
+    the members of :data:`RUNTIME_MODES`. Anything else is not a stamp and has
+    to be read as "unstamped", because the alternative is believing a
+    duck-typed double. ``unittest.mock.MagicMock`` answers every attribute
+    access, so ``getattr(worker, "_runtime_mode", None)`` hands back a Mock --
+    not ``None``, not ``MODE_THREAD`` -- and a caller that only compares
+    against those two concludes "some non-thread mode". It then either refuses
+    to deliver (``WorkerQueryTransportMissing`` naming ``<MagicMock
+    name='mock._runtime_mode'>`` as the mode) or tries to carry the worker's
+    spec across a process boundary the worker never had (``PicklingError`` on
+    the mock). Both were real regressions, which is why the check below is
+    membership in the mode vocabulary rather than uniqueness of ``None``.
+
+    A double -- and a stamp from a future build this one does not implement --
+    therefore reads as unstamped, and every caller's unstamped branch is the
+    pre-C3-1 behaviour: the queues.
+    """
+    # Function-local for the same reason every other worker_runtime import in
+    # this module is: this module is also loaded inside a worker's own process,
+    # and a module-level import would put a supervisor-only module in that
+    # graph.
+    from tools.workspace.worker_runtime import RUNTIME_MODES
+
+    mode = getattr(worker, "_runtime_mode", None)
+    if isinstance(mode, str) and mode in RUNTIME_MODES:
+        return mode
+    return None
+
+
 def runtime_dispatch_handle(worker: Any) -> Optional[Any]:
     """The runtime handle that must carry *worker*'s queries, or ``None``.
 
@@ -1534,10 +1567,11 @@ def runtime_dispatch_handle(worker: Any) -> Optional[Any]:
 
     ``None`` therefore means "use the queues", and it covers the two cases where
     that is right: thread mode, and an unstamped worker (a hand-built or
-    duck-typed double, i.e. ``_runtime_mode`` absent). A mode stamp WITHOUT a
-    matching handle also returns ``None`` -- :func:`deliver_query_to_worker`
-    turns that into :class:`WorkerQueryTransportMissing` rather than a queue
-    read that can only time out.
+    duck-typed double -- see :func:`declared_runtime_mode` for what counts as a
+    stamp at all). A mode stamp WITHOUT a matching handle also returns
+    ``None`` -- :func:`deliver_query_to_worker` turns that into
+    :class:`WorkerQueryTransportMissing` rather than a queue read that can only
+    time out.
 
     The mode match is deliberate: a handle built for a different mode speaks
     for a body this caller cannot see, and dispatching through it would deliver
@@ -1549,7 +1583,7 @@ def runtime_dispatch_handle(worker: Any) -> Optional[Any]:
     # graph.
     from tools.workspace.worker_runtime import MODE_THREAD
 
-    mode = getattr(worker, "_runtime_mode", None)
+    mode = declared_runtime_mode(worker)
     if mode is None or mode == MODE_THREAD:
         return None
     handle = getattr(worker, "_runtime_handle", None)
@@ -1577,7 +1611,7 @@ def deliver_query_to_worker(worker: Any, query: Any, *, timeout: float) -> Any:
         return handle.dispatch_query(str(query), timeout=timeout)
     from tools.workspace.worker_runtime import MODE_THREAD
 
-    mode = getattr(worker, "_runtime_mode", None)
+    mode = declared_runtime_mode(worker)
     if mode is not None and mode != MODE_THREAD:
         raise WorkerQueryTransportMissing(
             f"worker {getattr(worker, 'worker_name', '<unknown>')!r} runs in "
@@ -1613,7 +1647,7 @@ def worker_is_dispatchable(worker: Any) -> bool:
         return True
     from tools.workspace.worker_runtime import MODE_THREAD
 
-    mode = getattr(worker, "_runtime_mode", None)
+    mode = declared_runtime_mode(worker)
     if mode is not None and mode != MODE_THREAD:
         # Stamped for a child body. Its liveness is the child's, not the
         # supervisor thread's; the runtime handle reports that honestly.
@@ -1667,7 +1701,7 @@ def enqueue_query_to_worker(
         return
     from tools.workspace.worker_runtime import MODE_THREAD
 
-    mode = getattr(worker, "_runtime_mode", None)
+    mode = declared_runtime_mode(worker)
     if mode is not None and mode != MODE_THREAD:
         raise WorkerQueryTransportMissing(
             f"worker {getattr(worker, 'worker_name', '<unknown>')!r} runs in "
@@ -7655,7 +7689,7 @@ class Worker(ToolBase):
             )
             from tools.workspace.worker_runtime import MODE_THREAD
 
-            _spawn_mode = getattr(thread, "_runtime_mode", None)
+            _spawn_mode = declared_runtime_mode(thread)
             _spawn_handle = getattr(thread, "_runtime_handle", None)
             # The handle is only usable if it speaks for the mode the thread is
             # actually stamped with: a stale handle from an earlier incarnation
