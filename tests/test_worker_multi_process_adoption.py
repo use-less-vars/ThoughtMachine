@@ -86,6 +86,7 @@ from tools.workspace.inflight_journal import (
     utcnow_iso,
     write_inflight,
 )
+from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_thread import WorkerThread
 
 try:  # ``spawn`` is the only start method this test is about.
@@ -95,6 +96,9 @@ except ValueError:  # pragma: no cover - platform without spawn
 
 #: Worker name shared by every incarnation (the directory key).
 NAME = "mp-adoption-worker"
+
+#: Session the puppet workers are spawned in (namespaces their worker dir).
+SESSION = "sess-mp-adoption"
 
 #: The answer a completed turn produces.
 WORK = "THE TURN'S OWN ANSWER, delivered."
@@ -230,8 +234,14 @@ def _build_puppet_worker(**kwargs) -> WorkerThread:
 # ── parent side helpers ─────────────────────────────────────────────────────
 
 def _worker_dir(tmp_path, name: str, instance_id: int) -> Path:
-    label = worker_thread_module._WorkerRegistry.instance_label(name, instance_id)
-    return Path(tmp_path) / "workers" / label
+    """The directory the SPAWNED process really uses for this worker.
+
+    Delegates to ``WorkerRegistry.worker_dir`` (``workers/<session>/<label>``)
+    instead of hand-assembling ``workers/<label>``: the puppet specs below spawn
+    each incarnation with ``session_id=SESSION``, so the legacy, un-namespaced
+    path is one no process journals into — every poll against it timed out.
+    """
+    return WorkerRegistry.worker_dir(tmp_path, SESSION, name, instance_id)
 
 
 def _witness_path(tmp_path) -> Path:
@@ -298,7 +308,7 @@ def _spec(tmp_path, *, name: str, instance_id: int, block_on, epoch: int = 1) ->
             "name": name,
             "instance_id": instance_id,
             "workspace_dir": str(Path(tmp_path)),
-            "session_id": "sess-mp-adoption",
+            "session_id": SESSION,
             "witness_path": str(_witness_path(tmp_path)),
             "block_on": block_on,
         },
@@ -572,7 +582,7 @@ def test_poison_record_at_max_attempts_is_not_adopted(tmp_path, live_runtimes):
     # generation assertion below proves the declination was "too many
     # attempts" rather than "not an older epoch".
     fence = CommandFence(
-        session_id="sess-mp-adoption",
+        session_id=SESSION,
         worker_name=NAME,
         instance_id=1,
         epoch=0,

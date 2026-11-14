@@ -142,7 +142,8 @@ def test_respawn_after_bus_replacement_still_delivers_tool_events(session_id):
     try:
         # 1. First spawn binds the bridge to the old bus.
         _publish_worker_spawned(session_id, worker_name)
-        assert worker_name in bridge._worker_bus_subs, (
+        # Subscription keys are session-qualified: "<session>:<instance_label>".
+        assert f"{session_id}:{worker_name}" in bridge._worker_bus_subs, (
             f"bridge did not subscribe to the per-worker bus on spawn; "
             f"keys={sorted(bridge._worker_bus_subs.keys())}"
         )
@@ -209,7 +210,7 @@ def test_missing_worker_bus_retries_boundedly_then_degrades_once(session_id):
             f"expected exactly 5 bounded resolution attempts, got {len(attempts)}"
         )
         assert all(a[1] == worker_name for a in attempts), attempts
-        assert worker_name not in bridge._worker_bus_subs, (
+        assert f"{session_id}:{worker_name}" not in bridge._worker_bus_subs, (
             "a failed resolution must not leave a subscription entry behind"
         )
 
@@ -250,12 +251,13 @@ def test_stop_and_respawn_without_completion_leaves_no_dead_bus_bound(session_id
     bridge, received = _make_bridge(session_id)
     try:
         _publish_worker_spawned(session_id, worker_name)
-        assert worker_name in bridge._worker_bus_subs, sorted(bridge._worker_bus_subs.keys())
+        assert f"{session_id}:{worker_name}" in bridge._worker_bus_subs, \
+            sorted(bridge._worker_bus_subs.keys())
 
         # Worker thread dies without publishing WORKER_COMPLETED to the bridge:
         # the registry entry just disappears (worker_thread.py ``finally`` path).
         unregister_worker_event_bus(session_id, worker_name, instance_id=1)
-        assert worker_name in bridge._worker_bus_subs, (
+        assert f"{session_id}:{worker_name}" in bridge._worker_bus_subs, (
             "precondition: the bridge is expected to still hold the entry for a "
             "worker that died without a delivered WORKER_COMPLETED"
         )
