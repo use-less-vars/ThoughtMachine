@@ -379,6 +379,11 @@ web_ui/frontend/.npmrc
 !docs/windows_installation_saga.md
 !docs/windows_stability_contract.md
 !docs/worker_smoke_checklist.md
+# Gen 64 worktree SOP (2026-11-14): public tier -- agents and the Host both need
+# the branch -> worktree -> commit -> PR -> CI -> merge loop written down in one
+# place, and `docs/*` is a catch-all, so this line is what makes the file
+# committable at all.
+!docs/worktree-sop.md
 .worktrees/
 
 # Internal audit working documents -- deliberately NOT published to docs/.
