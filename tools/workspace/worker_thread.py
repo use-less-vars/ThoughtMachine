@@ -3380,6 +3380,28 @@ class WorkerThread(threading.Thread):
         if "workspace_path" not in worker_cfg and self._project_root:
             worker_cfg["workspace_path"] = self._project_root
 
+        # ── Default worktree_root: one worktree per session ────────────
+        # An explicitly configured root (the parent session's) always wins.
+        # Otherwise give the worker its own checkout under
+        # ``<workspace>/.worktrees/<session>`` so its file operations cannot
+        # collide with the main agent's.  Fail-open: no workspace root, no git
+        # binary, no repository, or a failing ``git worktree add`` all leave
+        # worktree_root unset, i.e. exactly the pre-existing behaviour.  The
+        # directory is created HERE because ``worktree_root`` is validated
+        # fail-closed downstream — the validator is never relaxed.
+        if not worker_cfg.get("worktree_root"):
+            from tools.workspace.worktree_defaults import (
+                resolve_worker_worktree_root,
+            )
+
+            _default_worktree_root = resolve_worker_worktree_root(
+                worker_cfg.get("workspace_path") or self._project_root,
+                self.session_id,
+                effective_permissions=worker_cfg.get("session_permissions"),
+            )
+            if _default_worktree_root:
+                worker_cfg["worktree_root"] = _default_worktree_root
+
         # Safety net: ensure max_turns is a valid int (fall back to 100)
         if "max_turns" not in worker_cfg or worker_cfg.get("max_turns") is None:
             worker_cfg["max_turns"] = 100
