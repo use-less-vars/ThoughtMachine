@@ -17,17 +17,29 @@ host." It doesn't. There are four regions of execution.
 |---|---|---|
 | Server | Host process | N/A — it *is* the host process |
 | Agent | Host process | No — it reasons and calls tools; it does not execute |
-| Workers | Host process, **as threads in the server** | No |
+| Workers | Host process, **a child OS process per worker** (default); a thread in the server only under `WORKER_RUNTIME_MODE=thread` | No |
 | File tools | Host process, **in-process Python** | **No** — see below |
 | `host_bash` | Host process, a real shell | **Yes** — the only one |
 | Git-as-resource | Container | No |
 | `DockerCodeRunner` | Container | No |
 
-**Workers are threads.** Not processes, not subprocesses, not containers
-(`WorkerThread(threading.Thread)` in `tools/workspace/worker_thread.py`): one server process, one
-shared in-memory registry, keyed `(session, name, iid)` — and with no workspace id in that key, a
-name lookup is global by construction. Every cross-workspace worker bug we have had is explained by
+**Workers are processes.** Not threads, not containers. An absent `WORKER_RUNTIME_MODE` resolves to
+`DEFAULT_RUNTIME_MODE = MODE_PROCESS` (`tools/workspace/worker_runtime.py:83`, with
+`MODE_PROCESS = "process"` at line 72), and the production spawn site (`worker_thread._action_spawn`)
+passes no `mode=` (`tools/workspace/worker_runtime.py:1277-1281`), so a spawned worker is served by a
+real child process. `WorkerThread(threading.Thread)`
+(`tools/workspace/worker_thread.py:1630`) is still the class declaration, but it is now the
+*in-process body* — the fallback reached only when the mode is explicitly thread:
+`WORKER_RUNTIME_MODE=thread`, or an explicit `mode=MODE_THREAD`.
+
+What did not change is the registry. There is one shared in-memory registry, still keyed
+`(session_key, name, iid)` (`tools/workspace/worker_thread.py:7404`, where `session_key` is
+`self.session_id or _NO_SESSION_KEY`, line 6501) — and with no workspace id in that key, a name
+lookup is global by construction. Every cross-workspace worker bug we have had is explained by
 this; the fixes are about making the registry scope correctly, not about process isolation.
+
+The behavioural proof that the default path is a real process, not a thread, is
+`tests/test_worker_is_a_real_process.py`.
 
 **File tools are not host execution.** They are Python functions in the server's own process,
 confined to the workspace root by path checks. They spawn nothing and reach nothing outside the
