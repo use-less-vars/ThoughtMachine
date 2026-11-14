@@ -671,11 +671,28 @@ class WorkerRuntimeHandle:
 
         1. **epoch drift** -- the worker now reports a different
            ``_generation`` than the one latched at construction;
-        2. **death** -- the worker's own ``is_alive()`` answers ``False``, so
-           no dispatch can ever be answered;
+        2. **death** -- the body this handle supervises is gone, so no
+           dispatch can ever be answered (see below for what counts);
         3. **a successor in the registry** -- the registry has recorded a
            higher epoch for this ``(session_id, worker_name)`` pair, i.e. the
            replacement was announced even if this object cannot see it.
+
+        Death evidence is *mode dependent*, and getting this wrong is not a
+        detail -- it silently disabled process mode. ``WorkerThread.is_alive()``
+        reports on the thread's own ``run()`` loop, so it is evidence only in
+        **thread** mode, where that loop *is* the worker body. In **process**
+        mode the supervisor thread is deliberately never started (``start()``
+        returns early: ``WorkerThread.start`` refuses to run a second body next
+        to a child interpreter), so ``is_alive()`` answers ``False`` for the
+        whole life of a perfectly healthy worker. Treating that as death made
+        every handle verb -- ``dispatch_query``, ``_ensure_process_runtime``
+        and therefore stop/pause/resume/kill -- raise
+        :class:`StaleWorkerFence` against a live child: a fence that fenced out
+        the only route to the body. In process mode the body is the child, so
+        the evidence is the child: a runtime that was built and is no longer
+        alive. A runtime that was never built yet is **not** death (it is
+        spawned lazily at the first verb), and a handle that never supervised a
+        child never acquires the evidence.
 
         Absence of evidence is never a fence: a worker that reports no epoch,
         has no ``is_alive``, or matches no registry entry passes. That keeps
@@ -701,15 +718,32 @@ class WorkerRuntimeHandle:
                     expected_epoch=expected,
                     observed_epoch=observed,
                 )
-            is_alive = getattr(worker, "is_alive", None)
-            if callable(is_alive) and is_alive() is False:
-                raise StaleWorkerFence(
-                    self._fence_message(
-                        "the worker is no longer alive", observed=observed
-                    ),
-                    expected_epoch=expected,
-                    observed_epoch=observed,
-                )
+            if self._mode == MODE_THREAD:
+                # Thread mode: the worker's own loop is the body.
+                is_alive = getattr(worker, "is_alive", None)
+                if callable(is_alive) and is_alive() is False:
+                    raise StaleWorkerFence(
+                        self._fence_message(
+                            "the worker is no longer alive", observed=observed
+                        ),
+                        expected_epoch=expected,
+                        observed_epoch=observed,
+                    )
+            else:
+                # Process mode: the child is the body, so the child is the
+                # evidence. The supervisor thread was never started on purpose
+                # -- asking it ``is_alive()`` here would report a live worker
+                # dead and fence out every route to it.
+                runtime = self._process_runtime
+                if runtime is not None and not runtime.alive:
+                    raise StaleWorkerFence(
+                        self._fence_message(
+                            "the worker's runtime process is no longer alive",
+                            observed=observed,
+                        ),
+                        expected_epoch=expected,
+                        observed_epoch=observed,
+                    )
             from tools.workspace.worker_registry import stored_epoch_for
 
             stored = stored_epoch_for(self._session_id, self._worker_name)
