@@ -1589,6 +1589,178 @@ def deliver_query_to_worker(worker: Any, query: Any, *, timeout: float) -> Any:
     return worker.send_query(query, timeout=timeout)
 
 
+def worker_is_dispatchable(worker: Any) -> bool:
+    """True when a query has somewhere to go -- *not* "the thread is running".
+
+    ``is_alive()`` answers "is the supervisor's ``run()`` loop executing", which
+    is the right death test in **thread mode** and the wrong one in process mode:
+    ``WorkerThread.start`` returns early there rather than run a second body
+    beside the child, so a perfectly healthy process-mode worker reports
+    ``is_alive() is False`` forever. Gating a query on it made every
+    ``query``/``submit_query`` against a process-mode worker answer
+    "is no longer alive" without ever asking the child (the async-enqueue
+    hole; same bug class as the S7a-2 fence).
+
+    So the test is mode-first: a stamped non-thread worker is dispatchable as
+    long as *a* transport could exist, and if the handle is missing the delivery
+    helper names the real fault (:class:`WorkerQueryTransportMissing`) instead of
+    this predicate inventing a death that did not happen. An unstamped or
+    duck-typed worker keeps the original ``is_alive()`` semantics, and a double
+    with no ``is_alive`` at all is treated as dispatchable so the delivery path
+    -- which does raise -- decides.
+    """
+    if runtime_dispatch_handle(worker) is not None:
+        return True
+    from tools.workspace.worker_runtime import MODE_THREAD
+
+    mode = getattr(worker, "_runtime_mode", None)
+    if mode is not None and mode != MODE_THREAD:
+        # Stamped for a child body. Its liveness is the child's, not the
+        # supervisor thread's; the runtime handle reports that honestly.
+        return True
+    is_alive = getattr(worker, "is_alive", None)
+    if not callable(is_alive):
+        return True
+    try:
+        return bool(is_alive())
+    except Exception:  # noqa: BLE001 - a broken double is not death evidence
+        return True
+
+
+def enqueue_query_to_worker(
+    worker: Any,
+    job_id: Any,
+    query: Any,
+    *,
+    timeout: float,
+    on_result: Optional[Callable[[str, Any, Any], None]] = None,
+) -> None:
+    """Hand *query* to *worker*'s body for LATER execution, over the right transport.
+
+    The submission half of :func:`deliver_query_to_worker`: the caller keeps its
+    ``job_id`` and returns immediately, so this must not wait for a reply.
+
+    *Process mode* -- the body is a child interpreter and the thread's queues
+    have no consumer there, so the query becomes a ``dispatch_query`` frame via
+    ``handle.dispatch_query_async``, correlated on *job_id* (the same id the
+    child's own reply pump and this side's job registry use). *on_result* is
+    called once the child answers, which is how a cross-process job reaches a
+    terminal registry state -- the child's WORKER_* events stay in its own
+    interpreter.
+
+    *Thread mode* -- byte-identical to what every submission site did before
+    this helper existed: the bookkept FIFO appender (``enqueue_query``), or the
+    raw queue on a duck-typed double.
+
+    Raises :class:`WorkerQueryTransportMissing` for a non-thread worker with no
+    usable handle: nothing was enqueued, and the caller must say so rather than
+    return a job_id that no body will ever run.
+    """
+    handle = runtime_dispatch_handle(worker)
+    if handle is not None:
+        handle.dispatch_query_async(
+            str(query),
+            timeout=timeout,
+            query_id=str(job_id),
+            on_result=on_result,
+        )
+        return
+    from tools.workspace.worker_runtime import MODE_THREAD
+
+    mode = getattr(worker, "_runtime_mode", None)
+    if mode is not None and mode != MODE_THREAD:
+        raise WorkerQueryTransportMissing(
+            f"worker {getattr(worker, 'worker_name', '<unknown>')!r} runs in "
+            f"{mode} mode but its runtime handle is missing, so there is no "
+            "transport to submit a query to. Nothing was enqueued and no body "
+            "will ever run it: the supervisor must keep the handle it built at "
+            "spawn (attach_thread_frame_sink)."
+        )
+    enqueue = getattr(worker, "enqueue_query", None)
+    if callable(enqueue):
+        enqueue(job_id, query)
+        return
+    worker._input_queue.put((job_id, query, None))  # pragma: no cover - doubles
+
+
+def _job_registry_reporter(job_id: Any) -> Callable[[str, Any, Any], None]:
+    """Build the ``on_result`` callback that closes *job_id* in the job registry.
+
+    A process-mode child publishes its WORKER_* events on ITS event bus; they
+    never reach the supervisor's (``WorkerRuntimeHandle.on_frame`` caches the
+    last ``Event`` frame but republishes nothing), so the registry cannot
+    complete a cross-process job by watching events. The reply this side gets
+    back is the authoritative signal, and this reporter turns it into the same
+    terminal record an in-process job would have got: ``completed`` with the
+    envelope, ``timeout``, or ``error``.
+
+    Every branch is best-effort and idempotent: the registry creates a record on
+    demand and refuses to overwrite a terminal one, a missing registry is a
+    no-op, and no failure here may propagate -- this runs on the runtime's
+    daemon waiter thread, where an exception would only be logged.
+    """
+
+    def _report(query_id: str, reply: Any, error: Any) -> None:
+        try:
+            registry = _get_worker_job_registry()
+            if registry is None:
+                return
+            envelope = getattr(reply, "envelope", None)
+            if not isinstance(envelope, dict):
+                envelope = {}
+            if error is None and bool(getattr(reply, "ok", False)):
+                registry.complete(job_id, envelope)
+                return
+            if error is None:
+                # A real reply frame that says the runtime refused or failed
+                # the query. Carry ITS status through; do not invent one.
+                status = envelope.get("status")
+                if status == "timeout":
+                    registry.terminalize(job_id, status="timeout", envelope=envelope)
+                else:
+                    registry.terminalize(
+                        job_id,
+                        status="error",
+                        envelope={
+                            "error": f"worker runtime reported {status!r}",
+                            "status": "error",
+                            "query_id": job_id,
+                        },
+                    )
+                return
+            if isinstance(error, TimeoutError):
+                terminal = getattr(error, "reply", None)
+                terminal_envelope = getattr(terminal, "envelope", None)
+                registry.terminalize(
+                    job_id,
+                    status="timeout",
+                    envelope=(
+                        terminal_envelope
+                        if isinstance(terminal_envelope, dict) and terminal_envelope
+                        else {"error": str(error), "status": "timeout"}
+                    ),
+                )
+                return
+            registry.terminalize(
+                job_id,
+                status="error",
+                envelope={
+                    "error": str(error) or type(error).__name__,
+                    "status": "error",
+                    "query_id": job_id,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must never raise
+            logger.warning(
+                "job registry report for %s failed: %s: %s",
+                job_id,
+                type(exc).__name__,
+                exc,
+            )
+
+    return _report
+
+
 # ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
@@ -7756,7 +7928,11 @@ class Worker(ToolBase):
                 "worker_name": self.worker_name,
             }
 
-        if not thread.is_alive():
+        # "Can this query reach a body?" -- NOT "is the supervisor's run() loop
+        # running?" (worker_is_dispatchable): in process mode the loop is
+        # deliberately never started, so the bare is_alive() test answered every
+        # query with "no longer alive" while the child was healthy and idle.
+        if not worker_is_dispatchable(thread):
             return {
                 "error": f"Worker '{self.worker_name}' is no longer alive "
                           f"(status: {thread.status}).",
@@ -7774,6 +7950,14 @@ class Worker(ToolBase):
         # deliveries alike.  No context -> delivered_query IS worker_query.
         delivered_query, context_note = self._compose_followup_query()
 
+        # ONE CLOCK: the budget the asynchronous branch below must carry into the
+        # runtime frame (and the synchronous branch's wait, computed once here so
+        # both deliveries use the same number).
+        wait = _worker_query_wait_timeout(
+            getattr(thread, "_timeout_seconds", None),
+            fallback=DEFAULT_REQUEST_SECONDS,
+        )
+
         # PHASE 2.1b: a submission against a DETACHED worker is QUEUED and
         # returns immediately -- it does NOT resume the worker. Resuming is
         # operator-initiated only (docs/design-worker-lifecycle.md, "Queries
@@ -7783,11 +7967,31 @@ class Worker(ToolBase):
         if thread.status == "detached":
             job_id = uuid.uuid4().hex
             try:
-                enqueue = getattr(thread, "enqueue_query", None)
-                if callable(enqueue):
-                    enqueue(job_id, delivered_query)
-                else:  # pragma: no cover - duck-typed thread doubles
-                    thread._input_queue.put((job_id, delivered_query, None))
+                # Runtime-mode aware (enqueue_query_to_worker): in process mode
+                # the thread's queues have NO consumer, so this submission must
+                # become a runtime frame or it silently never runs. The reporter
+                # closes the job record when the child answers -- its WORKER_*
+                # events stay in the child's interpreter.
+                enqueue_query_to_worker(
+                    thread,
+                    job_id,
+                    delivered_query,
+                    timeout=wait,
+                    on_result=_job_registry_reporter(job_id),
+                )
+            except WorkerQueryTransportMissing as exc:
+                # Nothing was queued, so no body will ever run this job. Say
+                # that instead of handing back a job_id that can only expire.
+                return {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "note": "The query was NOT queued: the worker is stamped for a "
+                            "non-thread runtime mode but has no usable runtime "
+                            "handle. This is a supervisor bug, not a worker "
+                            "failure. Re-spawn the worker before submitting again.",
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "status": thread.status,
+                }
             except Exception as exc:
                 return {
                     "error": f"Failed to enqueue query: {exc}",
@@ -7885,10 +8089,7 @@ class Worker(ToolBase):
             default=DEFAULT_REQUEST_SECONDS,
             source="worker_thread.query",
         )
-        wait = _worker_query_wait_timeout(
-            getattr(thread, "_timeout_seconds", None),
-            fallback=DEFAULT_REQUEST_SECONDS,
-        )
+        # ``wait`` was computed above (the async branch carries it too).
         if wait != DEFAULT_REQUEST_SECONDS:
             logger.info(
                 "query wait %.0fs (effective timeout %.0fs + grace); "
@@ -8068,7 +8269,9 @@ class Worker(ToolBase):
             )
         except _WorkerAmbiguityError as exc:
             return {"error": str(exc), "worker_name": self.worker_name}
-        if not thread.is_alive():
+        # Same mode-aware gate as action='query': a process-mode worker has no
+        # supervisor run() loop, so is_alive() is not a death test there.
+        if not worker_is_dispatchable(thread):
             return {
                 "error": f"Worker '{self.worker_name}' is no longer alive (status: {thread.status}).",
                 "status": thread.status,
@@ -8080,15 +8283,35 @@ class Worker(ToolBase):
         # what the worker later reads, so the context must ride inside it.
         delivered_query, context_note = self._compose_followup_query()
         job_id = uuid.uuid4().hex
+        wait = _worker_query_wait_timeout(
+            getattr(thread, "_timeout_seconds", None),
+            fallback=DEFAULT_REQUEST_SECONDS,
+        )
         try:
             # PHASE 2.1b: append through the bookkept FIFO appender. This only
             # ever appends (a busy worker's later submissions queue behind the
             # running turn; a detached worker stays parked and burns nothing).
-            enqueue = getattr(thread, "enqueue_query", None)
-            if callable(enqueue):
-                enqueue(job_id, delivered_query)
-            else:  # pragma: no cover - duck-typed thread doubles
-                thread._input_queue.put((job_id, delivered_query, None))
+            # Runtime-mode aware: in process mode that appender has no consumer,
+            # so the submission becomes a runtime frame instead and the reporter
+            # closes the job record when the child answers.
+            enqueue_query_to_worker(
+                thread,
+                job_id,
+                delivered_query,
+                timeout=wait,
+                on_result=_job_registry_reporter(job_id),
+            )
+        except WorkerQueryTransportMissing as exc:
+            return {
+                "error": f"{type(exc).__name__}: {exc}",
+                "note": "The query was NOT submitted: the worker is stamped for a "
+                        "non-thread runtime mode but has no usable runtime "
+                        "handle. This is a supervisor bug, not a worker failure. "
+                        "Re-spawn the worker before submitting again.",
+                "worker_name": self.worker_name,
+                "instance_id": iid,
+                "status": thread.status,
+            }
         except Exception as exc:
             return {"error": f"Failed to enqueue query: {exc}", "worker_name": self.worker_name}
         registry = _get_worker_job_registry()

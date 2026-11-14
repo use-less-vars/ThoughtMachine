@@ -56,9 +56,10 @@ import logging
 import os
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
 from tools.workspace.worker_runtime_protocol import Event, Heartbeat, WorkerState
 
@@ -788,6 +789,54 @@ class WorkerRuntimeHandle:
                 query, timeout=timeout
             )
         return self._worker.send_query(query, timeout=timeout)
+
+    def dispatch_query_async(
+        self,
+        query: str,
+        *,
+        timeout: float = 120.0,
+        query_id: Optional[str] = None,
+        on_result: Optional[Callable[[str, Any, Any], None]] = None,
+    ) -> str:
+        """Submit *query* without waiting for the answer; return its id.
+
+        The non-blocking half of :meth:`dispatch_query`, and the transport the
+        submission routes need: a caller that queues work and returns a job
+        handle must not sit on the reply, but it must still reach the *body*.
+
+        *Process mode*: the query becomes a ``dispatch_query`` frame and the
+        reply is matched on *query_id* by ``ProcessWorkerRuntime`` (§4.8).
+        *on_result* fires exactly once, on the runtime's daemon waiter thread,
+        and is the only channel a reply can take -- the correlation table
+        consumes the frame.
+
+        *Thread mode*: the query goes through the same bookkept FIFO appender
+        (``enqueue_query``) the submission paths always used, so *on_result*
+        never fires -- the report is the in-process event stream the body
+        already publishes (WORKER_PARTIAL_RESULT / WORKER_COMPLETED), which
+        the job registry consumes directly. Documented rather than emulated:
+        inventing a second report path in thread mode would make the same job
+        complete twice.
+
+        The S7a-2 fence runs first, in both modes, exactly as in
+        :meth:`dispatch_query`: a stale handle raises instead of submitting
+        into whatever now occupies the worker slot.
+        """
+        self._assert_current()
+        if self._mode == MODE_PROCESS:
+            return self._ensure_process_runtime().dispatch_query_async(
+                query,
+                timeout=timeout,
+                query_id=query_id,
+                on_result=on_result,
+            )
+        resolved_id = str(query_id) if query_id else uuid.uuid4().hex
+        enqueue = getattr(self._worker, "enqueue_query", None)
+        if callable(enqueue):
+            enqueue(resolved_id, str(query))
+        else:  # pragma: no cover - duck-typed thread doubles
+            self._worker._input_queue.put((resolved_id, str(query), None))
+        return resolved_id
 
     def update_config(self, config: Mapping[str, Any], *, timeout: float = 30.0) -> Any:
         """Push *config* (an ``AgentConfig`` patch) at the live worker (§4.9).
