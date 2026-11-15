@@ -193,12 +193,20 @@ try:
 except Exception:
     _CM = None  # type: ignore
 
+# Diagnostic only: recorded when the ExecutionState import fails and surfaced in
+# the per-worker presenter lazy-init warning (_run_tool_loop) instead of being
+# logged here.  At import time ``log`` is bound either to agent.logging.log (line
+# above) or -- when that import failed -- to a bare ``logging.getLogger``, whose
+# signature is not ``log(level, tag, message)``; an import-time call would then
+# raise and take the whole module down.
+_EXECUTION_STATE_IMPORT_ERROR: Optional[str] = None
 try:
     from agent.core.state import ExecutionState, TurnState, TimeState
-except ImportError:
+except ImportError as _exec_state_exc:
     ExecutionState = None
     TurnState = None
     TimeState = None
+    _EXECUTION_STATE_IMPORT_ERROR = f"{type(_exec_state_exc).__name__}: {_exec_state_exc}"
 
 from tools.workspace.worker_container import (
     _WORKER_CONTAINER_LABEL,
@@ -3781,6 +3789,19 @@ class WorkerThread(threading.Thread):
                     f"Lazy-init complete [worker={self.worker_name}]: "
                     f"worker_bus_adapter={'SET' if self._worker_bus_adapter else 'NONE'}, "
                     f"event_processor={'SET' if self._event_processor else 'NONE'}")
+            else:
+                # Diagnostic only: the adapter was silently left as None, so every
+                # agent event below is dropped without a trace.  Once per worker
+                # instance -- this block is re-entered on every query for as long
+                # as ``_state_bridge`` stays None.
+                if not getattr(self, "_bus_adapter_missing_warned", False):
+                    self._bus_adapter_missing_warned = True
+                    log("WARNING", "pipeline.worker",
+                        f"Presenter lazy-init DISABLED [worker={self.worker_name}]: "
+                        f"StateBridge={'NONE' if StateBridge is None else 'SET'}, "
+                        f"ExecutionState={'NONE' if ExecutionState is None else 'SET'}, "
+                        f"import_error={_EXECUTION_STATE_IMPORT_ERROR or 'none'}"
+                        f" -- no WorkerBusAdapter: agent events will not reach the frontend")
 
         # Log the user query as a user_message event
         self._publish_event("user_message", {"query": query})
@@ -4049,6 +4070,17 @@ class WorkerThread(threading.Thread):
                         self._worker_bus_adapter.forward_agent_event(event)
                     except Exception as exc:
                         log('WARNING', 'tools.worker', f"forward_agent_event failed for {event_type}: {exc}")
+                else:
+                    # Diagnostic only: the adapter is absent, so this event -- and
+                    # every later one -- is dropped here.  Once per worker lifetime:
+                    # this is the per-event hot path.
+                    if not getattr(self, "_bus_event_drop_warned", False):
+                        self._bus_event_drop_warned = True
+                        log("WARNING", "tools.worker",
+                            f"agent event DROPPED [worker={self.worker_name}]: "
+                            f"no WorkerBusAdapter, first dropped type={event_type!r} "
+                            f"-- worker events will not reach the frontend "
+                            f"(see the 'Presenter lazy-init DISABLED' warning)")
 
                 # Capture final response content and reasoning
                 if event_type == "agent_responded":
@@ -5620,6 +5652,16 @@ class WorkerThread(threading.Thread):
         if "worker_name" not in data:
             data = {**data, "worker_name": self.worker_name}
         if self._event_bus is None or create_event is None or EventType is None:
+            # Diagnostic only: this early return silently drops the event.  Once
+            # per worker lifetime -- _publish_event is a hot path.
+            if not getattr(self, "_publish_event_disabled_warned", False):
+                self._publish_event_disabled_warned = True
+                log("WARNING", "tools.worker",
+                    f"_publish_event DISABLED [worker={self.worker_name}]: "
+                    f"event_bus={'NONE' if self._event_bus is None else 'SET'}, "
+                    f"create_event={'NONE' if create_event is None else 'SET'}, "
+                    f"EventType={'NONE' if EventType is None else 'SET'}"
+                    f" -- dropping {event_type!r} and every later event")
             return
 
         try:
