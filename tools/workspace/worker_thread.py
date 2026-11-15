@@ -1501,6 +1501,129 @@ def is_initial_context_message(message: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Runtime-mode aware query delivery
+# ---------------------------------------------------------------------------
+
+
+class WorkerQueryTransportMissing(RuntimeError):
+    """A worker is stamped for a non-thread runtime but has no usable handle.
+
+    Not a worker fault and not a timeout: the supervisor built (or inherited) a
+    worker whose body lives in a child interpreter and then could not find the
+    handle that is the only transport to it. Raising names the bug; the queue
+    fallback the callers used to take would have said "did not respond" after
+    blocking for the whole query budget.
+    """
+
+
+def declared_runtime_mode(worker: Any) -> Optional[str]:
+    """The runtime mode *worker* really declares, or ``None`` if it declares none.
+
+    ``_runtime_mode`` is a STAMP, not a hint: only
+    ``WorkerRuntimeHandle.__init__`` writes it, and the only legal values are
+    the members of :data:`RUNTIME_MODES`. Anything else is not a stamp and has
+    to be read as "unstamped", because the alternative is believing a
+    duck-typed double. ``unittest.mock.MagicMock`` answers every attribute
+    access, so ``getattr(worker, "_runtime_mode", None)`` hands back a Mock --
+    not ``None``, not ``MODE_THREAD`` -- and a caller that only compares
+    against those two concludes "some non-thread mode". It then either refuses
+    to deliver (``WorkerQueryTransportMissing`` naming ``<MagicMock
+    name='mock._runtime_mode'>`` as the mode) or tries to carry the worker's
+    spec across a process boundary the worker never had (``PicklingError`` on
+    the mock). Both were real regressions, which is why the check below is
+    membership in the mode vocabulary rather than uniqueness of ``None``.
+
+    A double -- and a stamp from a future build this one does not implement --
+    therefore reads as unstamped, and every caller's unstamped branch is the
+    pre-C3-1 behaviour: the queues.
+    """
+    # Function-local for the same reason every other worker_runtime import in
+    # this module is: this module is also loaded inside a worker's own process,
+    # and a module-level import would put a supervisor-only module in that
+    # graph.
+    from tools.workspace.worker_runtime import RUNTIME_MODES
+
+    mode = getattr(worker, "_runtime_mode", None)
+    if isinstance(mode, str) and mode in RUNTIME_MODES:
+        return mode
+    return None
+
+
+def runtime_dispatch_handle(worker: Any) -> Optional[Any]:
+    """The runtime handle that must carry *worker*'s queries, or ``None``.
+
+    A worker's queries reach its body over one of exactly two transports, and
+    which one is live is a property of the worker's stamped *runtime mode*, not
+    of the caller (C3-1, ``WorkerRuntimeHandle.__init__``):
+
+    * **thread mode** -- the body IS the ``WorkerThread``'s own ``run()`` loop,
+      so ``send_query`` / ``_input_queue.put`` is the transport and there is no
+      handle to prefer;
+    * **process mode** -- the body is a child interpreter. The supervisor's
+      thread is *deliberately never started* (``WorkerThread.start`` returns
+      early rather than run a second body beside the child), so its queues have
+      no consumer: a query put there is accepted, never runs, and the caller
+      waits out its full budget for an answer that cannot come.
+
+    ``None`` therefore means "use the queues", and it covers the two cases where
+    that is right: thread mode, and an unstamped worker (a hand-built or
+    duck-typed double -- see :func:`declared_runtime_mode` for what counts as a
+    stamp at all). A mode stamp WITHOUT a matching handle also returns
+    ``None`` -- :func:`deliver_query_to_worker` turns that into
+    :class:`WorkerQueryTransportMissing` rather than a queue read that can only
+    time out.
+
+    The mode match is deliberate: a handle built for a different mode speaks
+    for a body this caller cannot see, and dispatching through it would deliver
+    the query somewhere else entirely.
+    """
+    # Function-local for the same reason every other worker_runtime import in
+    # this module is: this module is also loaded inside a worker's own process,
+    # and a module-level import would put a supervisor-only module in that
+    # graph.
+    from tools.workspace.worker_runtime import MODE_THREAD
+
+    mode = declared_runtime_mode(worker)
+    if mode is None or mode == MODE_THREAD:
+        return None
+    handle = getattr(worker, "_runtime_handle", None)
+    if handle is None or getattr(handle, "mode", None) != mode:
+        return None
+    return handle
+
+
+def deliver_query_to_worker(worker: Any, query: Any, *, timeout: float) -> Any:
+    """Deliver *query* to *worker* and return the reply, over the right transport.
+
+    Thread mode delegates to ``worker.send_query`` -- byte-identical to what
+    every caller did before this helper existed. Process mode goes through the
+    runtime handle, which starts the child on first use and matches the reply on
+    its ``query_id``.
+
+    Exceptions are the caller's to interpret, and they are all real answers:
+    :class:`TimeoutError` (``WorkerQueryTimeout`` subclasses it) for "no reply
+    in the window", ``WorkerRuntimeLost`` for "the child died under the query",
+    and :class:`WorkerQueryTransportMissing` for "this supervisor forgot to give
+    the worker a handle".
+    """
+    handle = runtime_dispatch_handle(worker)
+    if handle is not None:
+        return handle.dispatch_query(str(query), timeout=timeout)
+    from tools.workspace.worker_runtime import MODE_THREAD
+
+    mode = declared_runtime_mode(worker)
+    if mode is not None and mode != MODE_THREAD:
+        raise WorkerQueryTransportMissing(
+            f"worker {getattr(worker, 'worker_name', '<unknown>')!r} runs in "
+            f"{mode} mode but its runtime handle is missing, so there is no "
+            "transport for a query. Nothing was delivered and nothing will "
+            "answer: the supervisor must keep the handle it built at spawn "
+            "(attach_thread_frame_sink)."
+        )
+    return worker.send_query(query, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
 
@@ -6720,7 +6843,13 @@ class Worker(ToolBase):
             # ── Commit 8: dispatch window opens — query about to be delivered ──
             dispatch_started_at = time.time()
             try:
-                response = reuse_thread.send_query(query, timeout=wait)
+                # Runtime-mode aware: in process mode the existing instance's
+                # queues have no consumer (its thread was never started), so a
+                # direct send_query would be dropped on the floor and answered
+                # by nothing.
+                response = deliver_query_to_worker(
+                    reuse_thread, query, timeout=wait
+                )
             except TimeoutError as exc:
                 return {
                     "error": str(exc),
@@ -6729,6 +6858,24 @@ class Worker(ToolBase):
                         "not respond within the query window; the existing "
                         "instance is still alive and can be queried again via "
                         "action='query'."
+                    ),
+                    "worker_name": self.worker_name,
+                    "instance_id": reuse_iid,
+                    "instance_label": getattr(reuse_thread, "instance_label", None),
+                    "spawned": False,
+                    "status": reuse_thread.status,
+                }
+            except RuntimeError as exc:
+                # WorkerQueryTransportMissing / WorkerRuntimeLost: no transport,
+                # or the child died under the query. Both are answers about this
+                # instance, and neither may escape a spawn call as a raise.
+                return {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "note": (
+                        f"Worker '{self.worker_name}' instance {reuse_iid} "
+                        "could not be delivered the query; it was not "
+                        "restarted. Check it with action='check', then query "
+                        "it again or stop it."
                     ),
                     "worker_name": self.worker_name,
                     "instance_id": reuse_iid,
@@ -6793,32 +6940,61 @@ class Worker(ToolBase):
             # input queue.  If a real query was queued by someone else, keep it — but the
             # NEW spawn query runs FIRST (F4 FIFO): it is enqueued before the
             # stale item, which is re-queued at the tail and processed after.
-            stale_query = None
-            try:
-                while True:
-                    item = resume_paused_worker._input_queue.get_nowait()
-                    if item is not None and item is not _PARK_SENTINEL:
-                        stale_query = item
-                        break
-            except queue.Empty:
-                pass
-
             # ── Commit 8: dispatch window opens — query about to be delivered ──
             dispatch_started_at = time.time()
-            resume_paused_worker._input_queue.put(query)
-            if stale_query is not None:
-                resume_paused_worker._input_queue.put(stale_query)
             resume_wait = _worker_query_wait_timeout(
                 getattr(resume_paused_worker, "_timeout_seconds", None),
                 fallback=SPAWN_QUEUE_TIMEOUT,
             )
-            try:
-                final_result = resume_paused_worker._output_queue.get(timeout=resume_wait)
-            except queue.Empty:
-                final_result = json.dumps({
-                    "error": f"Worker '{self.worker_name}' did not respond within {resume_wait}s",
-                    "note": "Worker timed out. The paused worker was resumed but did not produce a response.",
-                })
+            _resume_handle = runtime_dispatch_handle(resume_paused_worker)
+            if _resume_handle is not None:
+                # Process mode: the resumed body is a child. The input queue
+                # below belongs to a thread that was never started, so draining
+                # stale park markers and reading _output_queue would be theatre
+                # — nothing consumes either. The handle is the transport, and
+                # the stale-marker drain is a thread-mode concern only.
+                try:
+                    final_result = _resume_handle.dispatch_query(
+                        str(query), timeout=resume_wait
+                    )
+                except Exception as exc:  # noqa: BLE001 - a spawn reports, never raises
+                    logger.debug(
+                        "Spawn: resume-path dispatch failed for worker '%s'",
+                        self.worker_name, exc_info=True,
+                    )
+                    final_result = json.dumps({
+                        "error": (
+                            f"Worker '{self.worker_name}' did not answer the "
+                            f"resumed query: {type(exc).__name__}: {exc}"
+                        ),
+                        "note": (
+                            "The paused worker was resumed but its runtime "
+                            "did not produce a response."
+                        ),
+                    })
+            else:
+                stale_query = None
+                try:
+                    while True:
+                        item = resume_paused_worker._input_queue.get_nowait()
+                        if item is not None and item is not _PARK_SENTINEL:
+                            stale_query = item
+                            break
+                except queue.Empty:
+                    pass
+
+                resume_paused_worker._input_queue.put(query)
+                if stale_query is not None:
+                    resume_paused_worker._input_queue.put(stale_query)
+                try:
+                    final_result = resume_paused_worker._output_queue.get(
+                        timeout=resume_wait
+                    )
+                except queue.Empty:
+                    final_result = json.dumps({
+                        "error": f"Worker '{self.worker_name}' did not respond within {resume_wait}s",
+                        "note": "Worker timed out. The paused worker was resumed but did not produce a response.",
+                    })
             try:
                 parsed = json.loads(final_result) if final_result else {}
             except (json.JSONDecodeError, TypeError):
@@ -7311,6 +7487,24 @@ class Worker(ToolBase):
         # and puts the result in _output_queue.  We wait for that first
         # response, then return it while the thread stays alive for future
         # queries.  If no auto-query was queued, return immediately.
+        #
+        # Which body runs that query, though, depends on the runtime mode, and
+        # only ONE of the two answers to that question has a producer:
+        #
+        # * thread mode -- the worker's own run() auto-consumes
+        #   ``_initial_context["query"]`` and puts the reply on
+        #   ``_output_queue``. Reading the queue is correct.
+        # * process mode -- the supervisor thread is deliberately never
+        #   started (``WorkerThread.start`` refuses to run a second body beside
+        #   the child), and the briefing that crosses the process boundary has
+        #   the query stripped (``_briefing_only``), precisely so the child does
+        #   not run it a second time. Nothing in the child writes to this
+        #   queue. The spawn therefore has to drive the child itself, through
+        #   the handle, and read the answer from the dispatch.
+        #
+        # Getting this wrong is silent: the queue read cannot fail, it can only
+        # wait, so a healthy process-mode worker was reported as "did not
+        # respond within 63.0s" after blocking the spawn for 63s.
         has_auto_query = (
             thread._initial_context is not None
             and isinstance(thread._initial_context, dict)
@@ -7321,17 +7515,70 @@ class Worker(ToolBase):
                 getattr(thread, "_timeout_seconds", None),
                 fallback=SPAWN_QUEUE_TIMEOUT,
             )
-            try:
-                final_result = thread._output_queue.get(timeout=auto_wait)
-            except queue.Empty:
+            from tools.workspace.worker_runtime import MODE_THREAD
+
+            _spawn_mode = declared_runtime_mode(thread)
+            _spawn_handle = getattr(thread, "_runtime_handle", None)
+            # The handle is only usable if it speaks for the mode the thread is
+            # actually stamped with: a stale handle from an earlier incarnation
+            # would dispatch into a body this spawn did not create.
+            if (
+                _spawn_mode is not None
+                and _spawn_mode != MODE_THREAD
+                and _spawn_handle is not None
+                and getattr(_spawn_handle, "mode", None) == _spawn_mode
+            ):
+                try:
+                    final_result = _spawn_handle.dispatch_query(
+                        str(thread._initial_context["query"]),
+                        timeout=auto_wait,
+                    )
+                except Exception as exc:  # noqa: BLE001 - a spawn reports, never raises
+                    # A fence, a lost runtime or a per-query timeout: each is a
+                    # real answer about this worker, and none of them may
+                    # escape as an exception from a spawn call.
+                    logger.debug(
+                        "Worker '%s': %s-mode spawn dispatch failed",
+                        self.worker_name, _spawn_mode, exc_info=True,
+                    )
+                    final_result = json.dumps({
+                        "error": (
+                            f"Worker '{self.worker_name}' spawn query failed "
+                            f"in {_spawn_mode} mode: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                        "note": (
+                            "The worker's runtime did not answer the spawn "
+                            "query. It is registered and can be retried via "
+                            "action='query'."
+                        ),
+                        "runtime_mode": _spawn_mode,
+                    })
+            elif _spawn_mode is not None and _spawn_mode != MODE_THREAD:
+                # Fail fast instead of burning the budget: in a non-thread mode
+                # there is no producer for _output_queue, so the fallback below
+                # would block for the whole timeout and lie about the cause.
                 final_result = json.dumps({
-                    "error": f"Worker '{self.worker_name}' did not respond "
-                             f"within {auto_wait}s",
-                    "note": "Worker timed out. The result above is partial work "
-                             "completed before timeout. The worker thread is still "
-                             "alive — you can query it again via action='query' to "
-                             "request continuation.",
+                    "error": (
+                        f"Worker '{self.worker_name}' spawned in "
+                        f"{_spawn_mode} mode but has no runtime handle, so "
+                        "its spawn query cannot be dispatched. This is a "
+                        "supervisor bug, not a worker failure."
+                    ),
+                    "runtime_mode": _spawn_mode,
                 })
+            else:
+                try:
+                    final_result = thread._output_queue.get(timeout=auto_wait)
+                except queue.Empty:
+                    final_result = json.dumps({
+                        "error": f"Worker '{self.worker_name}' did not respond "
+                                 f"within {auto_wait}s",
+                        "note": "Worker timed out. The result above is partial work "
+                                 "completed before timeout. The worker thread is still "
+                                 "alive — you can query it again via action='query' to "
+                                 "request continuation.",
+                    })
             try:
                 parsed = json.loads(final_result) if final_result else {}
             except (json.JSONDecodeError, TypeError):
@@ -7684,8 +7931,14 @@ class Worker(ToolBase):
                 wait - QUERY_WAIT_GRACE_SECONDS,
             )
         try:
-            # Block until the worker responds
-            response = thread.send_query(delivered_query, timeout=wait)
+            # Block until the worker responds. Runtime-mode aware: in process
+            # mode the body is a child interpreter, so this must go through the
+            # runtime handle -- the thread's queues have no consumer there and a
+            # direct send_query would block for the full budget and then report
+            # a healthy worker as dead.
+            response = deliver_query_to_worker(
+                thread, delivered_query, timeout=wait
+            )
             elapsed = thread._last_elapsed()
             result = {
                 "worker_name": self.worker_name,
@@ -7784,6 +8037,50 @@ class Worker(ToolBase):
                 "error": str(exc),
                 "note": degraded_note if not clean_exit else stopped_note,
                 "worker_name": self.worker_name,
+                "status": thread.status,
+            }
+        except RuntimeError as exc:
+            # Transport failure, NOT a worker failure -- and therefore the one
+            # failure mode this method must never answer with the timeout
+            # path's kill/reclaim reflex. A WorkerQueryTransportMissing means
+            # the worker is stamped with a non-thread runtime mode but has no
+            # usable handle (a supervisor bug: nothing can ever reach the
+            # body), and a WorkerRuntimeLost means the child runtime went away
+            # underneath the handle. In both cases there is no live body left
+            # to stop, and calling kill() here would destroy the evidence of
+            # the real fault while reporting the wrong cause to the caller.
+            # The registry entry is deliberately left intact so the caller can
+            # re-spawn explicitly.
+            transport_missing = isinstance(exc, WorkerQueryTransportMissing)
+            logger.error(
+                "query delivery to worker '%s' failed (%s): %s: %s",
+                self.worker_name,
+                "no transport" if transport_missing else "runtime error",
+                type(exc).__name__,
+                exc,
+            )
+            if transport_missing:
+                note = (
+                    "The query could not be delivered: the worker is stamped "
+                    "for a non-thread runtime mode but has no usable runtime "
+                    "handle. This is a supervisor bug, not a worker failure. "
+                    "The worker was not restarted; re-spawn it before "
+                    "querying again."
+                )
+            else:
+                note = (
+                    "The query could not be delivered to the worker's "
+                    "runtime and no reply was produced. The worker was not "
+                    "restarted; re-spawn it before querying again."
+                )
+            return {
+                "error": f"{type(exc).__name__}: {exc}",
+                "note": note,
+                "worker_name": self.worker_name,
+                "instance_id": iid,
+                "instance_label": _WorkerRegistry.instance_label(
+                    self.worker_name, iid
+                ),
                 "status": thread.status,
             }
 

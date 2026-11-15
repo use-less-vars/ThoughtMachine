@@ -25,6 +25,7 @@ query it was given and answers through a real ``queue.Queue``, so a passing
 from __future__ import annotations
 
 import json
+import os
 import queue
 from typing import Any, List
 
@@ -115,6 +116,16 @@ def drive(monkeypatch, tmp_path):
         ),
         encoding="utf-8",
     )
+    # The double below is an IN-PROCESS body: its start() runs in this
+    # interpreter and answers from a real queue.Queue.  The runtime mode is a
+    # spawn-time property (WORKER_RUNTIME_MODE, default "process", C62), so
+    # without this the spawn would build a process-mode handle around a
+    # duck-typed stand-in, start a real child for it and block on an answer
+    # that stand-in can never send.  Thread mode is the substrate this harness
+    # models; the process substrate has real coverage in
+    # tests/test_worker_process_e2e.py.
+    monkeypatch.setitem(os.environ, "WORKER_RUNTIME_MODE", "thread")
+
     created: List[_RecordingThread] = []
 
     def _factory(**kwargs: Any) -> _RecordingThread:

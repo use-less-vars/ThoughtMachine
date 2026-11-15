@@ -171,13 +171,21 @@ def _briefing_only(
 ) -> Optional[Dict[str, Any]]:
     """``initial_context`` without the spawn query, for the process boundary.
 
-    The spawn query is executed by the parent-side thread; its reply is what
-    the spawner reads back at ``worker_thread.py:7032``. A worker rebuilt from
-    this spec self-queues ``initial_context["query"]`` in ``run()``
-    (``worker_thread.py:4004`` fresh / ``:4047`` loaded context), so letting
-    the query travel would pay for the same turn twice and repeat its side
-    effects. The briefing (purpose/style/context) still crosses, because the
-    child needs it to serve ``dispatch_query`` coherently.
+    The spawn query is executed on the *supervisor* side: in thread mode the
+    worker's own ``run()`` auto-consumes it, and in process mode the spawn site
+    explicitly dispatches it through the runtime handle. Its reply is what the
+    spawner reads back at ``worker_thread.py:7032``. A worker rebuilt from this
+    spec self-queues ``initial_context["query"]`` in ``run()``
+    (``worker_thread.py:4004`` fresh / ``:4047`` loaded context), so letting the
+    query travel would pay for the same turn twice and repeat its side
+    effects -- and the second copy would run *after* the spawn had already
+    returned its answer. The briefing (purpose/style/context) still crosses,
+    because the child needs it to serve ``dispatch_query`` coherently.
+
+    The consequence for this side: a process-mode spawn must not read its reply
+    off the worker's in-process ``_output_queue``. Nothing in the child writes
+    there, so that read can only time out -- it blocked for the full budget and
+    reported a healthy worker as unresponsive.
     """
     if not initial_context:
         return initial_context
