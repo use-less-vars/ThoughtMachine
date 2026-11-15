@@ -243,16 +243,23 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"filesystem": "write"}, {"filesystem": "read"})
         assert result == {"filesystem": "read"}
 
-    def test_legacy_write_feature_branches_token_is_unknown_level_fail_open(self):
+    def test_legacy_write_feature_branches_translates_on_git_then_fails_closed(self):
         # A raw legacy 'write_feature_branches' token is not part of any
-        # canonical ceiling vocabulary (git uses 'write_on_feature_branch').
-        # When such a token reaches the gate directly (loader bypassed) it is
-        # an UNKNOWN level: fail-open with a WARN, so the session grant stands.
-        for resource in ("filesystem", "git"):
-            result = apply_workspace_ceiling(
-                {resource: "write_feature_branches"}, {resource: "write"}
-            )
-            assert result == {resource: "write"}, resource
+        # canonical ceiling vocabulary (git spells it
+        # 'write_on_feature_branch').  When such a token reaches the gate
+        # directly (loader bypassed) it is TRANSLATED onto the canonical
+        # spelling where that level is legal -- the git grain -- so it caps a
+        # session write grant to branch-restricted write (rank 2.5).
+        result = apply_workspace_ceiling(
+            {"git": "write_feature_branches"}, {"git": "write"}
+        )
+        assert result == {"git": "write_on_feature_branch"}
+        # On any other grain the canonical level is NOT legal, so the token is
+        # an UNKNOWN VALUE for a known resource and fails CLOSED to 'banned'.
+        result = apply_workspace_ceiling(
+            {"filesystem": "write_feature_branches"}, {"filesystem": "write"}
+        )
+        assert result == {"filesystem": "banned"}
 
     def test_git_write_on_feature_branch_ceiling_caps_write_grant(self):
         # Normative DISPATCH-6 example: ceiling write_on_feature_branch
@@ -302,29 +309,36 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"filesystem": "read"}, {"filesystem": "full"})
         assert result == {"filesystem": "read"}
 
-    def test_unknown_ceiling_level_fail_open(self):
+    def test_unknown_ceiling_level_fails_closed(self):
+        # An unknown ceiling VALUE for a known resource now DENIES the
+        # resource: a typo in a security ceiling must never silently mean
+        # "no restriction".
         result = apply_workspace_ceiling({"filesystem": "mega"}, {"filesystem": "write"})
-        assert result == {"filesystem": "write"}
+        assert result == {"filesystem": "banned"}
 
     def test_unknown_resource_ignored(self):
         result = apply_workspace_ceiling({"not_a_resource": "banned"}, {"filesystem": "write"})
         assert result == {"filesystem": "write"}
 
-    def test_fail_policy_unknown_ceiling_value_is_fail_open(self):
-        # B4 fail-policy, *value* direction: an unknown ceiling VALUE -- an
-        # unknown level token, or a resource token outside the catalog -- must
-        # NOT cap the session grant. The unknown value is dropped (never
-        # injected, never banned): fail-OPEN, the session value stands uncapped.
+    def test_fail_policy_unknown_ceiling_value_fails_closed(self):
+        # B4 fail-policy, *value* direction -- REVERSED to fail-CLOSED: an
+        # unknown ceiling VALUE for a KNOWN resource (an unknown level token)
+        # now DENIES that resource.  Only the unknown RESOURCE token keeps the
+        # fail-open policy (forward compatibility), so it is neither capped nor
+        # injected and the session value stands for it alone.
         session = {"filesystem": "write", "git": "write"}
         result = apply_workspace_ceiling(
             {"filesystem": "mega", "git": "banana", "not_a_resource": "banned"},
             session,
         )
-        assert result == {"filesystem": "write", "git": "write"}
-        # Fail-open == "no ceiling applied": the unknown resource is neither
-        # capped nor injected, and the permissive session levels survive verbatim.
+        assert result == {"filesystem": "banned", "git": "banned"}
+        # Fail-closed == "deny the resource", never "inject the bad token".
+        assert "mega" not in result.values()
+        assert "banana" not in result.values()
+        # The unknown RESOURCE is still ignored (fail-open, forward compat).
         assert "not_a_resource" not in result
         assert result is not session
+        assert session == {"filesystem": "write", "git": "write"}
 
     def test_git_ask_ceiling_caps_write_to_ask(self):
         result = apply_workspace_ceiling({"git": "ask"}, {"git": "write"})
@@ -376,10 +390,12 @@ class TestApplyWorkspaceCeiling:
         )
         assert result == {"git": "write_on_feature_branch"}
 
-    def test_write_on_feature_branch_ceiling_invalid_on_git_grains_fail_open(self):
-        # wofb exists on the git aggregate scale only; git_read/git_write take
-        # the four-level scale, so a wofb ceiling there is an unknown level:
-        # fail-open with a WARN and the session grant stands.
+    def test_unknown_resource_git_write_grain_ignored_fail_open(self):
+        # ``git_write`` is no longer a recognised ceiling RESOURCE (the catalog
+        # keeps the single ``git`` grain), so a ceiling stored under it is an
+        # unknown resource: logged and IGNORED (fail-OPEN, forward
+        # compatibility for maps written by a newer/older build) with a WARN,
+        # and the session entry stands untouched.
         result = apply_workspace_ceiling(
             {"git_write": "write_on_feature_branch"}, {"git_write": "write"}
         )
