@@ -1,6 +1,4 @@
 """Test the per-worker EventBus → bridge wiring end-to-end."""
-import sys
-sys.path.insert(0, '/workspace/pytest_install')
 import time
 
 from agent.events import EventBus, EventType, global_event_bus, create_event

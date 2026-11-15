@@ -29,15 +29,16 @@ from __future__ import annotations
 
 import sys
 
-_bad_prefix = "/workspace/tests"
-sys.path = [p for p in sys.path if not p.startswith(_bad_prefix)]
+# sys.path is prepared by tests/conftest.py, which derives the repo root from
+# this checkout's own __file__.  Never insert a literal container path here:
+# "/workspace" resolves to the PARENT checkout when the suite runs from a git
+# worktree, so the module imported another tree's security/tools/agent and still
+# went green.  Pinned by tests/test_import_provenance.py.
+# Kept: the sandbox-only /tmp/stubs fake agent package is still put first.
 _stubs_path = "/tmp/stubs"
 if _stubs_path in sys.path:
     sys.path.remove(_stubs_path)
-if "/workspace" in sys.path:
-    sys.path.remove("/workspace")
 sys.path.insert(0, _stubs_path)
-sys.path.insert(1, "/workspace")
 
 import json
 import logging
