@@ -667,6 +667,108 @@ class ProcessWorkerRuntime:
             return raw
         return json.dumps(envelope)
 
+    def dispatch_query_async(
+        self,
+        query: str,
+        *,
+        timeout: float = 120.0,
+        query_id: Optional[str] = None,
+        on_result: Optional[Callable[[str, Optional["Reply"], Optional[BaseException]], None]] = None,
+    ) -> str:
+        """Send *query* and return its ``query_id`` WITHOUT waiting (§4.8).
+
+        This is the submission half of :meth:`dispatch_query`: same frame, same
+        correlation table, same failure surface when the frame cannot be sent --
+        it simply does not block the caller for the answer. The answer arrives
+        later on *on_result*, and that callback is the ONLY channel a reply can
+        take: the reader thread pops ``self._pending`` by ``query_id`` (§4.8), so
+        a caller that does not supply *on_result* has thrown the reply away by
+        choice, not by accident.
+
+        *query_id*, when given, is used verbatim as the correlation id. The
+        supervisor passes the job_id it already registered, so the registry,
+        the child's own per-query bookkeeping (``worker_runtime_main`` keys its
+        reply pump on the same id) and the frame all name the job the same way.
+
+        *on_result* is called exactly once, from this runtime's daemon waiter
+        thread, as ``on_result(query_id, reply, error)``:
+
+        * ``error is None`` -- *reply* is the runtime's own frame; read
+          ``reply.ok`` and ``reply.envelope``.
+        * ``error`` is a :class:`WorkerQueryTimeout` -- no reply inside
+          *timeout*; ``error.reply`` is the synthesised terminal frame.
+        * ``error`` is anything else -- the stream ended or the waiter was torn
+          down; the runtime is gone.
+
+        Exceptions from *on_result* are logged and swallowed: it runs on a
+        daemon thread nobody is waiting on, so letting one escape would kill the
+        only consumer of this reply and turn a reporting bug into a leak.
+        """
+        outbox = self._require_sendable("dispatch_query")
+        resolved_id = str(query_id) if query_id else uuid.uuid4().hex
+        if resolved_id in self._pending:
+            raise ValueError(
+                f"query id {resolved_id!r} is already in flight on the runtime "
+                f"for {self._spec['worker']!r}; a second dispatch under the same "
+                "id would steal the first one's reply (§4.8)"
+            )
+        future: "futures.Future[Reply]" = futures.Future()
+        self._pending[resolved_id] = future
+        try:
+            outbox.put(
+                DispatchQuery(
+                    query_id=resolved_id,
+                    query=str(query),
+                    timeout_seconds=float(timeout),
+                )
+            )
+        except BaseException:
+            # Nothing was sent, so nothing may ever answer this id: forget it
+            # rather than leave a future no reply can reach (§4.8).
+            self._pending.pop(resolved_id, None)
+            raise
+        threading.Thread(
+            target=self._await_async_reply,
+            args=(resolved_id, future, float(timeout), on_result),
+            name=f"worker-async-{resolved_id[:8]}",
+            daemon=True,
+        ).start()
+        return resolved_id
+
+    def _await_async_reply(
+        self,
+        query_id: str,
+        future: "futures.Future[Reply]",
+        timeout: float,
+        on_result: Optional[Callable[[str, Optional["Reply"], Optional[BaseException]], None]],
+    ) -> None:
+        """Wait for an async query's reply and hand it to *on_result* (§4.8)."""
+        reply: Optional["Reply"] = None
+        error: Optional[BaseException] = None
+        try:
+            reply = future.result(timeout=timeout)
+        except futures.TimeoutError:
+            # Same rule as the synchronous path: forget the query so a late
+            # reply cannot be handed to the next dispatch (§4.8).
+            self._pending.pop(query_id, None)
+            error = WorkerQueryTimeout(
+                f"query {query_id} got no reply within {timeout}s (§4.4)",
+                reply=_terminal_reply(query_id, "timeout"),
+            )
+        except BaseException as exc:  # noqa: BLE001 - cancelled / torn down
+            self._pending.pop(query_id, None)
+            error = exc
+        if on_result is None:
+            return
+        try:
+            on_result(query_id, reply, error)
+        except BaseException as exc:  # noqa: BLE001 - a reporter must not leak
+            print(
+                f"worker_runtime_process: on_result for query {query_id!r} of "
+                f"{self._spec['worker']!r} raised {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
     # ------------------------------------------------------------------
     # Control plane (§10)
     # ------------------------------------------------------------------
