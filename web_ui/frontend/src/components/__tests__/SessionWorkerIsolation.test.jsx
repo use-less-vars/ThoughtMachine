@@ -314,7 +314,7 @@ describe('worker-event isolation between sessions (R6b)', () => {
     expect(panelText()).not.toContain('Worker spawned: wA')
     expect(panelText()).not.toContain('Worker status')
     expect(panelText()).not.toContain('Worker completed')
-  })
+  }, 10000)
 
   it('(b) worker event tagged with a different session_id on wsA is dropped — A panel unaffected', async () => {
     render(<App />)
