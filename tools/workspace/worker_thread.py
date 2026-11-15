@@ -5506,8 +5506,11 @@ class WorkerThread(threading.Thread):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, default=str)
+            # Cross-process exclusion is kept, but bounded to 1.0s: this file
+            # is a non-essential mirror and the except below already logs and
+            # continues, so a contended disk must not cost the caller 10s.
             if FileLock is not None:
-                with FileLock(str(target)):
+                with FileLock(str(target), timeout=1.0):
                     os.replace(tmp_path_str, str(target))
             else:
                 os.replace(tmp_path_str, str(target))
@@ -5586,8 +5589,11 @@ class WorkerThread(threading.Thread):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, default=str)
+            # Cross-process exclusion is kept, but bounded to 1.0s: this file
+            # is a non-essential mirror and the except below already logs and
+            # continues, so a contended disk must not cost the caller 10s.
             if FileLock is not None:
-                with FileLock(str(target)):
+                with FileLock(str(target), timeout=1.0):
                     os.replace(tmp_path_str, str(target))
             else:
                 os.replace(tmp_path_str, str(target))
