@@ -1076,6 +1076,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       case 'worker:worker_status':
       case 'worker:worker_completed':
       case 'worker:worker_error':
+      case 'worker:worker_partial_result':
       case 'worker:worker_paused':
       case 'worker:worker_resumed':
       case 'worker:system_notification':
