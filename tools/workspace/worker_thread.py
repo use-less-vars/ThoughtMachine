@@ -777,10 +777,21 @@ class WorkerSessionLifecycle:
 
     Provides the state property and setter that EventProcessor expects,
     without session persistence or GUI callback registration.
+
+    Contract note: ``EventProcessor`` calls ``auto_save_current_session()``
+    (unconditionally from ``_process_error_event`` / ``_process_session_stop_event``
+    / ``_process_user_interaction_event``, and as a ``finally`` invariant for
+    terminal events) and reads ``_restarting`` from the stopped/
+    thread_finished branch, so both must exist here even though a worker has
+    nothing to persist to a session store.
     """
 
     def __init__(self):
         self._state = ExecutionState.READY if ExecutionState else None
+        # Read by EventProcessor._process_terminal_event for 'stopped' /
+        # 'thread_finished'.  A worker never runs the session-restart dance,
+        # so this mirrors SessionLifecycle.__init__'s default and stays False.
+        self._restarting = False
 
     @property
     def state(self):
@@ -795,6 +806,28 @@ class WorkerSessionLifecycle:
         pass
 
     def has_unsaved_changes(self) -> bool:
+        return False
+
+    def auto_save_current_session(self) -> bool:
+        """No-op: a worker owns no session store, so there is nothing to save.
+
+        ``EventProcessor`` treats this as a persistence invariant for terminal
+        events, but the worker's persistence lives elsewhere and must stay
+        there:
+
+        * Worker turn data is persisted by ``WorkerThread._save_context()``
+          (``context.json``), which ``_run_tool_loop`` calls *after* it sets
+          ``_last_completed_query`` -- deliberately not from here.  A save
+          taken mid-turn would store ``last_query != last_completed_query``
+          for a query that did complete and make a force-respawn prune the
+          finished attempt (see the F1 marker comments in this module).
+        * The parent session is saved by the backend's own
+          ``SessionLifecycle.auto_save_current_session()``, not by the worker.
+
+        The method exists so the lifecycle handed to ``EventProcessor`` meets
+        the processor's contract; returning ``False`` reports honestly that no
+        save happened.
+        """
         return False
 
 

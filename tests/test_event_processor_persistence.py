@@ -42,6 +42,7 @@ class _FakeGui:
         self.fail_on_status = fail_on_status
         self.status_messages = []
         self.conversation_changed_count = 0
+        self.errors = []
 
     def emit_status_message(self, message):
         if self.fail_on_status:
@@ -50,6 +51,9 @@ class _FakeGui:
 
     def emit_conversation_changed(self):
         self.conversation_changed_count += 1
+
+    def emit_error_occurred(self, message, traceback_text):
+        self.errors.append((message, traceback_text))
 
 
 class _FakeStateBridge:
@@ -198,3 +202,60 @@ def test_paused_event_is_inert_and_the_handler_is_gone():
     # post-dispatch trace: no '\u23f8 Paused' bubble comes back.
     assert gui.status_messages == ['Event: paused'], gui.status_messages
     assert lifecycle.save_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Worker mode: the lifecycle stub handed to EventProcessor must meet the same
+# contract, or the save/dispatch path itself raises.
+# ---------------------------------------------------------------------------
+
+_SAVING_EVENT_TYPES = [
+    # Terminal events (the `finally` invariant).
+    'agent_responded',
+    'stopped',
+    'max_turns',
+    'thread_finished',
+    # Non-terminal events that also call auto_save_current_session() inline.
+    'error',
+    'session_stop',
+]
+
+
+@pytest.mark.parametrize('event_type', _SAVING_EVENT_TYPES)
+def test_worker_lifecycle_satisfies_auto_save_contract(event_type):
+    """The worker's lifecycle stub must not raise out of ``process_event``.
+
+    Regression: ``WorkerThread`` builds an ``EventProcessor`` from
+    ``WorkerSessionLifecycle``, a stub that only implemented ``state``.  Every
+    event type above reaches ``session_lifecycle.auto_save_current_session()``
+    (the terminal ones from the ``finally``, so the raise aborted the rest of
+    the dispatch too), and the stub had no such attribute -- the worker logged
+    "EventProcessor failed for agent_responded: 'WorkerSessionLifecycle' object
+    has no attribute 'auto_save_current_session'" and dropped the event.
+
+    The post-dispatch ``emit_status_message(f'Event: {event_type}')`` is the
+    assertion point: it sits after the ``finally``, so it only runs when the
+    terminal dispatch completed without raising.
+    """
+    from tools.workspace.worker import WorkerSessionLifecycle
+
+    processor, lifecycle, gui, _state_bridge = _make_processor(
+        lifecycle=WorkerSessionLifecycle(),
+    )
+
+    processor.process_event({
+        'type': event_type,
+        'session_id': 'sess-1',
+        'content': 'the answer',
+        'reasoning': 'because',
+        'stop_reason': 'paused',
+        'message': 'boom',
+    })
+
+    assert gui.status_messages[-1] == f'Event: {event_type}', gui.status_messages
+    # 'error' / 'session_stop' emit it from the handler too; the point is that
+    # the pre-dispatch emission of Path A still happened.
+    assert gui.conversation_changed_count >= 1
+    # The stub reports honestly that it saved nothing: a worker owns no store.
+    assert lifecycle.auto_save_current_session() is False
+    assert lifecycle.has_unsaved_changes() is False

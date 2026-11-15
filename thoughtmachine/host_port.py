@@ -83,6 +83,21 @@ AUTHORIZED_VALUES: Dict[str, frozenset] = {
     "host_bash": frozenset({"allow"}),
     "mcp": frozenset({"connect", "full"}),
     "network": frozenset({"outbound", "write"}),
+    # ``git`` is the one host git call the runtime itself makes: the
+    # per-session bootstrap ``git worktree add --detach`` in
+    # ``tools/workspace/worktree_defaults.py``.  Without this row that call was
+    # refused at step 1 as an UNKNOWN grain, so every worker spawn fell back to
+    # the workspace root and the whole per-session worktree feature was dead
+    # while logging an "unknown permission grain" warning each time.
+    #
+    # Only the WRITE tier is accepted, deliberately.  The port cannot see the
+    # subcommand, so accepting ``read`` here would let a read-only git session
+    # spend this grain on an arbitrary host git subcommand -- the exact
+    # careless-caller hole step 1 exists to close.  ``write_on_feature_branch``
+    # ranks at the write tier (its restriction is enforced tool-side at commit
+    # time), and ``ask`` is excluded for the same reason as ``host_bash``: the
+    # port cannot prompt.
+    "git": frozenset({"write", "write_on_feature_branch"}),
 }
 
 #: Env keys that look credential-shaped.  Check (7) refuses a CALLER-SUPPLIED
