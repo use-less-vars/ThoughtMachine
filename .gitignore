@@ -452,3 +452,10 @@ web_ui/frontend/.dist-build-stamp
 # the file is never versioned and vanishes on the next clone.
 !docs/design-worker-process-substrate.md
 !docs/security-audit-gen64.md
+# Gen 65 contract gate (2026-11): the claim ledger the fast gate enforces.
+# `docs/*` above is a catch-all, so this negation is required or the file is
+# never versioned, never committed, and vanishes on the next clone -- while
+# .github/workflows/contract-gate.yml, which reads it, survives. The parity
+# test (tests/test_contracts_ledger_parity.py) reddens the gate when the
+# ledger is absent, so a missing negation fails loudly instead of silently.
+!docs/CONTRACTS.md

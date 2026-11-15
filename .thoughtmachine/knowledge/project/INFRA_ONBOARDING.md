@@ -10,6 +10,11 @@ Read the files; this only tells you which, and why.*
 3. Before acting on a file you have not read this session, run `git log --oneline -3 <file>` — the map may be stale relative to what you are about to change.
 4. Never cat a §3 file whole.
 5. When you find a fact in the wrong file, fix it in the file, not by adding a note here.
+6. **Always `git fetch` before declaring a knowledge-base or doc file missing.** Local `dev` was one
+   merge behind (`27a9da52` vs `origin/dev` `cd06c87c`) and a file was reported missing that existed on
+   `origin/dev`. This is class `handoff-claims-require-disk-read`
+   (`knowledge/project/working_agreements.md:714`) applied to the checkout itself: the disk read must be
+   of `origin/dev`, not of a stale local tree.
 
 ## §0 — Onboarding ceremony (your first turn)
 
@@ -65,22 +70,24 @@ stage them.
 gates, the three container types. It is the only file that answers the plain
 question, and it is short. Read it before the six below.
 
-Six files. Under 100 KB total. Read them once, in order, before your first task.
+Six files. Read them once, in order, before your first task. No byte counts are quoted here — run
+`wc -c <path>` for the current size. A size copied into this index is a fact whose authority is the
+disk, and it goes stale silently.
 
-- **`status.md`** (`knowledge/project/`, ~5 KB) — current state, one page.
+- **`status.md`** (`knowledge/project/`) — current state, one page.
   **Cadence: updated at strand close, by whoever closes the strand.** If the
   last completed strand isn't reflected in it, that's a bug in the doc.
-- **`machine_model.md`** (`knowledge/project/`, ~8 KB) — the six-layer promise
+- **`machine_model.md`** (`knowledge/project/`) — the six-layer promise
   table. What the machine promises, and how each promise is verified.
-- **`design_layers_and_truth_ownership.md`** (`knowledge/project/`, ~24 KB) —
+- **`design_layers_and_truth_ownership.md`** (`knowledge/project/`) —
   Pass 2a. The layer ownership map and cross-layer Invariants 1–6.
-- **`design_permission_facts_ownership.md`** (`knowledge/project/`, ~28 KB) —
+- **`design_permission_facts_ownership.md`** (`knowledge/project/`) —
   Pass 2c. Ownership of the four permission facts, artifacts A/B/C/D, the D4
   migration sequence, the D6 test-pin register.
-- **`design_permission_bins_shape.md`** (`knowledge/project/`, ~23 KB) —
+- **`design_permission_bins_shape.md`** (`knowledge/project/`) —
   Pass 2b. Shape A bins (vocabulary × bin), the `deny<ask<allow` meet, and
   T1/T2/T3 dissolve-only-in-steady-state. The destination.
-- **`rulings-permission-facts.md`** (`working_docs/`, ~1 KB) — session rulings,
+- **`rulings-permission-facts.md`** (`working_docs/`) — session rulings,
   append-only. R-1 (network default) is binding at D4 step 4.
 
 **Plus one slot, filled by the operator each session:**

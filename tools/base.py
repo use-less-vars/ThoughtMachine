@@ -107,6 +107,12 @@ class ToolBase(BaseModel):
     # layer would silently degrade it to the shared '<no-session>' scope.
     requires_authenticated_session: ClassVar[bool] = False
 
+    # True only for tools that build a CHILD AGENT in the same session trust
+    # domain (e.g. the Worker tool).  Such a tool may receive the live provider
+    # api key inside the injected ``agent_config`` dict; every handover is
+    # audited as a CREDENTIAL_USE event.  All other tools get the key omitted.
+    inherits_parent_api_key: ClassVar[bool] = False
+
     # Name of the hidden resource (see agent/config/defaults.RESOURCE_REGISTRY)
     # this tool must execute inside, or None for tools that need no resource
     # container. When set, tool execution is denied unless the session holds

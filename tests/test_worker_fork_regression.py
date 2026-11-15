@@ -54,6 +54,7 @@ import pytest
 import tools.workspace.worker as worker_module
 import tools.workspace.worker_runtime as worker_runtime_module
 import tools.workspace.worker_thread as worker_thread_module
+from tools.workspace.job_registry import WorkerJobRegistry
 from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_runtime import (
     MODE_PROCESS,
@@ -191,6 +192,7 @@ class _NeverStartedBody(threading.Thread):
         # duck-typed/mocked value degrades to unversioned, an int does not.
         self._generation = 1
         self.status = "ready"
+        self.error = None
         self.current_task = None
         self.last_heartbeat = None
         self._last_reasoning = None
@@ -448,3 +450,287 @@ def test_spawn_fails_fast_when_process_mode_has_no_handle(tmp_path, monkeypatch)
         )
     finally:
         _cleanup(session_id, created[-1] if created else None)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# C73 part 2: the same fork hole in query / submit_query (the async routes)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# The spawn fix above repaired ONE caller. ``action='query'`` (on a detached
+# worker) and ``action='submit_query'`` reach the body by a different route and
+# carried the same two defects:
+#
+# 1. **The guard.** Both opened with ``if not thread.is_alive(): return "Worker
+#    '...' is no longer alive"``. In process mode the supervisor thread is never
+#    started, so that answer was returned for every healthy worker -- before any
+#    child was asked anything.
+# 2. **The transport.** Both then enqueued into ``thread._input_queue`` /
+#    ``withdraw_queued_query`` bookkeeping that has NO consumer in process mode:
+#    a query put there is accepted and never runs, and the job record it
+#    registered never reaches a terminal state (the child's WORKER_* events stay
+#    in the child's interpreter).
+#
+# The fix has two halves, and these tests pin both without spawning a child:
+# ``worker_is_dispatchable`` (mode-first liveness) and
+# ``enqueue_query_to_worker`` (frame dispatch + an ``on_result`` reporter that
+# closes the registry record cross-process). The handle is the seam: it is
+# faked, everything else -- the real ``Worker._action_query`` /
+# ``_action_submit_query``, the real helpers, the real ``WorkerJobRegistry`` --
+# runs unpatched.
+
+
+class _FakeReply:
+    """The shape ``ProcessWorkerRuntime`` hands back: ``.ok`` + ``.envelope``."""
+
+    def __init__(self, content: str) -> None:
+        self.query_id = "unused"
+        self.ok = True
+        self.envelope = {"status": "ok", "response": content, "content": content}
+        self.elapsed_seconds = 0.0
+
+
+class _RecordingRuntimeHandle:
+    """A runtime handle that records the frame instead of crossing a process.
+
+    ``dispatch_query_async`` is the whole transport contract the submission
+    paths use. Recording ``on_result`` (rather than only calling it) is what
+    lets a test drive the reply *after* the tool has returned -- the ordering
+    production has -- and the ``auto_reply`` variant reproduces the opposite
+    ordering, a child that answers before the supervisor finishes registering.
+    """
+
+    mode = MODE_PROCESS
+
+    def __init__(self, auto_reply: Optional[_FakeReply] = None) -> None:
+        self.auto_reply = auto_reply
+        self.calls: List[dict] = []
+        self.closed = False
+
+    def dispatch_query_async(self, query, *, timeout, query_id=None, on_result=None):
+        self.calls.append(
+            {
+                "query_id": query_id,
+                "query": query,
+                "timeout": timeout,
+                "on_result": on_result,
+            }
+        )
+        if self.auto_reply is not None and on_result is not None:
+            on_result(query_id, self.auto_reply, None)
+        return query_id
+
+    def close(self, **kwargs: Any) -> None:
+        self.closed = True
+
+
+def _dispatch_via_runtime(
+    tmp_path,
+    monkeypatch,
+    *,
+    action: str,
+    handle: Optional[_RecordingRuntimeHandle],
+    status: str,
+    registry: Any,
+):
+    """Drive the REAL ``_action_query`` / ``_action_submit_query`` for *action*.
+
+    ``_resolve_worker_thread`` and ``_get_worker_job_registry`` are the only
+    seams patched: the first hands back the supervisor-side object a process-mode
+    spawn leaves behind (a thread that was never started), the second keeps the
+    job records of this test out of the shared registry.
+    """
+    thread = _NeverStartedBody(name=WORKER, instance_id="c73-async-1")
+    # Stamped exactly as ``attach_thread_frame_sink`` stamps it in process mode.
+    thread._runtime_mode = MODE_PROCESS
+    thread._runtime_handle = handle
+    thread.status = status
+    session_id = f"sess-c73-async-{abs(hash(str(tmp_path)))}"
+
+    monkeypatch.setattr(
+        worker_thread_module,
+        "_resolve_worker_thread",
+        lambda *a, **k: (thread, session_id, thread.instance_id),
+    )
+    monkeypatch.setattr(
+        worker_thread_module, "_get_worker_job_registry", lambda: registry
+    )
+
+    tool = worker_thread_module.Worker(
+        action=action,
+        worker_name=WORKER,
+        worker_query=QUERY,
+        session_id=session_id,
+        workspace_path=str(tmp_path),
+        agent_config={"provider": "openai", "model": "gpt-4"},
+    )
+    if action == "query":
+        result = tool._action_query([])
+    else:
+        result = tool._action_submit_query([])
+    return result, thread, session_id
+
+
+@pytest.mark.parametrize(
+    "action,status",
+    [("query", "detached"), ("submit_query", "ready")],
+)
+def test_async_routes_dispatch_to_the_child_runtime_not_the_queues(
+    tmp_path, monkeypatch, action, status
+):
+    """C73: query/submit_query reach a process-mode body and the job CLOSES.
+
+    Red on the old tree twice over: the envelope was
+    ``"Worker 'c73-w' is no longer alive (status: detached)"`` (the is_alive
+    guard, returned before anything was dispatched), and even past that guard
+    the query went into ``_input_queue`` -- ``queue_sends`` non-empty, the
+    handle never touched, and the job record stuck at ``submitted`` forever.
+    """
+    handle = _RecordingRuntimeHandle()
+    registry = WorkerJobRegistry()
+    result, thread, session_id = _dispatch_via_runtime(
+        tmp_path,
+        monkeypatch,
+        action=action,
+        handle=handle,
+        status=status,
+        registry=registry,
+    )
+    try:
+        # (1) The guard answered with a death that did not happen.
+        assert "no longer alive" not in json.dumps(result, default=str), (
+            "a live child was reported dead: process mode never starts the "
+            f"supervisor thread, so is_alive() must not gate dispatch. {result!r}"
+        )
+        assert "error" not in result, f"{action} failed instead of dispatching: {result!r}"
+        assert result.get("status") == "submitted", f"unexpected envelope: {result!r}"
+
+        # (2) It went through the runtime handle, on the job's own id.
+        assert len(handle.calls) == 1, (
+            f"the child runtime received {len(handle.calls)} dispatch(es) for "
+            f"{action}; expected exactly one: {handle.calls!r}"
+        )
+        call = handle.calls[0]
+        assert call["query"] == QUERY, f"wrong query crossed the boundary: {call!r}"
+        assert call["query_id"] == result["job_id"], (
+            "the frame's query_id does not match the returned job_id, so the "
+            f"child's reply could never be matched to the job: {call!r} vs "
+            f"{result['job_id']!r}"
+        )
+        assert call["on_result"] is not None, (
+            "no reply reporter was wired: a cross-process job can then never "
+            "reach a terminal registry state (the child's WORKER_* events stay "
+            "in the child's interpreter)"
+        )
+        assert call["timeout"] > 0, f"the dispatch carried no budget: {call!r}"
+
+        # (3) The queues were never used.
+        assert thread.queue_sends == [], (
+            f"the query went through the thread's queues in process mode: "
+            f"{thread.queue_sends!r}"
+        )
+
+        # (4) The job is registered, then closed by the child's reply.
+        record = registry.job(result["job_id"])
+        assert record is not None, "the accepted job was never registered"
+        assert record["status"] == "submitted", (
+            f"a queued job must start out in flight, got {record['status']!r}"
+        )
+        call["on_result"](result["job_id"], _FakeReply("child-answer"), None)
+        record = registry.job(result["job_id"])
+        assert record["status"] == "completed", (
+            "the child answered but the job stayed "
+            f"{record['status']!r}: the reporter is not wired to the registry"
+        )
+        assert record["result"]["content"] == "child-answer"
+
+        # (5) The predicate that used to fence: still False, and now harmless.
+        assert thread.is_alive() is False, (
+            "precondition: in process mode the supervisor thread is never started"
+        )
+    finally:
+        _cleanup(session_id, thread)
+
+
+def test_fast_cross_process_reply_is_not_resurrected_by_registration(
+    tmp_path, monkeypatch
+):
+    """A reply that beats ``register()`` must leave the job COMPLETED.
+
+    The submission paths enqueue first and register second (all-or-nothing), so
+    the reply can arrive before the record exists. ``complete()`` creates it on
+    demand -- and a plain unconditional ``register()`` would then overwrite that
+    terminal record with ``submitted``, leaving a finished job looking in flight
+    to every later ``job_status`` / ``join``. This pins the ordering in the
+    worst case rather than the usual one.
+    """
+    handle = _RecordingRuntimeHandle(auto_reply=_FakeReply("answered-immediately"))
+    registry = WorkerJobRegistry()
+    result, thread, session_id = _dispatch_via_runtime(
+        tmp_path,
+        monkeypatch,
+        action="submit_query",
+        handle=handle,
+        status="ready",
+        registry=registry,
+    )
+    try:
+        assert "error" not in result, f"submit_query failed: {result!r}"
+        record = registry.job(result["job_id"])
+        assert record is not None, "no job record at all"
+        assert record["status"] == "completed", (
+            "registration resurrected a job the child had already answered: "
+            f"status is {record['status']!r}, result is {record['result']!r}"
+        )
+        assert record["worker_name"] == WORKER, (
+            "the terminal record lost its worker attribution: "
+            f"{record.get('worker_name')!r}"
+        )
+    finally:
+        _cleanup(session_id, thread)
+
+
+@pytest.mark.parametrize(
+    "action,status",
+    [("query", "detached"), ("submit_query", "ready")],
+)
+def test_async_routes_without_a_handle_fail_loudly_not_as_death(
+    tmp_path, monkeypatch, action, status
+):
+    """Stamped process mode, no handle: say THAT, do not invent a death.
+
+    The guard that replaced ``is_alive()`` must not swing all the way to "always
+    dispatchable" either: a supervisor bug that loses the handle has to surface
+    as itself (``WorkerQueryTransportMissing``), because the alternative is a
+    job_id that no body will ever run.
+    """
+    registry = WorkerJobRegistry()
+    result, thread, session_id = _dispatch_via_runtime(
+        tmp_path,
+        monkeypatch,
+        action=action,
+        handle=None,
+        status=status,
+        registry=registry,
+    )
+    try:
+        dumped = json.dumps(result, default=str)
+        assert "no longer alive" not in dumped, (
+            f"the missing handle was reported as a dead worker: {result!r}"
+        )
+        assert "error" in result, (
+            f"a submission with no transport returned a success envelope: {result!r}"
+        )
+        assert "WorkerQueryTransportMissing" in str(result.get("error")), (
+            "the error does not name the real fault (no runtime handle): "
+            f"{result.get('error')!r}"
+        )
+        assert "job_id" not in result, (
+            "a job_id was handed back for a query that nothing will ever run: "
+            f"{result!r}"
+        )
+        assert registry.jobs(worker_name=WORKER) == [], (
+            "a job record was created for a query that was never submitted"
+        )
+    finally:
+        _cleanup(session_id, thread)
+

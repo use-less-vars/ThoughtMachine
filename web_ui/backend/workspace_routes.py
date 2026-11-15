@@ -1372,6 +1372,7 @@ def _stop_worker_instance(
     # Registry keys are tuples (session_id, worker_name[, instance_id]), so
     # iterate all entries matching the worker name — optionally narrowed to
     # the requested session and/or instance.
+    matched: List[Any] = []
     with _registry_lock:
         for key, thread in list(_worker_registry.items()):
             wname = key[1]
@@ -1381,13 +1382,19 @@ def _stop_worker_instance(
                 continue
             if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
                 continue
-            try:
-                if terminate:
-                    thread.kill()
-                else:
-                    thread.stop()
-            except Exception:
-                pass  # The file-based command will still work
+            matched.append(thread)
+
+    # Signal OUTSIDE the registry lock: ``stop()``/``kill()`` touch the worker's
+    # status file, so holding the registry lock across them can self-block
+    # against a status writer in this same process.
+    for thread in matched:
+        try:
+            if terminate:
+                thread.kill()
+            else:
+                thread.stop()
+        except Exception:
+            pass  # The file-based command will still work
 
     resp = {"status": "ok", "name": name}
     if target_label is not None:
@@ -1885,6 +1892,7 @@ async def pause_worker(
     # Registry keys are tuples (session_id, worker_name[, instance_id]), so
     # iterate all entries matching the worker name — optionally narrowed to
     # the requested instance.
+    matched: List[Any] = []
     with _registry_lock:
         for key, thread in list(_worker_registry.items()):
             wname = key[1]
@@ -1892,10 +1900,16 @@ async def pause_worker(
                 continue
             if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
                 continue
-            try:
-                thread.pause()
-            except Exception:
-                pass  # File-based pause will still work
+            matched.append(thread)
+
+    # Signal OUTSIDE the registry lock: ``pause()`` touches the worker's status
+    # file, so holding the registry lock across it can self-block against a
+    # status writer in this same process.
+    for thread in matched:
+        try:
+            thread.pause()
+        except Exception:
+            pass  # File-based pause will still work
 
     resp = {"status": "accepted", "name": name}
     if target_label is not None:
@@ -2023,6 +2037,7 @@ async def resume_worker(
     # truthfully instead of unconditionally claiming "resumed".
     resumed_threads: List[Dict[str, Any]] = []
     refused_threads: List[Dict[str, Any]] = []
+    matched: List[Any] = []
     with _registry_lock:
         for key, thread in list(_worker_registry.items()):
             wname = key[1]
@@ -2031,25 +2046,32 @@ async def resume_worker(
             tid = key[2] if len(key) > 2 else 1
             if instance_id is not None and tid != instance_id:
                 continue
-            try:
-                outcome = thread.resume()
-            except Exception as exc:
-                outcome = False
-                logger.warning(
-                    "Resume: worker '%s' instance %s raised on resume: %s",
-                    wname, tid, exc,
-                )
-            if outcome is False:
-                refused_threads.append({
-                    "worker_name": wname,
-                    "instance_id": tid,
-                    "reason": "stop already in flight",
-                })
-            else:
-                resumed_threads.append({
-                    "worker_name": wname,
-                    "instance_id": tid,
-                })
+            matched.append((wname, tid, thread))
+
+    # Revive OUTSIDE the registry lock: ``resume()`` touches the worker's
+    # status file, so holding the registry lock across it can self-block
+    # against a status writer in this same process.  Iteration order (and so
+    # the order of the reported outcomes) is preserved by the snapshot.
+    for wname, tid, thread in matched:
+        try:
+            outcome = thread.resume()
+        except Exception as exc:
+            outcome = False
+            logger.warning(
+                "Resume: worker '%s' instance %s raised on resume: %s",
+                wname, tid, exc,
+            )
+        if outcome is False:
+            refused_threads.append({
+                "worker_name": wname,
+                "instance_id": tid,
+                "reason": "stop already in flight",
+            })
+        else:
+            resumed_threads.append({
+                "worker_name": wname,
+                "instance_id": tid,
+            })
 
     if not resumed_threads and not refused_threads:
         # Zero in-memory matches.  That is EXPECTED for a worker running in
