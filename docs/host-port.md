@@ -169,13 +169,14 @@ audit-PRE, spawn, audit-POST.
 
 ## 4. The grain is a category name
 
-`AUTHORIZED_VALUES` is the whole authorization surface, and it is three rows:
+`AUTHORIZED_VALUES` is the whole authorization surface, and it is four rows:
 
 | grain | values the port accepts | catalog levels |
 |---|---|---|
 | `host_bash` | `allow` | `banned / ask / allow` |
 | `mcp` | `connect`, `full` | `banned / connect / full` |
 | `network` | `outbound`, `write` | `banned / ask / write / outbound` |
+| `git` | `write`, `write_on_feature_branch` | `banned / ask / read / write / write_on_feature_branch` |
 
 A `grain` is a **key of this mapping** -- a resource in `security/resource_catalog.py`
 (`host_bash`, `mcp`, `network`, ...) -- never a `"category:value"` pair. The value comes
@@ -188,6 +189,12 @@ consequences worth stating:
 - Because the port cannot prompt, `ask` is never an authorized value for any category here.
   In particular `host_bash` accepts only `allow`; a session sitting at `ask` is refused,
   not escalated and not prompted.
+- `git` accepts the write tier only, and that is the fail-closed choice rather than an
+  oversight: the port never sees the subcommand, so accepting `read` would let a
+  read-only session spend the grain on an arbitrary host git subcommand. The one host
+  git call the runtime makes is the per-session `git worktree add --detach` bootstrap in
+  `tools/workspace/worktree_defaults.py`, which is a write. A below-write session is
+  refused (and that bootstrap falls back to the workspace root), not widened.
 
 ## 5. What the port does not do about the taxonomy
 

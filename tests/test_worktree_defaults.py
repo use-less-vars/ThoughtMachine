@@ -13,6 +13,7 @@ Three things are proven here:
 
 from __future__ import annotations
 
+import logging
 import os
 
 import pytest
@@ -22,6 +23,7 @@ from tools.file_search_tool import FileSearchTool
 from tools.glob_tool import GlobTool
 from tools.utils import DEFAULT_EXCLUDE_DIRS
 from tools.workspace.worktree_defaults import (
+    _host_git_runner,
     resolve_worker_worktree_root,
     session_worktree_name,
 )
@@ -232,6 +234,27 @@ class TestResolveWorkerWorktreeRoot:
         root = _repo(tmp_path)
 
         assert resolve_worker_worktree_root(str(root), "sess-1") is None
+
+    def test_a_refusing_host_port_yields_a_non_zero_status(self, tmp_path, monkeypatch, caplog):
+        """``host_run`` REFUSES by raising; the runner contract is a returncode.
+
+        The conversion is what keeps a below-write git grant a logged fallback
+        instead of an unexpected exception on the spawn path.
+        """
+        root = _repo(tmp_path)
+
+        def refuse(*args, **kwargs):
+            raise PermissionError("permission grain 'git' not authorized")
+
+        monkeypatch.setattr("thoughtmachine.host_port.host_run", refuse)
+        runner = _host_git_runner(str(root), "sess-1", {"git": "read"})
+
+        with caplog.at_level(logging.WARNING):
+            status = runner(["worktree", "add", "--detach", "x"], str(root))
+
+        assert status == 1
+        assert "host git refused" in caplog.text
+        assert "not authorized" in caplog.text
 
     def test_the_session_name_is_filesystem_safe(self):
         assert session_worktree_name("2024/01/sess 1") == "2024-01-sess-1"

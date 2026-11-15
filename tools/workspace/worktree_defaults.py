@@ -69,15 +69,25 @@ def _host_git_runner(
     def run(argv: List[str], cwd: str) -> int:
         from thoughtmachine.host_port import host_run  # local: keeps import cost off spawn
 
-        result = host_run(
-            ["git", *argv],
-            workspace_id=_resolve_workspace_id(workspace_root) or "",
-            session_id=session_id,
-            grain="git",
-            cwd=cwd,
-            timeout=60,
-            effective_permissions=effective_permissions,
-        )
+        try:
+            result = host_run(
+                ["git", *argv],
+                workspace_id=_resolve_workspace_id(workspace_root) or "",
+                session_id=session_id,
+                grain="git",
+                cwd=cwd,
+                timeout=60,
+                effective_permissions=effective_permissions,
+            )
+        except PermissionError as exc:
+            # ``host_run`` REPORTS a refusal by raising, so without this the
+            # docstring's "a refused ... backend simply yields a non-zero
+            # status" would be a lie and the refusal would reach the caller as
+            # the much vaguer "git worktree add raised (...)".  Log the real
+            # reason once, here, and return the non-zero status the contract
+            # promises.
+            logger.warning("Worker worktree default: host git refused (%s)", exc)
+            return 1
         return 0 if result.ok else (result.exit_code or 1)
 
     return run

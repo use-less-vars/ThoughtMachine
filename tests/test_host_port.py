@@ -285,6 +285,39 @@ def test_host_run_refuses_unknown_grain(permitted):
         assert grain in message, message
 
 
+@pytest.mark.parametrize("level", ["write", "write_on_feature_branch"])
+def test_host_run_spends_the_git_grain_at_the_write_tier(permitted, level):
+    """The port must be able to discharge ``git`` at the write tier.
+
+    Regression pin: ``tools/workspace/worktree_defaults.py`` bootstraps the
+    per-session worker worktree with ``git worktree add`` THROUGH this port.
+    While ``git`` was absent from ``AUTHORIZED_VALUES`` the call was refused at
+    step 1 as an unknown grain, the caller's fail-open ``except`` swallowed the
+    raise, and every worker spawn silently ran in the workspace root.
+    """
+    result = permitted.run(
+        _noop(), grain="git", effective_permissions={"git": level}
+    )
+
+    assert result.ok is True
+    assert result.exit_code == 0
+    assert permitted.audit_lines()[0]["grain"] == "git"
+
+
+@pytest.mark.parametrize("level", ["read", "ask", "banned"])
+def test_host_run_refuses_the_git_grain_below_the_write_tier(permitted, level):
+    """``git`` is accepted at the write tier only.
+
+    The port cannot see the subcommand, so a ``read`` grant must not be able to
+    spend this grain on an arbitrary host git call; ``ask`` has nowhere to go
+    (the port cannot prompt) and ``banned`` is never authorized.
+    """
+    message = _expect_refusal(
+        permitted, grain="git", effective_permissions={"git": level}
+    )
+    assert "git" in message
+
+
 # ---------------------------------------------------------------------------
 # 4: workspace operator kill switch
 # ---------------------------------------------------------------------------
@@ -540,7 +573,9 @@ def test_host_run_async_is_signature_only(permitted):
 
 def test_authorized_values_use_real_categories():
     assert set(AUTHORIZED_VALUES) <= set(RESOURCE_CATALOG)
-    assert set(AUTHORIZED_VALUES) <= {"host_bash", "mcp", "network"}
+    # ``git`` joined this set with the per-session worktree bootstrap: the
+    # runtime's only host git call (``git worktree add``) spends it.
+    assert set(AUTHORIZED_VALUES) <= {"host_bash", "mcp", "network", "git"}
 
     known_levels = {
         level
