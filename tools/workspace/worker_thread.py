@@ -7035,15 +7035,33 @@ class Worker(ToolBase):
                     thread.kill()
                     # Robust join with retry (same pattern as the termination
                     # paths in _action_reset / the session cascade)
-                    _budget = max(30, thread._timeout_seconds)
-                    _elapsed = 0.0
-                    while _elapsed < _budget:
-                        thread.join(timeout=2.0)
-                        _elapsed += 2.0
-                        if not thread.is_alive():
-                            break
-                    if thread.is_alive():
-                        survived_force_stop = True
+                    # A thread that was never started in THIS process has no
+                    # ``ident``, and ``Thread.join()`` then raises RuntimeError
+                    # ("cannot join thread before it is started"). In the
+                    # default process runtime mode that is the NORMAL shape:
+                    # ``start()`` deliberately returns early because the body
+                    # lives in the child process. So there is nothing here to
+                    # wait for -- skip the wait instead of raising. Skipping
+                    # proves nothing about liveness, so ``survived_force_stop``
+                    # is still decided by the ``is_alive()`` probe alone.
+                    if getattr(thread, "ident", None) is None:
+                        logger.debug(
+                            "Force-spawn: stale worker '%s' was never started in "
+                            "this process (no thread ident); skipping join",
+                            worker_label,
+                        )
+                        if thread.is_alive():
+                            survived_force_stop = True
+                    else:
+                        _budget = max(30, thread._timeout_seconds)
+                        _elapsed = 0.0
+                        while _elapsed < _budget:
+                            thread.join(timeout=2.0)
+                            _elapsed += 2.0
+                            if not thread.is_alive():
+                                break
+                        if thread.is_alive():
+                            survived_force_stop = True
                 except Exception as exc:
                     logger.exception("Error killing stale worker '%s': %s", worker_label, exc)
                     # stop() raised: the thread is only recycled if it actually died.
