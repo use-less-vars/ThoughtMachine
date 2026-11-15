@@ -1,0 +1,64 @@
+# contract-gate.yml - the fast gate over the invariants named in docs/CONTRACTS.md.
+#
+# It runs ONLY the test files cited by the ledger, enumerated by hand (no glob, no
+# `-m` marker expression, never the whole suite). Docker, secrets and the image
+# cache of python-version-matrix.yml are deliberately absent: every file here is
+# hermetic, so this job should finish in well under the 2-minute budget.
+name: Contract Gate
+
+on:
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contract-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract-gate:
+    name: Contract gate (docs/CONTRACTS.md)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Contract gate (only the tests named in docs/CONTRACTS.md)
+        run: |
+          set +e
+          start=$(date +%s)
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_worker_security.py \
+            tests/tools/test_tool_schemas.py \
+            tests/test_security_gate_disk.py \
+            tests/trust/test_gate_contract.py \
+            tests/test_worker_is_a_real_process.py \
+            tests/test_contracts_ledger_parity.py
+          status=$?
+          end=$(date +%s)
+          seconds=$((end - start))
+          echo "CONTRACT_GATE_SECONDS=${seconds}" >> "$GITHUB_ENV"
+          exit $status
+
+      - name: "Report pytest wall time (budget 120s; install time excluded)"
+        if: always()
+        run: |
+          echo "contract-gate pytest wall time: ${CONTRACT_GATE_SECONDS:-unknown}s (budget 120s)"
