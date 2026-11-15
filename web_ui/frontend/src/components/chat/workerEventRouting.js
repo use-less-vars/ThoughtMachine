@@ -6,10 +6,16 @@
  * A panel is identified by its instance key `<worker_name>#<instance_id>`
  * (missing instance id treated as '0'). An event matches a panel when its
  * instance identity lines up, in order of precision:
- *   1. event.instance_id != null  → strict equality with panel.instance_id
- *   2. event.instance_label != null → strict equality with panel.instance_label
- *   3. otherwise                   → bare worker_name equality (event has no
- *      instance identity — matches EVERY panel for that worker name)
+ *   1. BOTH sides carry instance_id    → strict equality
+ *   2. BOTH sides carry instance_label → strict equality
+ *   3. otherwise                       → bare worker_name equality (an event or
+ *      panel with no identity of its own matches every instance of that name)
+ *
+ * A comparison is only made when BOTH sides carry the field. An older build
+ * persisted panels without instance identity (JSON.stringify drops `undefined`),
+ * and `undefined === 1` is false, so treating a missing side as a mismatch hid
+ * every event from a restored panel. A missing side now falls through to the
+ * next, coarser rule instead (panels are backfilled on restore — see App.jsx).
  *
  * Events without a worker_name match nothing (instanceKeyOf returns null).
  */
@@ -28,8 +34,15 @@ export const matchesPanel = (event, panel) => {
   // match nothing, and a name mismatch never matches (prevents cross-worker
   // leakage when different workers share instance ids/labels).
   if (!event.worker_name || event.worker_name !== panel.worker_name) return false
-  if (event.instance_id != null) return event.instance_id === panel.instance_id
-  if (event.instance_label != null) return event.instance_label === panel.instance_label
+  // Compare instance identity only when BOTH sides carry it: a panel restored
+  // from localStorage written by an older build may have no instance_id /
+  // instance_label, and `undefined === 1` would drop all of its events.
+  if (event.instance_id != null && panel.instance_id != null) {
+    return event.instance_id === panel.instance_id
+  }
+  if (event.instance_label != null && panel.instance_label != null) {
+    return event.instance_label === panel.instance_label
+  }
   return true
 }
 

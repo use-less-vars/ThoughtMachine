@@ -205,11 +205,38 @@ def _worker_instance_parts(label: str) -> Tuple[str, int]:
     Labels are ``<name>`` for instance 1 and ``<name>#<N>`` for N>1.  A trailing
     ``#<int>`` suffix belongs to that instance; anything else is a bare name
     (instance 1).
+
+    LOSSY: a worker *name* may itself contain ``#``, so this is only a legacy
+    fallback for envelopes that carry no identity of their own.  Prefer
+    ``_worker_instance_fields`` for anything that reaches the frontend.
     """
     base, sep, suffix = label.rpartition('#')
     if sep and suffix.isdigit():
         return base, int(suffix)
     return label, 1
+
+
+def _worker_instance_fields(data: dict, worker_label: str) -> Tuple[Any, str]:
+    """Resolve the ``(instance_id, instance_label)`` pair for a worker envelope.
+
+    The producing ``WorkerThread`` / ``WorkerBusAdapter`` stamp ``instance_id``
+    and ``instance_label`` onto EVERY event it publishes on the worker's own
+    EventBus, from the single source of truth (``WorkerThread.instance_id`` /
+    ``instance_label``).  Those stamped values are used verbatim, so the
+    identity in an envelope is always the one the worker actually has.
+
+    ``worker_label`` is only a LEGACY fallback for a producer that predates the
+    stamp: re-deriving the instance id by parsing ``<name>#<N>`` out of the
+    label is lossy (a worker *name* may contain ``#``), and deriving it here
+    was how panel identity and event identity could disagree.
+    """
+    instance_id = data.get('instance_id')
+    if instance_id is None:
+        instance_id = _worker_instance_parts(worker_label)[1]
+    instance_label = data.get('instance_label')
+    if instance_label is None:
+        instance_label = worker_label
+    return instance_id, instance_label
 
 
 def _normalise_workspace_root(path: Optional[str]) -> str:
@@ -1309,6 +1336,11 @@ class WebAgentBridge:
                     f"original_type={original_type!r}, "
                     f"data_keys={list(data.keys())}, "
                     f"n_callbacks={len(self._forwarder._callbacks)}")
+                # Instance identity is taken from the event's own stamp (single
+                # source of truth: WorkerThread.instance_id / instance_label),
+                # never re-derived from the label.  Computed once per event and
+                # shared by every branch below.
+                instance_id, instance_label = _worker_instance_fields(data, worker_label)
                 # Special handling for tokens_updated - flatten to top-level
                 # so the frontend's existing 'tokens_updated' handler picks it up.
                 if original_type == 'tokens_updated':
@@ -1318,8 +1350,8 @@ class WebAgentBridge:
                         'output': data.get('total_output', 0),
                         'source': 'worker',
                         'worker_name': data.get('worker_name', worker_label),
-                        'instance_id': data.get('instance_id', _worker_instance_parts(worker_label)[1]),
-                        'instance_label': data.get('instance_label', worker_label),
+                        'instance_id': instance_id,
+                        'instance_label': instance_label,
                     }
                 elif original_type == 'context_updated':
                     context_length_val = data.get('context_length', 0)
@@ -1346,8 +1378,8 @@ class WebAgentBridge:
                         'context_length': context_length_val,
                         'source': 'worker',
                         'worker_name': data.get('worker_name', worker_label),
-                        'instance_id': data.get('instance_id', _worker_instance_parts(worker_label)[1]),
-                        'instance_label': data.get('instance_label', worker_label),
+                        'instance_id': instance_id,
+                        'instance_label': instance_label,
                         'timestamp': (
                             event.metadata.timestamp.isoformat()
                             if hasattr(event, 'metadata') and event.metadata
@@ -1358,8 +1390,8 @@ class WebAgentBridge:
                     event_dict = {
                         'type': 'worker:context_summarized',
                         'worker_name': data.get('worker_name', worker_label),
-                        'instance_id': data.get('instance_id', _worker_instance_parts(worker_label)[1]),
-                        'instance_label': data.get('instance_label', worker_label),
+                        'instance_id': instance_id,
+                        'instance_label': instance_label,
                         'message': data.get('message', 'Context has been summarized'),
                         'timestamp': (
                             event.metadata.timestamp.isoformat()
@@ -1372,8 +1404,8 @@ class WebAgentBridge:
                     event_dict = {
                         'type': f'worker:{original_type}',
                         'worker_name': data.get('worker_name', worker_label),
-                        'instance_id': data.get('instance_id', _worker_instance_parts(worker_label)[1]),
-                        'instance_label': data.get('instance_label', worker_label),
+                        'instance_id': instance_id,
+                        'instance_label': instance_label,
                         'timestamp': (
                             event.metadata.timestamp.isoformat()
                             if hasattr(event, 'metadata') and event.metadata

@@ -451,6 +451,31 @@ def _publish_global_worker_event(event_type, data: dict) -> None:
         pass
 
 
+def _stamp_instance_identity(data: dict, instance_id, instance_label) -> dict:
+    """Return ``data`` with a worker instance's identity stamped onto it.
+
+    ``instance_id`` / ``instance_label`` come from the producing
+    ``WorkerThread`` (``self.instance_id`` / ``self.instance_label``) and are
+    the SINGLE SOURCE OF TRUTH for the identity of a worker-instance event:
+    every event published on a worker's own EventBus carries them.
+
+    Consumers (``web_ui.backend.bridge``) must never re-derive the identity by
+    parsing the instance label.  That parse is lossy for a worker *name* that
+    itself contains ``#``: name ``foo#3`` on instance 1 has the label
+    ``foo#3``, which parses back as instance 3 while the REST layer reports
+    instance 1 — exactly the panel/event disagreement this stamp prevents.
+
+    A value already present in ``data`` wins, so call sites that publish the
+    identity themselves are unaffected.
+    """
+    missing = {}
+    if data.get("instance_id") is None:
+        missing["instance_id"] = instance_id
+    if data.get("instance_label") is None:
+        missing["instance_label"] = instance_label
+    return {**data, **missing} if missing else data
+
+
 class WorkerBusAdapter:
     """Drop-in replacement for GUIIntegration that publishes to per-worker EventBus.
 
@@ -459,13 +484,18 @@ class WorkerBusAdapter:
     """
 
     def __init__(self, event_bus, worker_name: str, state_bridge=None,
-                 session_id: str | None = None):
+                 session_id: str | None = None, instance_id: int = 1):
         self._event_bus = event_bus
         self.worker_name = worker_name
         self._state_bridge = state_bridge
         # Session that owns this worker.  Stamped onto published events so the
         # bridge can tell two same-named workers in different sessions apart.
         self.session_id = session_id
+        # Worker instance identity — passed in from ``WorkerThread.instance_id``
+        # (the owner) rather than re-derived here, and stamped onto every
+        # published event (see _stamp_instance_identity).
+        self.instance_id = instance_id
+        self.instance_label = _WorkerRegistry.instance_label(worker_name, instance_id)
         self._state = ExecutionState.READY if ExecutionState else None
 
     @property
@@ -483,6 +513,8 @@ class WorkerBusAdapter:
                         "worker_name": self.worker_name,
                         "execution_state": new_state.value if hasattr(new_state, 'value') else str(new_state),
                         "old_execution_state": old_state.value if hasattr(old_state, 'value') else str(old_state),
+                        "instance_id": self.instance_id,
+                        "instance_label": self.instance_label,
                     }
                     # Session attribution must also live in the payload, not only in
                     # the metadata (see WorkerBusAdapter._publish).
@@ -722,6 +754,11 @@ class WorkerBusAdapter:
             payload = {**data, "worker_name": self.worker_name}
             if session_id:
                 payload["session_id"] = session_id
+            # Instance identity travels with every event on the per-worker bus,
+            # stamped from the owner's instance_id (single source of truth), so
+            # the bridge never has to parse it back out of the label.
+            payload = _stamp_instance_identity(
+                payload, self.instance_id, self.instance_label)
             event = BaseEvent(
                 type=evt,
                 metadata=EventMetadata(source="worker", session_id=session_id),
@@ -3777,6 +3814,7 @@ class WorkerThread(threading.Thread):
                     self._event_bus, self.worker_name,
                     state_bridge=self._state_bridge,
                     session_id=self.session_id,
+                    instance_id=self.instance_id,
                 )
                 self._worker_bus_adapter = bus_adapter
                 session_lifecycle = WorkerSessionLifecycle()
@@ -5694,6 +5732,9 @@ class WorkerThread(threading.Thread):
         """
         if "worker_name" not in data:
             data = {**data, "worker_name": self.worker_name}
+        # Same single-source-of-truth stamp as WorkerBusAdapter._publish: every
+        # event on the worker's own EventBus carries this instance's identity.
+        data = _stamp_instance_identity(data, self.instance_id, self.instance_label)
         if self._event_bus is None or create_event is None or EventType is None:
             # Diagnostic only: this early return silently drops the event.  Once
             # per worker lifetime -- _publish_event is a hot path.

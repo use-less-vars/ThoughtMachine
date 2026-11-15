@@ -58,6 +58,32 @@ const PANEL_SIZE_DEFAULT = 350
 // Instance key uniquely identifying a worker panel within a session
 // (worker name + instance id; missing instance id treated as '0').
 const workerPanelInstanceKey = (panel) => `${panel.worker_name}#${panel.instance_id ?? '0'}`
+// Normalise a panel restored from localStorage. A panel persisted by an older
+// build can carry no instance identity at all (`JSON.stringify` drops
+// `undefined`), while the backend reports instance 1 for every single-instance
+// worker (`getattr(thread, 'instance_id', 1)` in workspace_routes.py). The
+// same default is backfilled here: a restored panel keyed `<name>#0` matches no
+// event (every event carries instance_id 1), so it would render nothing.
+// Warned once per panel key so a stale store cannot flood the console on boot.
+const warnedPersistedPanelIdentity = new Set()
+const normalisePersistedPanel = (panel) => {
+  const instanceId = panel.instance_id ?? 1
+  const instanceLabel = panel.instance_label
+    ?? (instanceId > 1 ? `${panel.worker_name}#${instanceId}` : panel.worker_name)
+  if (panel.instance_id == null || panel.instance_label == null) {
+    const key = `${panel.worker_name}#${instanceId}`
+    if (!warnedPersistedPanelIdentity.has(key)) {
+      warnedPersistedPanelIdentity.add(key)
+      console.warn(
+        `[workerPanels] restored panel ${key} carried no instance identity ` +
+        `(instance_id=${String(panel.instance_id)}, ` +
+        `instance_label=${String(panel.instance_label)}); backfilled ` +
+        `instance_id=${instanceId}, instance_label=${instanceLabel}`
+      )
+    }
+  }
+  return { ...panel, instance_id: instanceId, instance_label: instanceLabel }
+}
 // Session ids that already have tabs in the tab store. Used at boot to
 // decide which per-session worker-panel state to restore from localStorage.
 function bootSessionIds() {
@@ -127,7 +153,9 @@ export default function App() {
         if (!saved) return
         const parsed = JSON.parse(saved)
         if (!Array.isArray(parsed)) return
-        const panels = parsed.filter(p => p && typeof p === 'object' && p.worker_name)
+        const panels = parsed
+          .filter(p => p && typeof p === 'object' && p.worker_name)
+          .map(normalisePersistedPanel)
         if (panels.length > 0) result[sid] = panels
       })
       return result
@@ -971,7 +999,9 @@ export default function App() {
           try {
             const parsed = JSON.parse(saved)
             if (Array.isArray(parsed)) {
-              const panels = parsed.filter(p => p && typeof p === 'object' && p.worker_name)
+              const panels = parsed
+                .filter(p => p && typeof p === 'object' && p.worker_name)
+                .map(normalisePersistedPanel)
               if (panels.length > 0) {
                 setWorkerPanelsBySession(prev => (prev[sid] ? prev : { ...prev, [sid]: panels }))
               }
