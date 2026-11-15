@@ -62,6 +62,7 @@ The full resolution chain:
 
 from __future__ import annotations
 
+import collections
 import copy
 import json
 import os
@@ -547,6 +548,15 @@ class WebAgentBridge:
         self._worker_event_buffer_max = 100
         self._worker_event_buffer_lock = threading.Lock()
 
+        # Spawns parked while this bridge has no session bound yet.  On the
+        # real startup path WORKER_SPAWNED is published BEFORE start() assigns
+        # ``_session_id``, so the deny-by-default session gate would drop the
+        # frame (and with it the per-worker subscription and the reconnect
+        # buffer).  Such frames are parked here and replayed by
+        # ``_bind_session_id()`` once the session is known.  Bounded FIFO:
+        # oldest dropped first, so an unbound bridge cannot grow unbounded.
+        self._parked_worker_spawns: collections.deque = collections.deque(maxlen=32)
+
         # Serialises whole-session persistence against live-state mutation
         # (the addendum REST routes): a snapshot taken while a route mutates
         # the live Session could otherwise be written after that route's own
@@ -925,6 +935,110 @@ class WebAgentBridge:
             log('WARNING', 'server.bridge',
                 f"[DISCOVERY] Failed to discover existing workers: {e}")
 
+    def _bind_session_id(self, session_id: Optional[str]) -> None:
+        """Bind this bridge to *session_id* and replay parked worker spawns.
+
+        Single entry point for every ``_session_id`` assignment outside
+        ``close_session()``.  A ``WORKER_SPAWNED`` published before the bridge
+        knew its session is parked by ``_on_worker_spawned``; assigning the id
+        here is the moment those frames can be validated and replayed to the
+        registered callbacks.
+
+        Only a transition from "no session" to "a session" replays anything:
+        re-binding an already-bound bridge has nothing to flush, and parked
+        frames belonging to another session are discarded rather than kept
+        forever.  Per-worker discovery runs on every transition so a bridge
+        that adopts a session late (cold start, reconnect, second tab) still
+        binds the buses of workers that are already running.
+        """
+        previous_session_id = self._session_id
+        self._session_id = session_id
+        if previous_session_id or not session_id:
+            return
+
+        replay: List[Dict[str, Any]] = []
+        discarded = 0
+        while True:
+            try:
+                parked_entry = self._parked_worker_spawns.popleft()
+            except IndexError:
+                break
+            parked_data = parked_entry.get('data') if isinstance(parked_entry, dict) else None
+            parked_session_id = (
+                parked_data.get('session_id') if isinstance(parked_data, dict) else None
+            )
+            if parked_session_id == session_id:
+                replay.append(parked_entry)
+            else:
+                discarded += 1
+        if discarded:
+            log('DEBUG', 'pipeline.bridge',
+                f'_bind_session_id: discarded {discarded} parked WORKER_SPAWNED '
+                f'frame(s) belonging to another session while binding to '
+                f'{session_id}')
+
+        for position, parked_entry in enumerate(replay):
+            # Popped BEFORE the replay call, so an entry the handler rejects
+            # again is re-parked by the handler instead of looping here.
+            self._on_worker_spawned(parked_entry['event'])
+            if any(queued is parked_entry for queued in self._parked_worker_spawns):
+                log('WARNING', 'server.bridge',
+                    f'_bind_session_id: parked WORKER_SPAWNED for '
+                    f'{parked_entry.get("worker_name", "?")!r} was rejected '
+                    f'again after binding session {session_id} — left parked '
+                    f'(bridge session is now {self._session_id!r})')
+                for remaining_entry in replay[position + 1:]:
+                    self._parked_worker_spawns.append(remaining_entry)
+                break
+
+        self._discover_existing_workers(session_id)
+
+    def _park_worker_spawn(self, event: Any) -> None:
+        """Retain a ``WORKER_SPAWNED`` whose session is known but not yet bound.
+
+        Bounded FIFO (``_parked_worker_spawns``): once 32 entries are held the
+        oldest is dropped.  No per-worker EventBus resolution happens here —
+        that path retries for up to ~1.25 s and would stall the event
+        publishing thread; it runs on replay instead.
+
+        Each parked entry is the frame that would have been forwarded, with the
+        original event kept under ``'event'`` so ``_bind_session_id`` can
+        re-run the full handler (bus subscription, reconnect buffer, callback
+        fan-out) instead of only replaying a pre-rendered dict.
+        """
+        data = getattr(event, 'data', None) or {}
+        worker_name = data.get('worker_name', '') if isinstance(data, dict) else ''
+        instance_id = (data.get('instance_id') or 1) if isinstance(data, dict) else 1
+        event_session_id = data.get('session_id') if isinstance(data, dict) else None
+        worker_label = _worker_instance_label(worker_name, instance_id)
+
+        already_parked = False
+        for queued_entry in self._parked_worker_spawns:
+            if (queued_entry.get('worker_name') == worker_name
+                    and (queued_entry.get('instance_id') or 1) == instance_id):
+                already_parked = True
+                break
+
+        self._parked_worker_spawns.append({
+            'type': f'worker:{event.type.value}',
+            'worker_name': worker_name,
+            'instance_id': instance_id,
+            'instance_label': worker_label,
+            'data': data,
+            'event': event,
+        })
+        if already_parked:
+            # One visible warning per worker, not one per repeated spawn.
+            log('DEBUG', 'pipeline.bridge',
+                f'_on_worker_spawned: parked another WORKER_SPAWNED for '
+                f'{worker_label} (still no session bound)')
+            return
+        log('WARNING', 'server.bridge',
+            f'_on_worker_spawned: no session bound yet — parking '
+            f'WORKER_SPAWNED for {worker_label} (event session='
+            f'{event_session_id!r}) until this bridge is bound to a session; '
+            f'it will be replayed then')
+
     def _on_worker_token_warning(self, event: TokenWarningEvent) -> None:
         """Forward non-worker token warnings to the frontend as system notifications.
 
@@ -1055,9 +1169,29 @@ class WebAgentBridge:
             f"WORKER_BUS_AVAILABLE={WORKER_BUS_AVAILABLE}, "
             f"get_worker_event_bus={'SET' if get_worker_event_bus is not None else 'NONE'}")
         if not self._event_belongs_to_this_session(data):
-            log('DEBUG', 'pipeline.bridge',
-                f"_on_worker_spawned: SKIPPING (session mismatch or missing "
-                f"session id)")
+            event_session_id = data.get('session_id') if isinstance(data, dict) else None
+            if event_session_id and not self._session_id:
+                # The spawn knows its session, this bridge does not (yet) —
+                # the normal cold-start ordering.  Park the ORIGINAL event and
+                # replay it from _bind_session_id() rather than dropping it
+                # along with its per-worker subscription and replay-buffer
+                # entry.
+                self._park_worker_spawn(event)
+                return
+            if event_session_id:
+                # Both sides name a session and they differ: deny-by-default.
+                log('WARNING', 'server.bridge',
+                    f'_on_worker_spawned: DROPPING WORKER_SPAWNED '
+                    f'{worker_label!r} — event belongs to session '
+                    f'{event_session_id} but this bridge is bound to session '
+                    f'{self._session_id}')
+                return
+            # The event carries no session id, so it cannot be attributed to
+            # any bridge's session.
+            log('WARNING', 'server.bridge',
+                f'_on_worker_spawned: DROPPING WORKER_SPAWNED {worker_label!r} — '
+                f'event carries no session id (bridge session='
+                f'{self._session_id!r})')
             return
 
         # A respawned worker gets a brand-new per-worker EventBus, while our
@@ -1803,7 +1937,7 @@ class WebAgentBridge:
 
         self._session = session
         self._agent = Agent(agent_config, session=session)
-        self._session_id = session.session_id
+        self._bind_session_id(session.session_id)
 
         # Queue the initial query
         self._query_queue.put(query)
@@ -2126,7 +2260,7 @@ class WebAgentBridge:
 
         # Preserve session ID
         if self._session is not None:
-            self._session_id = self._session.session_id
+            self._bind_session_id(self._session.session_id)
 
         log('INFO', 'server.bridge', '_restart_controller: controller restarted')
 
@@ -3075,6 +3209,9 @@ class WebAgentBridge:
         self._session = None
         self._loaded_session = None
         self._session_id = None
+        # Parked spawns belong to the session being closed; never replay them
+        # into the next one.
+        self._parked_worker_spawns.clear()
         self._forwarder.broadcast(None, "session_cleared", {})
         self._forwarder.broadcast(None, "state_changed", {
             "state": "IDLE",
@@ -3271,7 +3408,7 @@ class WebAgentBridge:
         if self._session_id is None:
             sid = event.get('session_id')
             if sid is not None:
-                self._session_id = sid
+                self._bind_session_id(sid)
                 self.save_open_session()
                 log('INFO', 'server.bridge', f"Session ID captured from controller event: {sid}")
 
