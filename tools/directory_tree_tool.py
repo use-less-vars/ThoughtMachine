@@ -1,4 +1,5 @@
 from .base import ToolBase
+from .utils import DEFAULT_EXCLUDE_DIRS
 import os
 import pathlib
 import stat
@@ -41,7 +42,7 @@ class DirectoryTreeTool(ToolBase):
     format: str = Field(default='tree', description="Output format: 'tree' (directory tree) or 'list' (flat file list)")
     max_results: int = Field(default=100, description="Maximum files/entries to show (0=unlimited, applies to both list and tree formats)")
     sort_by: str = Field(default='name', description="Sort order for list format: 'name', 'size', or 'modified'")
-    exclude_dirs: List[str] = Field(default_factory=lambda: ["__pycache__", ".git", ".svn", ".hg", "node_modules", ".idea", ".vscode", ".pytest_cache", "build", "dist", "*.egg-info", "reports", "logs", "temp", "tmp", "tmp_packages"], description="Directories to exclude from traversal")
+    exclude_dirs: List[str] = Field(default_factory=lambda: list(DEFAULT_EXCLUDE_DIRS) + ["reports", "logs", "temp", "tmp", "tmp_packages"], description="Directories to exclude from traversal")
     
     def execute(self) -> str:
         self._debug_log(f"DirectoryTreeTool.execute called with directory={self.directory}, exclude_dirs={self.exclude_dirs}")

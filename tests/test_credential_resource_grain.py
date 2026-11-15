@@ -177,15 +177,38 @@ def test_credential_disk_read_failure_fails_closed_to_banned():
 # ---------------------------------------------------------------------------
 
 
-def test_credential_use_emits_event_with_name_only(tmp_path, monkeypatch):
-    """``_execute_single_tool`` emits exactly ONE ``CREDENTIAL_USE`` event.
+def _pin_credential_grain(monkeypatch, level):
+    """Pin the executor's ``credential`` resolution to *level*.
 
-    The real injection seam is the executor: it resolves the placeholders and
-    then must report WHAT was used (credential name), WHO used it (tool name)
-    and in WHICH session -- and must never carry the secret itself.  Note
-    ``Secret`` only redacts ``repr``/``str``/``format``, so ``json.dumps`` of a
-    payload holding the raw value (or a pydantic-coerced plain ``str`` copy of
-    it) would leak the secret.
+    Without this the disk-authoritative branch reads a real vault permission
+    store and the grain (``banned`` by default) is only incidental -- the seam
+    under test must be exercised both refused (``banned``) and granted
+    (``use``).
+    """
+    from agent.core import tool_executor as executor_mod
+    from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
+
+    monkeypatch.setattr(
+        executor_mod,
+        "get_workspace_capabilities",
+        lambda _ws_id: WorkspaceCapabilities(),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "get_effective_permissions",
+        lambda *a, **k: {"credential": level},
+    )
+
+
+def test_credential_placeholder_denied_without_grant(tmp_path, monkeypatch):
+    """A ``banned`` grain refuses the placeholder -- and emits NO event.
+
+    This is the D1 seam: the executor resolves ``{{credential:<name>}}``
+    after the declaration-based category gate, so a tool that declares no
+    ``credential:use`` requirement used to receive the secret despite an
+    all-banned ``credential`` grain.  The refusal must use the gate's own
+    wording, must not run the injector, and must not report a use that never
+    happened.
     """
     from typing import ClassVar, List
 
@@ -204,6 +227,7 @@ def test_credential_use_emits_event_with_name_only(tmp_path, monkeypatch):
     scope.mkdir(parents=True)
     raw_value = "planted-value-must-not-be-logged"
     (scope / "demo_key").write_text(raw_value + "\n", encoding="utf-8")
+    _pin_credential_grain(monkeypatch, "banned")
 
     class CredentialEchoTool(ToolBase):
         """Minimal tool that declares the args the injector rewrites."""
@@ -235,6 +259,90 @@ def test_credential_use_emits_event_with_name_only(tmp_path, monkeypatch):
         state=FakeState(),
         logger=None,
         security_available=False,
+        agent=None,
+        event_bus=bus,
+    )
+    result = executor._execute_single_tool(
+        CredentialEchoTool,
+        {"workspace_id": "ws-audit", "api_key": "{{credential:demo_key}}"},
+        "CredentialEchoTool",
+        0,
+        lambda: False,
+        lambda: None,
+        lambda: 0,
+        session_id="sess-audit-1",
+        workspace_id="ws-audit",
+    )
+
+    # Refused, in the single house denial format, before the injector runs.
+    assert result["success"] is False
+    assert "credential:use" in result["result"]
+    assert raw_value not in json.dumps(result, default=str)
+
+    events = [
+        event
+        for event in captured
+        if getattr(event, "type", None) == EventType.CREDENTIAL_USE
+    ]
+    assert events == []
+
+
+def test_credential_use_emits_event_with_name_only(tmp_path, monkeypatch):
+    """``_execute_single_tool`` emits exactly ONE ``CREDENTIAL_USE`` event.
+
+    The real injection seam is the executor: it resolves the placeholders and
+    then must report WHAT was used (credential name), WHO used it (tool name)
+    and in WHICH session -- and must never carry the secret itself.  Note
+    ``Secret`` only redacts ``repr``/``str``/``format``, so ``json.dumps`` of a
+    payload holding the raw value (or a pydantic-coerced plain ``str`` copy of
+    it) would leak the secret.
+
+    The ``credential: use`` grant is pinned via the gate seam: the audit-event
+    contract only applies to a call the grain actually permits.
+    """
+    from typing import ClassVar, List
+
+    import agent.credentials.injector as injector_mod
+    from agent.core.tool_executor import ToolExecutor
+    from agent.events import EventBus, EventType
+    from tools.base import ToolBase
+
+    monkeypatch.setattr(injector_mod, "vault_root", lambda: tmp_path)
+    scope = tmp_path / "credentials" / "ws-audit"
+    scope.mkdir(parents=True)
+    raw_value = "planted-value-must-not-be-logged"
+    (scope / "demo_key").write_text(raw_value + "\n", encoding="utf-8")
+    _pin_credential_grain(monkeypatch, "use")
+
+    class CredentialEchoTool(ToolBase):
+        """Minimal tool that declares the args the injector rewrites."""
+
+        tool: str = "CredentialEchoTool"
+        required_categories: ClassVar[List[str]] = []
+        workspace_id: str = ""
+        api_key: str = ""
+
+        def execute(self) -> str:
+            return "injected" if self.api_key == raw_value else "unresolved"
+
+    class FakeConfig:
+        workspace_path = None
+        tool_output_token_limit = None
+        session_permissions = None
+
+    class FakeState:
+        security_config = None
+
+    bus = EventBus()
+    captured = []
+    bus.subscribe(None, lambda event: captured.append(event))
+
+    executor = ToolExecutor(
+        tool_classes=[CredentialEchoTool],
+        config=FakeConfig(),
+        state=FakeState(),
+        logger=None,
+        security_available=True,
         agent=None,
         event_bus=bus,
     )

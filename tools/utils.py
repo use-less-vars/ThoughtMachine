@@ -4,6 +4,34 @@ from pydantic import BaseModel
 import copy
 
 
+# Shared default directory exclusions for the traversal tools (GlobTool,
+# FileSearchTool, DirectoryTreeTool).  Single source of truth: a tool must not
+# carry its own copy, or a new exclusion (e.g. ``.worktrees``) silently applies
+# to some tools and not others.
+#
+# ``.worktrees`` is the git-worktree container: it holds full checkouts of the
+# same tree, so traversing it duplicates every hit -- and for a worker or
+# session bound to one of those worktrees, it leaks the sibling checkouts into
+# its own results.
+DEFAULT_EXCLUDE_DIRS: Tuple[str, ...] = (
+    "__pycache__",
+    ".git",
+    ".svn",
+    ".hg",
+    "node_modules",
+    ".idea",
+    ".vscode",
+    ".pytest_cache",
+    "build",
+    "dist",
+    "*.egg-info",
+    "venv",
+    "env",
+    ".venv",
+    ".worktrees",
+)
+
+
 def _simplify_schema(schema: dict) -> dict:
     """
     Recursively remove titles, defaults, and simplify nullable anyOf.

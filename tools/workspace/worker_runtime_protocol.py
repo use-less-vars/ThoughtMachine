@@ -460,6 +460,19 @@ class Hello(Message):
     what lets the supervisor notice it can only be driven the old way. It is
     therefore a field of this frame rather than a separate kind, so the one
     handshake stays one round trip.
+
+    ``incarnation_id`` is OPTIONAL on the wire and NON-OPTIONAL in effect
+    (§4.7): it is the nonce the supervisor minted for *this* spawn, and the
+    runtime echoes it back verbatim rather than minting its own. ``pid`` and
+    ``epoch_seen`` cannot carry that job -- a pid is recycled by the OS and an
+    epoch is reused across a respawn from a stale spec -- so a frame replayed
+    from an earlier incarnation can satisfy both. A nonce that only the
+    supervisor knows and only the child it spawned can read back cannot be
+    guessed, so :meth:`ProcessWorkerRuntime.start` refuses a hello that does not
+    carry the one it issued. Declared ``_OPTIONAL`` because a pre-existing
+    runtime sends no such field: decoding it as mandatory would fail inside the
+    reader thread, where the refusal would surface as a 30 s hello timeout
+    instead of a named mismatch. Absent means empty, and empty is refused.
     """
 
     KIND: ClassVar[str] = "hello"
@@ -468,9 +481,10 @@ class Hello(Message):
         ("started_at", str),
         ("runtime_version", str),
         ("epoch_seen", int),
+        ("incarnation_id", str),
         ("capabilities", list),
     )
-    _OPTIONAL: ClassVar[Tuple[str, ...]] = ("capabilities",)
+    _OPTIONAL: ClassVar[Tuple[str, ...]] = ("capabilities", "incarnation_id")
 
     pid: int
     started_at: str
@@ -479,6 +493,11 @@ class Hello(Message):
     #: Names from :data:`HELLO_CAPABILITIES`. A tuple so a received hello is
     #: hashable and comparable; the wire form is a JSON array (§4.5).
     capabilities: Tuple[str, ...] = ()
+    #: The nonce the supervisor issued for THIS spawn, echoed verbatim (§4.7).
+    #: Empty when the runtime predates the field; that is a refusal, not a
+    #: default, because an unauthenticated greeting is exactly what a replayed
+    #: frame looks like.
+    incarnation_id: str = ""
 
     def __post_init__(self) -> None:
         caps = self.capabilities

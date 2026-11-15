@@ -8,6 +8,7 @@ Provides fast file discovery using Python's glob module with:
 - Both tree and list output formats
 """
 from .base import ToolBase
+from .utils import DEFAULT_EXCLUDE_DIRS
 import os
 import sys
 import glob
@@ -49,7 +50,7 @@ class GlobTool(ToolBase):
         description="If True, '**' pattern matches any subdirectories (including all levels)"
     )
     exclude_dirs: List[str] = Field(
-        default_factory=lambda: ["__pycache__", ".git", ".svn", ".hg", "node_modules", ".idea", ".vscode", ".pytest_cache", "build", "dist", "*.egg-info", "venv", "env", ".venv"],
+        default_factory=lambda: list(DEFAULT_EXCLUDE_DIRS),
         description="Directory names to exclude (exact match or glob patterns)"
     )
     page: int = Field(

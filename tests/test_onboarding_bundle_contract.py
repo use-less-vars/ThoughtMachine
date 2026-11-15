@@ -90,14 +90,17 @@ QUEUE_SENTINEL = "<!-- queue body collapsed: branch-local, see test_queue_block_
 #
 # Coupling: when dev is meant to move into the router, regenerate HANDOFF.md
 # and update these constants in the same change. That is the only link.
-PINNED_DEV_SHA = "b43163dc"
-PINNED_DEV_SUBJECT = "docs: log security boundary C-items"
+PINNED_DEV_SHA = "3eef2b56"
+PINNED_DEV_SUBJECT = "Merge pull request #369 from use-less-vars/fix/c73-worker-namespace"
 PINNED_RECENT = (
-    "b43163dc docs: log security boundary C-items\n"
-    "10809b2b docs: log security boundary C-items\n"
-    "88d387bf Merge pull request #336 from use-less-vars/fix/gen62-tier0-honest-state\n"
-    "0ff6ae6c Merge pull request #337 from use-less-vars/fix/gen62-d16-sliced-wait\n"
-    "0c907aff test(tier0): assert the pause route's real status in the stale-handle test"
+    "3eef2b56 Merge pull request #369 from use-less-vars/fix/c73-worker-namespace\n"
+    "bf10c56d C73: scope worker dirs, bus subscriptions and resume cache per session\n"
+    "1d6dcd46 Merge remote-tracking branch 'origin/feat/c68-security-and-worktrees' "
+    "into feat/c68-security-and-worktrees\n"
+    "a3fc5ef1 fix merged tree: restore the docs negation the resolution ate, and pin "
+    "which epoch the fence carries\n"
+    "10efa3e0 Merge remote-tracking branch 'origin/dev' into "
+    "feat/c68-security-and-worktrees"
 )
 
 DEV_LINE_RE = re.compile(r"^- `dev` at `([^`]+)` -- \*(.*)\*$")
