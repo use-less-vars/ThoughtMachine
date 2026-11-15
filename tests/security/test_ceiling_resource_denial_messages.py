@@ -30,19 +30,15 @@ Full battery (this file + the neighbouring ceiling suites) is green:
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
-# ── Fix sys.path for the Docker sandbox (same preamble as test_security_gate.py) ──
-_bad_prefix = "/workspace/tests"
-sys.path = [p for p in sys.path if not p.startswith(_bad_prefix)]
-_stubs_path = "/tmp/stubs"
-if _stubs_path in sys.path:
-    sys.path.remove(_stubs_path)
-if "/workspace" in sys.path:
-    sys.path.remove("/workspace")
-sys.path.insert(0, _stubs_path)
-sys.path.insert(1, "/workspace")
+# sys.path is prepared by tests/security/conftest.py: it derives the repo root
+# from its own __file__, drops the pytest-injected ``tests/`` directory and puts
+# the sandbox /tmp/stubs fake agent package first when that directory exists.
+# Never insert a literal container path here: "/workspace" resolves to the
+# PARENT checkout when the suite runs from a git worktree, so the module
+# imported another tree's security/tools/agent and still went green.
+# Pinned by tests/test_import_provenance.py.
 
 import pytest
 

@@ -12,27 +12,17 @@ Verifies that:
 
 from __future__ import annotations
 
-import sys
 import time
 
 import pytest
 
-# ── Fix sys.path for Docker sandbox ──────────────────────────────────────
-# Pytest inserts ``tests/`` at the front of ``sys.path``, so any bare
-# ``import security`` finds ``/workspace/tests/security/`` first and caches
-# it in ``sys.modules['security']`` with the wrong `__file__`.
-# Fix: remove tests dir from sys.path, and put /tmp/stubs (stub agent
-# package) first to avoid loading the heavy dependency chain.
-_bad_prefix = "/workspace/tests"
-sys.path = [p for p in sys.path if not p.startswith(_bad_prefix)]
-
-_stubs_path = "/tmp/stubs"
-if _stubs_path in sys.path:
-    sys.path.remove(_stubs_path)
-if "/workspace" in sys.path:
-    sys.path.remove("/workspace")
-sys.path.insert(0, _stubs_path)
-sys.path.insert(1, "/workspace")
+# sys.path is prepared by tests/security/conftest.py: it derives the repo root
+# from its own __file__, drops the pytest-injected ``tests/`` directory and puts
+# the sandbox /tmp/stubs fake agent package first when that directory exists.
+# Never insert a literal container path here: "/workspace" resolves to the
+# PARENT checkout when the suite runs from a git worktree, so the module
+# imported another tree's security/tools/agent and still went green.
+# Pinned by tests/test_import_provenance.py.
 
 
 from agent.events import NullEventBus
