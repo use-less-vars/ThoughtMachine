@@ -100,4 +100,22 @@ describe('routeEventsToPanels', () => {
     expect(routeEventsToPanels('nope', [{ worker_name: 'w1' }])).toEqual({ 'w1#0': [] })
     expect(routeEventsToPanels([], [{ worker_name: 'w1' }])).toEqual({ 'w1#0': [] })
   })
+
+  // Regression: a panel persisted by an OLDER build can carry no instance
+  // identity at all — `JSON.stringify` drops `undefined` — and `undefined === 1`
+  // is false, so every instance-1 event was dropped and the restored panel
+  // rendered nothing. App.jsx backfills `instance_id ?? 1` / `instance_label ??
+  // worker_name` on both rehydrate paths (normalisePersistedPanel), which is
+  // exactly the shape asserted here.
+  it('routes instance-1 events (and only those) to a backfilled legacy panel', () => {
+    const panel = { worker_name: 'w1', instance_id: 1, instance_label: 'w1' }
+    const e1 = { worker_name: 'w1', instance_id: 1, instance_label: 'w1' }
+    const e2 = { worker_name: 'w1', instance_id: 2, instance_label: 'w1#2' }
+
+    const routed = routeEventsToPanels([e1, e2], [panel])
+
+    expect(routed).toEqual({ 'w1#1': [e1] })
+    expect(routed['w1#1']).toContain(e1)
+    expect(routed['w1#1']).not.toContain(e2)
+  })
 })
