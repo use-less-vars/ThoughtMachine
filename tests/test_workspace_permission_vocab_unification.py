@@ -29,15 +29,16 @@ from __future__ import annotations
 
 import sys
 
-_bad_prefix = "/workspace/tests"
-sys.path = [p for p in sys.path if not p.startswith(_bad_prefix)]
+# sys.path is prepared by tests/conftest.py, which derives the repo root from
+# this checkout's own __file__.  Never insert a literal container path here:
+# "/workspace" resolves to the PARENT checkout when the suite runs from a git
+# worktree, so the module imported another tree's security/tools/agent and still
+# went green.  Pinned by tests/test_import_provenance.py.
+# Kept: the sandbox-only /tmp/stubs fake agent package is still put first.
 _stubs_path = "/tmp/stubs"
 if _stubs_path in sys.path:
     sys.path.remove(_stubs_path)
-if "/workspace" in sys.path:
-    sys.path.remove("/workspace")
 sys.path.insert(0, _stubs_path)
-sys.path.insert(1, "/workspace")
 
 import json
 import logging
@@ -170,9 +171,12 @@ class TestWorkspaceCeilingMcp:
         result = apply_workspace_ceiling({"mcp": "full"}, {"mcp": "connect"})
         assert result == {"mcp": "connect"}
 
-    def test_mcp_unknown_ceiling_level_fail_open(self):
+    def test_mcp_unknown_ceiling_level_fails_closed(self):
+        # 'read' is not on the mcp ceiling scale (banned/connect/full), so it
+        # is an UNKNOWN VALUE for a known resource: it now fails CLOSED -- the
+        # session grant is denied instead of standing at 'full'.
         result = apply_workspace_ceiling({"mcp": "read"}, {"mcp": "full"})
-        assert result == {"mcp": "full"}
+        assert result == {"mcp": "banned"}
 
 
 def test_ceiling_key_mcp_emits_no_warning(caplog):

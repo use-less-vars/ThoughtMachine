@@ -90,16 +90,22 @@ because each answers a different question:
   The ask inversion: a session ``read`` grant ranks 1.0, so an ``ask``
   ceiling (2.0) does NOT cap it -- read-only sessions are never forced
   into an interactive ask loop.  A session ``write`` grant ranks 3.0, so
-  an ``ask`` ceiling caps it to the read tier (``read`` for the
-  read-capable filesystem/git keys,
-  ``banned`` for the others), and a ``write_on_feature_branch`` *ceiling*
-  (2.5, strictly between ask and write) caps ``write`` down to
-  branch-restricted write -- never unlimited.  Ceilings at rank 4.0
-  (``outbound``/``full``) are unlimited and leave the session grant
-  standing.  :data:`WORKSPACE_CEILING_VOCAB` additionally whitelists,
-  per session key, which ceiling levels may ever apply; a ceiling level
-  outside the key's vocabulary is ignored fail-open by the gate (never
-  coerced).
+  an ``ask`` ceiling caps it DOWN TO ``ask``, not to the read tier, on
+  every grain where ``ask`` is a legal level (``filesystem``, ``git``,
+  ``network``, ``visual``).  ``host_bash`` has its own scale and never
+  fabricates a prompt level, so an ``ask`` ceiling over an ``allow``
+  grant caps to ``banned``.  The grains with no ``ask`` level (``mcp``,
+  ``ci``, ``credential``) and the boolean ``container`` grain treat
+  ``ask`` as an unknown value and fail closed (``banned`` / ``False``).
+  A ``write_on_feature_branch`` *ceiling* (2.5, strictly between ask and
+  write) caps ``write`` down to branch-restricted write -- never
+  unlimited.  Ceilings at rank 4.0 (``outbound``/``full``) are unlimited
+  and leave the session grant standing.
+  :data:`WORKSPACE_CEILING_VOCAB` additionally whitelists, per session
+  key, which ceiling levels may ever apply; a ceiling level outside the
+  key's vocabulary FAILS CLOSED -- the grain is denied, never silently
+  ignored -- except for the legacy spellings translated by
+  ``apply_workspace_ceiling``'s alias table before that check.
 
 Legacy-load-normalisation policy: the workspace-permission loader
 normalises legacy stored ceilings onto the canonical vocabularies --
@@ -107,11 +113,20 @@ legacy ``full`` ceilings for ``git``/``filesystem`` are stored as
 ``write``, legacy container string ceilings are stored as booleans, and
 the removed legacy grains are folded or dropped (``git_read`` +
 ``git_write`` fold onto the single ``git`` ceiling; ``system`` and
-``execution`` are dropped).  Any stray ``full`` ceiling or
-container string that still reaches the gate at runtime is handled
-fail-open: ``full`` ranks 4.0 (unlimited; the session value stands) and
-an out-of-vocab container string is warned about and ignored (no
-ceiling applied).
+``execution`` are dropped).  A legacy value that still reaches the gate
+at runtime is resolved by ``apply_workspace_ceiling``'s alias table and
+vocabulary check: a stray ``full`` ceiling becomes ``write`` where that
+level is legal for the grain (so it CAPS the grant instead of bricking
+it), and is left alone (rank 4.0, unlimited) only where ``full`` is
+itself legal -- ``mcp``; a ``write_feature_branches`` ceiling becomes
+``write_on_feature_branch`` on ``git`` only.  A boolean ceiling keeps a
+meaning only on the boolean ``container`` grain and fails closed on every
+other grain.  A container *string* ceiling resolves on the generic rank
+scale -- write-level strings (``write``) and rank-4.0 strings (``full``)
+allow the container grant, anything below the write tier denies it
+(``False``) -- and a string that is no level at all is an unknown value
+that fails CLOSED.  An unknown value on a known resource is therefore
+always logged and always denies, never a silent no-op.
 
 """
 

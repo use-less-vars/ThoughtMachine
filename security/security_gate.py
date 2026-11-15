@@ -203,10 +203,13 @@ _WORKSPACE_CEILING_LEVELS = WORKSPACE_CEILING_LEVELS_RANKS
 # INVARIANT: this map MUST carry an entry for EVERY capped grain.
 # ``_WORKSPACE_CEILING_KEYS`` is derived from ``RESOURCE_CATALOG``, so a
 # catalog key is ACCEPTED as a ceiling name even when it is missing here --
-# and ``apply_workspace_ceiling`` then silently ``continue``s past it, making
-# that grain's workspace ceiling a NO-OP.  NOTE: ``ci`` is absent from this
-# map today; that is a KNOWN, pre-existing defect tracked separately and is
-# NOT the pattern to copy.
+# and a missing entry would make that grain's workspace ceiling a NO-OP.
+# That was exactly the ``ci`` hole (``ci`` is a real ``SessionPermissions``
+# field and a ``WORKSPACE_CEILING_VOCAB`` key, but had no mapping here, so a
+# configured ``ci`` ceiling was dropped without a trace).  It is now mapped,
+# the :func:`apply_workspace_ceiling` skip branch is LOUD for an unmapped
+# grain (WARNING, never silent), and
+# ``tests/test_ceiling_map_completeness.py`` locks the invariant.
 _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "filesystem": "filesystem",
     "docker": "container",
@@ -215,6 +218,7 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "git": "git",
     "network": "network",
     "mcp": "mcp",
+    "ci": "ci",
     "credential": "credential",
     "visual": "visual",
 }
@@ -231,6 +235,49 @@ _WORKSPACE_CEILING_KEYS = frozenset(RESOURCE_CATALOG) | {
     "docker",
 }
 
+#: Legacy ceiling-VALUE spellings -> their canonical level.
+#:
+#: Derived from the vocabularies rather than guessed.  An entry only ever takes
+#: effect when BOTH halves of the legality guard hold for the resource being
+#: capped (see ``WORKSPACE_CEILING_VOCAB``):
+#:
+#:   1. the raw token is NOT itself a legal ceiling level for that resource,
+#:      and
+#:   2. the canonical target IS a legal ceiling level for that resource.
+#:
+#: ``write_feature_branches`` is the retired pre-rename spelling of
+#: ``write_on_feature_branch``, legal on the ``git`` grain only -- elsewhere
+#: the translation does not apply and the token is an unknown value
+#: (fail-closed below).
+#:
+#: ``full`` is the legacy generic top level.  It is a legal mcp level, so
+#: guard (1) keeps it INTACT there (an mcp ``full`` ceiling stays unlimited);
+#: on ``git``/``filesystem`` the loader normalises legacy stored ``full``
+#: ceilings to ``write``, and a stray runtime ``full`` used to rank 4.0
+#: (unlimited).  Translating it to ``write`` where that is legal restores the
+#: loader's reading and keeps the intent -- CAP the grain -- instead of
+#: bricking it to ``banned``, which is far too sharp an edge for a security
+#: change.  It never widens: ``write`` (3.0) is the strictest tier the alias
+#: can produce for these grains.  Grains with no ``write`` level (host_bash,
+#: ci, credential, visual) get no translation and fail closed as before.
+_CEILING_VALUE_ALIASES: Dict[str, str] = {
+    "write_feature_branches": "write_on_feature_branch",
+    "full": "write",
+}
+
+#: Level emitted when a KNOWN resource carries an unknown ceiling VALUE.
+_CEILING_FAIL_CLOSED_LEVEL = "banned"
+
+
+def _ceiling_fail_closed_value(key: str) -> Any:
+    """Most-restrictive legal permission value for session grain *key*.
+
+    ``container`` is the boolean-typed grain, so its deny-all spelling is
+    ``False``; every other grain denies with ``banned``.
+    """
+    return False if key == "container" else _CEILING_FAIL_CLOSED_LEVEL
+
+
 def apply_workspace_ceiling(
     workspace_permissions: Dict[str, Any],
     session_permissions: Dict[str, Any],
@@ -238,12 +285,15 @@ def apply_workspace_ceiling(
     """
     Cap session permission levels at the workspace permission ceiling.
 
-    Fail-policy: an unknown ceiling *value* (a resource token outside the
-    catalog, or a level token not valid for its resource) is fail-OPEN — it is
-    logged and the session value stands.  An unreadable or missing on-disk
-    configuration is fail-CLOSED — it resolves to the most restrictive profile
-    (handled by the disk read in :func:`get_effective_permissions`).  This
-    function implements only the *value* side of that policy.
+    Fail-policy: an unknown ceiling *value* for a KNOWN resource (a level
+    token not valid for that resource, or a value of the wrong type for it) is
+    fail-CLOSED — it is logged and the resource is denied outright (``banned``,
+    or ``False`` for the boolean ``container`` grain), so a typo in a security
+    ceiling can never silently mean "no restriction".  An unknown *resource*
+    key is a different policy and stays fail-OPEN (see below).  An unreadable
+    or missing on-disk configuration is fail-CLOSED — it resolves to the most
+    restrictive profile (handled by the disk read in
+    :func:`get_effective_permissions`).
 
     Returns a NEW dict; ``session_permissions`` is not mutated.  For every
     resource present in ``workspace_permissions`` the result is the more
@@ -261,12 +311,18 @@ def apply_workspace_ceiling(
           ``write`` grant down to branch-restricted write — never unlimited.
           Ceilings at rank 4.0 (``outbound``/``full``) are unlimited — the
           session value stands.
-        * An unknown ceiling *value* -- a level not in this resource's
-          vocabulary -- is treated as no ceiling (fail-open), so
-          forward-compatible workspace maps never break session resolution.
-        * An unknown ceiling *value* -- a resource outside ``RESOURCE_CATALOG``
+        * An unknown ceiling *value* for a known resource -- a level not in
+          that resource's vocabulary, or a value of the wrong type for it --
+          is logged and fails CLOSED: the resource is denied (``banned``, or
+          ``False`` for ``container``).
+        * A legacy ceiling-value spelling (``write_feature_branches``) is
+          translated onto its canonical level (``write_on_feature_branch``)
+          where that level is legal for the resource, and treated as an
+          unknown value (fail-closed) where it is not.
+        * An unknown ceiling *resource* -- a key outside ``RESOURCE_CATALOG``
           and the legacy workspace alias ``docker`` -- is logged and ignored
-          (fail-open) -- the session value stands.
+          (fail-open) -- the session value stands, so a workspace map written
+          by a newer build never breaks session resolution.
         * ``docker`` is a legacy alias for ``container``: it is normalised
           onto ``container`` by ``_WORKSPACE_RESOURCE_MAP`` before ranking,
           so a docker ceiling of ``write`` (or ``full``/``True``) allows the
@@ -305,8 +361,22 @@ def apply_workspace_ceiling(
             )
             continue
         key = _WORKSPACE_RESOURCE_MAP.get(resource)
-        if key is None or key not in result:
-            continue  # unknown resource / not a session key: no ceiling
+        if key is None:
+            # A recognised ceiling resource with no session-side mapping: the
+            # ceiling is a NO-OP for this grain.  That must never be silent --
+            # a silent skip here is a fail-open ceiling with no evidence trail
+            # (the historical ``ci`` hole).
+            logger.warning(
+                "workspace ceiling for resource %r SKIPPED: it has no "
+                "session-side mapping in _WORKSPACE_RESOURCE_MAP, so the "
+                "session value stands uncapped.  Add the mapping (and a "
+                "completeness test) -- a configured ceiling must never be "
+                "a silent NO-OP.",
+                resource,
+            )
+            continue
+        if key not in result:
+            continue  # session carries no grant for this grain: nothing to cap
         session_val = result[key]
 
         # host_bash ranks on its own scale -- banned < ask < allow -- which
@@ -328,12 +398,18 @@ def apply_workspace_ceiling(
             else:
                 ceiling_rank = None
             if ceiling_rank is None:
+                # Unknown host_bash ceiling VALUE: fail closed.  host_bash is
+                # string-typed, so the deny-all spelling is 'banned' (the only
+                # tier below 'ask'); a 'read'/'write' ceiling that drifted in
+                # from the legacy generic scale is likewise unknown here.
                 logger.warning(
-                    "ignoring workspace ceiling level %r for host_bash "
+                    "invalid workspace ceiling level %r for host_bash "
                     "(not a host_bash level: banned/ask/allow); "
-                    "fail-open: no ceiling applied",
+                    "failing closed: %r",
                     ceiling,
+                    _ceiling_fail_closed_value(key),
                 )
+                result[key] = _ceiling_fail_closed_value(key)
                 continue
             if isinstance(session_val, bool):
                 # Boolean session host_bash: True ~ allow (2.0).
@@ -356,39 +432,76 @@ def apply_workspace_ceiling(
                 result[key] = "banned"
             continue
 
-        # Normalise the ceiling to a rank; unknown ceilings are fail-open.
+        # Normalise the ceiling to a rank.  A KNOWN resource carrying an
+        # unknown ceiling VALUE is fail-CLOSED: the resource is denied, so a
+        # typo in a security ceiling can never silently mean "no restriction".
+        ceiling_lower = None
         if isinstance(ceiling, bool):
-            ceiling_rank = 3.0 if ceiling else 0.0
+            # ``container`` is the boolean-typed grain, where a bool is the
+            # native spelling.  Every other grain takes a level token, so a
+            # bool there is a wrong-typed (hence unknown) value -> fail closed
+            # rather than letting it reach SessionPermissions and kill the
+            # whole session in validation.
+            if key == "container":
+                ceiling_rank = 3.0 if ceiling else 0.0
+            else:
+                logger.warning(
+                    "invalid workspace ceiling value %r for resource %r "
+                    "(boolean value, but %s takes a level token); "
+                    "failing closed: %r",
+                    ceiling,
+                    resource,
+                    key,
+                    _ceiling_fail_closed_value(key),
+                )
+                result[key] = _ceiling_fail_closed_value(key)
+                continue
         elif isinstance(ceiling, str):
             ceiling_lower = ceiling.lower()
             # Per-key vocab unification: only levels on this session key's
-            # own scale may cap it (e.g. an mcp 'read' ceiling, a docker
-            # 'write_on_feature_branch' ceiling or the legacy
-            # 'write_feature_branches' marker are NOT valid for these keys)
-            # -- anything else is ignored fail-open so the session value
-            # stands.
+            # own scale may cap it (e.g. an mcp 'read' ceiling or a docker
+            # 'write_on_feature_branch' ceiling are NOT valid for these keys).
+            # A legacy spelling is translated FIRST, subject to the two-way
+            # legality guard documented on _CEILING_VALUE_ALIASES: it fires
+            # only when the raw token is not already legal for this key AND
+            # the canonical target is.  So a legal 'full' on mcp is left
+            # alone, while a stray 'full' on git/filesystem becomes 'write'
+            # (capped, not bricked); anything with no legal target stays an
+            # unknown value like any other and fails closed.
             ceiling_vocab = WORKSPACE_CEILING_VOCAB.get(key)
+            alias = _CEILING_VALUE_ALIASES.get(ceiling_lower)
+            if (
+                alias is not None
+                and ceiling_vocab is not None
+                and ceiling_lower not in ceiling_vocab
+                and alias in ceiling_vocab
+            ):
+                ceiling_lower = alias
             if ceiling_vocab is not None and ceiling_lower not in ceiling_vocab:
                 logger.warning(
-                    "ignoring workspace ceiling level %r for resource %r "
+                    "invalid workspace ceiling level %r for resource %r "
                     "(not a valid ceiling level for %s; allowed: %s); "
-                    "fail-open: no ceiling applied",
+                    "failing closed: %r",
                     ceiling,
                     resource,
                     key,
                     sorted(ceiling_vocab),
+                    _ceiling_fail_closed_value(key),
                 )
+                result[key] = _ceiling_fail_closed_value(key)
                 continue
             ceiling_rank = _WORKSPACE_CEILING_LEVELS.get(ceiling_lower)
         else:
             ceiling_rank = None
         if ceiling_rank is None:
             logger.warning(
-                "ignoring workspace ceiling level %r for resource %r "
-                "(not a known ceiling level); fail-open: no ceiling applied",
+                "invalid workspace ceiling level %r for resource %r "
+                "(not a known ceiling level); failing closed: %r",
                 ceiling,
                 resource,
+                _ceiling_fail_closed_value(key),
             )
+            result[key] = _ceiling_fail_closed_value(key)
             continue
         if ceiling_rank >= 4.0:
             continue  # outbound/full ceilings -> unlimited
@@ -415,11 +528,11 @@ def apply_workspace_ceiling(
         if session_rank is None:
             continue
         if ceiling_rank < session_rank:
-            result[key] = (
-                ceiling
-                if isinstance(ceiling, bool)
-                else str(ceiling).lower()
-            )
+            # Emit the CANONICAL level token: an aliased legacy ceiling
+            # ('write_feature_branches') must never reach the session profile
+            # under its retired spelling, which SessionPermissions would
+            # reject (killing the whole session).
+            result[key] = ceiling_lower
     return result
 
 

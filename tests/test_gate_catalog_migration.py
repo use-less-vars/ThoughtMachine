@@ -4,15 +4,17 @@ test_gate_catalog_migration.py — security_gate consuming resource_catalog.
 Phase-2 migration contract (security/security_gate.py now consumes
 ``security/resource_catalog.py``):
 
-* **Ceiling-vocabulary validation (fail-open):** ``apply_workspace_ceiling``
-  recognises the canonical catalog resource keys (filesystem, git,
-  container, network, mcp, host_bash) plus the legacy workspace alias
-  ``docker`` (normalised onto ``container``).  A ceiling on an unknown
-  resource or with an unknown level is logged at WARNING and ignored — the
-  session value stands (forward-compatible workspace maps never break
-  resolution).  The legacy ``git_read``/``git_write`` ceiling grains were
-  removed in the permission-schema unification and are unknown resources
-  now.
+* **Ceiling-value validation (fail-CLOSED, resource validation fail-open):**
+  ``apply_workspace_ceiling`` recognises the canonical catalog resource keys
+  (filesystem, git, container, network, mcp, host_bash) plus the legacy
+  workspace alias ``docker`` (normalised onto ``container``).  An unknown
+  ceiling *level* for a known resource is logged at WARNING and now FAILS
+  CLOSED — the resource is denied (``banned``; ``False`` for ``container``).
+  An unknown ceiling *resource* keeps the separate fail-OPEN policy: it is
+  logged at WARNING and ignored, so the session value stands
+  (forward-compatible workspace maps never break resolution).  The legacy
+  ``git_read``/``git_write`` ceiling grains were removed in the
+  permission-schema unification and are unknown resources now.
 * **write_on_feature_branch is a first-class git level:** it ranks at
   write level in ``_min_permission``, ceiling comparisons AND
   ``_value_satisfies`` (Phase-3 helper edit: the outer ``git:write``
@@ -81,15 +83,21 @@ def test_ceiling_unknown_resource_warns_fail_open(caplog):
     )
 
 
-def test_ceiling_unknown_level_warns_fail_open(caplog):
-    """An unknown ceiling level is logged and ignored (fail-open)."""
+def test_ceiling_unknown_level_fails_closed(caplog):
+    """An unknown ceiling level is logged and FAILS CLOSED.
+
+    Re-pinned: this used to assert the fail-open reading ("logged and ignored,
+    the session value stands").  An unknown VALUE for a known resource now
+    denies the resource outright, so a typo in a security ceiling can never
+    silently mean "no restriction".
+    """
     with caplog.at_level(logging.WARNING):
         result = apply_workspace_ceiling(
             {"filesystem": "mega"}, {"filesystem": "write"}
         )
-    assert result == {"filesystem": "write"}
+    assert result == {"filesystem": "banned"}
     assert any(
-        "ignoring workspace ceiling level" in r.message for r in caplog.records
+        "invalid workspace ceiling level" in r.message for r in caplog.records
     )
 
 

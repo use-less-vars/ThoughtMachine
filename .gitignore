@@ -459,3 +459,8 @@ web_ui/frontend/.dist-build-stamp
 # test (tests/test_contracts_ledger_parity.py) reddens the gate when the
 # ledger is absent, so a missing negation fails loudly instead of silently.
 !docs/CONTRACTS.md
+
+# Competitive analysis brief (Claude Code, 2026-11): public tier, ships with the
+# repo. `docs/*` above is a catch-all, so the negation is required or the file is
+# never versioned and vanishes on the next clone.
+!docs/competitive-analysis-claude-code.md
