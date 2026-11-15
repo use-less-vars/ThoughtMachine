@@ -748,6 +748,10 @@ export default function WorkerManagementPanel({
   // ── State ────────────────────────────────────────────────────────────────
   const [workers, setWorkers] = useState([]);        // from GET /api/workspace/{ws_id}/workers/active (runtime instances)
   const [loading, setLoading] = useState(true);
+  // Last POLL failure, '' when the last poll succeeded. A failed poll is a
+  // DIFFERENT state from "no workers" and is rendered differently below:
+  // it never clears rows that already loaded (see fetchWorkers).
+  const [loadError, setLoadError] = useState('');
   const [stopErrors, setStopErrors] = useState({});
 
   // Modal state
@@ -839,8 +843,15 @@ export default function WorkerManagementPanel({
             current_task: e.current_task,
           };
         }));
+        setLoadError('');
       })
-      .catch(() => setWorkers([]))
+      .catch((err) => {
+        // A failed poll is NOT an empty list. Keep whatever rows already loaded
+        // -- blanking good data on one hiccup is the same lie in a different
+        // costume -- and record why so the panel can say so. The 3s interval is
+        // never cleared, so the next successful fetch self-heals this.
+        setLoadError(err?.message || String(err));
+      })
       .finally(() => setLoading(false));
   }, [workspaceId, sessionId]);
 
@@ -1345,6 +1356,26 @@ export default function WorkerManagementPanel({
 
       {/* ── Worker list ───────────────────────────────────────────────── */}
       {workers.length === 0 ? (
+        loadError ? (
+          // (c) FAILED with nothing to display: an explicit error state naming
+          // the failure. Never the empty state -- "the request failed" and
+          // "there are no workers" must not look the same.
+          <div
+            role="alert"
+            style={{
+              border: '1px solid #f38ba8',
+              borderRadius: '6px',
+              padding: '0.5rem 0.6rem',
+              fontSize: '0.75rem',
+              color: '#f38ba8',
+            }}
+          >
+            ✗ Could not load workers: {loadError}
+            <div style={{ color: '#6c7086', marginTop: '0.25rem' }}>
+              Still polling every 3s — this clears on the next successful load.
+            </div>
+          </div>
+        ) : (
         <EmptyState
           message="No workers configured. Create one now, or start from a template."
           onNew={() => {
@@ -1357,6 +1388,7 @@ export default function WorkerManagementPanel({
             setShowTemplatePicker(true);
           }}
         />
+        )
       ) : (
         <div
           style={{
@@ -1860,6 +1892,22 @@ export default function WorkerManagementPanel({
         }
         return null;
       })}
+
+      {/* ── Load-failure notice (non-destructive) ──────────────────────────────────── */}
+      {/* A refresh that failed must not blank a list that already loaded: the
+          rows stay on screen and the failure is reported alongside them. */}
+      {loadError && workers.length > 0 && (
+        <div
+          role="alert"
+          style={{
+            marginTop: '0.3rem',
+            fontSize: '0.75rem',
+            color: '#f38ba8',
+          }}
+        >
+          ✗ Refresh failed: {loadError} — showing the last successful list; still polling every 3s.
+        </div>
+      )}
 
       {/* ── Inline stop errors ────────────────────────────────────────── */}
       {Object.entries(stopErrors).map(([name, err]) => (
