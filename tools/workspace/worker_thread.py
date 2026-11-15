@@ -3802,6 +3802,12 @@ class WorkerThread(threading.Thread):
                         f"ExecutionState={'NONE' if ExecutionState is None else 'SET'}, "
                         f"import_error={_EXECUTION_STATE_IMPORT_ERROR or 'none'}"
                         f" -- no WorkerBusAdapter: agent events will not reach the frontend")
+                    self._log_stream_diag(
+                        f"Presenter lazy-init DISABLED [worker={self.worker_name}]: "
+                        f"StateBridge={'NONE' if StateBridge is None else 'SET'}, "
+                        f"ExecutionState={'NONE' if ExecutionState is None else 'SET'}, "
+                        f"import_error={_EXECUTION_STATE_IMPORT_ERROR or 'none'}"
+                        f" -- no WorkerBusAdapter: agent events will not reach the frontend")
 
         # Log the user query as a user_message event
         self._publish_event("user_message", {"query": query})
@@ -4077,6 +4083,11 @@ class WorkerThread(threading.Thread):
                     if not getattr(self, "_bus_event_drop_warned", False):
                         self._bus_event_drop_warned = True
                         log("WARNING", "tools.worker",
+                            f"agent event DROPPED [worker={self.worker_name}]: "
+                            f"no WorkerBusAdapter, first dropped type={event_type!r} "
+                            f"-- worker events will not reach the frontend "
+                            f"(see the 'Presenter lazy-init DISABLED' warning)")
+                        self._log_stream_diag(
                             f"agent event DROPPED [worker={self.worker_name}]: "
                             f"no WorkerBusAdapter, first dropped type={event_type!r} "
                             f"-- worker events will not reach the frontend "
@@ -5506,6 +5517,38 @@ class WorkerThread(threading.Thread):
         except Exception as exc:
             log("WARNING", "tools.worker", f"frame_sink failed: {exc}")
 
+    def _log_stream_diag(self, message: str) -> None:
+        """
+        Append one line to ``<worker_dir>/stream_diagnostics.log``.
+
+        A diagnostic issued from the event pipeline cannot rely on the worker
+        logger reaching a file: the web API backend registers it with
+        ``enable_file_logging=False``, so ``log()`` only reaches stderr, and a
+        process-mode child has no unified logger at all until its Agent is
+        built.  A line written here is produced by the worker itself, so it
+        survives both gaps.
+
+        The directory is resolved exactly as ``_write_status_file`` resolves
+        its own target -- ``self._worker_dir / <name>``, the attribute set
+        unconditionally in ``__init__``.  That writer has no fallback for an
+        unset attribute either, so neither does this one; the guard below is
+        what keeps such a case from escaping.
+
+        UTC-timestamped.  Never raises: a diagnostic that could fail the turn
+        it describes would be worse than no diagnostic.  Once the file passes
+        64 KiB, further lines are skipped -- this is called from hot paths.
+        """
+        try:
+            target = self._worker_dir / "stream_diagnostics.log"
+            if target.exists() and target.stat().st_size > 64 * 1024:
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with open(target, "a", encoding="utf-8") as f:
+                f.write(f"{stamp} {message}\n")
+        except Exception:
+            pass
+
     def _write_status_file(self) -> None:
         """
         Write runtime status to ``status.json`` so the web API backend
@@ -5657,6 +5700,12 @@ class WorkerThread(threading.Thread):
             if not getattr(self, "_publish_event_disabled_warned", False):
                 self._publish_event_disabled_warned = True
                 log("WARNING", "tools.worker",
+                    f"_publish_event DISABLED [worker={self.worker_name}]: "
+                    f"event_bus={'NONE' if self._event_bus is None else 'SET'}, "
+                    f"create_event={'NONE' if create_event is None else 'SET'}, "
+                    f"EventType={'NONE' if EventType is None else 'SET'}"
+                    f" -- dropping {event_type!r} and every later event")
+                self._log_stream_diag(
                     f"_publish_event DISABLED [worker={self.worker_name}]: "
                     f"event_bus={'NONE' if self._event_bus is None else 'SET'}, "
                     f"create_event={'NONE' if create_event is None else 'SET'}, "
