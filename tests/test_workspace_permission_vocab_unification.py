@@ -170,9 +170,12 @@ class TestWorkspaceCeilingMcp:
         result = apply_workspace_ceiling({"mcp": "full"}, {"mcp": "connect"})
         assert result == {"mcp": "connect"}
 
-    def test_mcp_unknown_ceiling_level_fail_open(self):
+    def test_mcp_unknown_ceiling_level_fails_closed(self):
+        # 'read' is not on the mcp ceiling scale (banned/connect/full), so it
+        # is an UNKNOWN VALUE for a known resource: it now fails CLOSED -- the
+        # session grant is denied instead of standing at 'full'.
         result = apply_workspace_ceiling({"mcp": "read"}, {"mcp": "full"})
-        assert result == {"mcp": "full"}
+        assert result == {"mcp": "banned"}
 
 
 def test_ceiling_key_mcp_emits_no_warning(caplog):
