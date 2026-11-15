@@ -121,6 +121,46 @@ _RUNTIME_HANDLES_LOCK = threading.Lock()
 
 _LOGGER = logging.getLogger(__name__)
 
+#: The "resolved runtime mode" notice (ITEM: promoting it to WARNING is only
+#: useful if it appears ONCE). The mode is resolved on every spawn by design
+#: ("read at spawn time", never memoised), so announcing it per resolution
+#: would repeat the same sentence for every worker spawned. One emission per
+#: process carries the same information.
+_MODE_ANNOUNCED = False
+_MODE_ANNOUNCE_LOCK = threading.Lock()
+
+
+def _announce_resolved_mode(mode: str, environ: Optional[Mapping[str, str]] = None) -> None:
+    """Log the worker runtime mode actually in force, at most once per process.
+
+    Diagnostics only: nothing is cached, returned or enforced here -- the
+    fail-closed refusal for an unusable flag stays in
+    :func:`resolve_runtime_mode`, where the spawn needs it. An operator reading
+    a production log (which carries WARNING and above) otherwise has no way to
+    tell which mode the workers they are inspecting are running in.
+    """
+    global _MODE_ANNOUNCED
+    with _MODE_ANNOUNCE_LOCK:
+        if _MODE_ANNOUNCED:
+            return
+        _MODE_ANNOUNCED = True
+    raw = (os.environ if environ is None else environ).get(WORKER_RUNTIME_MODE_ENV)
+    if raw is None:
+        source = f"{WORKER_RUNTIME_MODE_ENV} unset"
+    else:
+        source = f"{WORKER_RUNTIME_MODE_ENV}={raw!r}"
+    if mode == MODE_PROCESS:
+        consequence = (
+            "worker bodies run in a child process and WorkerThread.start() "
+            "deliberately starts no in-process body"
+        )
+    else:
+        consequence = "worker bodies run in the supervisor's interpreter"
+    _LOGGER.warning(
+        "worker runtime mode resolved to %r [%s]: %s (announced once per process)",
+        mode, source, consequence,
+    )
+
 
 def _runtime_handle_key(
     session_id: Optional[str],
@@ -1356,6 +1396,7 @@ def attach_thread_frame_sink(
     resource of its own in thread mode (``close`` is a no-op there).
     """
     resolved_mode = resolve_runtime_mode() if mode is None else mode
+    _announce_resolved_mode(resolved_mode)
     handle = WorkerRuntimeHandle(worker, mode=resolved_mode)
     worker._frame_sink = handle.on_frame
     worker._runtime_handle = handle

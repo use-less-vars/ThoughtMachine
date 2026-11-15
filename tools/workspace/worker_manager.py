@@ -952,6 +952,19 @@ class WorkerManager:
 _STALE_CHECK_ENV = "WORKER_STALE_CHECK_ENABLED"
 _STALE_CHECK_TRUTHY = {"1", "true", "yes", "on"}
 
+# The "reaper is DISABLED" notice used to be emitted on EVERY
+# ``get_manager()`` call -- i.e. on every workers-active HTTP poll -- which put
+# it in the production log ~23k times. It is an operator notice, not a
+# per-request diagnostic, so it is announced at most once per process.
+#
+# The dedupe key is the IDENTITY of the manager last announced for, not a bare
+# bool: production only ever passes the ``_MANAGER_INSTANCE`` singleton (so
+# exactly one warning per process), while a test that hands in a fresh stub
+# still gets the warning for that stub. ``None`` = nothing announced yet.
+_ANNOUNCE_LOCK = threading.Lock()
+_STALE_CHECK_ANNOUNCED_FOR: Optional[object] = None
+_STALE_MONITOR_ERROR_ANNOUNCED = False
+
 
 def stale_check_enabled() -> bool:
     """Whether the interrupting stale-worker reaper should be wired.
@@ -972,6 +985,18 @@ def ensure_stale_check(manager) -> bool:
     if stale_check_enabled():
         manager.start_stale_check()
         return True
+    global _STALE_CHECK_ANNOUNCED_FOR
+    with _ANNOUNCE_LOCK:
+        already_announced = _STALE_CHECK_ANNOUNCED_FOR is manager
+        if not already_announced:
+            _STALE_CHECK_ANNOUNCED_FOR = manager
+    if already_announced:
+        logger.debug(
+            "%s is not set: stale-worker reaper still DISABLED (already "
+            "announced for this manager; not repeating).",
+            _STALE_CHECK_ENV,
+        )
+        return False
     logger.warning(
         "%s is not set: the stale-worker reaper is DISABLED. Detached "
         "workers will NOT be reaped and will stay parked until an operator "
@@ -1004,5 +1029,14 @@ def get_manager() -> WorkerManager:
         _MANAGER_INSTANCE.ensure_stale_monitor()
         ensure_stale_check(_MANAGER_INSTANCE)
     except Exception as exc:  # noqa: BLE001 - a monitor must not break the caller
-        logger.warning("stale monitor/reaper could not be started: %s", exc)
+        # Same hot path as the notice above: one emission per process, so a
+        # persistent watchdog failure cannot flood the log every poll.
+        global _STALE_MONITOR_ERROR_ANNOUNCED
+        with _ANNOUNCE_LOCK:
+            first_error = not _STALE_MONITOR_ERROR_ANNOUNCED
+            _STALE_MONITOR_ERROR_ANNOUNCED = True
+        if first_error:
+            logger.warning("stale monitor/reaper could not be started: %s", exc)
+        else:
+            logger.debug("stale monitor/reaper still could not be started: %s", exc)
     return _MANAGER_INSTANCE

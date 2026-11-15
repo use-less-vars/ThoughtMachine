@@ -188,6 +188,16 @@ def _to_frontend_state(raw: Optional[str]) -> str:
 # EventBuses by these labels (get_event_buses_for_session), so the bridge keys
 # its per-worker subscriptions the same way to keep instances distinct.
 
+#: The per-worker-bus subscription line is the ONLY evidence in a production log
+#: that worker events actually reach the Web UI. It used to be logged at INFO,
+#: which a production logger sitting at WARNING swallows completely -- so the log
+#: showed zero lines about it and the bus path looked dead. It is promoted to
+#: WARNING, once per process: subscriptions happen once per spawned worker
+#: instance, and repeating the same sentence per instance would be noise, not
+#: information. Later subscriptions keep the exact same text at DEBUG.
+_BUS_SUBSCRIBE_ANNOUNCED = False
+_BUS_SUBSCRIBE_ANNOUNCE_LOCK = threading.Lock()
+
 
 def _worker_instance_label(worker_name: str, instance_id: Optional[int]) -> str:
     """Build the instance label for a worker (mirrors WorkerRegistry.instance_label).
@@ -1478,8 +1488,18 @@ class WebAgentBridge:
             'instance_id': instance_id,
             'subs': subs,
         }
-        log('INFO', 'server.bridge',
-            f'Subscribed to per-worker bus for {worker_label} ({len(subs)} event types)')
+        subscribe_msg = (
+            f'Subscribed to per-worker bus for {worker_label} '
+            f'({len(subs)} event types)'
+        )
+        global _BUS_SUBSCRIBE_ANNOUNCED
+        with _BUS_SUBSCRIBE_ANNOUNCE_LOCK:
+            first_subscription = not _BUS_SUBSCRIBE_ANNOUNCED
+            _BUS_SUBSCRIBE_ANNOUNCED = True
+        if first_subscription:
+            log('WARNING', 'server.bridge', subscribe_msg)
+        else:
+            log('DEBUG', 'server.bridge', subscribe_msg)
         log('DEBUG', 'pipeline.bridge',
             f"_subscribe_to_worker_bus complete [worker={worker_label}]: "
             f"{len(subs)}/{len(subscribed_types)} subscriptions successful")
