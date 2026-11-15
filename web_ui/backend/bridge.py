@@ -1433,7 +1433,7 @@ class WebAgentBridge:
                 log('DEBUG', 'pipeline.bridge',
                     f"Subscribed to {evt_type!r} on per-worker bus for {worker_label}")
             except (ValueError, Exception) as exc:
-                log('DEBUG', 'server.bridge',
+                log('WARNING', 'server.bridge',
                     f'Could not subscribe to {evt_type} for {worker_label}: {exc}')
 
         if session_id is None:
