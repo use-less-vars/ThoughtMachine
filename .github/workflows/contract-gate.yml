@@ -51,7 +51,14 @@ jobs:
             tests/test_security_gate_disk.py \
             tests/trust/test_gate_contract.py \
             tests/test_worker_is_a_real_process.py \
-            tests/test_contracts_ledger_parity.py
+            tests/test_contracts_ledger_parity.py \
+            tests/test_ceiling_value_fail_closed.py \
+            tests/test_ceiling_map_completeness.py \
+            tests/test_permission_hierarchy.py \
+            tests/test_workspace_permissions.py \
+            tests/test_gate_catalog_migration.py \
+            tests/test_workspace_permission_vocab_unification.py \
+            tests/test_visual_grain_closure.py
           status=$?
           end=$(date +%s)
           seconds=$((end - start))
