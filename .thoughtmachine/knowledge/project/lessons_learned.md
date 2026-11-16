@@ -97,3 +97,46 @@ The backend sent a tool call and its result as two independent events with no sh
 **Rule.** Every IPC/WebSocket event needs a unique id, so the consumer can upsert idempotently instead of appending blindly. For history written before the id existed, derive a synthetic one from position (`legacy:{msg}:{tc}:{name}`, `legacy:result:{msg}`) — position keeps genuinely repeated identical calls distinct, and a reserved prefix cannot collide with a real id. Never pair a result that has no id: an unpaired row is honest, a wrongly paired row is a lie.
 
 **Corollary.** "The frontend should have known" is not a diagnosis. If the wire format cannot express the relationship, the fix belongs on the wire.
+
+## 2026-11-16 — C76 marker sweep (Gen 69): seven rules, earned over four chunks
+
+### 1. Three units of measure — never interchange them
+A trust-harness marker sweep produces three *different* numbers, and every wrong claim this sprint came from treating one as another:
+- **AST B sites** — syntactic occurrences of the trust gate in source. A property of the *code*, not of the markers. Marking tests does NOT move this number.
+- **Decorator lines** — how many marker decorators were physically added.
+- **Marked node ids** — how many *collected test ids* those decorators actually cover.
+Measured on the 26-file `tests/` set (integration excluded): 111 sites, 177 decorator lines (45+53+59+20), 195 marked node ids (58+56+59+22). The decorator→node ratio is NOT a constant: 1.29x, 1.06x, 1.00x, 1.10x across four chunks. It can also be below 1.0 in the other direction, when one decorator lands on a `@parametrize` (one decorator / three ids). Never extrapolate a fan-out ratio from chunk N to chunk N+1; measure every chunk.
+
+### 2. The flag-off measurement recipe: <=8 files per batch, redirect, never pipe
+- Batch at most ~8 files per pytest invocation (integration tests are far slower: batch ~3-4).
+- ALWAYS redirect output to a file under `logs/` in the worktree and read the file afterwards. NEVER pipe pytest into `tail`/`grep`/`head`: the container is hard-capped at 512 MB, piping makes the process die with rc 143/137 and you lose the summary line, which is the only part you needed.
+- Containers are ephemeral per tool call, so `/tmp` does not survive between calls. Logs go under the worktree, not `/tmp`.
+
+### 3. Mutate by symbol anchor, verify the sha, restore byte-identically
+- Mutate the trust fixture by searching for its **symbol** (a def/name), never by line number or by a remembered short name. Line numbers drift; briefs lie.
+- Record `sha256sum` of the file before mutating, after mutating, and after restoring. The restore must be byte-identical, not merely 'looks right'.
+- Verify restoration with `git diff <file>` from inside the worktree; an empty diff is the only acceptable proof.
+- Practical trap when asserting on fixture source: a `count()` over a Python *list* of lines never matches an indented string — count on `'\n'.join(lines)` instead. And substring-matching a line you want to KEEP is unsafe when it is a substring of a line you want to REMOVE (e.g. `enable_test_harness_trust(True)` inside `auth_boundary.enable_test_harness_trust(True)`); match on the exact stripped line.
+
+### 4. Probe-first: make it fail, read the ids, then mark exactly those
+The sequence that worked four times: mutate the trust gate OFF -> run the target file(s) flag-off -> read the actual failing node ids from the report -> apply markers to exactly those tests -> re-run flag-off and require zero failures -> restore and re-run flag-on and require zero failures. Marking before probing guesses at coverage and silently over-marks. A whole-file mark where only some tests are flag-dependent produces *inert* markers: they pass in both directions and therefore prove nothing (chunk 2 left 5 such ids in one file; they are queued for the dead-test burn-down, not celebrated as coverage).
+
+### 5. The closure proof is a summation, not a percentage
+The gate that actually convinces: flag-ON `257 passed, 0 failed`; flag-OFF `0 failed, 257 passed`. Both directions equal the *collected* total (257), so no test is left unaccounted for in either direction. State all three numbers (collected, on, off). A pass count alone can be satisfied by tests that skip or vanish.
+
+### 6. Short names in a brief are a hazard, not shorthand
+A brief that names files by fragment (`sidecar_clobber_guard`, `grain_projection`, `vocabulary_closure`) will resolve to the wrong file roughly half the time — in one chunk, 7 of 11 short names pointed at the wrong path. Two specific traps:
+- `tests/web_ui/backend/...` and `web_ui/backend/tests/...` are transposed twins; both exist, only one is collected.
+- `sidecar_clobber_guard` is `test_permission_sidecar_clobber_guard.py`, NOT `test_sidecar_clobber_guard.py`.
+Resolve every path before writing anything, and echo the resolved absolute-ish paths back in the report so the reviewer can check them without re-deriving them.
+
+### 7. Tooling gaps observed live (for the engineers)
+- `git_write commit` can fail with exit 1 and an EMPTY body when nothing is staged. Always run `git status` after a commit; never trust the return alone.
+- `git_read diff` on a CLEAN file returns 'no diff output ... check the path spelling'. It reads like an error but means success; there is no way to distinguish 'no change' from 'no such path'.
+- `git_read show_file` requires the parameter named `path`; passing `file_path` errors 'path is required'.
+- `git_read show` maps `format` to `--format=`, so `--stat` is rejected (exit 128).
+- `git_read ls_tree` ignores the `prefix`/`path` arguments, so a subtree listing returns the whole tree (and ~5k tokens).
+- `Worker` results intermittently come back with `status: null` / `confidence: null`. That is NOT a completion signal; verify the artefact on disk.
+- The worker container is hard-capped at 512 MB regardless of a larger `mem_limit` in config.
+- The worker container has no `git`, so a worker's claim to have run git commands is false by construction.
+- Positive note: asking for a 900 s worker timeout is refused and clamped to 600 s, with a clear explanation. That is exemplary behaviour and worth keeping.
