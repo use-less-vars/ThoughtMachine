@@ -459,3 +459,5 @@ different file, different name. Never rename one to the other.
 - **C86** — Process-Mode Observability (State Seam). Event seam is fixed, but state seam is leaking. Enforced deadline != reported deadline (10s requested, 70s blocked). No exit-code reader exists. Cache `_last_event` is never read. See audit doc for 12 proposals.
 - **C88** — Host Resource Guardrails. System OOM-killed backend/workers under heavy parallel load (3 workspaces). Pre-flight memory check needed before spawning workers/containers. Enforce hard caps on child processes.
 - **C89** — Session Autosave. Lossy crashes drop active conversational context and UI state. Needs periodic write-to-disk for session state (beyond just the final prompt).
+
+- **C90** — Exec Reaper SIGTERM. `ContainerExecTool`/`DockerCodeRunner` reaper kills the process group (rc=143) even on low memory. Workaround: run via `setsid` and ignore SIGTERM. See logs/5b_sigterm_finding.md.
