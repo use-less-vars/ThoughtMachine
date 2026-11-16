@@ -334,6 +334,7 @@ class FakeManager:
 
 # ── T1: grouping + entry fields ─────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_get_groups_and_entry_fields(vault, monkeypatch):
     _seed(vault, record_id="rec-e", name="c-e", docker_id="docker-e",
           lifecycle_class="ephemeral")
@@ -380,6 +381,7 @@ def test_get_groups_and_entry_fields(vault, monkeypatch):
 
 # ── T2: pre-v5 / unwired record => permissions None, drift None ─────────────
 
+@pytest.mark.trust_harness
 def test_unwired_record_permissions_and_drift_null(vault, monkeypatch):
     _seed(vault, record_id="rec-e", name="c-e", docker_id="docker-e",
           lifecycle_class="ephemeral", permissions=None)
@@ -396,6 +398,7 @@ def test_unwired_record_permissions_and_drift_null(vault, monkeypatch):
 
 # ── T3: stop an ephemeral container ─────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_action_stop_ephemeral(vault, monkeypatch):
     _seed(vault, record_id="rec-e", name="c-e", docker_id="docker-e",
           lifecycle_class="ephemeral")
@@ -415,6 +418,7 @@ def test_action_stop_ephemeral(vault, monkeypatch):
 
 # ── T4: restart a resource container => recreate path, new docker_id ─────────
 
+@pytest.mark.trust_harness
 def test_action_restart_resource_recreates(vault, monkeypatch):
     _seed(vault, record_id="rec-r", name="c-r", docker_id="docker-r",
           lifecycle_class="resource")
@@ -437,6 +441,7 @@ def test_action_restart_resource_recreates(vault, monkeypatch):
 
 # ── T5: remove a RESOURCE container => refused ───────────────────────────────
 
+@pytest.mark.trust_harness
 def test_action_remove_resource_refused(vault, monkeypatch):
     _seed(vault, record_id="rec-r", name="c-r", docker_id="docker-r",
           lifecycle_class="resource")
@@ -462,6 +467,7 @@ def test_action_remove_resource_refused(vault, monkeypatch):
 # property whose operator is the only actor routed through this HTTP path; _resolve_actor is attribution, not authentication, so the record-keyed
 # route must reach ``manager.remove`` and end with the record gone.
 
+@pytest.mark.trust_harness
 def test_action_remove_persistent_allowed(vault, monkeypatch):
     _seed(vault, record_id="rec-p", name="c-p", docker_id="docker-p",
           lifecycle_class="persistent")
@@ -516,6 +522,7 @@ class _ReapingManager(FakeManager):
         return result
 
 
+@pytest.mark.trust_harness
 def test_action_remove_persistent_reaped_by_manager(vault, monkeypatch):
     _seed(vault, record_id="rec-p", name="c-p", docker_id="docker-p",
           lifecycle_class="persistent")
@@ -530,6 +537,7 @@ def test_action_remove_persistent_reaped_by_manager(vault, monkeypatch):
     assert cr_api.load_record("ws1", "rec-p", vault_root=vault) is None
 
 
+@pytest.mark.trust_harness
 def test_action_remove_persistent_identity_is_attribution_only(vault,
                                                               monkeypatch):
     """This route carries no actor-NAME authorisation; any token removes.
@@ -561,6 +569,7 @@ def test_action_remove_persistent_identity_is_attribution_only(vault,
 
 # ── T5d: remove is an ALLOW-list => service / unknown classes are refused ────
 
+@pytest.mark.trust_harness
 def test_action_remove_service_refused(vault, monkeypatch):
     """``service`` is not on the remove allow-list -> 403, no Docker verb."""
     _seed(vault, record_id="rec-s", name="c-s", docker_id="docker-s",
@@ -579,6 +588,7 @@ def test_action_remove_service_refused(vault, monkeypatch):
     assert cr_api.load_record("ws1", "rec-s", vault_root=vault) is not None
 
 
+@pytest.mark.trust_harness
 def test_action_remove_unknown_class_refused(monkeypatch):
     """Fail closed: an unreadable lifecycle class is refused, pre-manager."""
     monkeypatch.setattr(
@@ -607,6 +617,7 @@ def test_action_remove_unknown_class_refused(monkeypatch):
 
 # ── T6: PATCH resource resources => stop + recreate, new limits ──────────────
 
+@pytest.mark.trust_harness
 def test_patch_resource_resources_recreates(vault, monkeypatch):
     _seed(vault, record_id="rec-r", name="c-r", docker_id="docker-r",
           lifecycle_class="resource",
@@ -631,6 +642,7 @@ def test_patch_resource_resources_recreates(vault, monkeypatch):
 
 # ── T7: PATCH ephemeral resources => same, NOT refused ──────────────────────
 
+@pytest.mark.trust_harness
 def test_patch_ephemeral_resources_not_refused(vault, monkeypatch):
     _seed(vault, record_id="rec-e", name="c-e", docker_id="docker-e",
           lifecycle_class="ephemeral",
@@ -719,6 +731,7 @@ def test_status_reports_oom_killed():
 
 # ── T12b: GET surfaces an OOM-killed container as state == "oom" ────────────
 
+@pytest.mark.trust_harness
 def test_get_entry_state_oom(vault, monkeypatch):
     _seed(vault, record_id="rec-e", name="c-e", docker_id="docker-e",
           lifecycle_class="ephemeral")
@@ -736,6 +749,7 @@ def test_get_entry_state_oom(vault, monkeypatch):
 
 # ── T14: remove an ephemeral container => direct delete, {"id","removed"} ────
 
+@pytest.mark.trust_harness
 def test_action_remove_ephemeral(vault, monkeypatch):
     _seed(vault, record_id="rec-e", name="c-e", docker_id="docker-e",
           lifecycle_class="ephemeral")
@@ -754,6 +768,7 @@ def test_action_remove_ephemeral(vault, monkeypatch):
 
 # ── Empty workspace => empty flat entry list (PC3) ────────
 
+@pytest.mark.trust_harness
 def test_empty_workspace_yields_empty_container_list(vault, monkeypatch):
     _install_manager(monkeypatch, FakeManager(statuses={}))
 
@@ -767,6 +782,7 @@ def test_empty_workspace_yields_empty_container_list(vault, monkeypatch):
 
 # ── T15: GET legacy contract survives a record-store failure ────────────────
 
+@pytest.mark.trust_harness
 def test_get_legacy_contract_and_store_failure(vault, monkeypatch):
     _seed(vault, record_id="rec-e", name="c-e", docker_id="docker-e",
           lifecycle_class="ephemeral")
@@ -814,6 +830,7 @@ class _CapturingManager(FakeManager):
                              created_by=created_by, cpu_quota=cpu_quota)
 
 
+@pytest.mark.trust_harness
 def test_patch_persists_intent_before_recreate(vault, monkeypatch):
     _seed(vault, record_id="rec-r", name="c-r", docker_id="docker-r",
           lifecycle_class="resource",
@@ -883,6 +900,7 @@ def _find_entry_by_name(entries, name):
     raise AssertionError(f"no entry with name={name!r} in {entries!r}")
 
 
+@pytest.mark.trust_harness
 def test_record_without_live_container_marked_not_live(vault, monkeypatch):
     """Test A: a record with no live container is visibly distinct (not live).
 
@@ -912,6 +930,7 @@ def test_record_without_live_container_marked_not_live(vault, monkeypatch):
     assert dead["live"] != live["live"]
 
 
+@pytest.mark.trust_harness
 def test_live_container_with_record_shown_live(vault, monkeypatch):
     """Test B: a live container with a record renders with its live status.
 
@@ -930,6 +949,7 @@ def test_live_container_with_record_shown_live(vault, monkeypatch):
     assert ENTRY_KEYS <= set(entry)
 
 
+@pytest.mark.trust_harness
 def test_live_container_without_record_appears(vault, monkeypatch):
     """Test C: a live container with NO record still appears.
 
@@ -989,6 +1009,7 @@ def _install_live_set(monkeypatch, containers):
         lambda manager, workspace_id: list(containers))
 
 
+@pytest.mark.trust_harness
 def test_entry_live_envelope_derived_from_running_container(vault, monkeypatch):
     """Fix A: a record's entry carries ``live_envelope`` from the LIVE attrs.
 
@@ -1009,6 +1030,7 @@ def test_entry_live_envelope_derived_from_running_container(vault, monkeypatch):
         "network": False, "filesystem": "read", "mem_limit": "536870912"}
 
 
+@pytest.mark.trust_harness
 def test_recordless_live_container_carries_live_envelope(vault, monkeypatch):
     """Fix A: an unrecorded live container also carries ``live_envelope``."""
     _install_manager(monkeypatch, FakeManager(
@@ -1041,6 +1063,7 @@ class _ResourceHidingManager(FakeManager):
                 if not (c.get("name") or "").lstrip("/").startswith("tm-res-")]
 
 
+@pytest.mark.trust_harness
 def test_listed_count_includes_live_resource_container(vault, monkeypatch):
     """EXTENSION 2: the entries-derived count covers the reconciled list the
     panel renders (including the live RESOURCE container), while
@@ -1081,6 +1104,7 @@ def test_listed_count_includes_live_resource_container(vault, monkeypatch):
     assert data["containers_listed"] != data["containers_in_use"]
 
 
+@pytest.mark.trust_harness
 def test_entries_pin_live_and_unrecorded_keys(vault, monkeypatch):
     """EXTENSION 2: the two new entry keys (``live``, ``unrecorded``) are pinned
     in ``ENTRY_KEYS`` AND present in EVERY returned entry.
@@ -1115,6 +1139,7 @@ def test_entries_pin_live_and_unrecorded_keys(vault, monkeypatch):
 
 # ── Sticky note on the entry (D1: the note was missing from the payload) ─────
 
+@pytest.mark.trust_harness
 def test_entry_carries_record_note_and_recordless_empty(vault, monkeypatch):
     """D1: every entry carries ``note`` -- the record's sticky note VERBATIM,
     and ``""`` for a live container that has no record (no note lives there).
