@@ -104,6 +104,7 @@ class _FakeRegistry:
 # 1-5. Persistence across restart
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_persistence_workspace_permission_ceiling_survives_restart(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t1")
@@ -118,6 +119,7 @@ def test_persistence_workspace_permission_ceiling_survives_restart(env):
     assert perms["filesystem"] == "write", perms
 
 
+@pytest.mark.trust_harness
 def test_persistence_session_permission_grants_survive_restart_capped_by_ceiling(env):
     """Session permission grants persist across restart at the store level, but
     the effective permissions served by ``load_session`` are capped by the
@@ -312,6 +314,7 @@ def test_session_worker_timeout_propagates_to_workermanager(tmp_path):
     assert envelope["delivery"]["spawned"] is True, envelope
 
 
+@pytest.mark.trust_harness
 def test_workspace_ceiling_caps_session_effective_permission(env):
     """A session permission grant can never exceed the workspace ceiling.
 

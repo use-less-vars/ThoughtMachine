@@ -115,6 +115,7 @@ def _inject_raw_session_permissions(sid, ws_id):
 # [a] REST effective_permissions without a session id must honor the ceiling
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_effective_permissions_without_session_reflects_workspace_ceiling(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="pr_a")
@@ -132,6 +133,7 @@ def test_effective_permissions_without_session_reflects_workspace_ceiling(env):
 # [b] REST effective_permissions with a raw session grant must be capped
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_effective_permissions_caps_session_grant_by_ceiling(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="pr_b")
@@ -154,6 +156,7 @@ def test_effective_permissions_caps_session_grant_by_ceiling(env):
 # [c] Restart: the persisted ceiling must still be enforced by REST
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_effective_permissions_capped_after_restart(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="pr_c")
@@ -172,6 +175,7 @@ def test_effective_permissions_capped_after_restart(env):
 # [e] WS load_session (first connection and same-process reconnect)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_same_process_ws_reconnect_live_state_is_ceiled(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="pr_e")
@@ -213,6 +217,7 @@ def test_same_process_ws_reconnect_live_state_is_ceiled(env):
 # [d] Subprocess: ceiling persists across a real process boundary
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_workspace_permission_persists_across_full_process_restart():
     tmp_home = tempfile.mkdtemp(prefix="pr_d_")
     ws_id_file = os.path.join(tmp_home, "pr_d_ws_id.txt")

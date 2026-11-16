@@ -25,8 +25,9 @@ It does three things.
 3. It lets a single test *ask* for that allowance by name, with
    ``@pytest.mark.trust_harness``, so the session-wide grant can later shrink to
    the tests that actually need it without those tests being rewritten first.
-   The marker changes nothing on its own: the hooks at the foot of this file
-   turn the flag on for a marked test and put back what they found.
+   The marker changes nothing on its own: the ``autouse`` fixture at the foot
+   of this file turns the flag on for a marked test and puts back what it
+   found.
 
 Why the hook is needed
 ----------------------
@@ -180,16 +181,28 @@ def _trust_the_in_process_asgi_harness():
 # The session fixture above grants the allowance to every test in the run.  A
 # test that would rather state the dependency itself -- so the allowance can
 # later stop being session-wide without every such test being rewritten -- says
-# so with ``@pytest.mark.trust_harness``.  The two hooks below are the whole
-# mechanism: setup turns the flag on, teardown puts back the value that was in
-# force beforehand.
+# so with ``@pytest.mark.trust_harness``.  The autouse fixture below is the
+# whole mechanism: it turns the flag on for a marked test and puts back the
+# value that was in force beforehand.
 #
-# Hooks rather than a fixture, because the marker has to work for a test that
-# names no fixture, and because ``pytest_runtest_teardown`` still runs when the
-# test body fails.  It does *not* run when setup fails, so a marked test whose
-# own fixture raises can leave the flag on for its neighbours; that is the one
-# hole this shape of mechanism has, and it is why the value is remembered and
-# restored rather than assumed to be the shipped default.
+# A fixture rather than the setup-hook/teardown-hook pair this used to be, and
+# the difference is the whole point.  A hook is not a fixture: the old
+# ``pytest_runtest_setup(tryfirst=True)`` ran *before* the session-scoped
+# fixture above was instantiated, so on the first marked test of a session it
+# read the shipped default ``False`` and remembered that, and teardown then
+# restored ``False`` through the recording setter -- which wrote
+# ``_suite_trust=False``.  The import hook applies ``_suite_trust`` to every
+# re-imported boundary, so from that moment on every later
+# ``*_survives_restart`` test got a disarmed boundary and a 401 it did not ask
+# for.  ``autouse`` needs no test to name it, so the old "a hook still runs for
+# a test that names no fixture" advantage is void; and a function-scoped
+# fixture is ordered *after* the session-scoped one, so by the time it runs the
+# allowance is in force and what it remembers is ``True``.  A ``finally``
+# around the ``yield`` also runs when the test body fails (and when a later
+# fixture's setup fails), so the restore happens on the failure path too -- the
+# old hook teardown was simply never reached when setup failed, which is why
+# the value is remembered and restored rather than assumed to be the shipped
+# default.
 
 
 def pytest_configure(config):
@@ -201,32 +214,40 @@ def pytest_configure(config):
     )
 
 
-#: Where setup remembers the value in force, for teardown to put back.  Stashed
-#: on the item, so two marked tests cannot overwrite each other's value.
-_PREVIOUS_TRUST = pytest.StashKey[bool]()
+def _live_boundary():
+    """The ``auth_boundary`` module a *test* would get right now.
+
+    Deliberately not the module-level ``auth_boundary`` name above: that binding
+    was frozen when this file was imported, and the suite's ``sys.modules`` purge
+    replaces the module object, so writing to it arms an object no test resolves.
+    """
+    live = sys.modules.get(_TARGET_MODULE)
+    if live is None:
+        live = importlib.import_module(_TARGET_MODULE)
+    return live
 
 
-@pytest.hookimpl(tryfirst=True)
-def pytest_runtest_setup(item):
+@pytest.fixture(autouse=True)
+def _harness_trust_for_marked_tests(request):
     """Grant the allowance to a test carrying ``@pytest.mark.trust_harness``.
 
     Strict no-op for every other test: an unmarked test must not have its flag
     touched, or the negative direction of the boundary stops being testable.
+
+    ``autouse`` so a marked test need not name it, and function-scoped so it is
+    set up *after* the session-scoped fixture above: what it remembers is the
+    value in force, not the shipped default.  Both ends re-resolve the live
+    module, because the test body may purge ``web_ui.backend`` and get a
+    different object back.
     """
-    if item.get_closest_marker("trust_harness") is None:
+    if request.node.get_closest_marker("trust_harness") is None:
+        yield
         return
-    item.stash[_PREVIOUS_TRUST] = auth_boundary.TRUST_TEST_HARNESS
-    auth_boundary.enable_test_harness_trust(True)
 
-
-@pytest.hookimpl(trylast=True)
-def pytest_runtest_teardown(item):
-    """Restore the value the marked test found, not the shipped default.
-
-    The suite's own value is ``True`` while the session fixture is in force, so
-    restoring a hardcoded ``False`` here would disarm an unrelated test that
-    runs next.  Only a marked item has anything stashed.
-    """
-    if item.get_closest_marker("trust_harness") is None:
-        return
-    auth_boundary.enable_test_harness_trust(item.stash[_PREVIOUS_TRUST])
+    boundary = _live_boundary()
+    previous = boundary.TRUST_TEST_HARNESS
+    try:
+        boundary.enable_test_harness_trust(True)
+        yield
+    finally:
+        _live_boundary().enable_test_harness_trust(previous)
