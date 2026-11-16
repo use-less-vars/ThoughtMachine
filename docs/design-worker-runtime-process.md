@@ -71,11 +71,16 @@ Versus **`docs/design-worker-lifecycle.md`**:
   the park machinery. This document treats the park loop as load-bearing.
 ## 1. Current state
 ### 1.1 Where workers actually live
-`WorkerThread(threading.Thread)`, constructed with `daemon=True` and
-`name=f"worker-{instance_label}"`, spawned from `_action_spawn` (the `Worker` tool), i.e.
-**inside the process that hosts the FastAPI app**. That process is started as
-`uvicorn web_ui.backend.server:app` — so the API, the tool loops and every worker share one
-address space and one PID. `WorkerRegistry` keeps them in `_worker_registry`, keyed by the
+**Correction — this section describes thread mode, which is not the default.** A worker body
+is a child OS process per worker by default (`tools/workspace/worker_runtime.py:84`); the API
+and each worker then have separate PIDs. The in-process shape below is reached only under
+`WORKER_RUNTIME_MODE=thread`.
+
+`WorkerThread(threading.Thread)` (`tools/workspace/worker_thread.py:1880`), constructed with
+`daemon=True` (`:1930`) and `name=f"worker-{instance_label}"`, spawned from `_action_spawn`
+(the `Worker` tool) at `:7676`, i.e. **inside the process that hosts the FastAPI app**. That
+process is started as `uvicorn web_ui.backend.server:app` — so in thread mode the API, the
+tool loops and every worker share one address space and one PID. `WorkerRegistry` keeps them in `_worker_registry`, keyed by the
 3-tuple `(session_id, worker_name, instance_id)`, under `_registry_lock`, and calls
 `atexit.register(self.shutdown_workers, session_id=ALL_SESSIONS)`.
 ### 1.2 The four in-process channels

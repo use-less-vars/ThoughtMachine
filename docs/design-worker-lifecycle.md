@@ -422,9 +422,11 @@ pattern in the layer is `exec()`'s thread + `join(timeout)` + `kill()`.
 | `infra/container_registry.py:811/872`, `:812/820/873` | `.stop(` / `.remove(` | unbounded | 15 s / 60 s |
 | `infra/container_lifecycle.py:145/153` | `container.stop(timeout=…)` / `.remove(force=…)` | bounded by `intent.timeout or 5`, but wrapped in a bare `except Exception` | keep, tighten to a wall-clock join |
 
-**Mechanism.** `signal.alarm` is not usable: workers are threads inside the server
-process (Q1 / `docs/ARCHITECTURE_MACHINE_MODEL.md` — workers are "Host process, **as
-threads in the server**"), and `SIGALRM` is delivered to the main thread only. The house
+**Mechanism.** `signal.alarm` is not usable: `SIGALRM` is delivered to a process's main
+thread only, and none of the sites above is guaranteed to run there — tools run inline on
+the worker's own turn thread (`tools/workspace/worker_thread.py:3906-3908`), and a worker
+body is a child OS process per worker by default (`docs/ARCHITECTURE_MACHINE_MODEL.md`
+§1), not a thread of the API server. The house
 pattern already in the file is the right one — spawn a daemon thread, `join(timeout)`,
 and on timeout mark the resource dead. Adopt one helper and route every site above
 through it:

@@ -883,7 +883,7 @@ Overflow drops the oldest event silently and inserts no marker, so a client conn
 
 ### 11.6 What the worker subsystem is not
 
-There is no isolation: the worker is a thread inside the parent process, tools/workspace/worker_thread.py:3909-3921, so a worker that exhausts memory or corrupts shared state takes the parent with it.
+There is no isolation: the worker body is a child OS process per worker by default, tools/workspace/worker_runtime.py:84, and only under WORKER_RUNTIME_MODE=thread is it a thread inside the parent process, tools/workspace/worker_thread.py:1880 — so only in that mode does a worker that exhausts memory or corrupts shared state take the parent with it.
 
 There are no per-worker resource limits; agent/config/defaults.py:33-64 bounds time, count and retries, and bounds no memory and no CPU.
 

@@ -464,3 +464,9 @@ web_ui/frontend/.dist-build-stamp
 # repo. `docs/*` above is a catch-all, so the negation is required or the file is
 # never versioned and vanishes on the next clone.
 !docs/competitive-analysis-claude-code.md
+
+# Onboarding "invariants and lore" document: the invariants that must not be
+# broken, first in §1 of `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md`.
+# `docs/*` above is a catch-all, so the negation is required or the file is never
+# versioned and vanishes on the next clone while the pointer survives.
+!docs/MACHINE_INVARIANTS_AND_LORE.md
