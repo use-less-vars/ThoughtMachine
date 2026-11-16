@@ -550,18 +550,37 @@ class Reply(Message):
     elapsed_seconds: float
 
 
+#: The two buses an event can be published on in the sender (§4.4). The
+#: name travels on the frame because it is the one thing the event's own
+#: payload cannot say: the same event reaches the receiver once per bus.
+EVENT_STREAM_GLOBAL = "global"
+EVENT_STREAM_WORKER = "worker"
+
+
 @dataclass(frozen=True)
 class Event(Message):
-    """``event`` -- what ``_publish_event`` / ``_publish_global_event`` send (§4.4)."""
+    """``event`` -- what ``_publish_event`` / ``_publish_global_event`` send (§4.4).
+
+    ``stream`` names the bus the sender published on -- the module-level
+    ``global_event_bus`` or the worker's OWN bus. The receiver needs it because
+    the two do not land in the same place there: a ``global`` event belongs on
+    the supervisor's global bus, a ``worker`` event on the per-worker bus the
+    bridge resolves by identity (§4.4). Additive per §4.5: a peer that predates
+    the field omits it and the dataclass default (``global``) is used, which is
+    exactly what such a peer's events were.
+    """
 
     KIND: ClassVar[str] = "event"
     _FIELDS: ClassVar[Tuple[Tuple[str, Any], ...]] = (
         ("event_type", str),
         ("data", dict),
+        ("stream", str),
     )
+    _OPTIONAL: ClassVar[Tuple[str, ...]] = ("stream",)
 
     event_type: str
     data: Dict[str, Any]
+    stream: str = EVENT_STREAM_GLOBAL
 
 
 @dataclass(frozen=True)

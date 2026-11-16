@@ -39,6 +39,7 @@ from tools.workspace.worker_runtime_main import (
 from tools.workspace.worker_runtime_protocol import (
     DIRECTION_FROM_RUNTIME,
     DIRECTION_TO_RUNTIME,
+    EVENT_STREAM_GLOBAL,
     Event,
     FrameDecoder,
     FrameEmitter,
@@ -163,7 +164,7 @@ def test_the_frame_callback_swallows_what_it_cannot_translate(capsys):
     """A non-event on the bus is reported, not raised, and not framed."""
     outbox = _RecordingOutbox()
 
-    _event_publisher(outbox)(object())
+    _event_publisher(outbox, EVENT_STREAM_GLOBAL)(object())
 
     assert outbox.messages == []
     assert "dropping an event frame" in capsys.readouterr().err

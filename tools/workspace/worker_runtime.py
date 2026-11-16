@@ -61,7 +61,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
-from tools.workspace.worker_runtime_protocol import Event, Heartbeat, WorkerState
+from tools.workspace.worker_runtime_protocol import (
+    EVENT_STREAM_GLOBAL,
+    EVENT_STREAM_WORKER,
+    Event,
+    Heartbeat,
+    WorkerState,
+)
 
 #: The flag that selects the runtime mode (§10, D11).
 WORKER_RUNTIME_MODE_ENV = "WORKER_RUNTIME_MODE"
@@ -503,6 +509,75 @@ def _epoch_or_none(value: Any) -> Optional[int]:
     return _coerce_epoch(value)
 
 
+def _parent_global_event_bus() -> Optional[Any]:
+    """This process' module-level ``EventBus``, or ``None`` if it has none.
+
+    Resolved through the module on every call (a deferred import, like the rest
+    of this module's cross-package imports) so the bus a test or a host swaps
+    in is the one forwarded ``global``-stream events land on -- a module-level
+    ``from ... import`` here would freeze whatever existed at import time.
+    """
+    try:
+        from agent.events import global_event_bus
+    except Exception:  # noqa: BLE001 - no bus, no forwarding, still a handle
+        return None
+    return global_event_bus
+
+
+def _revive_event(
+    frame: Event, warn: Optional[Callable[[str], None]] = None
+) -> Optional[Any]:
+    """Rebuild the typed event the child dumped into ``frame.data`` (§4.4).
+
+    ``worker_runtime_main`` frames ``event.model_dump(mode="json")``, i.e. the
+    WHOLE event -- ``type`` / ``metadata`` / ``data`` -- because a subscriber on
+    this side is registered per ``EventType``: handing it the raw dict would
+    make ``event.type`` a string and miss every subscription it has.
+    ``create_event`` is the one constructor that maps the type and revalidates
+    the payload, so an event it refuses is one this side could not have
+    represented anyway and is dropped rather than invented.
+    """
+    def _drop(reason: str) -> None:
+        """Report a refused frame, through the handle's warn-once gate if any."""
+        if warn is None:
+            _LOGGER.warning("worker event forwarding: %s", reason)
+        else:
+            warn(reason)
+
+    dumped = frame.data if isinstance(frame.data, dict) else None
+    if not dumped:
+        _drop(f"dropped event {frame.event_type!r}: the frame carried no event payload")
+        return None
+    try:
+        from agent.events import create_event
+    except Exception as exc:  # noqa: BLE001 - no events module, no forwarding
+        _drop(
+            f"dropped event {frame.event_type!r}: the events module is "
+            f"unavailable ({type(exc).__name__}: {exc})"
+        )
+        return None
+    metadata = dumped.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    payload = dumped.get("data")
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        return create_event(
+            dumped.get("type") or frame.event_type,
+            payload,
+            source=metadata.get("source") or "worker_runtime",
+            session_id=metadata.get("session_id"),
+            turn=metadata.get("turn"),
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        _drop(
+            f"dropped event {frame.event_type!r}: create_event refused it "
+            f"({type(exc).__name__}: {exc})"
+        )
+        return None
+
+
 class StaleWorkerFence(RuntimeError):
     """This handle's incarnation is gone; it must not dispatch again.
 
@@ -644,6 +719,27 @@ class WorkerRuntimeHandle:
         # the transport last delivered (``frame_arrival_age_seconds``). Two
         # slots because they answer two questions; see ``on_frame``.
         self._last_received_at: Optional[float] = None
+        # S8: the parent-side half of the event seam. A process-mode worker
+        # publishes on its OWN bus in the CHILD process, which the bridge can
+        # never resolve; this is the bus the forwarded ``worker``-stream events
+        # are republished onto in the parent, keyed by the very identity the
+        # bridge resolves with. Built and REGISTERED here, at construction, and
+        # not on the first event: the lookup runs while the forwarded
+        # ``worker_spawned`` is being published, so a bus registered any later
+        # would lose that worker's whole event stream for its lifetime.
+        # ``MODE_THREAD`` is left alone -- the in-process body registers its
+        # real bus inside ``WorkerThread.run`` and must keep doing exactly that
+        # (§11.1).
+        self._event_bus: Optional[Any] = None
+        if mode == MODE_PROCESS:
+            self._event_bus = self._register_parent_event_bus()
+        # S8: a dropped forwarded event is a bug the operator has to see, so the
+        # failure paths warn at WARNING -- but a sick event type arrives on
+        # every turn, so each KIND warns ONCE per handle. Two booleans, not a
+        # counter: the question is "has this been reported for this
+        # incarnation", and the answer never needs to change back.
+        self._revive_failure_logged = False
+        self._republish_failure_logged = False
 
     @classmethod
     def spawn(
@@ -691,6 +787,121 @@ class WorkerRuntimeHandle:
         worker would make the fence agree with whatever it found.
         """
         return self._epoch
+
+    def _register_parent_event_bus(self) -> Optional[Any]:
+        """Create (or reuse) and register this worker's PARENT-side ``EventBus``.
+
+        The bridge resolves a worker's bus with
+        ``get_worker_event_bus(session_id, worker_name, instance_id)``; under
+        ``MODE_PROCESS`` the worker that would have registered that bus lives in
+        another interpreter, so this handle registers one on its behalf -- the
+        bus :meth:`_republish_event` publishes the forwarded ``worker``-stream
+        events onto.
+
+        Reused BY IDENTITY rather than replaced: a handle built for an
+        incarnation the bridge is already subscribed to must not swap the bus
+        out from under those subscriptions. The registry's epoch fence keeps
+        that honest -- a refusal there means a strictly newer incarnation owns
+        the key, and the bus to publish onto is the one it registered.
+        """
+        if not self._worker_name:
+            # No name, no key: a bus nobody could ever look up is a leak with
+            # no reader, so a worker that cannot answer for itself gets none.
+            return None
+        try:
+            from agent.events import EventBus
+            from tools.workspace.worker_registry import WorkerRegistry
+        except Exception as exc:  # noqa: BLE001 - no bus, no seam, still a handle
+            _LOGGER.debug("no parent-side event bus for %r: %s", self._worker_name, exc)
+            return None
+        session_id = self._session_id or ""
+        instance_id = 1 if self._instance_id is None else self._instance_id
+        registry = WorkerRegistry.get_instance()
+        try:
+            existing = registry.get_event_bus(session_id, self._worker_name, instance_id)
+            if existing is not None:
+                return existing
+            bus = EventBus()
+            registered = registry.register_event_bus(
+                session_id,
+                self._worker_name,
+                bus,
+                instance_id=instance_id,
+                epoch=self._epoch,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            _LOGGER.warning(
+                "could not register a parent-side event bus for %r: %s",
+                self._worker_name,
+                exc,
+            )
+            return None
+        if registered is False:
+            # Epoch-fenced: a strictly newer incarnation owns the key.
+            return registry.get_event_bus(session_id, self._worker_name, instance_id)
+        return bus
+
+    def _republish_event(self, frame: Event) -> None:
+        """Put a forwarded event back on the parent-side bus it came from (§4.4).
+
+        The frame's ``stream`` says WHICH bus the child published on, and only
+        the frame can say it: the same event reaches the child's two buses and
+        has to leave on the matching one here -- ``global`` onto this process'
+        module-level bus, ``worker`` onto the per-worker bus registered at
+        construction. A frame from a peer that predates the field carries no
+        stream and is treated as ``global``, which is what such a peer's events
+        were.
+
+        Never raises: it runs inside :meth:`on_frame`, on the socket read loop,
+        and a subscriber that blows up must not take the transport with it.
+        (``EventBus.publish`` already contains its own subscribers; this
+        contains everything else.)
+        """
+        try:
+            stream = getattr(frame, "stream", None) or EVENT_STREAM_GLOBAL
+            event = _revive_event(frame, self._warn_revive_failure)
+            if event is None:
+                return
+            if stream == EVENT_STREAM_WORKER:
+                bus = self._event_bus
+            else:
+                bus = _parent_global_event_bus()
+            if bus is None:
+                return
+            bus.publish(event)
+        except Exception as exc:  # noqa: BLE001
+            self._warn_republish_failure(
+                f"dropped event {getattr(frame, 'event_type', '?')!r}: republishing "
+                f"it failed ({type(exc).__name__}: {exc})"
+            )
+
+    def _warn_revive_failure(self, reason: str) -> None:
+        """Report the first revive failure for this handle, once (§4.4)."""
+        if self._revive_failure_logged:
+            return
+        self._revive_failure_logged = True
+        _LOGGER.warning(
+            "worker event forwarding: %s (worker=%r, session_id=%r, "
+            "instance_id=%r; reported once per handle)",
+            reason,
+            self._worker_name,
+            self._session_id,
+            self._instance_id,
+        )
+
+    def _warn_republish_failure(self, reason: str) -> None:
+        """Report the first republish failure for this handle, once (§4.4)."""
+        if self._republish_failure_logged:
+            return
+        self._republish_failure_logged = True
+        _LOGGER.warning(
+            "worker event forwarding: %s (worker=%r, session_id=%r, "
+            "instance_id=%r; reported once per handle)",
+            reason,
+            self._worker_name,
+            self._session_id,
+            self._instance_id,
+        )
 
     def _fence_message(self, reason: str, *, observed: Optional[int]) -> str:
         """Describe *reason* with this handle's identity and both epochs."""
@@ -1099,7 +1310,9 @@ class WorkerRuntimeHandle:
         ``heartbeat_age_seconds`` answerable. ``Event`` is the
         other kind with a producer today (S4b): the child forwards every event it
         publishes, so this branch is where a forwarder reads one without
-        touching the socket.
+        touching the socket -- cached as the last event AND republished onto the
+        parent bus the frame's ``stream`` names (:meth:`_republish_event`),
+        because a cache is not a delivery (§4.4).
         """
         try:
             if isinstance(frame, WorkerState):
@@ -1108,6 +1321,7 @@ class WorkerRuntimeHandle:
                 self._last_heartbeat_at = _epoch_seconds_from_iso8601(frame.at)
             elif isinstance(frame, Event):
                 self._last_event = frame
+                self._republish_event(frame)
             else:
                 return
             self._last_received_at = time.time()
