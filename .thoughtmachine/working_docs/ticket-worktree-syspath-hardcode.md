@@ -2,7 +2,7 @@
 
 **Filed:** 2026-02-14, while hardening `apply_workspace_ceiling` (worktree `harden-permissions`).
 **Severity:** MEDIUM — silently wrong code under test, and one observed mode is a **phantom PASS** on a security suite.
-**Status:** open; filed, not dispatched. Deliberately NOT fixed in this PR (the security diff must stay reviewable).
+**Status:** CLOSED (STALE — guard fires, mechanism does not reproduce). Closed Gen 66, at `544bd407`, by mutation proof: no-op'ing `security/security_gate.py:apply_workspace_ceiling` at line 285 (post-mutation SHA `d0fc6939fdf0d55bb7bd97d822082b5e46bc24da4092aa4c23deb41e424976a8`) drove 389 / 395 red across `test_security_gate_disk.py`, `test_permission_hierarchy.py`, `test_ceiling_prompt_gating.py`, `test_ceiling_denial_messages.py`, including 5 of the 6 modules named as phantom-pass in this ticket. Restore verified byte-identical (SHA `1a1d25ee8a4a6b1b1e98f709f971cd8d190bf86ab6ee30bc06b79f7be6a7ea12`). Evidence tree: `.worktrees/c81-provenance` at `544bd407`. The literal-removal fix (14d8fcfc) plus `test_import_provenance.py:39` is sufficient; the `sys.modules` caching mechanism this ticket feared does not survive the guard.
 
 ## Finding
 
