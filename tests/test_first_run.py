@@ -139,6 +139,7 @@ def poll_for_type(ws, expected_type: str, timeout: float = 5.0) -> list:
 # Tests
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_full_first_run_lifecycle(client):
     """Verify the complete first-run flow: new session, missing API key handled, config updated."""
     # All steps use a single WebSocket connection because bridge state

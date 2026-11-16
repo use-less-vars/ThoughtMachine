@@ -78,6 +78,7 @@ def _seed_vault(vault):
     )
 
 
+@pytest.mark.trust_harness
 def test_vault_status_warnings_with_actions_and_no_secrets(
     client, monkeypatch, tmp_path
 ):
@@ -105,6 +106,7 @@ def test_vault_status_warnings_with_actions_and_no_secrets(
         assert fragment not in text, fragment
 
 
+@pytest.mark.trust_harness
 def test_vault_status_aborts_on_invalid_json(client, monkeypatch, tmp_path):
     """Invalid JSON in a declared file aborts to the error shape, no secrets.
 

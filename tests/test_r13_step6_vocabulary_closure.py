@@ -55,6 +55,7 @@ def client():
                     os.environ["HOME"] = old_home
 
 
+@pytest.mark.trust_harness
 def test_a_session_vocabulary_is_subset_of_served_b_names(client):
     """Every A session-resource key must appear in the served B array."""
     resp = client.get("/api/resource-catalog")
@@ -65,6 +66,7 @@ def test_a_session_vocabulary_is_subset_of_served_b_names(client):
     assert not missing, f"A resources absent from B: {sorted(missing)}"
 
 
+@pytest.mark.trust_harness
 def test_served_b_minus_a_is_display_only_with_empty_grains(client):
     """B entries absent from A are display-only, with an empty grain set."""
     resp = client.get("/api/resource-catalog")
