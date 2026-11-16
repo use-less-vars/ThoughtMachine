@@ -4538,8 +4538,17 @@ class WorkerThread(threading.Thread):
                         },
                     )
                     global_event_bus.publish(evt)
-                except Exception:
-                    pass
+                    # WARNING, not DEBUG: the runtime threshold is WARNING in both the parent and the worker child, so anything lower is invisible in logs/backend_startup.log.
+                    logger.warning(
+                        "Published WORKER_SPAWNED for worker '%s' instance %s",
+                        self.worker_name, self.instance_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "WORKER_SPAWNED publish FAILED for worker '%s' "
+                        "instance %s: %s",
+                        self.worker_name, self.instance_id, exc,
+                    )
             # Also publish to the per-worker bus for local subscribers
             self._publish_event('worker_spawned', {'status': 'ready'})
             if self._worker_ctx is None:
