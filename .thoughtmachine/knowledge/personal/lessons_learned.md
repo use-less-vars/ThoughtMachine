@@ -985,6 +985,8 @@ FRONTEND TEST INFRA FACTS worth not rediscovering: (1) per-worktree `node_module
 9. Container has no `git`, no `ripgrep`; `FileEditor`/`ApplyEdits` reject absolute `/workspace/...` paths; workspace root is the MAIN checkout so worktree paths need the `.worktrees/<name>/` prefix.
 10. **Verify before you build.** Four remote branches (`fix/process-pause-deadlock`, `fix/worker-pause-registry-race`, `fix/gen67-worker-runtime-default-process`, `fix/runtime-default-truth`) were already merged into dev; a whole night of log analysis described a build older than the branch. `merge_base(is_ancestor)` is cheap and should run before any fix is written. Corollary: a zero grep count is only evidence if the handler can actually emit at the configured level — check the logger level first.
 
+**Correction (Gen 66, verified):** the failure mode is narrower than "`.venv` is broken." In the container, `.venv/bin/python` runs but raises `No module named pytest` — use system `python3` (3.12.15 / pytest 9.2.0). On the **host**, `.venv` works fully: Python 3.12.3, pytest 9.1.1. Test invocations from the host use `.venv/bin/python -m pytest`. Verified at `544bd407`.
+
 ## 2026-11-16 — ## Production logging threshold is WARNING — any DEBUG/INFO ...
 
 ## Production logging threshold is WARNING — any DEBUG/INFO diagnostic is invisible (verified at dev ee1ac54c)

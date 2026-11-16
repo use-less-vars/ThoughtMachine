@@ -141,8 +141,8 @@ and `check_requires_resource` are not imported by either cited file — see Know
 `DEFAULT_RUNTIME_MODE = MODE_PROCESS`, and process mode is answered by a real OS child process, not by
 the calling interpreter.
 
-**Enforcement site:** `tools/workspace/worker_runtime.py:83` (`DEFAULT_RUNTIME_MODE = MODE_PROCESS`,
-resolver at `tools/workspace/worker_runtime.py:317-331`) and the substrate in
+**Enforcement site:** `tools/workspace/worker_runtime.py:90` (`DEFAULT_RUNTIME_MODE = MODE_PROCESS`,
+resolver at `tools/workspace/worker_runtime.py:357`) and the substrate in
 `tools/workspace/worker_runtime_process.py:486-495`:
 
 ```python
@@ -257,28 +257,24 @@ What the trigger blocks and job names add to that table:
   `.github/workflows/platform-matrix.yml`'s `web-ui-backend-suite` job is named "(advisory)" and also
   carries `continue-on-error: true`. Those four of the eighteen jobs cannot fail their run.
 
-### OPEN ITEM — "required check" cannot be determined from this repository
+**RESOLVED (partial):** 10 required status checks exist server-side on `dev`, evidenced by GitHub's own rejection message on direct push at `a869255d` and `544bd407`: `remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are expected.` The check *names* still require `gh api repos/{owner}/{repo}/branches/dev/protection` (operator-admin). Whether branch protection blocks the *merge button*, as opposed to being bypassable by direct push, is still unknown and needs the same `gh api` call.
 
-Nothing in the tree records branch-protection settings, so this document makes **no claim about which
-checks are required**, and no other document should either. Every statement above is about what fails a
-workflow run. The two knowledge-base notes that would settle it contradict each other, and neither is
-checkable from the checkout:
+### OPEN ITEM (revised) — required checks: what the push rejection settles, and what it does not
 
-- `.thoughtmachine/knowledge/project/operator_observations.md:314` (2026-10-03, Main Gen 34):
-  "Edge 8 stands; the ruleset + required checks held (13 rows ran, 13 succeeded). Do NOT conflate.
-  Do NOT reopen Edge 8."
-- `.thoughtmachine/knowledge/project/working_agreements.md:127` (pointing at its own 2026-09-28
-  RECOMMENDATION): "Attempted form `gh pr checks <PR> --required --watch` returns 'no required checks
-  reported' in this repo — branch protection has no required checks configured, so every check is
-  advisory and `--required` gates on the empty set."
+This section previously concluded that required checks "cannot be determined from this repository". That conclusion is retired above. The evidence it rested on is preserved here, because none of it is reconstructible from the checkout, and one of the two notes rests on an inference the push rejection contradicts.
 
-Both are consistent with what is on disk here: repository settings can change between 2026-09-28 and
-2026-10-03, and a ruleset that makes checks required for merging is not the same object as the checks
-`gh pr checks --required` reports. Nor can either claim be reconstructed from the workflow files — a
-run's check rows are per-job, per-matrix-leg and per-workflow, so the "13 rows" count in the earlier
-note does not have to equal the eighteen jobs enumerated above.
+Two knowledge-base notes, quoted below as whole lines so a later reader can verify them with `sed -n '<line>p'` rather than trusting this document:
 
-**Needs a human.** Someone with admin access to the repository must query the branch protection and
-ruleset endpoints for `dev` (for example `gh api repos/{owner}/{repo}/branches/dev/protection` and the
-repository rulesets endpoint) and record the answer in this section. Until that happens, treat "is this
-check required?" as unknown.
+```
+.thoughtmachine/knowledge/project/operator_observations.md:314
+- **CAUTION:** This is about how the CLI reports merge eligibility, NOT about Edge 8. Edge 8 was about required checks being configured. Edge 8 stands; the ruleset + required checks held (13 rows ran, 13 succeeded). Do NOT conflate. Do NOT reopen Edge 8.
+
+.thoughtmachine/knowledge/project/working_agreements.md:127
+Required checks only, not the unfiltered set. Attempted form `gh pr checks <PR> --required --watch` returns "no required checks reported" in this repo — branch protection has no required checks configured, so every check is advisory and --required gates on the empty set. Operative form: filter the check list by name. The repo suffixes advisory checks with "(advisory)".
+```
+
+The push rejection at `544bd407` settles the underlying fact that EDGE 8 disputed — required status checks do exist on `dev`, 10 of them — so the first note's premise holds. It does **not** refute the second note, whose subject is narrower: both notes distinguish the configuration of required checks from what the CLI reports about merge eligibility, and `operator_observations.md:314` warns about that conflation in its own words. What is falsified is only the second note's *inference* (`branch protection has no required checks configured`); what it actually measured is that `gh pr checks --required` reports no required checks **by name** in this repo. That is a reporting gap, not an absence of protection. `.thoughtmachine/knowledge/project/working_agreements.md:127` should still be corrected in a follow-up, so it stops asserting the inference.
+
+Counts still do not have to reconcile: run rows are per-job, per-matrix-leg and per-workflow (§ above enumerates eighteen jobs), so "13 rows", "10 required checks" and the eighteen enumerated jobs are three different tallies of three different things.
+
+`CI_PROCESS.md:66-69` reproduces both notes above with different punctuation and backticking — a third rendering of the same two facts. Reconciling it with the files' actual bytes is a follow-up: that file is a hashed bundle member, so any edit to it requires regenerating `HANDOFF.md` in the same pass.

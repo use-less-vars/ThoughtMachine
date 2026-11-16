@@ -25,7 +25,7 @@ a3fc5ef1 fix merged tree: restore the docs negation the resolution ate, and pin 
 7. `.thoughtmachine/knowledge/project/vision_ledger.md` -- the five standing commitments (V1-V5). - sha256:5a01a13c684e94f5bc0e762807b8183d9e06f283b20caf3389aec662149ff930
 8. `.thoughtmachine/knowledge/project/ORCHESTRATOR_GUIDE.md` -- how to run workers without believing the brief. - sha256:dfb01550569ee64826e30b5e54cb97b8916db6803323d2a3cbea8ae0807fec40
 9. `.thoughtmachine/knowledge/project/CI_PROCESS.md` -- what CI actually runs, and what this repo cannot see. - sha256:85a02df0358a432461bf3041c863786e40c745d37ab600d264da0c2798a3120c
-10. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:fa126715c8646a50ba541e0e8791fe8d114d550a2fd989a788ca2eb493795969
+10. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:06fce4c4ca8de6db667790d86d4f02ef2d639077df3a1cd9f51a689dbb18af59
 
 ## First task (from the live queue)
 
