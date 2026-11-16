@@ -727,3 +727,291 @@ Earlier in this session the agent concluded the project's tests were unrunnable 
 ## Gen 60 — verification pattern that actually caught things
 Sequential pattern worth reusing: (1) worker makes the change and quotes code; (2) **main agent reads `git_read diff` on the named file in the MAIN tree** — a path that exists is not a path that is right, especially with 11 stale worktrees present; (3) a **different** worker, reset fresh, independently runs the tests and pastes raw output; (4) main agent commits only after (2) and (3). The independent-run step caught two false claims this session: a "likely broken test at line 1468" that was actually 60 passed, and forced honesty about which interpreter can run pytest. Also: `-p no:warnings` is mandatory here — the pydantic deprecation wall eats the `tail` window and hides the test names.
 
+
+## 2026-11-14 — ## Gen64 doc-truth wave — live problems hit while working (s...
+
+## Gen64 doc-truth wave — live problems hit while working (supervisor side)
+
+1. **`Worker(action="query")` cannot continue a spawned worker.** After a blocking `spawn` returns, the instance is gone: follow-up `query` → `{"error": "Worker 'default' is not running"}`. Consequence: **every follow-up is a fresh agent with zero memory**, so a 3-line wording fix costs a full context (~80k cumulative token_usage here vs 26.9 s wall time). Multi-turn worker iteration is effectively unavailable; budget briefs as one-shot and accept re-briefing cost, or fold fixes into the original brief.
+2. **A spawn that returns `status: null, confidence: null, meta: null`** (seen twice this session, on successful runs) — anything branching on `status == "final"` will mis-handle a good result. `telemetry` is populated, so the envelope is only half-filled.
+3. **`token_usage` appears to be per-worker-instance cumulative, not per-spawn.** 33,952 → 39,729 → 71,369 → 80,206 across four spawns all reporting `instance_id: 1`. A 26.9 s one-edit spawn "cost" 80,206 by that field. Do not quote it as a per-task cost.
+4. **`git_write worktree_add` ignores the `branch` parameter** and creates a **detached** worktree at HEAD ("Created worktree at '.worktrees/x' (base: HEAD)"), silently. The named branch is never created. Working recipe: `branch_create(base=...)` → `worktree_add(path=...)` → `checkout(branch=..., working_dir=<worktree>)`; verify with `git_read status(working_dir=...)` before editing.
+5. **`git_write worktree_add` rejects absolute paths** — `Path /workspace/.worktrees/x is outside workspace /home/jojo/...`. Must pass workspace-relative (`.worktrees/x`). Related: if the `base` ref is already checked out in the main worktree, `worktree_add` fails with `'dev' is already used by worktree` — omit `base` and rely on HEAD.
+6. **`CheckSystem query="vault_status"` returns ~150 individual file entries**, a large context hit for what should be a summary; it also reported `status: warnings` where every listed file was `ok` (only 3 drift warnings). Needs a detail=false mode.
+7. **`CheckSystem query="running_workers"` returns `[]` immediately after a successful blocking spawn** — live-only listing plus synchronous dispatch means the panel/query always looks dead after a worker just worked. Not a defect in the worker, a misleading surface.
+8. **Docs/pointer drift, found by worker verification, worth folding into the operator's file inventory:** `INFRA_ONBOARDING.md` and `status.md` live at `.thoughtmachine/knowledge/project/`, NOT repo root; that same file claims (line 58) "the KB is gitignored" but `git status` shows `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` as a **tracked modified file** — so the KB is committable and that claim is false at `cd06c87c`.
+
+### Agent-worker interaction pattern that keeps paying
+Demanding a `MEASURED REALITY vs OPERATOR CLAIMS` table with CONFIRMED / REFUTED / INCONCLUSIVE per claim. This pass it **refuted two operator claims** (a "byte-identical duplicate" doc that does not exist at the stated path, and the "Under 100 KB total" claim — real sum 124,954 B) and caught a briefed path that did not exist, without ever writing a false sentence. Also: instructing "if your budget runs short, report measurements and partial edits" + ordering measurement → edits → pytest meant the 240 s pass returned complete facts and finished edits with 70 s to spare.
+
+## 2026-11-14 — ## Gen65 — live problems, ranked by how much they cost
+
+### ...
+
+## Gen65 — live problems, ranked by how much they cost
+
+### 1. A spawn that "timed out with no reply" keeps running and keeps WRITING FILES (worst one yet)
+`Worker(action="spawn")` with `timeout_seconds: 300` returned a `WorkerQueryTimeout` after 361 s wall, `runtime_mode: "process"`. The envelope claimed the worker "is registered and can be retried via action='query'"; the immediate `action="query"` answered `Worker 'default' is not running`. Both statements are wrong in the same direction: the *forked child process* was still alive and still working.
+Proof, and how I found it: after I committed `tools/workspace/worker_thread.py` (clean tree, `git_read status` empty), the next `git_read status` showed it **modified again**. The delta was a fifth call site the original brief never listed — i.e. the ghost finished its own plan on top of my commit. `Worker(action="list")` → single `default` entry, `runtime_status: ready`, and `CheckSystem running_workers` → `alive: false, conversation_length: 0`. So every registry view says "not running" while a process is actively mutating the workspace.
+Consequences worth designing around: (a) any verification run in a worktree a timed-out spawn ever touched is racy; (b) a worker's own edits can silently land *after* the supervisor concludes the task failed and commits something else; (c) when a worker reported "another actor rewrote my file between read and write" it was right, and it is not a test artefact.
+Mitigation that actually worked: fingerprint `sha256sum` before AND after each run and require them to match (a worker did this unprompted and it is the only reason I trust the final green); `find . -newer <edited file> -name '*.py'` to enumerate what the ghost touched; and treat any `git_read status` that reappears non-empty after a clean commit as ghost evidence, never as "the commit didn't take".
+There is no agent-side kill: terminating is operator-only. `action="stop"` detaches a *registered* worker, and this one is not registered. So the supervisor's only recourse is detection plus serialisation by hand.
+
+### 2. pytest dies with SIGTERM/exit 143 in the sandbox, intermittently and unrelated to the test
+`tests/test_worker_process_contract.py`: 6 consecutive attempts, all `Terminated` (143), once after 9 collected tests; the same file passed `10 passed, 1 xfailed` earlier in the session on the same tree. The target file itself and `test_worker_is_a_real_process.py` were also SIGTERM'd once each and passed on retry. Kills land ~3-8 s in, well inside a 600 s budget. Raising mem_limit to 2 g/4 g did not help. A worker's hypothesis is worth following up: this looks like a **process-group kill from the production worker teardown path**, i.e. the ghost from problem 1 tearing down siblings. Reported counts are therefore only trustworthy when a run names the file it measured.
+Also in this bucket: one combined `cat > file && sha256sum && pytest` via DockerCodeRunner was **SIGKILLed (137) after the write had already landed** (file present, 6824 B). Split writes from test runs, always.
+
+### 3. Worker file-editing tools cannot reach a git worktree
+`ApplyEdits`/`FileEditor` refused `/workspace/.worktrees/c73-declared-mode/...` as "outside workspace": they resolve against the **host** path (`/home/jojo/PycharmProjects/ThoughtMachine-dev`) while the worktree lives on the **Docker** side of `/workspace`. Every edit had to be smuggled through `DockerCodeRunner` with a python/cat heredoc. This makes the standard "make a worktree, have a worker edit it in place" workflow impossible with the ordinary tools, and pushes workers onto heredocs where quoting mistakes are silent. A worker's workaround that I want to keep: guard the rewrite with a hash precondition and **abort instead of writing** when it fails (`AssertionError: 0`) — that is what saved the file from being clobbered by the version it did not intend.
+
+### 4. `git_read ls_tree` ignores `prefix` and returns the whole tree
+`ls_tree(treeish=<sha>, prefix="tests/", recursive=true)` dumped the entire repository (`original was 33330 tokens`, truncated at 10 k) with no error and no hint that the filter was dropped. It burned a large slice of context for zero information. If a prefix cannot be honoured, the tool should refuse rather than silently widen. Use `show_file(path=..., ref=..., source="committed")` to probe a single path — a clean `fatal: path ... does not exist in <ref>` is the cheapest existence check available here.
+
+### 5. Minor API annoyances, each one a wasted turn
+- `show_file` requires **`path`**, while every other operation takes **`file_path`**; passing the consistent one yields `Error: path is required for show_file operation`.
+- `git_write` has no `merge` and no branch-delete, and workers have no `git` binary at all (`command -v git` → 127). So "merge origin/dev, then push a PR" is unreachable from the agent side in every combination and always lands on the operator.
+- `Worktree_add` ignores its `branch` argument (always detached at `base`), rejects absolute paths, and refuses a `base` that is checked out elsewhere — but **accepts a commit SHA even when the branch pointing at it is checked out**, which is the workaround: `worktree_add(base=<sha>, path=".worktrees/x")`.
+- Piping hides exit codes: `/bin/sh` here rejects `${PIPESTATUS[@]}` ("Bad substitution"), so any `cmd | head` loses the status and a worker will confidently report a meaningless `EXIT=0`.
+
+## 2026-11-14 — ## Gen65 — the HANDOFF.md sha256 trap (why PR #380 went red,...
+
+## Gen65 — the HANDOFF.md sha256 trap (why PR #380 went red, and how to regenerate it safely)
+
+**Symptom looked unrelated to the branch's content:** two workflows failed on
+`tests/test_onboarding_bundle_contract.py::test_every_recorded_hash_matches_the_file_on_disk` and
+`::test_checked_in_handoff_matches_fresh_generation`, above two `WARNING: <file> changed since HANDOFF.md
+recorded sha256:...` lines. Cause: `.thoughtmachine/knowledge/project/HANDOFF.md` is *generated* by
+`scripts/gen_handoff.py` and carries an inline `- sha256:<64 hex>` pin for every entry in its
+`## 2. Read in this order` manifest. Editing a pinned doc (here `docs/ARCHITECTURE_MACHINE_MODEL.md` and
+`INFRA_ONBOARDING.md`) invalidates the router. Bug class already named in `working_agreements.md` as
+`sha-pinned-blocks-go-stale-on-correction`.
+
+**The invocation matters more than the script.** `gen_handoff.py` also records live git facts (branch head,
+subject, recent commits). If you run it bare in a worktree, it bakes *that worktree's* HEAD into the file and
+CI's fresh generation will disagree. The contract test passes overrides (`--root`, `--dev-sha`,
+`--dev-subject`, `--recent-file`, `--stdout`) whose values live as `PINNED_*` constants in the test module.
+Extract them with `ast.literal_eval` off the test source rather than retyping, then run the generator with
+exactly those. That is what makes the artifact CI-stable.
+
+**Verify by prediction, not by eyeballing the diff.** Recompute all manifest digests independently (parse the
+manifest, `hashlib.sha256` each named file) and print the mismatch set *before* regenerating; then require the
+emitted diff to change exactly that set. Here: 10 entries, 1 advisory (`PRIORITIES.md`, deliberately carries
+no digest because it is edited by every branch — recording it would red any branch merely up to date with dev),
+predicted 2 mismatches, got exactly 2.
+
+**Expect one tolerated extra hunk.** The `## First task (from the live queue)` body is regenerated from
+`PRIORITIES.md`; on this branch it added `+C68`/`+C69`. The contract collapses that block on both sides
+(`_without_queue_block`), so it does not affect the check. **Leave it as generated — do not splice the old
+queue back.** Hand-editing the router to keep a diff pretty is the exact drift the pin exists to catch.
+`bash scripts/check_kb_staleness.sh` is the shell-side twin and prints `PASS: HANDOFF.md is up to date.`
+
+**Read-order manifest has no `worker_thread.py`** (all entries are `docs/` and `.thoughtmachine/knowledge/project/`),
+so a change to `tools/workspace/worker_thread.py` never requires regenerating this router.
+
+### New tool finding: DockerCodeRunner does not share `/tmp` between calls
+A temp file written in one call is `FileNotFoundError` in the next. Anything that stages input for a later
+command (recent-commit lists, fixtures, heredoc payloads) must be created and consumed inside a single
+invocation. Cost a retry cycle here.
+
+## 2026-11-15 — ## Gen65 — a new `docs/` file is INVISIBLE to git (cost: wou...
+
+## Gen65 — a new `docs/` file is INVISIBLE to git (cost: would have shipped an empty contract gate)
+
+`.gitignore` here has `docs/*` as a **catch-all**, then ~79 `!docs/<name>` negations, one per published
+doc. The convention is stated in-file ("every docs/ file needs its own line") and has been followed 78
+times. Nobody added a line for the new `docs/CONTRACTS.md`, so the file existed on disk, the tests that
+read it passed, and `git status` did not list it. Committing what git offered would have shipped the
+workflow and the parity test **without the ledger they read** — the gate would then have failed on
+`LEDGER.is_file()`, or, had I ordered the commit differently, a workflow citing a document absent from
+the repo.
+
+**The process lesson is the transferable part:** a worker reporting "file written, verified, sha256 X"
+proves the bytes are on disk and proves nothing about whether git will ship them. `git status` after
+every write phase is not ceremony — it is the only check that distinguishes "created" from "versioned".
+Here it showed 2 untracked files where the worker had produced 3, which is what caught it.
+
+Generalisable traps in the same file worth knowing before adding anything new: `AI_tasks/`/`reports/`,
+`.thoughtmachine/working_docs/*` (re-ignored after being un-ignored, so a deliverable there needs a
+second negation AFTER the re-ignore), `.thoughtmachine/knowledge/project/**/*.md` (same shape), and
+`*secret*`/`test_*.json`/`fix_*.py` which silently swallow ordinary-looking real files. Order matters
+throughout: a negation must follow the ignore it overrides, and git cannot re-include a file beneath an
+excluded *directory* — hence the recurring `!docs/ci/` + `!docs/ci/**` pairs.
+
+## Verification-first briefs: three confident anchors, two wrong
+
+A design brief specified six `file:symbol` anchors for a claims ledger, with line numbers. A read-only
+pass before writing the document found: `tests/test_identity_injection.py` **does not exist**; the named
+enforcement symbol `_denial_layer_label` is denial-*message formatting* (`security_gate.py:610-622`,
+called from `_denial_clause:649`) and can neither allow nor deny — the real deciders are
+`check_required_categories:1600`, `check_atomic_operation:1492`, `check_requires_resource:1530`; and a
+supposedly mutation-proof test compares against `DEFAULT_RUNTIME_MODE` rather than `MODE_PROCESS`,
+so flipping the constant keeps it green.
+
+Cheapest reliable pattern found: a **separate read-only pass** whose only output is a report
+(`claim | verdict | real anchor | mutation-proof? | runs-without-docker?`), dispatched *before* the
+writing pass, with an explicit instruction to name missing things rather than substitute quietly. It
+converts a document that asserts into a document that has been checked, and it surfaced a genuine
+fail-open (`apply_workspace_ceiling`, `security_gate.py:234`) that the brief never mentioned.
+
+Related: the same pass confirmed the whole fast-gate set is hermetic (no docker, vault, network, `/proc`
+or git) — `tests/test_security_gate_disk.py` patches `vault_root()` via a `hermetic_vault` fixture, and
+`test_worker_is_a_real_process.py` documents "no LLM, vault, docker or network". 69 tests, 4.29 s.
+
+## 2026-11-15 — ## C77b — why the worker output panel never streamed (root c...
+
+## C77b — why the worker output panel never streamed (root cause + live tooling friction)
+
+**Finding (backend, not frontend).** `web_ui/backend/bridge.py` `_on_worker_spawned` computed
+`session_id = data.get('session_id', self._session_id or '')` (line ~1043) but the gate one line later
+called `_event_belongs_to_this_session(data)`, which re-reads the **raw** event and is deny-by-default.
+The denial `return` sat *before* the per-worker EventBus subscription and *before* the reconnect buffer,
+so a spawn rejected on an unbound/mismatched session was lost permanently: no subscription, no replay,
+no `tool_call` / `tool_result` / `assistant_message` frames. Both reported symptoms had that one cause —
+the worker list is REST-polled (so it looked fine) and `WorkerOutputPanel.jsx` defaults its dot to
+`'ready'` grey because only WS events populate `workerInfo`.
+
+Lesson: a guard that `return`s before a subscription/buffer is a *silent data-loss* pattern, not a
+validation. Any deny-by-default early return on an event path must be (a) logged at a level the
+deployment actually emits, and (b) ordered after any side effect whose absence is invisible to the UI.
+
+**Diagnosability lesson.** `agent.logging.log` writes to stderr and emits no stdlib records; with
+`TM_LOG_TAGS` unset the console admits WARNING+ only. The old drop was DEBUG-only, so
+`logs/backend_startup.log` (3,562 lines) contained **zero** DEBUG lines and the defect was
+unprovable after the fact. Fixed in `63abd246` by logging the mismatches at WARNING. Also: whether the
+original repro hit "bridge unbound" or "session mismatch" is *still unproven* — say so, don't guess.
+
+**Tooling friction met while doing it (for the engineer):**
+1. `git_write worktree_add` ignores its `branch` argument — always detached at HEAD; a later `commit`
+   then fails with "workspace HEAD is detached". Working order: `branch_create` → `worktree_add` →
+   `checkout branch=<name>` (staged changes survive).
+2. `working_dir` must be host-absolute; `/workspace/...` is rejected and the error is then re-worded as
+   `Not a git repository: <host path>`, naming a path the caller never typed.
+3. `git worktree repair` cannot fix worktrees whose gitdir points into a pre-rename clone; those must be
+   recreated. Recreate + `cp -p` + sha256 verify works.
+4. `Worker` timeout ceiling is a hard 600 s; 900 is refused outright rather than clamped.
+5. `DockerCodeRunner` gets a fresh container per invocation → `/tmp` baselines do not survive between
+   calls; keep baselines as files inside a sibling worktree.
+6. `FileEditor` rejects absolute container paths; needs workspace-root-relative paths.
+7. `.gitignore`'s `node_modules/` (trailing slash) does not match a symlinked `node_modules`, so it
+   shows up as untracked — never stage it.
+8. Live-log bug worth a ticket: `Worker worktree default skipped: git worktree add raised (unknown
+   permission grain 'git'; this port only accepts ['host_bash','mcp','network'])` — workers cannot
+   create their own worktrees in this instance.
+
+
+## 2026-11-15 — ### Live tooling / agent-worker problems observed while hard...
+
+### Live tooling / agent-worker problems observed while hardening `apply_workspace_ceiling` (worktree `harden-permissions`)
+
+Recorded per session instruction so the platform can fix these. Nothing here is a code bug in the product; all of it made the *work* slower or made verification untrustworthy.
+
+1. **`host_bash` is banned for me** — I cannot run a single shell command. Any `bash` heredoc an operator hands me is undoable, and every file must be created through a worker + FileEditor. Plan for this: read a proposed script, re-express it as worker instructions.
+2. **Worktree test runs silently test the WRONG code (worst issue found).** Nine `tests/` modules hard-code `sys.path.insert(1, "/workspace")`. Inside a worktree that literal is the **parent** checkout, and the parent's `security/`/`tools/`/`agent/` get imported and cached in `sys.modules` before the worktree root reaches `sys.path[0]`. Measured: 6 `tests/security/*` modules **PASS while importing the parent's `security_gate.py`** — a phantom pass on a security suite, the dangerous direction. Workaround that works: a `pytest_configure` plugin that strips the parent root and force-imports `security`, `agent`, `tools` from the worktree, run as `PYTHONPATH=/tmp/wtplug python -m pytest -p wtpreload ...`. Ticket filed: `.thoughtmachine/working_docs/ticket-worktree-syspath-hardcode.md`. **Implication: any earlier "N passed" figure from a worktree run is suspect** unless it was produced under that plugin.
+3. **`GlobTool` returns 0 results for patterns that do exist** (e.g. `conftest.py`). Never trust an empty glob as evidence of absence — confirm with a directory listing or a direct read.
+4. **`git_read` `show_file` takes `path`, not `file_path`**; passing `file_path` yields a bare "path is required". Also it rejects container-style paths (`/workspace/...`) with "outside workspace" — use host-workspace-relative paths (`.worktrees/<name>/...`), not the container path the worker sees.
+5. **`git_write` `worktree_add` ignores its `branch` argument** and produces a DETACHED worktree; you must follow with `checkout` to attach the branch. Costs a confusing detour every time.
+6. **DockerCodeRunner has no `git` binary and its `/tmp` does not persist between calls** — a preload plugin must be recreated on every invocation (cheap, but it invalidates "just set it up once" plans).
+7. **Worker hard timeout ceiling is 600s.** A 4-task chunk with a full test sweep took 430-510s and produced ~80k tokens of report. Chunk to ~4 tasks and expect to spend the whole budget; a 5th task gets truncated and the worker reports it as "out of scope" rather than as a timeout.
+
+## 2026-11-15 — **8. A worker can silently LOSE its own task instructions wh...
+
+**8. A worker can silently LOSE its own task instructions when its context compacts mid-task.** Observed live twice in one session. Symptom: the worker returns a confident "task complete" report that covers only *part* of the brief, and mentions in `meta.struggles` that "the numbered list is not in my post-summarisation context". In the worst instance a two-part brief (cheap doc write + expensive refactor) came back with the *cheap* part silently dropped because it had ordered the work the other way round. Mitigations that worked: (a) put the cheap deliverable FIRST in the brief, (b) number the deliverables and require the final report to be numbered to match, (c) keep a brief to ~2 tasks when it includes long test runs, (d) treat a report with no per-deliverable numbering as incomplete and re-verify the artifacts on disk yourself rather than trusting the summary.
+
+**9. Verify a worker's edits with a read of your own, not its report.** In the same session a worker correctly reported fixing a ticket's Status line as "blocked: file does not exist" — it was right (the file was on a different branch), and a less careful agent would have "fixed" it by inventing the file. Cross-checking `git status` plus `show_file` on the committed blob caught both the real work and the missing work.
+
+## 2026-11-15 — **10. `Worker spawn` in process mode can hard-fail with `Wor...
+
+**10. `Worker spawn` in process mode can hard-fail with `WorkerQueryTimeout` AFTER the worker has already done the work.** Observed: a 480 s spawn returned `WorkerQueryTimeout: query ... got no reply within 540.0s`, and `Worker check` then showed `status: ready, alive: false`. But `git status` in the target worktree showed both files already edited. **The report was lost, the edits were not.** Consequences: (a) never retry the same spawn blindly on this error — you will get duplicate edits stacked on top of the first attempt; (b) always reconcile by inspecting the artifacts (`git status` + `git diff`) before deciding what happened; (c) therefore, prefer to give a mutating worker task a *checkpoint the agent can verify* (exact files, exact intended hunks) rather than a narrative deliverable. A second spawn of the same task hit the same ~540 s wall (elapsed 536.8 s) even with `timeout_seconds: null` (effective 600) — so the wall is upstream of the worker's own timeout setting.
+
+**11. You cannot verify a full pytest run from inside a worker: the container runner caps one call at ~360 s and background processes do not survive between calls.** The whole suite here takes >10 minutes (measured: 53 % at 360.8 s, progress still advancing, so it is slow, not hung), dominated by WebSocket / security-prompt integration tests that dump large payloads and block on socket reads. The only workable pattern is targeted subsets (`pytest -q <specific files>`, `-k` filters) plus `python -m py_compile` for a syntax gate. Any earlier "full suite in 6.3 s" figure must have been a narrower file selection — do not repeat it as if it were the whole suite.
+
+## 2026-11-15 — FRONTEND SILENT-GATE PATTERN (found on the worker-panel-blan...
+
+FRONTEND SILENT-GATE PATTERN (found on the worker-panel-blank hunt, dev 4dc40618): a chain where every hop logs can still lose the payload at the ONE hop that does not log. Here: bridge envelope `{type:'worker:<evt>', worker_name, instance_id, instance_label, timestamp, data}` always stamps a numeric instance_id; the panel's own filter (WorkerOutputPanel.jsx:282) correctly requires "both sides present" before comparing instance ids, but the upstream router (components/chat/workerEventRouting.js:29) compares strictly with no guard — so `event.instance_id === panel.instance_id` is `1 === undefined` → false → zero events reach the panel, including worker_spawned/worker_status, which is why the status dot stays "Idle". Diagnostic lesson: when two layers implement the same matching rule with different leniency, the stricter layer wins and the failure is attributed to the layer that logs. Always compare duplicated predicates across layers, not within one layer.
+Also: a UI symptom described in prose by a human ("it shows Idle Worker") may not be a symptom at all — there is no such string; STATUS_DOT.ready.label is literally 'Idle', the normal healthy label. Grep for the literal before theorising about it. The real "nothing rendered" surface was `events.length === 0 → .worker-output-empty`.
+
+## 2026-11-15 — LIVE TOOLING PROBLEMS (for the engineer, session Gen65). (1)...
+
+LIVE TOOLING PROBLEMS (for the engineer, session Gen65). (1) Context budget: one Read-only forensics worker report on a 4-layer trace consumed ~77k worker tokens for 39 tool calls / 148 s and its report alone pushed my context past the 86k critical threshold immediately after a fresh summarise — deep code-archaeology tasks summarise me out within one spawn. A cheaper pattern is needed: have the worker emit findings as file:line + one-line verdict only, or write the long report to a working_doc and return a summary + pointer. (2) Two context resets were reported by the worker mid-task on a 148 s spawn, i.e. it summarised itself twice inside one task, so late deliverables in a numbered list are at real risk; I ordered deliverables so the crux was #1 and it survived. (3) `git_read search`-equivalent is absent: I cannot grep, so every code question costs a worker spawn — a read-only grep/glob tool for the agent would remove ~80% of my spawns. (4) `merge_base` ignores `commit1`/`commit2` and needs `a`/`b`+`is_ancestor`, `worktree_add` needs `path` not `paths` and drops `branch` (detached HEAD), `branch_create` ignores `commit1` — three silent parameter-name mismatches in one tool family, each costing a round trip. (5) Spawning with timeout_seconds=480 was honoured (timeout_clamped:false) and the worker finished at 148 s — generous timeouts are safe and cost nothing; that part works well.
+
+## 2026-11-15 — PROCESS FAILURE (mine, Gen65): before writing a NEW test fil...
+
+PROCESS FAILURE (mine, Gen65): before writing a NEW test file for a module, search for an EXISTING suite covering it. I had a worker add `src/components/chat/__tests__/workerEventRouting.test.js` when a comprehensive suite already lived at `src/components/__tests__/workerEventRouting.test.jsx`. The duplicate had the relaxed expectation baked in and the original had the strict one, so my "green" claim was meaningless — CI caught it, I didn't. Two suites for one module = the same drift that causes duplicated predicates to diverge. Rule: one suite per module, extend it, and if a behaviour change contradicts an existing assertion, treat that assertion as a specification to argue with, not a thing to edit until green.
+Related design rule learned the same day: fix a broken invariant at its SOURCE, not by widening the contract downstream. Here the panel identity was repaired at creation (backfill `?? 1`); the tempting alternative (make the router forgiving) would have let an identity-carrying event reach a panel that cannot be identified — i.e. silently mixing two worker instances into one stream. Widening a fail-closed check to stop a symptom usually trades a visible bug for an invisible one.
+FRONTEND TEST INFRA FACTS worth not rediscovering: (1) per-worktree `node_modules` does not exist, but a symlink works — `cd .worktrees/<wt>/web_ui/frontend && ln -s ../../../../web_ui/frontend/node_modules node_modules`; note `web_ui/frontend/.gitignore` has `node_modules/` (trailing slash) which does NOT ignore a symlink of that name, so remove the link after running or it shows up as untracked. (2) vitest in the container fails with `ENOENT: mkdir '/var/tmp/gobo…/web'` unless `TMPDIR=/tmp` is set — otherwise you get a bogus "Test Files 1 / Tests no tests / Errors 1". (3) There is no file-unlink tool for the agent/worker: FileEditor 'delete' wants line_numbers and only empties the file; deletion had to go through ContainerExecTool `rm` (host_bash is banned).
+
+## 2026-11-15 — ## 2026-02 — I was wrong about "no Zustand", and a §live-too...
+
+## 2026-02 — I was wrong about "no Zustand", and a §live-tooling note
+
+**My error (record it, it matters):** for three sessions I asserted "there is no Zustand store in this app; it's plain React useState". That was **half wrong**. Zustand IS a dependency (`web_ui/frontend/package.json:24` `"zustand": "^4.5.0"`) and there are **three live stores**: `src/sessionTabsStore.js:58`, `src/store/workspaceStore.js:245`, and `src/store/useStore.js:153` (slices: sessions, sessionModes, tabRunningStates, sessionConfigs, sessionMessages, sessionStates, sessionErrors, sessionDrafts, addendumEntries, runtimeNotices). What is true is the narrower claim I should have made: **`workerEvents` is not in any store** — it is `useState` in `App.jsx:193` (`{[sessionId]: [event,…]}`), read via `routeEventsToPanels()` in a `useMemo` at `App.jsx:232`. So "the Zustand slice for workerEvents is not being updated" was unfounded — there is no such slice. Lesson: when I refute a premise, refute the *specific* claim ("no workerEvents slice, no addWorkerEvent mutation anywhere") rather than the general one ("no state library") — the general claim was falsifiable in one grep of package.json and I never ran it.
+- Second false-premise check that DID pay: the same pass found `worker:worker_partial_result` missing from SessionTab's allow-list switch, i.e. "grep for the function the other engineer *assumed* exists" (`addWorkerEvent` → 0 hits) is what proved the premise wrong, and "diff the emitted type strings against the consumed case labels" is what found the real bug. Both are cheap, mechanical, and should be step 1 of any "the UI shows nothing" diagnosis.
+
+**Topology fact worth reusing:** there are **two** WebSocket connections. `App.jsx:284-322` `connectHub` = "Hub WebSocket (sessions list only)", only reacts to `msg.type === 'open_sessions'`; it never inspects `worker:*`. Worker events arrive on the **per-tab** socket: `SessionTab.jsx:352` `connectSessionWs` → `:371 new WebSocket(wsUrl())` → `:379-386 handleEvent(msg)` → switch → `onWorkerEventRef.current(...)` (ref set at `:345-346`, wired from `App.jsx:1440 onWorkerEvent={handleWorkerEvent}`). Any future "events don't arrive" report must say *which* socket is being inspected.
+
+**Live tooling problems for the engineer (this pass):**
+1. **No git binary inside worker containers.** `meta.tool_issues`: "git is not installed in the container image". Workaround discovered: the `git_read`/`git_write` tools carry their own containerized git backend, so real `git diff` still works from inside a worker — but `git diff --stat` has no tool flag, so stat lines have to be hand-assembled. Please add `--stat` (and `--name-only`) to `git_read diff`, or install git in the image.
+2. **No ripgrep in the image.** Workers fall back to `grep -rn`, which works but is slower and noisier. There is still **no grep/search tool for the agent itself** — every code question costs a full worker spawn (98 s and 166 s this pass for two questions that a `rg` would have answered in 2 s).
+3. **`FileSearchTool` rejects absolute `/workspace/...` paths** (it roots at the host path), while `FileEditor`/`ApplyEdits` accept workspace-relative `.worktrees/<name>/...`. Inconsistent path convention across the file tools.
+4. **`git_write worktree_add` ignores its `branch` argument as a "create this branch" instruction** — passing `branch` + `base=dev` produced `worktree add <path> dev` and failed with "'dev' is already used by worktree". The working recipe is: `branch_create` (which correctly bases on the main worktree's HEAD and reports the base hash) → then `worktree_add` with `base` = the existing branch name.
+5. Confirmed again: a clean worktree's `git status` returns **empty output** rather than a "clean" line, which reads like a tool failure.
+
+## 2026-11-15 — ## Live tooling problems (Gen65, worker-isolation investigat...
+
+## Live tooling problems (Gen65, worker-isolation investigation)
+
+1. **I briefed the worker with the WRONG workspace root.** I told two workers "your workspace root IS the worktree at `.worktrees/<name>`". Both times the worker's root was actually the **main checkout**, with the worktree nested *inside* it at `.worktrees/<name>`. Worker #1 worked it out and reported it; worker #2 got an explicit warning and worked it out immediately. Correct phrasing: "your workspace root is the main checkout; the tree to edit is the nested git worktree `.worktrees/<name>`, so prefix all paths with it."
+2. **Worker substrate died once** mid-session: `WorkerRuntimeLost: ... failed in the runtime: 'error'`. After that, `action='query'` answered "Worker 'default' is not running" while `Worker(action='inspect')` reported `child_pid 2567521, child_alive: true` and `running_workers` said `status: ready, alive: false` — three tools, three different answers about the same worker. `Worker(action='spawn', force=True)` recovered instantly. `inspect`/`running_workers`/`query` disagreeing is worth fixing in the substrate.
+3. **`spawn` rejects `query=` plus `context['query']`** unless byte-identical ("Conflicting tasks"). Reasonable, but the error arrives after you have already written the whole brief; putting the task in exactly one place is the only safe habit.
+4. **Workers have no `git` binary and no `ripgrep`.** `rg` and `git` both fail. Every brief must say "use plain `grep -rn`; I handle commits."
+5. **`FileEditor` / `ApplyEdits` / `FileSearchTool` reject absolute `/workspace/...` paths** with a path-violation security error; only workspace-relative paths work. Combined with (1) this is a real trap.
+6. **`worker_thread.py.bak.<epoch>` leftovers** appear in worktrees (gitignored, so invisible in `git status`). Workers evidently still write backup files when editing. Harmless but accumulates; check for them before declaring a tree clean.
+7. **Soft-timeout budget reality**: 300 s spawns that genuinely need ~190–245 s work fine, but a 300 s spawn whose `elapsed_seconds` lands within ~5 s of the cap is a soft timeout and its "final" content must be distrusted. Both spawns here finished comfortably inside (188 s, 244 s) with `timeout_triggered: false`.
+8. **Good pattern — proving a red state without touching source**: a throwaway test file that `delattr`s the injected attribute in memory and restores it in a `finally`, importing `_make_processor` from the real test module. Zero source edits, worktree stays clean, and the pre-fix `AttributeError` reproduces verbatim for all 6 parametrized event types. Reusable for any "I added a no-op method to satisfy a contract" fix.
+
+
+## 2026-11-16 — ## Gen66 — live tooling problems (reported, not worked aroun...
+
+## Gen66 — live tooling problems (reported, not worked around silently)
+
+1. **`git_write worktree_add(branch=X)` does not create branch X.** It creates a worktree at the base in **detached HEAD**, despite the parameter being called `branch`. Recovery: `branch_create(branch=X, base=<sha>)` from the **main checkout** (not the worktree), then `checkout(branch=X)` inside the worktree.
+2. **`branch_create` is refused in a detached-HEAD worktree** with `refusing to commit: the workspace HEAD is detached (not on a branch)` — the commit guard's message and policy applied to the one operation that repairs the condition. `checkout` is not blocked in the same state, so the guard is over-broad. Net effect: an agent that follows the error's own advice loops.
+3. **`.venv` is unusable inside worker containers.** `.venv/bin/python` is 3.13 while `site-packages` is `lib/python3.12` (`No module named pytest`), and `.venv/bin/pytest`'s shebang points at a non-existent `/usr/bin/python3.12`. Use system `python3` (3.12.15, pytest 9.2.0). Briefing workers to "use the venv" wastes a cycle.
+4. **`git_read ls_tree(recursive=true, pattern=...)` ignores the pattern** and dumps the whole tree (~10k tokens, truncated). Never use it for filename lookup in this repo.
+5. **`git_read log(commit=X)` ignores `commit`** and logs HEAD instead (asking for `b60c44d3` returned `dev@b800cb48`'s log). Use `branch=origin/dev`.
+6. **`Worker(action='query')` fails right after a completed spawn**: `Worker 'default' is not running`. The worker exits after `status: final`, so its context is gone — a follow-up must be a fresh `spawn(force=True)` carrying the full brief again.
+7. **A completed spawn can return `status: null`, `confidence: null`** while having full, correct `content` (observed on a 77s job). Do not treat null status as failure; read `content` and `telemetry`.
+8. **Provider streaming `APIConnectionError` aborted a turn mid-flight**; no state was lost (tool results stayed in history) but the user had to nudge with "go on".
+9. Container has no `git`, no `ripgrep`; `FileEditor`/`ApplyEdits` reject absolute `/workspace/...` paths; workspace root is the MAIN checkout so worktree paths need the `.worktrees/<name>/` prefix.
+10. **Verify before you build.** Four remote branches (`fix/process-pause-deadlock`, `fix/worker-pause-registry-race`, `fix/gen67-worker-runtime-default-process`, `fix/runtime-default-truth`) were already merged into dev; a whole night of log analysis described a build older than the branch. `merge_base(is_ancestor)` is cheap and should run before any fix is written. Corollary: a zero grep count is only evidence if the handler can actually emit at the configured level — check the logger level first.
+
+## 2026-11-16 — ## Production logging threshold is WARNING — any DEBUG/INFO ...
+
+## Production logging threshold is WARNING — any DEBUG/INFO diagnostic is invisible (verified at dev ee1ac54c)
+
+Anything added to `logs/backend_startup.log` at DEBUG or INFO on a `tools.*` logger is **dropped before it reaches the file**. Verified by count on a live 4145-line post-restart log plus a container reproduction of the spawn-child logging behaviour:
+
+- **Parent/backend process:** `tools.workspace.worker` is `logging.getLogger("tools.workspace.worker")` (`worker_thread.py:834`) with **no `setLevel` anywhere** → NOTSET → inherits **root = WARNING**. The repo installs **no root handler at all** (zero `basicConfig`/`dictConfig` in `agent/ tools/ web_ui/ thoughtmachine/ session/ infra/`); the handler printing `LEVEL:name:msg` comes from the launcher/dependency. Handler installs that do exist: `agent/logging/console.py:61-64` (on `thoughtmachine` only, `TM_LOG_CONSOLE_LEVEL` else WARNING), `agent/logging/lifecycle.py:70-76` (`thoughtmachine.lifecycle` at INFO), `session/history_provider.py:34-44` (env-gated).
+- **Worker child process:** configures **no logging whatsoever** (`worker_runtime_main.py` / `worker_runtime_process.py` / `worker_runtime.py` only `getLogger`). A `spawn` child inherits no handlers and no level → only `logging.lastResort` prints, and it prints **WARNING+ with a bare message** (no `LEVEL:name:` prefix). That is exactly why the child's `Worker worktree ... skipped` lines appear unprefixed in the log.
+- **Log evidence:** 39 `^WARNING:<logger>:` records from stdlib-style loggers, **0 INFO and 0 DEBUG records from any `tools.*` logger**, while many `logger.debug(...)` sites sit on certainly-executed paths. The 3412 `INFO` lines are all uvicorn's own format; an `INFO:` prefix in the file does **not** mean my INFO records would print.
+- **Consequence:** to be observable in production a diagnostic **must** be `logger.warning`. Precedent and rationale already documented in-repo at `infra/container_manager.py:5859-5866` ("WARNING is used deliberately: an INFO line would be dropped ... WARNING reaches stderr, which start_thoughtmachine.sh tees into logs/backend_startup.log"). `start_thoughtmachine.sh:184` does `( exec ... ) > >(tee "$BACKEND_LOG") 2>&1` — stderr is the channel that survives.
+- **Self-correction:** the DEBUG line I shipped in PR #391 for the join guard is **invisible in production**. Next time: WARNING, one-shot.
+- **Corollary that made this diagnosable:** the one-shot `worker runtime mode resolved to 'process'` WARNING (`worker_runtime.py:159`) is the load-bearing proof of which build is running, precisely because it is WARNING and once-per-process. Design every production diagnostic that way: **WARNING + one-shot + greppable noun phrase**.
+
+## 2026-11-16 — ## `.gitignore` catch-alls silently swallow new docs (bit me...
+
+## `.gitignore` catch-alls silently swallow new docs (bit me on `docs/`)
+
+`docs/` has a `docs/*` catch-all with per-file negations; `.thoughtmachine/knowledge/project/` is ignored wholesale with ~15 explicit `!` re-inclusions. Consequence: a **newly created** doc in either place is untracked-AND-ignored, so it never appears in `git status`, never gets committed, and vanishes on the next clone — while any pointer to it (index entry, cross-ref) survives and turns into a broken reference. This is exactly the mechanism that made `INFRA_ONBOARDING.md` misleading (17 index entries pointing at files not on disk).
+
+Detection: after creating any file under `docs/` or `.thoughtmachine/knowledge/`, confirm it is *visible to git*, not merely present on disk:
+
+```
+git check-ignore -v docs/NEWFILE.md     # prints a rule => it is ignored
+```
+
+Git-compatible check without the git binary (worker containers have no git): `pathspec` 1.1.1 is installed — `GitIgnoreSpec.from_lines(...)` + `.match_file(relpath)`. Verified this reproduces git's answer for this repo.
+
+Fix: add `!docs/NEWFILE.md` (and `!docs/` if the parent dir itself got pruned). Commit the negation in the SAME commit as the doc, otherwise the doc is lost while the commit looks complete.
+
+Tooling gap worth reporting: neither `git_read status` nor `git_write commit` warns that a file the agent just wrote is ignored-but-uncommitted — the commit simply succeeds with a smaller file list. A "wrote N files, committed <N files" mismatch check would have caught this instantly.
