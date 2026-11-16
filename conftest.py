@@ -51,7 +51,9 @@ pinned by
 """
 
 import importlib.machinery
+import gc
 import sys
+import types
 
 import pytest
 
@@ -157,18 +159,23 @@ _install_finder()
 
 @pytest.fixture(scope="session", autouse=True)
 def _trust_the_in_process_asgi_harness():
-    """Enable ``auth_boundary.TRUST_TEST_HARNESS`` for the whole session.
+    """Establish the CLOSED default for the whole session.
 
-    Session-scoped and autouse: the allowance is process-wide, so the fixture
-    that grants it has to outlive every module, and no test should have to
-    remember to ask for it.  The value is recorded in ``_suite_trust`` (which
-    the import hook re-applies to any re-imported ``auth_boundary``), and the
-    previous value is restored on the way out, which keeps the flip a property
-    of "a test session was running" rather than of "this process".
+    Session-scoped and autouse: the fixture that establishes the default has
+    to outlive every module, and no test should have to remember to opt out.
+    The value is recorded in ``_suite_trust`` (which the import hook
+    re-applies to any re-imported ``auth_boundary``), and the previous value
+    is restored on the way out, which keeps the closed default a property of
+    "a test session was running" rather than of "this process".  A test that
+    needs the allowance asks for it with ``@pytest.mark.trust_harness``.
     """
     previous = auth_boundary.TRUST_TEST_HARNESS
-    set_suite_trust_value(True)
-    auth_boundary.enable_test_harness_trust(True)
+    # OPT-IN per test now: a test asks for the allowance with
+    # @pytest.mark.trust_harness (the function-scoped marker fixture at the
+    # foot of this file).  The session no longer grants it to everything;
+    # the capture/restore of `previous` below is unchanged.
+    set_suite_trust_value(False)
+    auth_boundary.enable_test_harness_trust(False)
     try:
         yield
     finally:
@@ -178,7 +185,7 @@ def _trust_the_in_process_asgi_harness():
 
 # ── the opt-in marker: a test that asks for the allowance by name ─────────────
 #
-# The session fixture above grants the allowance to every test in the run.  A
+# The session fixture above establishes the closed default and grants nothing.  A
 # test that would rather state the dependency itself -- so the allowance can
 # later stop being session-wide without every such test being rewritten -- says
 # so with ``@pytest.mark.trust_harness``.  The autouse fixture below is the
@@ -219,12 +226,38 @@ def _live_boundary():
 
     Deliberately not the module-level ``auth_boundary`` name above: that binding
     was frozen when this file was imported, and the suite's ``sys.modules`` purge
-    replaces the module object, so writing to it arms an object no test resolves.
+    replaces the module object, so arming it alone arms an object no test resolves.
     """
     live = sys.modules.get(_TARGET_MODULE)
     if live is None:
         live = importlib.import_module(_TARGET_MODULE)
     return live
+
+
+def _boundary_modules():
+    """Every ``auth_boundary`` module object this process still holds.
+
+    Not just what ``sys.modules`` answers with: a purge drops the *entry*,
+    not the object, and whatever was imported through the old object keeps
+    it alive -- the app under test may be driving exactly that object's
+    functions.  Arming only the module the next import would return leaves
+    that app disarmed, so a marked test that runs after any purge gets the
+    401 it never asked for.  Module objects are tracked by the cycle
+    collector, so the heap is the authoritative list of every copy that can
+    still answer a request.
+    """
+    found = []
+    for candidate in [_live_boundary(), auth_boundary, *gc.get_objects()]:
+        if not isinstance(candidate, types.ModuleType):
+            continue
+        if getattr(candidate, "__name__", None) != _TARGET_MODULE:
+            continue
+        if not hasattr(candidate, "enable_test_harness_trust"):
+            continue
+        if any(candidate is seen for seen in found):
+            continue
+        found.append(candidate)
+    return found
 
 
 @pytest.fixture(autouse=True)
@@ -236,18 +269,23 @@ def _harness_trust_for_marked_tests(request):
 
     ``autouse`` so a marked test need not name it, and function-scoped so it is
     set up *after* the session-scoped fixture above: what it remembers is the
-    value in force, not the shipped default.  Both ends re-resolve the live
-    module, because the test body may purge ``web_ui.backend`` and get a
-    different object back.
+    value in force, not the shipped default.  Both ends arm every copy, not
+    just the module the next import would return, because the app a test drives
+    may be driving a copy a purge left behind.
     """
     if request.node.get_closest_marker("trust_harness") is None:
         yield
         return
 
-    boundary = _live_boundary()
-    previous = boundary.TRUST_TEST_HARNESS
+    modules = _boundary_modules()
+    previous = [(module, module.TRUST_TEST_HARNESS) for module in modules]
+    previous_suite = suite_trust_value()
     try:
-        boundary.enable_test_harness_trust(True)
+        set_suite_trust_value(True)
+        for module in modules:
+            module.enable_test_harness_trust(True)
         yield
     finally:
-        _live_boundary().enable_test_harness_trust(previous)
+        for module, armed in previous:
+            module.enable_test_harness_trust(armed)
+        set_suite_trust_value(previous_suite)
