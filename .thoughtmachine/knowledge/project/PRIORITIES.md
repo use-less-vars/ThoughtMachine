@@ -442,3 +442,16 @@ different file, different name. Never rename one to the other.
 
 - **C35: Prove the Host Port is sealed.** **Open.** Create a CI test (AST scan or grep) that proves subprocess and docker invocations only occur inside the approved wrappers. No tool may bypass the kill switch.
 - **C36: Verify Worker Trust Boundary.** **Open.** Write a test proving that a worker is bound to its session workspace_id and cannot execute tools using permissions of a different session if borrowed.
+
+- **C74** — `tools/mcp_client.py` bypasses the host-port chokepoint. (~11 other unadjudicated `import subprocess` sites).
+- **C75** — The AST no-tool-wrapping guard is parked, not enforced. 3 of its 4 own tests fail on an untouched checkout.
+- **C76** — `TRUST_TEST_HARNESS` is ON for the entire suite. Permission tests run against an open gate.
+- **C77** — `web_ui/backend/tests/test_bridge_dedup.py` poisons `sys.modules` at collection, causing real-bridge tests to skip.
+
+- **C74** — `tools/mcp_client.py` bypasses the host-port chokepoint.
+- **C75** — The AST no-tool-wrapping guard is parked, not enforced.
+- **C76** — `TRUST_TEST_HARNESS` is ON for the entire suite.
+- **C77** — `test_bridge_dedup.py` poisons `sys.modules` at collection.
+- **C78** — Preflight diagnostics truth: two port probes, FAIL weight on advisory output.
+- **C79** — Undeclared load-bearing config key (`git_allow_worktree_commits`) and worker worktree bootstrap failure (crash loop).
+- **C80** — `terminate_all` skips subprocesses with no pid during shutdown.
