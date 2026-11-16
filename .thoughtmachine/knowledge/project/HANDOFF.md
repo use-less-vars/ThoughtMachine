@@ -20,12 +20,12 @@ a3fc5ef1 fix merged tree: restore the docs negation the resolution ate, and pin 
 2. `docs/CONTROL_PLANE.md` -- the pause/stop/timeout contract. Doctrine. - sha256:3ecd6a73af659c1daf21c541ec0a5f1edd3dd2c1187028bbe2e7f6ae5402d0e1
 3. `.thoughtmachine/knowledge/project/MANDATORY_STOP.md` -- the read-on-entry rules; none of them are optional. - sha256:ca47ffe5df0e3b242bfd22543794ef4e8b03ec78b169fc9fb24851c08b76e9d1
 4. `.thoughtmachine/knowledge/project/architecture_invariants.md` -- the invariants a design must not re-derive. - sha256:d7364ff4686a59dc118d3cb9dbde7a516d64c3e3bf80853756e9e2b713da9645
-5. `docs/ARCHITECTURE_MACHINE_MODEL.md` -- what runs where, and what stops it. - sha256:6394990be5de08e97c77fcbff627ca03844bd0583550898dcdaf180e6e9e1955
-6. `.thoughtmachine/knowledge/project/machine_history_and_vision.md` -- the incidents behind the rules, and what they are for. - sha256:b444c581ca3648f9b6ddd985c6aa5e486e767abd07651edb07953b5df2bd6032
+5. `docs/ARCHITECTURE_MACHINE_MODEL.md` -- what runs where, and what stops it. - sha256:042d4f47e3a5187e1cae3fb4ae73164ac27c07dddf761ff0ef0c7a1cb8f0acf4
+6. `.thoughtmachine/knowledge/project/machine_history_and_vision.md` -- the incidents behind the rules, and what they are for. - sha256:fd0f890bf88e0dc4e70e9202e647013ffa959a6e1a216f1b33af9584e1fa6799
 7. `.thoughtmachine/knowledge/project/vision_ledger.md` -- the five standing commitments (V1-V5). - sha256:5a01a13c684e94f5bc0e762807b8183d9e06f283b20caf3389aec662149ff930
 8. `.thoughtmachine/knowledge/project/ORCHESTRATOR_GUIDE.md` -- how to run workers without believing the brief. - sha256:dfb01550569ee64826e30b5e54cb97b8916db6803323d2a3cbea8ae0807fec40
 9. `.thoughtmachine/knowledge/project/CI_PROCESS.md` -- what CI actually runs, and what this repo cannot see. - sha256:85a02df0358a432461bf3041c863786e40c745d37ab600d264da0c2798a3120c
-10. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:cb80e482c800fb8506a0e3abe768ab0c50fb215c1633209caabaf5441d53c9dc
+10. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:fa126715c8646a50ba541e0e8791fe8d114d550a2fd989a788ca2eb493795969
 
 ## First task (from the live queue)
 
