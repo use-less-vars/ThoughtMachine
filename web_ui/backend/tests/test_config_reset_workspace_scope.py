@@ -132,6 +132,7 @@ def _assert_config_file_reset(target: Path):
 class TestResetConfigCachedBridgeScope:
     """The cached-bridge update is workspace-scoped (PR #157 discipline)."""
 
+    @pytest.mark.trust_harness
     def test_same_workspace_bridge_is_still_updated(self, monkeypatch, isolated_config_file):
         """Control: a bridge cached for the requested workspace is reconfigured."""
         bridge = _cache_bridge(monkeypatch, "sess-same", "ws-a")
@@ -147,6 +148,7 @@ class TestResetConfigCachedBridgeScope:
         )
         _assert_config_file_reset(isolated_config_file)
 
+    @pytest.mark.trust_harness
     def test_bridge_of_another_workspace_is_not_updated(self, monkeypatch, isolated_config_file):
         """A ws-a bridge must not be reconfigured by a ws-b reset request."""
         bridge = _cache_bridge(monkeypatch, "sess-other", "ws-a")
@@ -163,6 +165,7 @@ class TestResetConfigCachedBridgeScope:
         assert isinstance(response.json(), dict), "the factory config must still be returned"
         _assert_config_file_reset(isolated_config_file)
 
+    @pytest.mark.trust_harness
     def test_sessionaless_cached_bridge_is_not_updated(self, monkeypatch, isolated_config_file):
         """A cached entry holding no session is a miss, not a target."""
         bridge = _cache_bridge(monkeypatch, "sess-empty", "ws-a", has_session=False)
