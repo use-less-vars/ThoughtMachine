@@ -1017,3 +1017,42 @@ Git-compatible check without the git binary (worker containers have no git): `pa
 Fix: add `!docs/NEWFILE.md` (and `!docs/` if the parent dir itself got pruned). Commit the negation in the SAME commit as the doc, otherwise the doc is lost while the commit looks complete.
 
 Tooling gap worth reporting: neither `git_read status` nor `git_write commit` warns that a file the agent just wrote is ignored-but-uncommitted — the commit simply succeeds with a smaller file list. A "wrote N files, committed <N files" mismatch check would have caught this instantly.
+
+## 2026-11-16 — ## C76 measurement (spawn 1) — suite-wide trust harness: sma...
+
+## C76 measurement (spawn 1) — suite-wide trust harness: small blast radius in auth_boundary, concentrated in tests/
+Worktree `.worktrees/c76-trust-harness` @ `544bd407`. Write-up: `measurement.md` (298 lines) + `## Stage 1–4` sections.
+- **S1 baseline** `web_ui/backend/tests/test_auth_boundary.py` (⚠️ NOT `tests/test_auth_boundary.py` — that path does not exist) → 66 tests green.
+- **S2 flag off suite-wide** → **1 failure (A:0, B:1)**: `test_a_freshly_imported_boundary_carries_the_suite_trust_value` — a harness *self*-test (asserts `fresh_boundary.TRUST_TEST_HARNESS is True`, 200 for a fresh harness re-import); legitimately needs the harness.
+- **S3** `-k "auth or websocket or harness or trust or permission"` over `tests/` → 1046 passed, 5 skipped, 6329 deselected, **42 failed (A:6, B:36)**; 52–91s per run (cheap — ran twice, nowhere near the wall).
+- All 42 share one mechanism: the closed gate refusing the `TestClient` peer `testclient` → **26× HTTP 401 `{"error":"unauthorized"}`** (16 at `tests/integration/harness.py:333`, 1 at `:373`, plus `test_ui_permission_persistence_flow.py:70`, `test_container_record_user_action_routes.py:399`, `test_permission_refresh_ws_clobber_guard.py:108`, `test_permission_sidecar_clobber_guard.py:82`/`:202`, `test_seeding_path_invariants.py:302`, `test_safe_defaults_single_owner.py:146`, `test_workspace_containers_view.py:389`) and **16× `WebSocketDisconnect`** at `starlette/testclient.py:143`.
+- **A-class = 6**: 5× `tests/integration/test_bind_workspace_authority.py` (`:156,:201,:238,:362,:405` — "would adopt B is refused", "cannot re-scope a handshake-bound socket", "refusal leaves `bridge._workspace_path` alone") + `tests/test_container_record_user_action_routes.py::test_permission_denied_403_audited` (`:391`, needs 403/no-permission distinguishable from 401/no-credential).
+- **B-class = 37** (1+36) = the explicit opt-in list for spawn 2.
+- **Restore: MATCH** — sha256 `a8c194c0b2c72e0aff19333f7f8d9a2c07528928f126004b30dbb7f72e84a606` pre-edit and post-restore; `git status --short` = only `?? measurement.md`; no `.bak`/`.orig`/`.pytest_cache` (every run used `-p no:cacheprovider`).
+- **Design conclusion**: the audit's "default off, require opt-in" is cheaper than feared for `test_auth_boundary.py` (1 test) and is entirely mechanical in `tests/` (36 of 42 are incidental setup).
+
+### Problems hit live (infra log)
+1. **Brief path drift**: the operator-authored brief pinned `tests/test_auth_boundary.py:161-167`; the file is `web_ui/backend/tests/test_auth_boundary.py`. It also made Stage 3's `--ignore=tests/test_auth_boundary.py` an **inert no-op** — a silent false assertion about coverage (harmless here only because that file is outside `tests/`). Briefs that pin file paths must be verified on the worker's first read, and deviations reported.
+2. **Ephemeral code-runner containers**: pytest output written to `/tmp` in one tool call was **gone** when a later call tried to append it → the first Stage 1 block in `measurement.md` came out empty and needed a correction note. Capture every result **inside the same tool call** as the run.
+3. `.venv/bin/python` **executes** inside the container but has `No module named pytest` → always fall back to system `python3` (3.12.15 / pytest 9.2.0).
+4. **No `git` in worker containers** → a brief instructing `git checkout -- <file>` to restore is not executable by the worker. Working substitute: record pre-edit `sha256sum` + the verbatim original lines at Stage 1, reverse edit, re-hash, compare. Proven clean this spawn.
+
+## 2026-11-16 — **Gen 68 — WorkingDocument `create` is silently lossy. Use `...
+
+**Gen 68 — WorkingDocument `create` is silently lossy. Use `append`.**
+`WorkingDocument(action="create", doc_id="my-spec", title=..., sections=[...], content=<long spec>)` writes a file whose sections are ALL EMPTY STRINGS and whose filename is an auto-generated id (`4a3ec61fa7e5.json`), not the `doc_id` you passed. Two separate defects in one call: `doc_id` ignored, `content` ignored. It reports success. Consequence: I briefed a worker to `cat` a filename that never existed; the worker spent a full spawn on `find / -xdev` (0 hits) and aborted with 0 edits — the second consecutive abort on the same task.
+Remedy that works: `create` (sections only, expect the auto id from the response), then `append(doc_id=<returned id>, section=..., content=...)` — append is honoured. Read the returned `doc_id`/`path` and use THAT, never the name you asked for. Belt-and-braces: also inline the whole spec in the spawn `context.query`, and make the worker's first action a heredoc write of the spec into its own worktree, re-read after every couple of edits. That third mechanism is the only one that survives worker-side compaction.
+
+**Gen 68 — never re-inject a citation from a previous document; source quotes from disk.**
+Sweeping `docs/CONTRACTS.md`'s stale "required check cannot be determined" section, I supplied two KB quotes copied out of the OLD section. They were paraphrases (single quotes for double, `` `--required` `` for bare, and the leading sentences dropped entirely). The worker inserted them faithfully, so the sweep briefly *created* new rot — attributing words to two KB files that those files do not contain. One dropped prefix (`CAUTION: this is about how the CLI reports merge eligibility, NOT about Edge 8`) also inverted the analysis: the two notes were about different objects and did not contradict.
+Rule: a doc-rot sweep must quote byte-exactly, and the instruction to the worker must be "read line N and paste its bytes", never "insert this sentence". Give the worker a verification step that diffs the quote against the file and reports MATCH/MISMATCH; an honest worker will then flag your paraphrase instead of laundering it.
+
+**Gen 68 — deleting a stale section deletes its evidence; retire the conclusion, keep the proof.**
+The first pass replaced a 26-line OPEN ITEM wholesale. The conclusion was indeed false and should die, but the section also held two quoted KB notes and a count-discrepancy analysis that cannot be reconstructed from the checkout. Better edit shape, and the one finally committed: corrected `**RESOLVED (partial):**` paragraph above, `### OPEN ITEM (revised)` below carrying the preserved evidence verbatim. Reviewing the worker's own `git diff` before committing is what caught this — the worker reported it as a "judgment call", not as a loss.
+
+**Gen 68 — the regenerate-a-hashed-doc contract does not need git.**
+`tests/test_onboarding_bundle_contract.py` pins sha256 for 9 bundle members, so editing any of them forces `HANDOFF.md` regeneration. `scripts/gen_handoff.py` looks like it needs git; it does not. The three git facts are literal constants in the test file (`PINNED_DEV_SHA`, `PINNED_DEV_SUBJECT`, `PINNED_RECENT`), deliberately frozen so `dev` advancing cannot turn the contract red. Pass them as `--dev-sha/--dev-subject/--recent-file` and it needs no git at all — so a container with no `git` binary can still satisfy it. Verify by checking that exactly ONE digest line changed in the regenerated file.
+Gotcha: write the `--recent-file` from a Python literal, not bash `printf '%s\n' "line with 'quotes'"` — bash quote-concatenation strips the inner quotes from `'origin/dev'` and you get a silent content diff (2 failed / 6 passed) that looks like a generator bug.
+
+**Gen 68 — host memory pressure kills pytest with rc=143 and empty output.**
+Four consecutive pytest runs, including a bare `--collect-only`, were SIGTERMed mid-run while `pytest --version` and `python3 -c` worked. Cause was host swap exhaustion (`free -m`: swap 12287/12287 MiB), not the tree. Symptom to recognise: rc=143, no pytest summary line. Retry after pressure eases or raise the runner memory limit; do not conclude the tree is broken and do not report counts from a run that never printed a summary line.
