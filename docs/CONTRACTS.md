@@ -214,3 +214,71 @@ if a named path is not present in the pytest invocation of `.github/workflows/co
 is what stops this ledger from rotting into a list of files that moved or that the gate no longer runs.
 Deliberately, a path mentioned as *non-existent* (see the note under Contract 1) is written without
 backticks, so the parser cannot mistake a negative mention for a citation.
+
+## What CI actually runs — and what this document does not claim
+
+Added by the onboarding documentation pass. Every line below was read off the six workflow files under
+`.github/workflows/` in the working tree — not from a CI run and not from the GitHub API, since no
+`gh` call and no `git fetch` was possible in the environment where this section was written.
+
+Eighteen jobs across six workflows. **Gating** here means one thing only: *a failure fails that
+workflow's run*. That is a statement about the workflow file, not about branch protection — see the
+open item below.
+
+| Workflow file | Jobs | Gating | Advisory (`continue-on-error: true`) |
+| --- | --- | --- | --- |
+| `.github/workflows/contract-gate.yml` — "Contract Gate" | `contract-gate` | 1 of 1 | — |
+| `.github/workflows/cross-platform-smoke.yml` — "Cross-Platform Smoke" | `linux-install`, `windows-smoke`, `macos-launcher` | 3 of 3 | — |
+| `.github/workflows/first_start_ci.yml` — "First-Start CI" | `first-start` | 1 of 1 | — |
+| `.github/workflows/platform-matrix.yml` — "Platform Matrix" | `ubuntu-suite`, `linux-install-smoke`, `linux-e2e-auth`, `windows-import-smoke`, `windows-thin-pytest`, `web-ui-frontend-suite` | 6 of 7 | `web-ui-backend-suite` |
+| `.github/workflows/platform-matrix-macos.yml` — "Platform Matrix (macOS, advisory)" | `macos-suite`, `macos-install-smoke`, `macos-docker-probe` | 0 of 3 | all three |
+| `.github/workflows/python-version-matrix.yml` — "Python Version Matrix" | `unit-tests` (matrix over `python-version`), `installer-contract`, `windows-python-314` | 3 of 3 | — |
+
+What the trigger blocks and job names add to that table:
+
+- `.github/workflows/contract-gate.yml` runs on `pull_request` targeting `dev` and on
+  `workflow_dispatch`. **It has no `push` trigger**, so a direct push to `dev` does not run the
+  contract gate, while it does run the other five workflows. Those five run on `push` to `dev` and
+  `master` and on `pull_request`.
+- `contract-gate` is the only workflow with any relationship to this document, and that relationship is
+  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of thirteen
+  test files** — no glob, no `-m` expression. Two consequences worth knowing: a new test that proves a
+  contract does not join the gate by existing (it must be added to the workflow *and* cited here), and
+  the parity check described in the previous section is itself one of the thirteen, so it fails the
+  gate it is part of. Note the direction: the gate runs thirteen files and this ledger cites nine of
+  them, because the parity check enforces *cited ⊆ run*, not equality. The job carries
+  `timeout-minutes: 10` and separately reports wall time against a stated 120-second budget; that
+  budget is observed, not enforced.
+- `platform-matrix.yml`'s `linux-e2e-auth` job skips itself unless auth-relevant files changed, and the
+  change detection is written to *run* rather than skip when it cannot decide. A skip in that job is
+  therefore not evidence that the auth path was exercised.
+- Two advisory surfaces, both visible in the workflow text: `.github/workflows/platform-matrix-macos.yml`
+  labels itself "(macOS, advisory)" and all three of its jobs carry `continue-on-error: true`;
+  `.github/workflows/platform-matrix.yml`'s `web-ui-backend-suite` job is named "(advisory)" and also
+  carries `continue-on-error: true`. Those four of the eighteen jobs cannot fail their run.
+
+### OPEN ITEM — "required check" cannot be determined from this repository
+
+Nothing in the tree records branch-protection settings, so this document makes **no claim about which
+checks are required**, and no other document should either. Every statement above is about what fails a
+workflow run. The two knowledge-base notes that would settle it contradict each other, and neither is
+checkable from the checkout:
+
+- `.thoughtmachine/knowledge/project/operator_observations.md:314` (2026-10-03, Main Gen 34):
+  "Edge 8 stands; the ruleset + required checks held (13 rows ran, 13 succeeded). Do NOT conflate.
+  Do NOT reopen Edge 8."
+- `.thoughtmachine/knowledge/project/working_agreements.md:127` (pointing at its own 2026-09-28
+  RECOMMENDATION): "Attempted form `gh pr checks <PR> --required --watch` returns 'no required checks
+  reported' in this repo — branch protection has no required checks configured, so every check is
+  advisory and `--required` gates on the empty set."
+
+Both are consistent with what is on disk here: repository settings can change between 2026-09-28 and
+2026-10-03, and a ruleset that makes checks required for merging is not the same object as the checks
+`gh pr checks --required` reports. Nor can either claim be reconstructed from the workflow files — a
+run's check rows are per-job, per-matrix-leg and per-workflow, so the "13 rows" count in the earlier
+note does not have to equal the eighteen jobs enumerated above.
+
+**Needs a human.** Someone with admin access to the repository must query the branch protection and
+ruleset endpoints for `dev` (for example `gh api repos/{owner}/{repo}/branches/dev/protection` and the
+repository rulesets endpoint) and record the answer in this section. Until that happens, treat "is this
+check required?" as unknown.

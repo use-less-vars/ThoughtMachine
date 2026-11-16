@@ -66,28 +66,45 @@ tracked by accident (`architecture_audit_2026-09.md` and
 `development_guides.md`); they stay dirty in every `git status` — never
 stage them.
 
+**Disk check, last pass.** Every path in §1-§3 was checked against the working tree with `ls` and
+`wc -c`; entries that were not there are marked **(absent — not on disk)**. They are marked, not
+deleted, so the index still records what it expects to exist. Two caveats, both from rule 6 above:
+that environment had no `git` binary, so no `git fetch` was possible and an absence means absent from
+*that checkout*, not from `origin/dev`; and an absent entry is a **gap in the tree, not evidence that
+the fact was retracted** — confirm against `origin/dev` before removing an entry or reasoning from it.
+
 **First read `docs/ARCHITECTURE_MACHINE_MODEL.md`** — what runs where, the three
 gates, the three container types. It is the only file that answers the plain
 question, and it is short. Read it before the six below.
+
+**Then read `docs/MACHINE_INVARIANTS_AND_LORE.md`** (31.1 KB) — the invariants that must not be
+broken, the traps that have already caught engineers, and the `path:line` anchor for each claim. It
+is the companion to the architecture doc: read it once here, then grep it by file name whenever a
+claim needs its code site.
 
 Six files. Read them once, in order, before your first task. No byte counts are quoted here — run
 `wc -c <path>` for the current size. A size copied into this index is a fact whose authority is the
 disk, and it goes stale silently.
 
+**Five of the six were absent from the working tree at the last disk check** (see the note above).
+The surviving mandatory read is `status.md`; where the rest are missing the substitute is
+`docs/ARCHITECTURE_MACHINE_MODEL.md` plus `docs/MACHINE_INVARIANTS_AND_LORE.md`. Record an absent
+file as absent — do not reconstruct its contents from memory or from a handoff that cites it.
+
 - **`status.md`** (`knowledge/project/`) — current state, one page.
   **Cadence: updated at strand close, by whoever closes the strand.** If the
   last completed strand isn't reflected in it, that's a bug in the doc.
-- **`machine_model.md`** (`knowledge/project/`) — the six-layer promise
+- **`machine_model.md`** (`knowledge/project/`) **(absent — not on disk)** — the six-layer promise
   table. What the machine promises, and how each promise is verified.
-- **`design_layers_and_truth_ownership.md`** (`knowledge/project/`) —
+- **`design_layers_and_truth_ownership.md`** (`knowledge/project/`) **(absent — not on disk)** —
   Pass 2a. The layer ownership map and cross-layer Invariants 1–6.
-- **`design_permission_facts_ownership.md`** (`knowledge/project/`) —
+- **`design_permission_facts_ownership.md`** (`knowledge/project/`) **(absent — not on disk)** —
   Pass 2c. Ownership of the four permission facts, artifacts A/B/C/D, the D4
   migration sequence, the D6 test-pin register.
-- **`design_permission_bins_shape.md`** (`knowledge/project/`) —
+- **`design_permission_bins_shape.md`** (`knowledge/project/`) **(absent — not on disk)** —
   Pass 2b. Shape A bins (vocabulary × bin), the `deny<ask<allow` meet, and
   T1/T2/T3 dissolve-only-in-steady-state. The destination.
-- **`rulings-permission-facts.md`** (`working_docs/`) — session rulings,
+- **`rulings-permission-facts.md`** (`working_docs/`) **(absent — not on disk)** — session rulings,
   append-only. R-1 (network default) is binding at D4 step 4.
 
 **Plus one slot, filled by the operator each session:**
@@ -103,70 +120,86 @@ disk, and it goes stale silently.
 One line per file: path · size · the question it answers · when to read it.
 Read the matching section, not the whole file.
 
-- **`current_map.md`** (`knowledge/project/`, ~3 KB) · *Where am I?* · Read
+Sizes are quoted from the last disk check (`wc -c`, one decimal) and are the disk's fact, not this
+file's — re-measure before leaning on one. Entries not on that tree are marked
+**(absent — not on disk)** and carry no size.
+
+- **`current_map.md`** (`knowledge/project/`) **(absent — not on disk)** · *Where am I?* · Read
   when disoriented. One page. **Cadence: phase-boundary.** If a thread isn't
   here, it isn't live.
-- **`operator_notes.md`** (`knowledge/project/`) · *Has the operator already said this?* · Grep before asking the operator a question they may have answered. **When picking up a queue item, grep this file for the topic first.**
-- **`operator_observations.md`** (`knowledge/project/`, ~78 KB) · *Is this already filed?* · The live ticket queue that `status.md` files its findings into. Read before filing a new bug; newest-at-bottom.
-- **`container_controls_findings.md`** (`knowledge/project/`, ~128 KB) · *Container controls, collected (pre-brief).* · Read the matching section, not the whole. Pre-dates `architecture_audit_2026-09.md`.
-- **`core.md`** (`knowledge/project/`, ~22 KB) · *Core-feature backlog.* · A workstream queue, not a state doc. Read the section for the strand.
-- **`MANDATORY_STOP.md`** (`knowledge/project/`, <1 KB) · *What must I never
+- **`operator_notes.md`** (`knowledge/project/`) **(absent — not on disk)** · *Has the operator already said this?* · Grep before asking the operator a question they may have answered. **When picking up a queue item, grep this file for the topic first.**
+- **`operator_observations.md`** (`knowledge/project/`, 152.3 KB) · *Is this already filed?* · The live ticket queue that `status.md` files its findings into. Read before filing a new bug; newest-at-bottom.
+- **`container_controls_findings.md`** (`knowledge/project/`) **(absent — not on disk)** · *Container controls, collected (pre-brief).* · Read the matching section, not the whole. Pre-dates `architecture_audit_2026-09.md`.
+- **`core.md`** (`knowledge/project/`) **(absent — not on disk)** · *Core-feature backlog.* · A workstream queue, not a state doc. Read the section for the strand.
+- **`MANDATORY_STOP.md`** (`knowledge/project/`, 4.0 KB) · *What must I never
   do?* · Read before any action that could trip a stop condition.
-- **`open_items_register.md`** (`knowledge/project/`, ~49 KB) · *Is this
+- **`open_items_register.md`** (`knowledge/project/`) **(absent — not on disk)** · *Is this
   already tracked?* · Read before filing a new item. Sections 1–8; read the
   matching section.
-- **`structural_debt_register.md`** (`knowledge/project/`, ~8 KB) · *Is this
+- **`structural_debt_register.md`** (`knowledge/project/`) **(absent — not on disk)** · *Is this
   debt known?* · Read before proposing a refactor.
-- **`working_agreements.md`** (`knowledge/project/`, ~34 KB) · *What are the
+- **`working_agreements.md`** (`knowledge/project/`, 84.0 KB) · *What are the
   standing rules?* · **Caveat: dated history mixed with live rules — grep
   `^## ` for the index, read the live rules, skip the dated entries.**
 - **`design_container_lifecycle_and_reclamation.md`** (`knowledge/project/`,
-  ~26 KB) · *How is a container created, kept, and reclaimed?* · Read when
+  26.7 KB) · *How is a container created, kept, and reclaimed?* · Read when
   working any container strand.
-- **`design_intent_state_divergence_family.md`** (`knowledge/project/`,
-  ~11 KB) · *Pass-1 edge rulings.* · Read when a fact at two sites disagrees.
-- **`system_architecture.md`** (`knowledge/project/`, ~50 KB) · *How is the
+- **`design_intent_state_divergence_family.md`** (`knowledge/project/`) **(absent — not on disk)** · *Pass-1 edge rulings.* · Read when a fact at two sites disagrees.
+- **`system_architecture.md`** (`knowledge/project/`) **(absent — not on disk)** · *How is the
   machine built?* · Read when the layer map (2a) isn't enough. Mixed: read the
   "Reference (evergreen)" section; dated sections are historical.
-- **`security_architecture.md`** (`knowledge/project/`, ~20 KB) · *How does
+- **`security_architecture.md`** (`knowledge/project/`, 22.4 KB) · *How does
   the security layer work?* · Read when working the permission layer.
-- **`architecture_audit_2026-09.md`** (`knowledge/project/`, ~140 KB) · *The
+- **`architecture_audit_2026-09.md`** (`knowledge/project/`, 139.4 KB) · *The
   earlier structural audit.* · Read the TOC, then the matching section. The
   R-row table and cross-reference table are the load-bearing parts.
-- **`reliability_log.md`** (`knowledge/project/`, ~5 KB) · *Is this flake
+- **`docs/CONTRACTS.md`** (`docs/`, 13.9 KB) · *Which invariants does this machine
+  actually guarantee, and what proves it?* · The contract ledger: each invariant
+  with its enforcement site and a test that would fail if the enforcement were
+  removed, plus (last section) what CI actually runs. Read before asserting that
+  an invariant "holds". **Pointer check:** this is the ledger that exists; the
+  `claim_ledger_design.md` cited by `v3_roadmap.md` and
+  `architecture_audit_2026-09.md` is **absent — not on disk** anywhere in the tree.
+- **`reliability_log.md`** (`knowledge/project/`) **(absent — not on disk)** · *Is this flake
   known?* · Read when investigating a recurring test failure.
-- **`roadmap.md`** (`knowledge/project/`, ~28 KB) · *Where is this going?* ·
+- **`roadmap.md`** (`knowledge/project/`, 28.6 KB) · *Where is this going?* ·
   Read when orienting a strand against the arc. Note: "Current Status" is
   dated 2026-08-16.
-- **`v3_roadmap.md`** (`knowledge/project/`, ~9 KB) · *What are the V3
+- **`v3_roadmap.md`** (`knowledge/project/`, 17.1 KB) · *What are the V3
   phases?* · Read when a strand needs its phase context.
-- **`v3_vision_full.md`** (`knowledge/project/`, ~8 KB) · *What is V3?* ·
+- **`v3_vision_full.md`** (`knowledge/project/`) **(absent — not on disk)** · *What is V3?* ·
   Read when a strand needs the destination.
-- **`gen30_journey.md`** (`knowledge/project/`, ~11 KB) · *How did this arc
+- **`gen30_journey.md`** (`knowledge/project/`) **(absent — not on disk)** · *How did this arc
   come to be?* · Read for provenance when a decision's origin is unclear.
-- **`development_guides.md`** (`knowledge/project/`, ~26 KB) · *How do I
+- **`development_guides.md`** (`knowledge/project/`, 52.0 KB) · *How do I
   build, test, and run?* · Read when setting up or running the suite. Read
   the specific topic heading; older sections are archived.
-- **`run_design_pass.md`** (`knowledge/project/`, ~43 KB) · *How does a
+- **`run_design_pass.md`** (`knowledge/project/`) **(absent — not on disk)** · *How does a
   design pass work?* · Read before drafting one.
 
 ---
 
 ## §3 — Pointers (do not cat)
 
-Thirteen files ≥100 KB live under `knowledge/` — 7 under `personal/`, 5 under `archive/`,
-and `project/architecture_audit_2026-09.md` at ~140 KB. Grep `^## ` for headers; read
-the matching section. The 4 largest (`personal/task_tracker.md`, `personal/lessons_learned.md`,
-`personal/bugs_and_fixes.md`, `personal/parking_lot.md`) are the primary offenders — do not `cat`.
+Measured at the last disk check (`wc -c` over the whole tree): `knowledge/` holds 33 files,
+1,542,562 B in total, and **six** are ≥100 KB — four under `project/` (`archive_arch_a.md` 242.9 KB,
+`operator_observations.md` 152.3 KB, `architecture_audit_2026-09.md` 139.4 KB, `archive_arch_b.md`
+118.3 KB), one under `_archive/personal/` (`bugs_and_fixes.md` 131.3 KB), and one under `personal/`
+(`lessons_learned.md` 105.5 KB). `personal/` itself holds exactly two files: `handoffs.md` (74.7 KB)
+and `lessons_learned.md`. This section previously claimed thirteen files ≥100 KB split 7/5 between
+`personal/` and `archive/`, and sized the four `personal/` files at 150-460 KB; neither matched the
+disk. Grep `^## ` for headers; read the matching section; do not `cat` any of the six.
 
-- **`lessons_learned.md`** (~450 KB) · Patterns and post-mortems. Read the
+- **`lessons_learned.md`** (`personal/`, 105.5 KB) · Patterns and post-mortems. Read the
   matching section when a pattern repeats.
-- **`bugs_and_fixes.md`** (~370 KB) · Filed bugs and their fixes. Read before
-  filing a bug that may be a recurrence.
-- **`task_tracker.md`** (~460 KB) · The full task history. Read when a
-  strand's provenance is unclear.
-- **`parking_lot.md`** (~150 KB) · Deferred ideas. Read before treating a
-  "new" idea as new.
+- **`bugs_and_fixes.md`** (`_archive/personal/`, 131.3 KB) · Filed bugs and their
+  fixes. Read before filing a bug that may be a recurrence. **Note the `_archive/`
+  prefix — it is not under `personal/`.**
+- **`handoffs.md`** (`personal/`, 74.7 KB) · Previous engineers' handoffs. Read
+  the newest entry for state, older entries for provenance.
+- **`task_tracker.md`, `parking_lot.md`** · **Absent — not on disk** at the last
+  check. A handoff that cites them cites something this tree does not contain; say
+  so rather than reconstructing their contents.
 
 ---
 

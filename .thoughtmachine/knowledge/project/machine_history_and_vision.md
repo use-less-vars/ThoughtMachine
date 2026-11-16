@@ -57,9 +57,10 @@ state survive the seat that wrote them.
 Only the facts the history below keeps touching.
 
 - **Four regions** (`docs/ARCHITECTURE_MACHINE_MODEL.md` §1). Two matter for the
-  boundary: workers are **threads inside the server process**
-  (`WorkerThread(threading.Thread)` in `tools/workspace/worker_thread.py`), and
-  `host_bash` is the **only** path that executes on the host.
+  boundary: workers are **a child OS process per worker** by default
+  (`WORKER_RUNTIME_MODE`, `tools/workspace/worker_runtime.py:84`; the thread form
+  survives as the in-process body, `tools/workspace/worker_thread.py:1880`), and
+  among the tools `host_bash` is the **only** one that executes on the host.
 - **Three gates, multiplied, not substituted** (`docs/ARCHITECTURE_MACHINE_MODEL.md` §2):
   the per-workspace kill switch `allow_host_resources` (read by
   `tools/host_resource_policy.py`), the workspace ceiling, and the session grant, with

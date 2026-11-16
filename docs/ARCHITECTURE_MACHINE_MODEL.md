@@ -4,6 +4,10 @@
 **Audience:** anyone joining infra who will touch execution, permissions, or containers.
 **Rule:** if this doc and the code disagree, the code is right. Fix this doc (§7).
 
+**Companion:** `docs/MACHINE_INVARIANTS_AND_LORE.md` — the invariants this model must keep true,
+the failure modes they prevent, and the traps that have already caught someone. Read it alongside
+this doc; where they overlap, it carries the `file:line` and this doc carries the picture.
+
 The doctrine in here is scattered across `machine_model.md`, `design_layers_and_truth_ownership.md`,
 and `design_resource_contract.md`. None of those answer the plain question: *what actually runs
 where, and what stops it?* This does. It is deliberately short.
@@ -24,13 +28,13 @@ host." It doesn't. There are four regions of execution.
 | `DockerCodeRunner` | Container | No |
 
 **Workers are processes.** Not threads, not containers. An absent `WORKER_RUNTIME_MODE` resolves to
-`DEFAULT_RUNTIME_MODE = MODE_PROCESS` (`tools/workspace/worker_runtime.py:83`, with
-`MODE_PROCESS = "process"` at line 72), and the production spawn site (`worker_thread._action_spawn`)
-passes no `mode=` (`tools/workspace/worker_runtime.py:1277-1281`), so a spawned worker is served by a
-real child process. `WorkerThread(threading.Thread)`
-(`tools/workspace/worker_thread.py:1630`) is still the class declaration, but it is now the
-*in-process body* — the fallback reached only when the mode is explicitly thread:
-`WORKER_RUNTIME_MODE=thread`, or an explicit `mode=MODE_THREAD`.
+`DEFAULT_RUNTIME_MODE = MODE_PROCESS` (`tools/workspace/worker_runtime.py:84`, with
+`MODE_PROCESS = "process"` at line 73), and the production spawn site
+(`worker_thread._action_spawn`) passes no explicit `mode`
+(`tools/workspace/worker_runtime.py:674`), so a spawned worker is served by a real child process.
+`WorkerThread(threading.Thread)` (`tools/workspace/worker_thread.py:1880`) is still the class
+declaration, but it is now the *in-process body* — the fallback reached only when the mode is
+explicitly thread: `WORKER_RUNTIME_MODE=thread`, or an explicit `mode=MODE_THREAD`.
 
 What did not change is the registry. There is one shared in-memory registry, still keyed
 `(session_key, name, iid)` (`tools/workspace/worker_thread.py:7404`, where `session_key` is

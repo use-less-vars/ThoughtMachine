@@ -15,14 +15,16 @@ tool, §9). Item C is not actually coupled to isolation and can ship first.
 
 ## 1. Problem, and what isolation actually buys
 
-Today every worker is a Python thread inside the FastAPI server process:
+Every worker used to be a Python thread inside the FastAPI server process. A worker body is now
+a child OS process per worker by default (`tools/workspace/worker_runtime.py:84`); the in-process
+shape below is reached under `WORKER_RUNTIME_MODE=thread`:
 
-- `tools/workspace/worker_thread.py:912` — `class WorkerThread(threading.Thread):`
-- `:949` — `super().__init__(daemon=True, name=f"worker-{instance_label}")`
-- `:4751` — `thread = WorkerThread(` (construction site)
-- `:4854` — `thread.start()`
-- plus a second thread class in the supervisor: `tools/workspace/worker_manager.py:107`
-  `class PeriodicStaleCheck(threading.Thread):`, `:137` (daemon), `:768 checker.start()`
+- `tools/workspace/worker_thread.py:1880` — `class WorkerThread(threading.Thread):`
+- `:1930` — `super().__init__(daemon=True, name=f"worker-{instance_label}")`
+- `:7676` — `thread = WorkerThread(` (construction site)
+- `:7883` — `thread.start()`
+- plus a second thread class in the supervisor: `tools/workspace/worker_manager.py:136`
+  `class PeriodicStaleCheck(threading.Thread):`, `:166` (daemon), `:835 checker.start()`
 
 Consequences that are true *because* they are threads in the API process:
 
