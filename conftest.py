@@ -7,7 +7,7 @@ project -- there was no such file before, and the alternative (the same fixture
 copied into ``tests/conftest.py`` and ``web_ui/backend/tests/conftest.py``)
 would leave the next test directory to be added uncovered.
 
-It does two things.
+It does three things.
 
 1. It hands the auth boundary the in-process harness allowance the pre-existing
    suite needs.  ``web_ui/backend/auth_boundary.py`` refuses every request it
@@ -21,6 +21,12 @@ It does two things.
 
 2. It keeps that allowance alive across the suite's own ``sys.modules`` purge,
    which is the only reason the ``sys.meta_path`` hook below exists.
+
+3. It lets a single test *ask* for that allowance by name, with
+   ``@pytest.mark.trust_harness``, so the session-wide grant can later shrink to
+   the tests that actually need it without those tests being rewritten first.
+   The marker changes nothing on its own: the hooks at the foot of this file
+   turn the flag on for a marked test and put back what they found.
 
 Why the hook is needed
 ----------------------
@@ -167,3 +173,60 @@ def _trust_the_in_process_asgi_harness():
     finally:
         auth_boundary.enable_test_harness_trust(previous)
         set_suite_trust_value(previous)
+
+
+# ── the opt-in marker: a test that asks for the allowance by name ─────────────
+#
+# The session fixture above grants the allowance to every test in the run.  A
+# test that would rather state the dependency itself -- so the allowance can
+# later stop being session-wide without every such test being rewritten -- says
+# so with ``@pytest.mark.trust_harness``.  The two hooks below are the whole
+# mechanism: setup turns the flag on, teardown puts back the value that was in
+# force beforehand.
+#
+# Hooks rather than a fixture, because the marker has to work for a test that
+# names no fixture, and because ``pytest_runtest_teardown`` still runs when the
+# test body fails.  It does *not* run when setup fails, so a marked test whose
+# own fixture raises can leave the flag on for its neighbours; that is the one
+# hole this shape of mechanism has, and it is why the value is remembered and
+# restored rather than assumed to be the shipped default.
+
+
+def pytest_configure(config):
+    """Declare the marker, so using it is not a warning."""
+    config.addinivalue_line(
+        "markers",
+        "trust_harness: request the in-process ASGI harness allowance "
+        "(``auth_boundary.TRUST_TEST_HARNESS``) for this test",
+    )
+
+
+#: Where setup remembers the value in force, for teardown to put back.  Stashed
+#: on the item, so two marked tests cannot overwrite each other's value.
+_PREVIOUS_TRUST = pytest.StashKey[bool]()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """Grant the allowance to a test carrying ``@pytest.mark.trust_harness``.
+
+    Strict no-op for every other test: an unmarked test must not have its flag
+    touched, or the negative direction of the boundary stops being testable.
+    """
+    if item.get_closest_marker("trust_harness") is None:
+        return
+    item.stash[_PREVIOUS_TRUST] = auth_boundary.TRUST_TEST_HARNESS
+    auth_boundary.enable_test_harness_trust(True)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item):
+    """Restore the value the marked test found, not the shipped default.
+
+    The suite's own value is ``True`` while the session fixture is in force, so
+    restoring a hardcoded ``False`` here would disarm an unrelated test that
+    runs next.  Only a marked item has anything stashed.
+    """
+    if item.get_closest_marker("trust_harness") is None:
+        return
+    auth_boundary.enable_test_harness_trust(item.stash[_PREVIOUS_TRUST])
