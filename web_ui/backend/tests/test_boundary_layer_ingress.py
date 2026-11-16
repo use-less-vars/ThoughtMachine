@@ -164,6 +164,7 @@ def test_ws_handshake_rejects_non_loopback_origin():
             ws.receive_json()
 
 
+@pytest.mark.trust_harness
 def test_ws_handshake_accepts_loopback_origin():
     client = TestClient(app)
     with client.websocket_connect(
@@ -173,6 +174,7 @@ def test_ws_handshake_accepts_loopback_origin():
         _collect(ws, "open_sessions")
 
 
+@pytest.mark.trust_harness
 def test_ws_handshake_accepts_absent_origin():
     client = TestClient(app)
     with client.websocket_connect("/ws") as ws:
@@ -191,6 +193,7 @@ def test_ws_handshake_rejects_project_inside_vault():
             ws.receive_json()
 
 
+@pytest.mark.trust_harness
 def test_set_project_rejects_path_inside_vault():
     client = TestClient(app)
     with client.websocket_connect("/ws") as ws:
@@ -204,6 +207,7 @@ def test_set_project_rejects_path_inside_vault():
     assert "Project path rejected" in rejection[0]["text"]
 
 
+@pytest.mark.trust_harness
 def test_apply_config_rejects_workspace_path_inside_vault():
     client = TestClient(app)
     with client.websocket_connect("/ws") as ws:
@@ -224,6 +228,7 @@ def test_apply_config_rejects_workspace_path_inside_vault():
 # Item 6 -- security_response is bound to the asking connection
 # ───────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_security_response_from_other_connection_is_refused():
     request_id = "rid-bound-to-another-socket"
     server_mod._record_escalation_asker(request_id, -12345)
@@ -246,6 +251,7 @@ def test_security_response_from_other_connection_is_refused():
         server_mod._forget_escalation(request_id)
 
 
+@pytest.mark.trust_harness
 def test_security_response_with_unknown_request_id_is_default_denied(monkeypatch):
     """An id no socket was asked to answer is refused, never quietly resolved.
 
@@ -310,6 +316,7 @@ class _SameAsSocket:
         return id(self)
 
 
+@pytest.mark.trust_harness
 def test_security_response_from_the_asking_connection_is_applied(monkeypatch):
     """CONTROL -- an answer from the connection the prompt was raised on is applied.
 
