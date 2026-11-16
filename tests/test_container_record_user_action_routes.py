@@ -241,6 +241,7 @@ def _real_manager(vault, client, *, workspace_id="ws1"):
 
 # ── Success paths ───────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_kill_success(vault, monkeypatch):
     _seed(vault)
     mgr = _install_manager(monkeypatch, FakeManager())
@@ -257,6 +258,7 @@ def test_kill_success(vault, monkeypatch):
     assert actions[-1]["actor"] == "tester"
 
 
+@pytest.mark.trust_harness
 def test_kill_audits_both_channels(vault, monkeypatch):
     _seed(vault)
     _install_manager(monkeypatch, FakeManager())
@@ -276,6 +278,7 @@ def test_kill_audits_both_channels(vault, monkeypatch):
     assert actions and actions[-1]["payload"]["decision"] == "applied"
 
 
+@pytest.mark.trust_harness
 def test_restart_success_stop_then_start(vault, monkeypatch):
     _seed(vault)
     mgr = _install_manager(monkeypatch, FakeManager())
@@ -291,6 +294,7 @@ def test_restart_success_stop_then_start(vault, monkeypatch):
     assert actions and actions[-1]["payload"]["decision"] == "applied"
 
 
+@pytest.mark.trust_harness
 def test_recreate_success_real_ladder(vault, monkeypatch):
     """Recreate happy path through the REAL identity ladder (endpoint-level).
 
@@ -338,6 +342,7 @@ def test_actor_missing_401(vault, monkeypatch):
     assert resp.status_code == 401, resp.text
 
 
+@pytest.mark.trust_harness
 def test_actor_malformed_400(vault, monkeypatch):
     _seed(vault)
     _install_manager(monkeypatch, FakeManager())
@@ -347,6 +352,7 @@ def test_actor_malformed_400(vault, monkeypatch):
     assert resp.status_code == 400, resp.text
 
 
+@pytest.mark.trust_harness
 def test_body_actor_overrides_header(vault, monkeypatch):
     _seed(vault)
     mgr = _install_manager(monkeypatch, FakeManager())
@@ -360,6 +366,7 @@ def test_body_actor_overrides_header(vault, monkeypatch):
 
 # ── Record resolution guards ────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_wrong_workspace_403(vault, monkeypatch):
     _seed(vault)  # record lives only in ws1
     _install_manager(monkeypatch, FakeManager())
@@ -369,6 +376,7 @@ def test_wrong_workspace_403(vault, monkeypatch):
     assert resp.status_code == 403, resp.text
 
 
+@pytest.mark.trust_harness
 def test_unknown_record_404(vault, monkeypatch):
     _seed(vault)
     _install_manager(monkeypatch, FakeManager())
@@ -378,6 +386,7 @@ def test_unknown_record_404(vault, monkeypatch):
     assert resp.status_code == 404, resp.text
 
 
+@pytest.mark.trust_harness
 def test_missing_workspace_id_400(vault, monkeypatch):
     _seed(vault)
     _install_manager(monkeypatch, FakeManager())
@@ -389,6 +398,7 @@ def test_missing_workspace_id_400(vault, monkeypatch):
 
 # ── Permission gate ─────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_permission_denied_403_audited(vault, monkeypatch):
     _seed(vault)
     _install_manager(monkeypatch, FakeManager())
@@ -403,6 +413,7 @@ def test_permission_denied_403_audited(vault, monkeypatch):
     assert actions and actions[-1]["payload"]["decision"] == "denied"
 
 
+@pytest.mark.trust_harness
 def test_fail_closed_unknown_workspace_denied(vault, monkeypatch):
     """No ``_container_write_allowed`` monkeypatch: default must DENY.
 
@@ -421,6 +432,7 @@ def test_fail_closed_unknown_workspace_denied(vault, monkeypatch):
 
 # ── State / conflict guards ─────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_record_without_name_409(vault, monkeypatch):
     _seed(vault, name="", attach=False)
     _install_manager(monkeypatch, FakeManager(entries=[]))
@@ -430,6 +442,7 @@ def test_record_without_name_409(vault, monkeypatch):
     assert resp.status_code == 409, resp.text
 
 
+@pytest.mark.trust_harness
 def test_record_without_container_409(vault, monkeypatch):
     _seed(vault, attach=False)  # record has name but no docker_id
     _install_manager(monkeypatch, FakeManager(entries=[]))
@@ -439,6 +452,7 @@ def test_record_without_container_409(vault, monkeypatch):
     assert resp.status_code == 409, resp.text
 
 
+@pytest.mark.trust_harness
 def test_start_error_maps_to_409_conflict(vault, monkeypatch):
     _seed(vault)
     _install_manager(monkeypatch, FakeManager(
@@ -451,6 +465,7 @@ def test_start_error_maps_to_409_conflict(vault, monkeypatch):
     assert actions and actions[-1]["payload"]["decision"] == "conflict"
 
 
+@pytest.mark.trust_harness
 def test_manager_status_error_maps_to_503(vault, monkeypatch):
     _seed(vault)
     _install_manager(monkeypatch, FakeManager(
@@ -505,6 +520,7 @@ def test_start_default_caller_reuses_live_container(vault):
 
 # ── Decision vocabulary (closed set) ────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_decisions_only_canonical_vocabulary(vault, monkeypatch):
     """Every emitted ``decision`` is a member of ``VALID_DECISIONS``.
 
@@ -557,6 +573,7 @@ def test_decisions_only_canonical_vocabulary(vault, monkeypatch):
 
 # ── keep_record threading: recreate PRESERVES, kill/restart never remove ─────
 
+@pytest.mark.trust_harness
 def test_recreate_route_tells_manager_to_keep_record(vault, monkeypatch):
     """The recreate ladder passes ``keep_record=True`` to ``ContainerManager.remove``.
 

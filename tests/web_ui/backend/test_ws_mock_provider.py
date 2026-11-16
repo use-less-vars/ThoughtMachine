@@ -236,6 +236,7 @@ def new_session(ws):
 
 class TestWebSocketWithMockProvider:
 
+    @pytest.mark.trust_harness
     def test_new_session_emits_five_events(self, mock_server):
         """new_session emits the standard 5 lifecycle events."""
         app, _tmp_home = mock_server
@@ -250,6 +251,7 @@ class TestWebSocketWithMockProvider:
         ]
         assert [m["type"] for m in messages] == expected_types
 
+    @pytest.mark.trust_harness
     def test_continue_session_mock_provider_not_used(self, mock_server):
         """
         continue_session without a usable provider emits an error status_message.
@@ -307,6 +309,7 @@ class TestWebSocketWithMockProvider:
             f"{len(MockProvider._instances)} — the mock must not be used"
         )
 
+    @pytest.mark.trust_harness
     def test_apply_config_permissions_payload_is_ignored(self, mock_server, caplog):
         """
         apply_config does NOT carry grants (P1): a ``session_permissions`` key
@@ -372,6 +375,7 @@ class TestWebSocketWithMockProvider:
             "session_permissions" in r.getMessage() for r in caplog.records
         ), caplog.records
 
+    @pytest.mark.trust_harness
     def test_model_override_ignored(self, mock_server):
         """
         model_override is NOT applied by apply_config (only model is mutable);
@@ -401,6 +405,7 @@ class TestWebSocketWithMockProvider:
             f"got model={last_config.get('model')!r}"
         )
 
+    @pytest.mark.trust_harness
     def test_api_key_stripped_from_config_dump(self, mock_server):
         """
         The config_changed event should NOT contain the actual api_key value.
@@ -431,6 +436,7 @@ class TestWebSocketWithMockProvider:
         # api_key is never persisted, so api_key_configured is False
         assert last_config.get("api_key_configured") is False
 
+    @pytest.mark.trust_harness
     def test_save_and_load_session_roundtrip_strips_grants(self, mock_server):
         """
         Saving a session and loading it back preserves config fields but does

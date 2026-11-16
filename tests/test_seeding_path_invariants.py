@@ -159,6 +159,7 @@ def _new_project(tmp_home, name):
 # Path 1 — REST POST /api/session/create {workspace_path}
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_rest_create_with_workspace_path_seeds_empty_sidecar(seed_server):
     app, vault = seed_server
     proj = _new_project(vault, "rest")
@@ -188,6 +189,7 @@ def test_rest_create_with_workspace_path_seeds_empty_sidecar(seed_server):
 # Path 2 — WS set_project
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_ws_set_project_seeds_empty_sidecar(seed_server):
     app, vault = seed_server
     proj = _new_project(vault, "setproj")
@@ -212,6 +214,7 @@ def test_ws_set_project_seeds_empty_sidecar(seed_server):
 # Path 3 — WS apply_config workspace-switch
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_ws_apply_config_workspace_switch_seeds_empty_sidecar(seed_server):
     app, vault = seed_server
     proj_a = _new_project(vault, "a")
@@ -276,6 +279,7 @@ def test_ws_apply_config_workspace_switch_seeds_empty_sidecar(seed_server):
     assert _read_grants(vault, ws_new, sid) == {}
 
 
+@pytest.mark.trust_harness
 def test_ws_apply_config_workspace_switch_sends_permission_reset_notice(seed_server):
     """The apply_config workspace-switch must emit the operator-facing
     permission-context RESET notice on the existing ``status_message``
@@ -394,6 +398,7 @@ def test_seed_primitive_is_absent_only(seed_server):
 # Transport round-trip — WS reset notice ⇄ REST HTTP read ⇄ refresh re-read
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_transport_roundtrip_ws_notice_rest_read_and_refresh_agree(seed_server):
     """After a workspace switch the post-switch permission-context state must
     AGREE across the three transports:

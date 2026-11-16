@@ -213,6 +213,7 @@ def test_loopback_client_is_served(app, env):
 
 # -- No event-log surface ----------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_payload_has_no_event_log_content(app, env, event_log):
     """The route neither serves nor even reads the vault-global event log.
 
@@ -236,6 +237,7 @@ def test_payload_has_no_event_log_content(app, env, event_log):
 
 # -- Retained (pre-existing) parameters --------------------------------------
 
+@pytest.mark.trust_harness
 def test_workspace_filter_still_applies(app, env):
     """``?workspace=`` keeps filtering workers/sessions (UI convenience)."""
     with TestClient(app) as client:

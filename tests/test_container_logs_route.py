@@ -11,6 +11,8 @@ Run:  python3 -m pytest tests/test_container_logs_route.py -q
 
 from __future__ import annotations
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 import web_ui.backend.server as server_module
@@ -63,6 +65,7 @@ def _get(tail=None):
 
 
 class TestContainerLogsRoute:
+    @pytest.mark.trust_harness
     def test_happy_path_matches_tool_shape(self, monkeypatch):
         manager = _install(monkeypatch, _FakeManager())
         resp = _get()
@@ -78,6 +81,7 @@ class TestContainerLogsRoute:
         assert manager.calls == [
             {"container_id": CID, "tail": 200, "since": None}]
 
+    @pytest.mark.trust_harness
     def test_tail_clamped_to_max(self, monkeypatch):
         manager = _install(monkeypatch, _FakeManager())
         resp = _get(tail=999999)
@@ -85,6 +89,7 @@ class TestContainerLogsRoute:
         assert server_module._CONTAINER_LOGS_MAX_TAIL == 10000
         assert manager.calls[0]["tail"] == 10000
 
+    @pytest.mark.trust_harness
     def test_negative_tail_rejected(self, monkeypatch):
         manager = _install(monkeypatch, _FakeManager())
         resp = _get(tail=-5)
@@ -92,28 +97,33 @@ class TestContainerLogsRoute:
         assert "tail" in resp.json()["error"]
         assert manager.calls == []
 
+    @pytest.mark.trust_harness
     def test_unknown_container_404(self, monkeypatch):
         _install(monkeypatch, _FakeManager(containers=[]))
         resp = _get()
         assert resp.status_code == 404
         assert NAME in resp.json()["error"]
 
+    @pytest.mark.trust_harness
     def test_not_found_runtime_error_is_404(self, monkeypatch):
         _install(monkeypatch, _FakeManager(
             logs_error=RuntimeError(f"Container {CID} not found")))
         assert _get().status_code == 404
 
+    @pytest.mark.trust_harness
     def test_other_runtime_error_is_503(self, monkeypatch):
         _install(monkeypatch, _FakeManager(
             logs_error=RuntimeError("Docker Python SDK not available")))
         assert _get().status_code == 503
 
+    @pytest.mark.trust_harness
     def test_manager_construction_failure_is_503(self, monkeypatch):
         def _boom(workspace_id, workspace_path=""):
             raise RuntimeError("boom")
         monkeypatch.setattr(server_module, "_make_container_manager", _boom)
         assert _get().status_code == 503
 
+    @pytest.mark.trust_harness
     def test_unresolvable_workspace_is_404(self, monkeypatch):
         monkeypatch.setattr(
             server_module, "_make_container_manager",
