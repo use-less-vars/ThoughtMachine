@@ -50,8 +50,8 @@ pinned by
 ``web_ui/backend/tests/test_auth_boundary.py::test_a_freshly_imported_boundary_carries_the_suite_trust_value``.
 """
 
-import importlib.machinery
 import gc
+import importlib.machinery
 import sys
 import types
 
