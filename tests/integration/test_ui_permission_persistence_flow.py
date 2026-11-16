@@ -90,6 +90,7 @@ def _inject_raw_session_permissions(sid, ws_id):
     store.save_session(session, workspace_id=ws_id)
 
 
+@pytest.mark.trust_harness
 def test_ui_flow_apply_restart_reload_persists(env):
     client, tmp_home, stop_fn = env
     ws = _create_research_workspace(client, tmp_home, name="ui_flow_ws")
@@ -127,6 +128,7 @@ def test_ui_flow_apply_restart_reload_persists(env):
     assert ep["effective_permissions"]["filesystem"] == "banned", ep
 
 
+@pytest.mark.trust_harness
 def test_session_grants_capped_after_restart(env):
     client, tmp_home, stop_fn = env
     ws = _create_research_workspace(client, tmp_home, name="ui_ceiling_ws")

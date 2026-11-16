@@ -374,6 +374,7 @@ def _assert_worker_message_event(messages, session_id, worker: str, label: str):
 # Tests
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_two_sessions_respond_independently(mock_server):
     """Two concurrent sessions answer only on their own socket."""
     app, _tmp_home = mock_server
@@ -452,6 +453,7 @@ def test_two_sessions_respond_independently(mock_server):
         )
 
 
+@pytest.mark.trust_harness
 def test_closing_session_a_leaves_session_b_running(mock_server):
     """Closing session A's WebSocket leaves session B running."""
     app, _tmp_home = mock_server
@@ -505,6 +507,7 @@ def _register_worker_for_session(registry, session_id: str, worker_name: str) ->
     return worker_bus
 
 
+@pytest.mark.trust_harness
 def test_worker_in_session_a_not_visible_to_session_b(mock_server):
     """
     The WorkerRegistry keys workers by (session_id, worker_name, instance_id):
@@ -572,6 +575,7 @@ def test_worker_in_session_a_not_visible_to_session_b(mock_server):
 
 
 
+@pytest.mark.trust_harness
 def test_two_sessions_same_workspace_run_concurrently(mock_server):
     """
     Two concurrent ``new_session`` handshakes from the same project root
@@ -623,6 +627,7 @@ def test_two_sessions_same_workspace_run_concurrently(mock_server):
                 _prime_session(ws_b, "query on B", "session B")
 
 
+@pytest.mark.trust_harness
 def test_worker_in_session_b_not_visible_to_session_a(mock_server):
     """
     Mirror of the session-A test: a worker registered for session B is
@@ -669,6 +674,7 @@ def test_worker_in_session_b_not_visible_to_session_a(mock_server):
                     registry.unregister_event_bus(sid_b, "worker_b")
 
 
+@pytest.mark.trust_harness
 def test_worker_events_delivered_only_to_owning_session(mock_server):
     """
     A WORKER_SPAWNED event tagged with a session_id is forwarded only to that

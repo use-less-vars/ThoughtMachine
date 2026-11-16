@@ -145,6 +145,7 @@ def _assert_valid_session_config(session, path_label: str) -> None:
 # Path 1: REST POST /api/session/create
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_rest_create_session_produces_valid_config(contract_server):
     """POST /api/session/create must persist a session with a valid SessionConfig."""
     app, _ = contract_server
@@ -167,6 +168,7 @@ def test_rest_create_session_produces_valid_config(contract_server):
 # Path 2: WS new_session command (routed via bridge.create_session → SessionManager)
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_ws_new_session_produces_valid_config(contract_server):
     """WS `new_session` must persist a session with a valid SessionConfig."""
     app, _ = contract_server
@@ -190,6 +192,7 @@ def test_ws_new_session_produces_valid_config(contract_server):
 # Path 3: WS set_project command (server.py:1750 — direct Session(), un-routed)
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_ws_set_project_produces_valid_config(contract_server):
     """WS `set_project` creates a session; it must also carry a valid SessionConfig."""
     app, _ = contract_server

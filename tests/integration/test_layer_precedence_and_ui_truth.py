@@ -157,6 +157,7 @@ def test_global_layer_then_agent_config(env):
         agent_config.unlink(missing_ok=True)
 
 
+@pytest.mark.trust_harness
 def test_agent_config_explicit_model_beats_provider_default_model(env):
     client, tmp_home, stop_fn = env
     agent_config = Path(tmp_home) / ".thoughtmachine" / "agent_config.json"
@@ -185,6 +186,7 @@ def test_agent_config_explicit_model_beats_provider_default_model(env):
         _delete_p1()
 
 
+@pytest.mark.trust_harness
 def test_workspace_defaults_beat_provider_layer(env):
     client, tmp_home, stop_fn = env
     _post_p1(client)
@@ -211,6 +213,7 @@ def test_workspace_defaults_beat_provider_layer(env):
         _delete_p1()
 
 
+@pytest.mark.trust_harness
 def test_session_layer_then_worker_overrides(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t5")

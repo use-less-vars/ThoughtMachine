@@ -225,6 +225,7 @@ def _registered_ws(tmp_home: str):
 
 # -- GET /api/workspace/{workspace_id}/containers ------------------------------
 
+@pytest.mark.trust_harness
 def test_list_containers_endpoint(contract_server, tmp_path, monkeypatch):
     """GET .../containers?workspace_path=... -> 200 with the container list."""
     app, tmp_home = contract_server
@@ -266,6 +267,7 @@ def test_list_containers_endpoint(contract_server, tmp_path, monkeypatch):
     assert fake.list_calls >= 1
 
 
+@pytest.mark.trust_harness
 def test_list_containers_unknown_workspace(contract_server):
     """No workspace_path and unknown ws_id -> 404 (registry lookup fails)."""
     app, _ = contract_server
@@ -277,6 +279,7 @@ def test_list_containers_unknown_workspace(contract_server):
     }
 
 
+@pytest.mark.trust_harness
 def test_list_containers_manager_failure(contract_server):
     """ContainerManager construction failure -> 503 with the error text."""
     app, tmp_home = contract_server
@@ -294,6 +297,7 @@ def test_list_containers_manager_failure(contract_server):
     assert resp.json() == {"error": "boom"}
 
 
+@pytest.mark.trust_harness
 def test_list_containers_registry_corrupt_returns_503(contract_server):
     """Corrupt registry (unreadable registry FILE) -> 503 naming the registry
     fault, NOT a misleading 404 'not found or path unresolvable'.
@@ -318,6 +322,7 @@ def test_list_containers_registry_corrupt_returns_503(contract_server):
     assert "registry" in resp.json()["error"].lower()
 
 
+@pytest.mark.trust_harness
 def test_list_containers_registry_corrupt_with_path_returns_503(contract_server):
     """Corrupt registry + explicit workspace_path -> 503 (NOT a bogus 400
     'not registered'): explicit-path validation must not swallow the fault."""
@@ -345,6 +350,7 @@ def test_list_containers_registry_corrupt_with_path_returns_503(contract_server)
 
 # -- GET /api/workspace/{workspace_id}/containers/{name}/status ----------------
 
+@pytest.mark.trust_harness
 def test_status_endpoint(contract_server):
     """Status lookup by container NAME -> 200, resolves to the real container_id."""
     app, tmp_home = contract_server
@@ -363,6 +369,7 @@ def test_status_endpoint(contract_server):
     assert fake.status_calls == ["c1"]
 
 
+@pytest.mark.trust_harness
 def test_status_not_found(contract_server):
     """Unknown container name -> 404."""
     app, tmp_home = contract_server
@@ -381,6 +388,7 @@ def test_status_not_found(contract_server):
 
 # -- POST /api/workspace/{workspace_id}/containers/{name}/start ----------------
 
+@pytest.mark.trust_harness
 def test_start_with_note(contract_server):
     """POST .../start with a JSON note -> 200 and start(name=..., note=...)."""
     app, tmp_home = contract_server
@@ -399,6 +407,7 @@ def test_start_with_note(contract_server):
     assert fake.start_calls == [{"image": None, "name": "box-a", "note": "hi"}]
 
 
+@pytest.mark.trust_harness
 def test_start_limit_conflict(contract_server):
     """Workspace container limit reached -> 409 with the manager's error."""
     app, tmp_home = contract_server
@@ -422,6 +431,7 @@ def test_start_limit_conflict(contract_server):
 
 # -- POST /api/workspace/{workspace_id}/containers/{name}/stop -----------------
 
+@pytest.mark.trust_harness
 def test_stop_endpoint(contract_server):
     """POST .../stop -> 200 and stop() called with the resolved container_id."""
     app, tmp_home = contract_server
@@ -441,6 +451,7 @@ def test_stop_endpoint(contract_server):
 
 # -- DELETE /api/workspace/{workspace_id}/containers/{name} --------------------
 
+@pytest.mark.trust_harness
 def test_delete_endpoint(contract_server):
     """DELETE .../containers/{name} -> 200 and remove() called with c1."""
     app, tmp_home = contract_server

@@ -317,6 +317,7 @@ def _drain_more(ws, events, n: int = 3, timeout: float = 5.0):
 # Test A: load_session response shape contract (single, PASSING)
 # ═════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_load_session_response_shape_contract(contract_server):
     """REST-created session, loaded via WS: frontend response-shape contract."""
     app, _ = contract_server
@@ -399,6 +400,7 @@ def test_load_session_response_shape_contract(contract_server):
 # Test B: load_session on a MISSING (dead) session id reports load_error
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_load_session_missing_session_reports_load_error(contract_server):
     """Regression for the S3 truthfulness bug: a dead session id must produce a
     load_error session_loaded, not a success-looking status.
@@ -454,6 +456,7 @@ def test_load_session_missing_session_reports_load_error(contract_server):
 # trigger a workspace switch / session replacement
 # ═════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_apply_config_same_workspace_path_does_not_switch_session(contract_server):
     """Fix 6 regression: apply_config must baseline its workspace_changed
     comparison on the SESSION's own workspace, not on _project_path.
@@ -549,6 +552,7 @@ def test_apply_config_same_workspace_path_does_not_switch_session(contract_serve
 # (replacement session_loaded with a new session id)
 # ═════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_apply_config_different_workspace_path_still_switches_session(contract_server):
     """Fix 6 must not break the genuine workspace-switch path: apply_config
     with a workspace_path DIFFERENT from the session's own workspace still
@@ -685,6 +689,7 @@ def _loaded_banners(events, session_id: str):
     ]
 
 
+@pytest.mark.trust_harness
 def test_reload_does_not_reemit_session_loaded_banner(contract_server):
     """A load must NOT emit the (now-removed) session-loaded banner at all.
 

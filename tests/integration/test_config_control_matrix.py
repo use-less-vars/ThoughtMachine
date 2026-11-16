@@ -167,6 +167,7 @@ def test_persistence_session_permission_grants_survive_restart_capped_by_ceiling
         assert perms["filesystem"] == "read", perms
 
 
+@pytest.mark.trust_harness
 def test_persistence_session_worker_timeout_survives_restart(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t3")
@@ -203,6 +204,7 @@ def test_persistence_session_worker_timeout_survives_restart(env):
         assert evt["config"]["worker_timeout_seconds"] == 120, evt["config"]
 
 
+@pytest.mark.trust_harness
 def test_persistence_provider_settings_survive_restart(env):
     client, tmp_home, stop_fn = env
     provider = {
@@ -227,6 +229,7 @@ def test_persistence_provider_settings_survive_restart(env):
     assert by_id["p1"]["default_model"] == "m1", by_id["p1"]
 
 
+@pytest.mark.trust_harness
 def test_persistence_allow_host_resources_survives_restart(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t5")
