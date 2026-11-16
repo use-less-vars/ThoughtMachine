@@ -60,11 +60,7 @@ named the wrong directories. The real paths:
 
 ## §1 — Mandatory (read once)
 
-**Enumerate with `find`, not `git ls-files`.** The KB is gitignored —
-`git ls-files` will lie to you. Two files under `knowledge/project/` are
-tracked by accident (`architecture_audit_2026-09.md` and
-`development_guides.md`); they stay dirty in every `git status` — never
-stage them.
+The KB is **tracked**. `git ls-files .thoughtmachine/knowledge/project/` returns 28 tracked files as of `544bd407`. The earlier 'gitignored / two tracked by accident' claim was a Gen 49 artifact. Enumerate with `git ls-files`, not `find`, when you want the versioned set.
 
 **Disk check, last pass.** Every path in §1-§3 was checked against the working tree with `ls` and
 `wc -c`; entries that were not there are marked **(absent — not on disk)**. They are marked, not

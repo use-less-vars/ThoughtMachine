@@ -36,8 +36,8 @@ An absent `WORKER_RUNTIME_MODE` resolves to `process`.
 | Flag name `WORKER_RUNTIME_MODE` | `tools/workspace/worker_runtime.py:67` |
 | `MODE_THREAD` / `MODE_PROCESS` | `worker_runtime.py:70` / `:73` |
 | `RUNTIME_MODES` — "Nothing else is a mode" | `worker_runtime.py:76` |
-| `DEFAULT_RUNTIME_MODE = MODE_PROCESS` | `worker_runtime.py:84` |
-| Resolution, not memoised; a typo raises | `worker_runtime.py:351-373` |
+| `DEFAULT_RUNTIME_MODE = MODE_PROCESS` | `worker_runtime.py:90` |
+| Resolution, not memoised; a typo raises | `worker_runtime.py:357` |
 | Production spawn resolves the mode here | `worker_runtime.py:674` |
 | `class WorkerThread(threading.Thread)` — now only the in-process body | `worker_thread.py:1880` |
 
@@ -381,10 +381,7 @@ fact in a standup.
 3. **"Timeouts" as the fix.** Which timeouts? The only lock-adjacent candidates are the bounded
    bus-resolve retry (`bridge.py:869-874`) and `join(timeout=…)` in force-spawn
    (`worker_thread.py:7054-7062`). Unconfirmed as *the* fix. **Section 4.**
-4. **Required-vs-advisory CI status.** Not determinable from the repo
-   (`docs/testing/ci_process.md:35-40`), and the KB's own two entries contradict each other
-   (`.thoughtmachine/knowledge/project/CI_PROCESS.md:66-70`). Needs `gh api` output or a screenshot
-   of branch protection. **Section 10.**
+4. **RESOLVED (partial):** 10 required status checks exist server-side on `dev`, evidenced by GitHub's own rejection message on direct push at `a869255d` and `544bd407`: `remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are expected.` The check *names* still require `gh api repos/{owner}/{repo}/branches/dev/protection` (operator-admin). Whether branch protection blocks the *merge button*, as opposed to being bypassable by direct push, is still unknown and needs the same `gh api` call.
 5. **"The only chokepoint."** Contradicted for MCP stdio, and ~11 other `import subprocess` sites
    remain unadjudicated one by one (git tools, `worker_execution.py`, `sandboxed_execution.py`,
    `doctor.py`, `workspace_lifecycle_manager.py`, `containers/executor.py:1259`). Needs a per-site
