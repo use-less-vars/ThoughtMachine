@@ -455,3 +455,7 @@ different file, different name. Never rename one to the other.
 - **C78** — Preflight diagnostics truth: two port probes, FAIL weight on advisory output.
 - **C79** — Undeclared load-bearing config key (`git_allow_worktree_commits`) and worker worktree bootstrap failure (crash loop).
 - **C80** — `terminate_all` skips subprocesses with no pid during shutdown.
+
+- **C86** — Process-Mode Observability (State Seam). Event seam is fixed, but state seam is leaking. Enforced deadline != reported deadline (10s requested, 70s blocked). No exit-code reader exists. Cache `_last_event` is never read. See audit doc for 12 proposals.
+- **C88** — Host Resource Guardrails. System OOM-killed backend/workers under heavy parallel load (3 workspaces). Pre-flight memory check needed before spawning workers/containers. Enforce hard caps on child processes.
+- **C89** — Session Autosave. Lossy crashes drop active conversational context and UI state. Needs periodic write-to-disk for session state (beyond just the final prompt).
