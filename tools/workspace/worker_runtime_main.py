@@ -50,6 +50,8 @@ from tools.workspace.worker_runtime_protocol import (
     CONFIG_TIER_REQUIRES_RESPAWN,
     DIRECTION_FROM_RUNTIME,
     DIRECTION_TO_RUNTIME,
+    EVENT_STREAM_GLOBAL,
+    EVENT_STREAM_WORKER,
     HELLO_CAPABILITIES,
     Bye,
     Cancel,
@@ -167,8 +169,14 @@ BUS_ATTACH_TIMEOUT_SECONDS = 5.0
 BUS_ATTACH_POLL_SECONDS = 0.01
 
 
-def _event_publisher(outbox: "_Outbox") -> Callable[[Any], None]:
+def _event_publisher(
+    outbox: "_Outbox", stream: str
+) -> Callable[[Any], None]:
     """Build the wildcard subscriber that turns a published event into a frame.
+
+    *stream* names the bus this subscriber is attached to (§4.4) and rides out
+    on every frame: one wildcard subscription per bus, so the frame would
+    otherwise be the only place the distinction could get lost.
 
     ``EventBus.publish`` runs its subscribers on the PUBLISHER's stack -- the
     worker's own turn loop -- so this callback must never block, raise or do
@@ -186,7 +194,11 @@ def _event_publisher(outbox: "_Outbox") -> Callable[[Any], None]:
             # is silent and the seq has already been spent.
             dumped = event.model_dump(mode="json")
             outbox.put(
-                Event(event_type=str(dumped.get("type") or ""), data=dumped)
+                Event(
+                    event_type=str(dumped.get("type") or ""),
+                    data=dumped,
+                    stream=stream,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - the publisher must not see it
             print(
@@ -235,7 +247,8 @@ def _subscribe_child_events(worker: Any, outbox: "_Outbox") -> None:
     ``start`` publishes is not missed -- which is only possible because the
     outbox is built before the worker too (§4.6).
     """
-    publish = _event_publisher(outbox)
+    publish = _event_publisher(outbox, EVENT_STREAM_GLOBAL)
+    worker_publish = _event_publisher(outbox, EVENT_STREAM_WORKER)
     try:
         from agent.events import global_event_bus
     except Exception as exc:  # noqa: BLE001 - no bus, no seam, still a worker
@@ -256,7 +269,7 @@ def _subscribe_child_events(worker: Any, outbox: "_Outbox") -> None:
             )
     threading.Thread(
         target=_subscribe_worker_bus,
-        args=(worker, publish),
+        args=(worker, worker_publish),
         name="runtime-event-subscribe",
         daemon=True,
     ).start()
