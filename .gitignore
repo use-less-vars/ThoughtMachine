@@ -470,3 +470,10 @@ web_ui/frontend/.dist-build-stamp
 # `docs/*` above is a catch-all, so the negation is required or the file is never
 # versioned and vanishes on the next clone while the pointer survives.
 !docs/MACHINE_INVARIANTS_AND_LORE.md
+
+# Branch protection policy for `dev` (C93, 2026-11-18): the derivation behind
+# scripts/apply_branch_protection.sh and the contexts it enforces. Public tier,
+# ships with the repo. `docs/*` above is a catch-all, so the negation is
+# required or the doc is never versioned and vanishes on the next clone while
+# the script that says what is enforced survives.
+!docs/BRANCH_PROTECTION.md
