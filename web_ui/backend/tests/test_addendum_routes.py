@@ -196,6 +196,7 @@ def _compose_system_prompt(monkeypatch, session) -> str:
 # (a) Fresh session: canonical defaults, no entries
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_a_get_fresh_addendum_defaults(vault, stub_store):
     stub_store.register()
 
@@ -216,6 +217,7 @@ def test_a_get_fresh_addendum_defaults(vault, stub_store):
 # (b) Accepted write: 200, entry shape, persisted, total_chars
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_b_post_accepts_and_persists_entry(vault, stub_store):
     stub_store.register()
 
@@ -250,6 +252,7 @@ def test_b_post_accepts_and_persists_entry(vault, stub_store):
 # (c) Full chain: REST write -> persisted session -> composed system prompt
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_c_written_entry_reaches_composed_system_prompt(vault, stub_store, monkeypatch):
     stub_store.register()
 
@@ -271,6 +274,7 @@ def test_c_written_entry_reaches_composed_system_prompt(vault, stub_store, monke
 # (d) Refused: over budget (cap 100, write 101) -> 409, nothing persisted
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_d_post_over_budget_refused(vault, stub_store):
     stub_store.register(addendum=_addendum([], budget_chars=100))
 
@@ -296,6 +300,7 @@ def test_d_post_over_budget_refused(vault, stub_store):
 # (e) Refused: entry limit (64 stored, the 65th) -> 409
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_e_post_at_max_entries_refused(vault, stub_store):
     stub_store.register(addendum=_addendum(_seed_entries(64)))
 
@@ -316,6 +321,7 @@ def test_e_post_at_max_entries_refused(vault, stub_store):
 # (f) Recovery: over-budget refusal -> clear -> the next write is accepted
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_f_recovery_after_clear(vault, stub_store):
     stub_store.register(addendum=_addendum([_entry("e-000", "z" * 90)], budget_chars=100))
 
@@ -349,6 +355,7 @@ def test_f_recovery_after_clear(vault, stub_store):
 # (g) Unknown session -> 404 on all three methods; foreign origin -> 403
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_g_unknown_session_404_and_foreign_origin_403(vault, stub_store):
     missing = "sess-does-not-exist"
 
@@ -377,6 +384,7 @@ def test_g_unknown_session_404_and_foreign_origin_403(vault, stub_store):
 # (h) The client cannot choose the entry source
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_h_client_cannot_smuggle_source(vault, stub_store):
     stub_store.register()
 

@@ -149,6 +149,7 @@ def _patch(record_id, body, *, workspace_id=WS, actor="tester"):
 
 # ── Route: invalid input never persists and never destroys ──────────────────
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("bad", ["banana", "", "-1", "1g extra", "1.5", None])
 def test_invalid_mem_limit_is_400_and_leaves_everything_untouched(
         vault, monkeypatch, bad):
@@ -168,6 +169,7 @@ def test_invalid_mem_limit_is_400_and_leaves_everything_untouched(
     assert after.intent_snapshot == {"mem_limit": "256m"}
 
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("bad", [-1, "1000", 1.5, True])
 def test_invalid_cpu_quota_is_400_and_leaves_everything_untouched(
         vault, monkeypatch, bad):
@@ -187,6 +189,7 @@ def test_invalid_cpu_quota_is_400_and_leaves_everything_untouched(
 
 # ── Route: valid resize keeps the record id and passes keep_record=True ─────
 
+@pytest.mark.trust_harness
 def test_valid_resize_keeps_record_id_and_remove_keeps_record(vault,
                                                              monkeypatch):
     record = _seed(vault, intent_snapshot={"mem_limit": "256m"})
@@ -215,6 +218,7 @@ def test_valid_resize_keeps_record_id_and_remove_keeps_record(vault,
 
 # ── Route: below the Docker 6MB floor never destroys anything ─────────────
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("bad", ["1m", "5m", "0", "6291455"])
 def test_mem_limit_below_docker_floor_is_400_and_destroys_nothing(
         vault, monkeypatch, bad):
@@ -234,6 +238,7 @@ def test_mem_limit_below_docker_floor_is_400_and_destroys_nothing(
     assert after.intent_snapshot == {"mem_limit": "256m"}
 
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("good", ["6m", "6291456"])
 def test_mem_limit_at_the_docker_floor_still_resizes(vault, monkeypatch, good):
     _seed(vault, intent_snapshot={"mem_limit": "256m"})
@@ -271,6 +276,7 @@ def _collect_resize_audits(monkeypatch):
     return seen
 
 
+@pytest.mark.trust_harness
 def test_start_error_dict_is_400_and_restores_previous_limits(vault,
                                                              monkeypatch):
     _seed(vault, intent_snapshot={"mem_limit": "256m", "cpu_quota": 50000})
@@ -303,6 +309,7 @@ def test_start_error_dict_is_400_and_restores_previous_limits(vault,
     assert "requested={'mem_limit': '8m'}" in audits[0][1]
 
 
+@pytest.mark.trust_harness
 def test_recovery_rebuild_runs_with_the_previous_limits(vault, monkeypatch):
     """The recovery ``start`` is handed the PREVIOUS limits, not the edit.
 
@@ -338,6 +345,7 @@ def test_recovery_rebuild_runs_with_the_previous_limits(vault, monkeypatch):
                                           "cpu_quota": 50000}
 
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("status_code,expected", [(400, 400), (500, 503)])
 def test_start_exception_status_code_maps_to_http_status(
         vault, monkeypatch, status_code, expected):
@@ -362,6 +370,7 @@ def test_start_exception_status_code_maps_to_http_status(
     assert "daemon said no" in audits[0][1]
 
 
+@pytest.mark.trust_harness
 def test_rebuild_failure_unbinds_the_record_docker_id(vault, monkeypatch):
     _seed(vault, intent_snapshot={"mem_limit": "256m"})
     manager = _install(monkeypatch, _FakeManager(
@@ -388,6 +397,7 @@ def test_rebuild_failure_unbinds_the_record_docker_id(vault, monkeypatch):
 
 # ── Route: the happy path labels the destroy as a resize ────────────────
 
+@pytest.mark.trust_harness
 def test_success_labels_the_destroy_as_a_resize_and_rebinds(vault, monkeypatch):
     _seed(vault, intent_snapshot={"mem_limit": "256m"})
     manager = _install(monkeypatch, _FakeManager(

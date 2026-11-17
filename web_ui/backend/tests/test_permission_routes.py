@@ -143,11 +143,13 @@ class TestSessionPermissionsRoutes:
 
     # --- 404 handling ------------------------------------------------------
 
+    @pytest.mark.trust_harness
     def test_get_permissions_unknown_session_404(self, vault, stub_store):
         resp = client.get(f"/api/session/{self.SID}/permissions")
         assert resp.status_code == 404
         assert "Session not found" in str(resp.json().get("detail"))
 
+    @pytest.mark.trust_harness
     def test_put_permissions_unknown_session_404(self, vault, stub_store):
         resp = client.put(
             f"/api/session/{self.SID}/permissions",
@@ -156,6 +158,7 @@ class TestSessionPermissionsRoutes:
         assert resp.status_code == 404
         assert "Session not found" in str(resp.json().get("detail"))
 
+    @pytest.mark.trust_harness
     def test_get_permissions_existing_session_without_source_404(
         self, vault, stub_store
     ):
@@ -169,6 +172,7 @@ class TestSessionPermissionsRoutes:
 
     # --- validation (422) --------------------------------------------------
 
+    @pytest.mark.trust_harness
     def test_put_unknown_session_permission_key_422(self, vault, stub_store):
         self._register(stub_store)
         resp = client.put(
@@ -181,6 +185,7 @@ class TestSessionPermissionsRoutes:
             "unknown session permission key: bogus" in err for err in errors
         )
 
+    @pytest.mark.trust_harness
     def test_put_invalid_session_permission_value_422(self, vault, stub_store):
         self._register(stub_store)
         resp = client.put(
@@ -193,6 +198,7 @@ class TestSessionPermissionsRoutes:
 
     # --- happy path roundtrip ---------------------------------------------
 
+    @pytest.mark.trust_harness
     def test_put_get_permissions_roundtrip(self, vault, stub_store):
         self._register(stub_store)
         _write_ceiling(
@@ -243,6 +249,7 @@ class TestSessionPermissionsRoutes:
         assert get_data["effective"] == expected_raw
         _assert_iso_utc(get_data["resolved_at"])
 
+    @pytest.mark.trust_harness
     def test_put_get_permissions_host_bash_ask_roundtrip(self, vault, stub_store):
         self._register(stub_store)
         _write_ceiling(
@@ -285,6 +292,7 @@ class TestSessionPermissionsRoutes:
         assert get_data["raw"] == expected_canonical
         assert get_data["effective"] == expected_raw
 
+    @pytest.mark.trust_harness
     def test_put_get_permissions_host_bash_allow_roundtrip(self, vault, stub_store):
         self._register(stub_store)
         _write_ceiling(
@@ -330,6 +338,7 @@ class TestSessionPermissionsRoutes:
         assert get_data["raw"] == expected_canonical
         assert get_data["effective"] == expected_raw
 
+    @pytest.mark.trust_harness
     def test_put_host_bash_write_422(self, vault, stub_store):
         # host_bash is a session-storable grain with its own banned/ask/allow
         # vocabulary; the legacy 'write' level must be rejected.
@@ -342,6 +351,7 @@ class TestSessionPermissionsRoutes:
         errors = resp.json().get("detail", {}).get("errors", [])
         assert errors and any("host_bash" in err for err in errors)
 
+    @pytest.mark.trust_harness
     def test_put_non_object_body_422(self, vault, stub_store):
         self._register(stub_store)
         resp = client.put(
@@ -350,6 +360,7 @@ class TestSessionPermissionsRoutes:
         )
         assert resp.status_code == 422
 
+    @pytest.mark.trust_harness
     def test_put_empty_body_resets_to_safe_defaults(self, vault, stub_store):
         self._register(stub_store)
         _write_ceiling(vault, self.WS, dict(SAFE_DEFAULTS))
@@ -362,6 +373,7 @@ class TestSessionPermissionsRoutes:
 
     # --- workspace ceiling capping ----------------------------------------
 
+    @pytest.mark.trust_harness
     def test_ceiling_caps_session_grants(self, vault, stub_store):
         self._register(stub_store)
         _write_json(
@@ -400,6 +412,7 @@ class TestSessionPermissionsRoutes:
             }
         }
 
+    @pytest.mark.trust_harness
     def test_ceiling_caps_git_raw_kept(self, vault, stub_store):
         self._register(stub_store)
         _write_json(
@@ -414,6 +427,7 @@ class TestSessionPermissionsRoutes:
         assert data["raw"]["git"] == "write"
         assert data["effective"]["git"] == "read"
 
+    @pytest.mark.trust_harness
     def test_no_ceiling_fails_closed_to_banned(self, vault, stub_store):
         # With no saved workspace ceiling the disk-mode gate fails closed: the
         # raw session grant is stored uncapped but the effective value is
@@ -427,6 +441,7 @@ class TestSessionPermissionsRoutes:
         assert data["raw"]["git"] == "write"
         assert data["effective"]["git"] == "banned"
 
+    @pytest.mark.trust_harness
     def test_put_git_write_on_feature_branch_persists(self, vault, stub_store):
         # Regression: git="write_on_feature_branch" is a git-only level that the
         # PUT validation must persist verbatim instead of clamping to "read".
@@ -486,6 +501,7 @@ class TestSessionPermissionsRoutes:
         assert data["effective"]["filesystem"] == "write"
         assert data["effective"]["network"] == "write"
 
+    @pytest.mark.trust_harness
     def test_get_corrupt_sidecar_500_fail_closed(self, vault, stub_store):
         self._register(stub_store)
         sidecar = session_grants_path(vault, self.WS, self.SID)
@@ -499,6 +515,7 @@ class TestSessionPermissionsRoutes:
 class TestWorkspacePermissionsRoutes:
     WS = "ws-perm-b"
 
+    @pytest.mark.trust_harness
     def test_get_fresh_workspace_returns_safe_defaults(self, vault):
         # A fresh workspace is bootstrapped by ensure_workspace_dirs(), which
         # seeds config.json['permissions'] with the safe-default map; the GET
@@ -514,6 +531,7 @@ class TestWorkspacePermissionsRoutes:
         assert data["declared_ceiling"] == CATALOG_DEFAULTS
         _assert_iso_utc(data["resolved_at"])
 
+    @pytest.mark.trust_harness
     def test_put_then_get_roundtrip_persists_config(self, vault):
         perms = {
             "filesystem": "write",
@@ -557,6 +575,7 @@ class TestWorkspacePermissionsRoutes:
         assert get_data["raw"] == perms
         assert get_data["allow_host_resources"] is True
 
+    @pytest.mark.trust_harness
     def test_put_unknown_resource_422(self, vault):
         resp = client.put(
             f"/api/workspace/{self.WS}/permissions",
@@ -566,6 +585,7 @@ class TestWorkspacePermissionsRoutes:
         errors = resp.json().get("detail", {}).get("errors", [])
         assert errors and "unknown resource 'bogus_resource'" in errors[0]
 
+    @pytest.mark.trust_harness
     def test_put_invalid_level_422(self, vault):
         resp = client.put(
             f"/api/workspace/{self.WS}/permissions",
@@ -575,6 +595,7 @@ class TestWorkspacePermissionsRoutes:
         errors = resp.json().get("detail", {}).get("errors", [])
         assert errors and "invalid level 'superuser' for resource 'network'" in errors[0]
 
+    @pytest.mark.trust_harness
     def test_put_ceiling_host_bash_levels_accepted(self, vault):
         # The workspace ceiling stores host_bash as a session-storable grain
         # with its own banned/ask/allow vocabulary.
@@ -591,6 +612,7 @@ class TestWorkspacePermissionsRoutes:
             assert get.status_code == 200, get.text
             assert get.json()["permissions"] == {"host_bash": level}
 
+    @pytest.mark.trust_harness
     def test_put_ceiling_host_bash_write_422(self, vault):
         resp = client.put(
             f"/api/workspace/{self.WS}/permissions",
@@ -600,6 +622,7 @@ class TestWorkspacePermissionsRoutes:
         errors = resp.json().get("detail", {}).get("errors", [])
         assert errors and "invalid level 'write' for resource 'host_bash'" in errors[0]
 
+    @pytest.mark.trust_harness
     def test_put_empty_permissions_then_get_returns_empty(self, vault):
         put = client.put(
             f"/api/workspace/{self.WS}/permissions", json={"permissions": {}}
@@ -617,6 +640,7 @@ class TestWorkspacePermissionsRoutes:
         assert get_data["declared_ceiling"] == {}
         assert get_data["allow_host_resources"] is False
 
+    @pytest.mark.trust_harness
     def test_put_empty_permissions_keeps_allow_host_resources(self, vault):
         first = client.put(
             f"/api/workspace/{self.WS}/permissions",
@@ -636,6 +660,7 @@ class TestWorkspacePermissionsRoutes:
         assert get_data["raw"] == {}
         assert get_data["permissions"] == {}
 
+    @pytest.mark.trust_harness
     def test_purpose_preset_not_resolved_when_no_permissions_saved(self, vault):
         _write_json(
             vault / "workspaces" / self.WS / "config.json",
@@ -663,6 +688,7 @@ class TestWorkspaceEffectivePermissionsRoutes:
     SID = "sess-eff-001"
     WS = "ws-eff-a"
 
+    @pytest.mark.trust_harness
     def test_effective_reads_sidecar_after_session_put(self, vault, stub_store):
         stub_store.register(self.SID, self.WS)
         _write_ceiling(vault, self.WS, {"filesystem": "write"})
@@ -681,6 +707,7 @@ class TestWorkspaceEffectivePermissionsRoutes:
         effective = resp.json()["effective_permissions"]
         assert effective["filesystem"] == "write"
 
+    @pytest.mark.trust_harness
     def test_effective_sidecar_supersedes_stale_metadata(self, vault):
         # Legacy record on disk says "read"; the sidecar (written later) says
         # "write".  The sidecar must win while it exists; once it is gone the
@@ -716,6 +743,7 @@ class TestWorkspaceEffectivePermissionsRoutes:
         assert resp.status_code == 200, resp.text
         assert resp.json()["effective_permissions"]["filesystem"] == "banned"
 
+    @pytest.mark.trust_harness
     def test_effective_unknown_session_returns_deny_all(self, vault):
         # An unknown session id has BOTH ids present, so the grants sidecar is
         # the sole source: its absence is an UNREADABLE grants path, and the
@@ -817,6 +845,7 @@ class TestSessionPermissionsNotice:
     SID = "sess-notice-001"
     WS = "ws-notice-a"
 
+    @pytest.mark.trust_harness
     def test_put_appends_one_notice_to_the_live_session(
         self, vault, stub_store, live_bridges
     ):
@@ -853,6 +882,7 @@ class TestSessionPermissionsNotice:
         # The permission write itself still persisted.
         assert session_grants_path(vault, self.WS, self.SID).exists()
 
+    @pytest.mark.trust_harness
     def test_put_without_live_session_succeeds_silently(
         self, vault, stub_store, live_bridges
     ):
@@ -866,6 +896,7 @@ class TestSessionPermissionsNotice:
         assert put.json()["raw"]["filesystem"] == "write"
         assert session_grants_path(vault, self.WS, self.SID).exists()
 
+    @pytest.mark.trust_harness
     def test_notice_failure_never_fails_the_write(
         self, vault, stub_store, live_bridges, monkeypatch
     ):
@@ -891,6 +922,7 @@ class TestWorkspacePermissionsNotice:
     WS = "ws-notice-b"
     SID = "sess-notice-002"
 
+    @pytest.mark.trust_harness
     def test_put_notifies_only_live_sessions_of_that_workspace(
         self, vault, live_bridges
     ):
@@ -911,6 +943,7 @@ class TestWorkspacePermissionsNotice:
         assert notices[0]["content"].startswith(SYSTEM_NOTICE_PREFIX)
         assert other_session.user_history == []
 
+    @pytest.mark.trust_harness
     def test_broken_bridge_never_fails_the_write(
         self, vault, live_bridges, monkeypatch
     ):

@@ -63,6 +63,7 @@ def client():
                     os.environ["HOME"] = old_home
 
 
+@pytest.mark.trust_harness
 def test_served_grain_set_projection_from_canonical(client):
     """The SERVED grain sets are the canonical A grain sets.
 

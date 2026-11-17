@@ -299,6 +299,7 @@ def _receive_until(ws, target_type: str, path_label: str, max_events: int = 25, 
 # F3: WS event payload contracts (10 tests)
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_config_changed_payload_contract(contract_server):
     """config_changed after load_session: config + top-level settings/permissions."""
     app, _ = contract_server
@@ -344,6 +345,7 @@ def test_config_changed_payload_contract(contract_server):
         )
 
 
+@pytest.mark.trust_harness
 def test_providers_list_payload_contract(contract_server):
     """providers_list: real provider keys + non-null session_id (F2 guard)."""
     app, tmp_home = contract_server
@@ -404,6 +406,7 @@ def test_providers_list_payload_contract(contract_server):
     assert seeded[0]["models"] == ["f3-model"]
 
 
+@pytest.mark.trust_harness
 def test_tools_list_payload_contract(contract_server):
     """tools_list: {name, description} entries; no session_id, no enabled key."""
     app, _ = contract_server
@@ -440,6 +443,7 @@ def test_tools_list_payload_contract(contract_server):
         assert "enabled" not in tool, f"tool {name!r} must not carry an enabled key"
 
 
+@pytest.mark.trust_harness
 def test_state_changed_payload_contract(contract_server):
     """state_changed after close_session: {state, is_running}, no session_id."""
     app, _ = contract_server
@@ -470,6 +474,7 @@ def test_state_changed_payload_contract(contract_server):
     )
 
 
+@pytest.mark.trust_harness
 def test_conversation_changed_payload_contract(contract_server):
     """conversation_changed: messages list + total_count/has_more; no session_id."""
     app, _ = contract_server
@@ -510,6 +515,7 @@ def test_conversation_changed_payload_contract(contract_server):
         )
 
 
+@pytest.mark.trust_harness
 def test_error_payload_contract(contract_server):
     """error after failed apply_config: session_id present + canonical message."""
     from web_ui.backend.bridge import WebAgentBridge
@@ -577,6 +583,7 @@ def test_session_stop_not_a_ws_event(contract_server):
     )
 
 
+@pytest.mark.trust_harness
 def test_session_cleared_payload_contract(contract_server):
     """session_cleared after close_session: type-only payload, NO session_id."""
     app, _ = contract_server
@@ -603,6 +610,7 @@ def test_session_cleared_payload_contract(contract_server):
     )
 
 
+@pytest.mark.trust_harness
 def test_session_renamed_payload_contract(contract_server):
     """session_renamed: {session_id, new_name} broadcast to the loaded session."""
     app, _ = contract_server
@@ -630,6 +638,7 @@ def test_session_renamed_payload_contract(contract_server):
     )
 
 
+@pytest.mark.trust_harness
 def test_session_deleted_payload_contract(contract_server):
     """session_deleted: {session_id} direct send after delete_session."""
     app, _ = contract_server

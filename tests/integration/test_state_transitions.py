@@ -625,6 +625,7 @@ def test_continue_session_requires_running(contract_server):
 # H. WS: start_session with empty query short-circuits (no agent thread)
 # ══════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_ws_start_session_empty_query(contract_server):
     """start_session empty query → status '⚠ Query cannot be empty.' (no bridge)."""
     app, _ = contract_server
@@ -653,6 +654,7 @@ def _load_session(client, session_id, ws):
     _receive_until_session_loaded(ws, "REST create → WS load_session")
 
 
+@pytest.mark.trust_harness
 def test_ws_pause_session_status_only(contract_server):
     """pause_session with no running agent → '⏸ Pausing…', NO state_changed."""
     app, _ = contract_server
@@ -670,6 +672,7 @@ def test_ws_pause_session_status_only(contract_server):
             _assert_quiet(ws, "pause_session must not emit state_changed", timeout=1.5)
 
 
+@pytest.mark.trust_harness
 def test_ws_resume_session_status_only(contract_server):
     """resume_session with no running agent → '▶ Resumed.', NO state_changed."""
     app, _ = contract_server
@@ -687,6 +690,7 @@ def test_ws_resume_session_status_only(contract_server):
             _assert_quiet(ws, "resume_session must not emit state_changed", timeout=1.5)
 
 
+@pytest.mark.trust_harness
 def test_ws_stop_session_status_only(contract_server):
     """stop_session with no running agent → '⏹ Stopped.', NO state_changed."""
     app, _ = contract_server
@@ -708,6 +712,7 @@ def test_ws_stop_session_status_only(contract_server):
 # K. WS: close_session → the ONLY direct state_changed: IDLE / False
 # ══════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_ws_close_session_idle_state_changed(contract_server):
     """close_session → first state_changed is EXACTLY {IDLE, is_running: False}."""
     app, _ = contract_server

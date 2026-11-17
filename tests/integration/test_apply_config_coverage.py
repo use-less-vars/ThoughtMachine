@@ -450,6 +450,7 @@ def _variant_config(case_name: str, workspace_type: str, **fields) -> dict:
 # Case 1 — session exists, change session_permissions
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_case1_permissions_change(contract_server, workspace_type):
@@ -530,6 +531,7 @@ def test_case1_permissions_change(contract_server, workspace_type):
 # Fix regression A — fresh workspace: apply_config NEW perms survive the vault
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_fresh_workspace_apply_defaults_not_deny_all(contract_server, workspace_type):
@@ -571,6 +573,7 @@ def test_fresh_workspace_apply_defaults_not_deny_all(contract_server, workspace_
 # Fix regression B — new_session handshake reflects DEFAULT perms (not deny-all)
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_new_session_handshake_default_permissions(contract_server, workspace_type):
@@ -599,6 +602,7 @@ def test_new_session_handshake_default_permissions(contract_server, workspace_ty
 # Case 2 — session exists, change provider/model
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_case2_provider_model_change(contract_server, workspace_type):
@@ -634,6 +638,7 @@ def test_case2_provider_model_change(contract_server, workspace_type):
 # Case 3 — no session
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_case3_no_session(contract_server, workspace_type):
@@ -675,6 +680,7 @@ def test_case3_no_session(contract_server, workspace_type):
 # Case 4 — workspace change A → B with a real conversation
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_case4_workspace_change_new_session(contract_server):
     """Workspace switch with a conversation-bearing session → NEW session for B,
     old session preserved (NOT closed), no session_closed/state_changed events."""
@@ -736,6 +742,7 @@ def test_case4_workspace_change_new_session(contract_server):
 # Case 5 — invalid provider_id
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_case5_invalid_provider(contract_server, workspace_type):
@@ -775,6 +782,7 @@ def test_case5_invalid_provider(contract_server, workspace_type):
 # Case 6 — two rapid consecutive apply_config
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_case6_rapid_consecutive_applies(contract_server, workspace_type):
@@ -819,6 +827,7 @@ def test_case6_rapid_consecutive_applies(contract_server, workspace_type):
 # (locks cbe5f72 "include workspace_path in apply_config config_changed event")
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("workspace_type", _WORKSPACE_TYPES,
                          ids=["default", "custom"])
 def test_case7_permission_only_apply_keeps_session(contract_server, workspace_type):
@@ -931,6 +940,7 @@ def test_case7_permission_only_apply_keeps_session(contract_server, workspace_ty
 # (locks e72a61a "normalize paths in apply_config workspace_changed detection")
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_case8_same_workspace_trailing_slash_no_replacement(contract_server):
     """apply_config whose workspace_path is the SAME directory with a trailing
     slash → os.path.normpath (server.py:730-732) makes it a no-op workspace
@@ -1004,6 +1014,7 @@ def test_case8_same_workspace_trailing_slash_no_replacement(contract_server):
 # (Config Change Queue: immediate path — controller idle → config_changed only)
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_case9_idle_apply_model_temp_tools(contract_server):
     """apply_config while the controller is IDLE (fresh session, agent not
     started) → immediate config_changed on the SAME session: model +
@@ -1072,6 +1083,7 @@ def test_case9_idle_apply_model_temp_tools(contract_server):
 # (Config Change Queue: queued path — busy → idle transition)
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_case10_busy_config_queued_then_deferred_apply(contract_server):
     """apply_config while the controller is BUSY (agent RUNNING) → the server
     ACKs with config_queued and applies NOTHING yet; once the controller becomes
@@ -1179,6 +1191,7 @@ def test_case10_busy_config_queued_then_deferred_apply(contract_server):
 # (Config Change Queue: queued path — busy → idle transition, failure branch)
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_case11_busy_config_queued_then_deferred_apply_fails(contract_server):
     """apply_config while the controller is BUSY → config_queued ACK only (no
     premature config_apply_failed); once the controller goes idle the deferred
@@ -1270,6 +1283,7 @@ def test_case11_busy_config_queued_then_deferred_apply_fails(contract_server):
 # 'content' string (never stored/leaked as a JSON object into the LLM prompt)
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_case12_system_prompt_file_object_dict_normalized(contract_server):
     """apply_config whose config.system_prompt is a file-object dict
     {"name", "content", "size_bytes", "modified_at"} (the injection shape) →
@@ -1338,6 +1352,7 @@ def test_case12_system_prompt_file_object_dict_normalized(contract_server):
 # idle on the SAME session (no lost updates, no premature config_changed)
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_config_change_guarantee_while_busy(contract_server):
     """A NON-workspace config change sent while the controller is RUNNING is
     GUARANTEED to be applied: the server ACKs it with config_queued within
@@ -1443,6 +1458,7 @@ def test_config_change_guarantee_while_busy(contract_server):
 # model on the SAME session (Config Change Queue: busy → idle transition)
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_case13_model_change_while_busy(contract_server):
     """apply_config {model: 'gpt-4o-turbo'} while the controller is RUNNING →
     config_queued ACK only (no premature config_changed); once the controller
@@ -1529,6 +1545,7 @@ def test_case13_model_change_while_busy(contract_server):
 # new temperature on the SAME session (Config Change Queue: busy → idle)
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_case14_temperature_change_while_busy(contract_server):
     """apply_config {temperature: 0.7} while the controller is RUNNING →
     config_queued ACK only (no premature config_changed); once the controller
@@ -1614,6 +1631,7 @@ def test_case14_temperature_change_while_busy(contract_server):
 # Invariant — an apply_config payload can NEVER write session grants
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.trust_harness
 def test_apply_config_payload_cannot_write_grants(contract_server):
     """``session_permissions`` in an apply_config payload is NOT a grants writer.
 

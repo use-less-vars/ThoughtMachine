@@ -167,6 +167,7 @@ def test_cli_host_env_override(clean_home, monkeypatch):
 # Fix 2 — /api/browse confinement (absolute, outside vault)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+@pytest.mark.trust_harness
 def test_browse_home_ok(client, clean_home):
     """Browsing $HOME (default and explicit) works and returns the home dir."""
     _, _, tmp_home = clean_home
@@ -185,6 +186,7 @@ def test_browse_home_ok(client, clean_home):
     assert data["current_path"] == expected
 
 
+@pytest.mark.trust_harness
 def test_browse_root_allowed(client):
     """The filesystem root is an absolute dir outside the vault — browsing it
     is legitimate (the legacy $HOME-only confinement is gone)."""
@@ -195,6 +197,7 @@ def test_browse_root_allowed(client):
     assert data["current_path"] == "/"
 
 
+@pytest.mark.trust_harness
 def test_browse_outside_home_dir_allowed(client, outside_home_dir):
     """A directory OUTSIDE $HOME (e.g. D:\\Coding on Windows, /etc on POSIX)
     is browsable: only the vault trust anchor is off-limits."""
@@ -205,6 +208,7 @@ def test_browse_outside_home_dir_allowed(client, outside_home_dir):
     assert data["current_path"] == os.path.realpath(outside_home_dir)
 
 
+@pytest.mark.trust_harness
 def test_browse_rejects_vault(client, clean_home):
     """~/.thoughtmachine (vault root) must be rejected even though it lives
     under $HOME."""
@@ -217,6 +221,7 @@ def test_browse_rejects_vault(client, clean_home):
     assert "vault" in data["error"].lower()
 
 
+@pytest.mark.trust_harness
 def test_browse_nonexistent_dir(client, clean_home):
     """An in-home path that does not exist yields the usual 'Not a directory'."""
     _, _, tmp_home = clean_home
@@ -228,6 +233,7 @@ def test_browse_nonexistent_dir(client, clean_home):
     assert "Not a directory" in data["error"]
 
 
+@pytest.mark.trust_harness
 def test_browse_rejects_symlink_into_vault(client, clean_home):
     """A symlink resolving INTO the vault must be rejected after resolution
     (no symlink-based escape INTO the trust anchor)."""
@@ -246,6 +252,7 @@ def test_browse_rejects_symlink_into_vault(client, clean_home):
 # Fix 2 — /api/browse/create confinement
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+@pytest.mark.trust_harness
 def test_create_directory_ok(client, clean_home):
     """Creating a directory inside $HOME works and it becomes browsable."""
     _, _, tmp_home = clean_home
@@ -261,6 +268,7 @@ def test_create_directory_ok(client, clean_home):
     assert resp.json()["success"] is True
 
 
+@pytest.mark.trust_harness
 def test_create_outside_home_parent_allowed(client, outside_home_dir):
     """Creating inside an absolute parent OUTSIDE $HOME succeeds: only the
     vault root is off-limits (emulates creating under D:\\ on Windows)."""
@@ -272,6 +280,7 @@ def test_create_outside_home_parent_allowed(client, outside_home_dir):
     assert os.path.isdir(os.path.join(outside_home_dir, "x"))
 
 
+@pytest.mark.trust_harness
 def test_create_absolute_name_outside_home_allowed(client, clean_home,
                                                    outside_home_dir):
     """An absolute ``name`` (a full path pasted into the New Folder prompt,
@@ -287,6 +296,7 @@ def test_create_absolute_name_outside_home_allowed(client, clean_home,
     assert os.path.isdir(target)
 
 
+@pytest.mark.trust_harness
 def test_create_rejects_absolute_name_in_vault(client, clean_home):
     """An absolute ``name`` resolving into the vault must be rejected: the
     absolute-name fast path is confined like every other host path."""
@@ -302,6 +312,7 @@ def test_create_rejects_absolute_name_in_vault(client, clean_home):
     assert not os.path.exists(target)
 
 
+@pytest.mark.trust_harness
 def test_create_rejects_traversal(client, clean_home):
     """A name containing ../ must not escape the parent directory."""
     _, _, tmp_home = clean_home
@@ -313,6 +324,7 @@ def test_create_rejects_traversal(client, clean_home):
     assert not os.path.exists(os.path.join(os.path.dirname(tmp_home), "escape"))
 
 
+@pytest.mark.trust_harness
 def test_create_rejects_vault_parent(client, clean_home):
     """A parent path inside the vault must be rejected."""
     _, _, tmp_home = clean_home
@@ -329,6 +341,7 @@ def test_create_rejects_vault_parent(client, clean_home):
 # Fix 3 — container lifecycle workspace_path validation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+@pytest.mark.trust_harness
 def test_container_start_rejects_vault_path(client, clean_home):
     """workspace_path inside the vault → HTTP 400."""
     _, _, tmp_home = clean_home
@@ -339,6 +352,7 @@ def test_container_start_rejects_vault_path(client, clean_home):
     assert "vault" in resp.json()["error"].lower()
 
 
+@pytest.mark.trust_harness
 def test_container_start_rejects_etc_outside_root_403(client, registered_ws):
     """workspace_path = /etc is an absolute dir outside the vault but NOT
     within the registered workspace root → HTTP 403 (registered-root gate
@@ -351,6 +365,7 @@ def test_container_start_rejects_etc_outside_root_403(client, registered_ws):
     assert "registered workspace root" in resp.json()["error"]
 
 
+@pytest.mark.trust_harness
 def test_container_start_rejects_unregistered_ws_root_400(client):
     """workspace_path = / with an UNREGISTERED workspace id → HTTP 400
     ('not registered'), because the registered-root gate cannot apply."""
@@ -360,6 +375,7 @@ def test_container_start_rejects_unregistered_ws_root_400(client):
     assert "not registered" in resp.json()["error"]
 
 
+@pytest.mark.trust_harness
 def test_container_start_rejects_nonexistent(client, clean_home):
     """workspace_path that is not an existing directory → HTTP 400."""
     _, _, tmp_home = clean_home
@@ -384,6 +400,7 @@ def test_container_start_registered_root_and_subdir_pass_validation(client, regi
         assert "registered workspace root" not in error
 
 
+@pytest.mark.trust_harness
 def test_container_start_rejects_sibling_dir_403(client, registered_ws):
     """An in-home directory that is NOT within the registered workspace root
     must be rejected with HTTP 403 (no arbitrary home dirs in containers)."""
@@ -395,6 +412,7 @@ def test_container_start_rejects_sibling_dir_403(client, registered_ws):
     assert "registered workspace root" in resp.json()["error"]
 
 
+@pytest.mark.trust_harness
 def test_container_start_unknown_ws_explicit_path_400(client, registered_ws):
     """Explicit workspace_path with an unregistered ws_id → HTTP 400."""
     resp = client.post(
@@ -405,6 +423,7 @@ def test_container_start_unknown_ws_explicit_path_400(client, registered_ws):
     assert "not registered" in resp.json()["error"]
 
 
+@pytest.mark.trust_harness
 def test_container_start_empty_path_falls_back_to_registry(client):
     """No explicit workspace_path: registry lookup for an unknown workspace
     → 404 (unchanged behavior, not a validation error)."""
@@ -413,6 +432,7 @@ def test_container_start_empty_path_falls_back_to_registry(client):
     assert "not found" in resp.json()["error"]
 
 
+@pytest.mark.trust_harness
 def test_container_list_rejects_vault_path(client, clean_home):
     """Validation is centralized: non-start lifecycle endpoints reject an
     explicit vault workspace_path with HTTP 400 too."""
@@ -428,6 +448,7 @@ def test_container_list_rejects_vault_path(client, clean_home):
 # Fix 4 — /api/workspace/resolve registration confinement
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+@pytest.mark.trust_harness
 def test_resolve_registers_new_path_under_home(client, clean_home):
     """A NEW registration under $HOME (outside the vault) succeeds and is
     idempotent: a second resolve returns the same workspace id."""
@@ -446,6 +467,7 @@ def test_resolve_registers_new_path_under_home(client, clean_home):
     assert resp2.json()["workspace_id"] == data["workspace_id"]
 
 
+@pytest.mark.trust_harness
 def test_resolve_registers_outside_home_absolute_200(client, outside_home_dir):
     """A NEW registration OUTSIDE $HOME (e.g. D:\\Coding on Windows, /etc on
     POSIX) succeeds and is idempotent: absolute + outside the vault is all
@@ -461,6 +483,7 @@ def test_resolve_registers_outside_home_absolute_200(client, outside_home_dir):
     assert resp2.json()["workspace_id"] == data["workspace_id"]
 
 
+@pytest.mark.trust_harness
 def test_resolve_rejects_vault_403(client, clean_home):
     """~/.thoughtmachine (the trust anchor) must never be registered → 403."""
     _, _, tmp_home = clean_home
@@ -470,6 +493,7 @@ def test_resolve_rejects_vault_403(client, clean_home):
     assert "vault" in resp.json()["detail"].lower()
 
 
+@pytest.mark.trust_harness
 def test_resolve_rejects_nonexistent_400(client, clean_home):
     """A path that is not an existing directory → HTTP 400."""
     _, _, tmp_home = clean_home
@@ -479,6 +503,7 @@ def test_resolve_rejects_nonexistent_400(client, clean_home):
     assert "not an existing directory" in resp.json()["detail"]
 
 
+@pytest.mark.trust_harness
 def test_resolve_rejects_empty_path_400(client):
     """An empty path is a client error, not a registration attempt."""
     resp = client.post("/api/workspace/resolve", json={"path": ""})
@@ -486,6 +511,7 @@ def test_resolve_rejects_empty_path_400(client):
     assert "path is required" in resp.json()["detail"]
 
 
+@pytest.mark.trust_harness
 def test_resolve_rejects_symlink_into_vault_403(client, clean_home):
     """A symlink resolving INTO the vault must be rejected after resolution
     (no symlink-based escape INTO the trust anchor)."""
@@ -498,6 +524,7 @@ def test_resolve_rejects_symlink_into_vault_403(client, clean_home):
     assert "vault" in resp.json()["detail"].lower()
 
 
+@pytest.mark.trust_harness
 def test_resolve_registered_under_home_returns_existing(client, registered_ws):
     """An already-registered workspace under $HOME resolves to its id."""
     resp = client.post("/api/workspace/resolve",
@@ -506,6 +533,7 @@ def test_resolve_registered_under_home_returns_existing(client, registered_ws):
     assert resp.json()["workspace_id"] == registered_ws["ws_id"]
 
 
+@pytest.mark.trust_harness
 def test_resolve_pre_registered_outside_home_still_resolves(client, clean_home):
     """Registry entries written by trusted code (bootstrap/server startup)
     resolve even when outside $HOME — only NEW registrations are validated
@@ -534,6 +562,7 @@ def test_resolve_pre_registered_outside_home_still_resolves(client, clean_home):
 _RECORD_ACTIONS = ("kill", "restart", "recreate")
 
 
+@pytest.mark.trust_harness
 def test_record_action_requires_workspace_id_400(client):
     """No ``workspace_id`` query param → HTTP 400, before attribution."""
     for action in _RECORD_ACTIONS:
@@ -551,6 +580,7 @@ def test_record_action_requires_actor_401(client):
         assert resp.status_code == 401, resp.text
 
 
+@pytest.mark.trust_harness
 def test_record_action_rejects_malformed_actor_400(client):
     """An actor outside the allowed alphabet → HTTP 400 (not 401)."""
     for action in _RECORD_ACTIONS:
@@ -561,6 +591,7 @@ def test_record_action_rejects_malformed_actor_400(client):
         assert "malformed" in resp.json()["error"]
 
 
+@pytest.mark.trust_harness
 def test_record_action_rejects_overlong_actor_400(client):
     """An actor longer than 64 chars → HTTP 400 (bounded token)."""
     resp = client.post("/api/container-records/rec-x/kill",
@@ -569,6 +600,7 @@ def test_record_action_rejects_overlong_actor_400(client):
     assert resp.status_code == 400, resp.text
 
 
+@pytest.mark.trust_harness
 def test_record_action_body_actor_passes_attribution_guard(client):
     """A body ``actor`` satisfies attribution with no header: the request
     advances PAST the actor guard (it must not fail 400/401 — it fails later,

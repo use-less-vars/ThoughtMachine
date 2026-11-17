@@ -114,11 +114,13 @@ def _write_provider_profile(tmp_home: str) -> Path:
 
 
 class TestOnboardingStatus:
+    @pytest.mark.trust_harness
     def test_status_false_when_empty(self, client):
         resp = client.get("/api/onboarding/status")
         assert resp.status_code == 200
         assert resp.json() == {"onboarding_complete": False}
 
+    @pytest.mark.trust_harness
     def test_status_false_with_malformed_marker(self, client, clean_home):
         _, tmp_home = clean_home
         marker = _write_marker(tmp_home, "{not valid json")
@@ -127,6 +129,7 @@ class TestOnboardingStatus:
         assert resp.status_code == 200
         assert resp.json() == {"onboarding_complete": False}
 
+    @pytest.mark.trust_harness
     def test_status_true_with_provider_profile(self, client, clean_home):
         _, tmp_home = clean_home
         _write_provider_profile(tmp_home)
@@ -134,6 +137,7 @@ class TestOnboardingStatus:
         assert resp.status_code == 200
         assert resp.json() == {"onboarding_complete": True}
 
+    @pytest.mark.trust_harness
     def test_status_true_with_workspace(self, client, clean_home):
         from thoughtmachine.workspace_registry import WorkspaceRegistry
 
@@ -152,6 +156,7 @@ class TestOnboardingStatus:
 
 
 class TestOnboardingComplete:
+    @pytest.mark.trust_harness
     def test_complete_and_status_true(self, client, clean_home):
         _, tmp_home = clean_home
         resp = client.post("/api/onboarding/complete")
@@ -165,6 +170,7 @@ class TestOnboardingComplete:
         status = client.get("/api/onboarding/status")
         assert status.json() == {"onboarding_complete": True}
 
+    @pytest.mark.trust_harness
     def test_complete_idempotent(self, client, clean_home):
         _, tmp_home = clean_home
         first = client.post("/api/onboarding/complete")
@@ -174,6 +180,7 @@ class TestOnboardingComplete:
         assert first.json() == {"onboarding_complete": True}
         assert second.json() == {"onboarding_complete": True}
 
+    @pytest.mark.trust_harness
     def test_complete_repairs_malformed_marker(self, client, clean_home):
         _, tmp_home = clean_home
         marker = _write_marker(tmp_home, "garbage")
@@ -186,6 +193,7 @@ class TestOnboardingComplete:
 
 
 class TestConnection:
+    @pytest.mark.trust_harness
     def test_connection_ok(self, client, monkeypatch):
         from llm_providers.factory import ProviderFactory
 
@@ -209,6 +217,7 @@ class TestConnection:
         assert resp.status_code == 200
         assert resp.json() == {"ok": True}
 
+    @pytest.mark.trust_harness
     def test_connection_failure_no_key_leak(self, client, monkeypatch):
         from llm_providers.factory import ProviderFactory
 
@@ -226,6 +235,7 @@ class TestConnection:
         assert "sk-test-abc" not in resp.text
         assert "sk-" not in body["error"]
 
+    @pytest.mark.trust_harness
     def test_connection_failure_chat_completion_raises(self, client, monkeypatch):
         from llm_providers.factory import ProviderFactory
 
@@ -245,6 +255,7 @@ class TestConnection:
         assert body["ok"] is False
         assert "sk-super-secret-key" not in resp.text
 
+    @pytest.mark.trust_harness
     def test_connection_invalid_provider(self, client, monkeypatch):
         from llm_providers.factory import ProviderFactory
         from llm_providers.exceptions import ProviderNotFoundError

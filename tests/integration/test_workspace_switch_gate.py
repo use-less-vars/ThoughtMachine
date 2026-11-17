@@ -170,6 +170,7 @@ def _set_project(target):
 # 1 — symlink into another workspace's root
 # ──────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_apply_config_refuses_symlink_to_other_workspace_root(gate_server):
     """A symlink whose target is workspace B's root IS workspace B.
 
@@ -213,6 +214,7 @@ def test_apply_config_refuses_symlink_to_other_workspace_root(gate_server):
 # 2 — brand-new path outside every registered root
 # ──────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_apply_config_allows_fresh_path_outside_all_roots(gate_server):
     """The legitimate case: a brand-new folder outside every workspace root.
 
@@ -431,6 +433,7 @@ def _assert_set_project_took_effect(
     )
 
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize(
     "case,kind,expected",
     _CASES,

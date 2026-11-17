@@ -129,6 +129,7 @@ def _recv_until_type(ws, target, timeout_hint="", max_events=40):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+@pytest.mark.trust_harness
 def test_open_sessions_payload_carries_workspace_id_per_session(open_sessions_server):
     """Every ``open_sessions`` entry names the workspace its session lives in."""
     app, vault, server_mod = open_sessions_server
@@ -174,6 +175,7 @@ def test_open_sessions_payload_carries_workspace_id_per_session(open_sessions_se
         assert "message_count" in entry
 
 
+@pytest.mark.trust_harness
 def test_open_sessions_reports_unknown_workspace_as_empty_string(open_sessions_server):
     """A legacy flat session reports ``""`` — the UI fails closed on it.
 

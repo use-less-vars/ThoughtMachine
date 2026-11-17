@@ -30,6 +30,7 @@ from pathlib import Path
 # Add project root so that imports work (same pattern as sibling tests).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
 from fastapi.testclient import TestClient
 
 from session.models import Session
@@ -52,6 +53,7 @@ def _recv_until(ws, want_type, max_msgs=40):
     )
 
 
+@pytest.mark.trust_harness
 def test_ws_load_session_refresh_does_not_clobber_rest_written_sidecar(
     hermetic_vault, tmp_path, monkeypatch
 ):

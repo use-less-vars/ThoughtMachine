@@ -184,6 +184,7 @@ def _user_actions(vault, record_id=RID):
 
 # ── FAKE manager: RECREATE is the rebuild path (the bug) ────────────────
 
+@pytest.mark.trust_harness
 def test_recreate_restores_both_recorded_axes(vault, monkeypatch):
     """The recreate rebuild receives BOTH recorded axes, not the policy pair."""
     _seed(vault, intent_snapshot={"network_mode": "bridge",
@@ -200,6 +201,7 @@ def test_recreate_restores_both_recorded_axes(vault, monkeypatch):
                                      "workspace_mode": "rw"}]
 
 
+@pytest.mark.trust_harness
 def test_recreate_workspace_mode_only(vault, monkeypatch):
     """Each axis is independent: a workspace-only record passes one key."""
     _seed(vault, intent_snapshot={"workspace_mode": "rw"})
@@ -212,6 +214,7 @@ def test_recreate_workspace_mode_only(vault, monkeypatch):
     assert manager.start_kwargs == [{"workspace_mode": "rw"}]
 
 
+@pytest.mark.trust_harness
 def test_recreate_network_mode_only(vault, monkeypatch):
     """Each axis is independent: a network-only record passes one key."""
     _seed(vault, intent_snapshot={"network_mode": "bridge"})
@@ -224,6 +227,7 @@ def test_recreate_network_mode_only(vault, monkeypatch):
     assert manager.start_kwargs == [{"network_mode": "bridge"}]
 
 
+@pytest.mark.trust_harness
 def test_recreate_without_recorded_envelope_passes_no_override(vault,
                                                                monkeypatch):
     # guard: passes with or without the fix; asserts start_kwargs == [{}] only.
@@ -238,6 +242,7 @@ def test_recreate_without_recorded_envelope_passes_no_override(vault,
     assert manager.start_kwargs == [{}]
 
 
+@pytest.mark.trust_harness
 def test_recreate_rebinds_record_to_the_rebuilt_container(vault, monkeypatch):
     """Recreate is the verb where a genuinely NEW container id appears.
 
@@ -258,6 +263,7 @@ def test_recreate_rebinds_record_to_the_rebuilt_container(vault, monkeypatch):
 
 # ── FAKE manager: RESTART only forwards (stop + reuse, not a rebuild) ───
 
+@pytest.mark.trust_harness
 def test_restart_forwards_recorded_envelope(vault, monkeypatch):
     """``restart`` FORWARDS the envelope; the reuse path never consumes it."""
     _seed(vault, intent_snapshot={"network_mode": "bridge",
@@ -272,6 +278,7 @@ def test_restart_forwards_recorded_envelope(vault, monkeypatch):
                                      "workspace_mode": "rw"}]
 
 
+@pytest.mark.trust_harness
 def test_restart_without_recorded_envelope_passes_no_override(vault,
                                                               monkeypatch):
     # guard: passes with or without the fix; asserts start_kwargs == [{}] only.
@@ -285,6 +292,7 @@ def test_restart_without_recorded_envelope_passes_no_override(vault,
     assert manager.start_kwargs == [{}]
 
 
+@pytest.mark.trust_harness
 def test_restart_only_stops_and_never_removes(vault, monkeypatch):
     # guard: passes with or without the fix; asserts the VERB SHAPE only
     # (restart = stop, no remove, allow_fresh=False), never the envelope.
@@ -302,6 +310,7 @@ def test_restart_only_stops_and_never_removes(vault, monkeypatch):
 
 # ── Route: a rebuild with no container id is an ERROR, not a rebind ─────
 
+@pytest.mark.trust_harness
 def test_recreate_without_rebuild_id_errors_and_keeps_old_handle(vault,
                                                                  monkeypatch):
     _seed(vault, intent_snapshot={"network_mode": "bridge"})
@@ -319,6 +328,7 @@ def test_recreate_without_rebuild_id_errors_and_keeps_old_handle(vault,
     assert decisions[-1] == "error", decisions
 
 
+@pytest.mark.trust_harness
 def test_restart_without_rebuild_id_errors_and_keeps_old_handle(vault,
                                                                 monkeypatch):
     _seed(vault, intent_snapshot={"network_mode": "bridge"})
@@ -402,6 +412,7 @@ def _real_manager(monkeypatch, vault):
     return manager, captured
 
 
+@pytest.mark.trust_harness
 def test_real_manager_recreate_rebuilds_with_both_recorded_axes(vault,
                                                                monkeypatch):
     """The REAL rebuild carries BOTH recorded axes, not ``none``/``ro``."""
@@ -420,6 +431,7 @@ def test_real_manager_recreate_rebuilds_with_both_recorded_axes(vault,
     assert captured["reuse_record_id"] == RID
 
 
+@pytest.mark.trust_harness
 def test_real_manager_recreate_proves_the_downgrade_without_the_envelope(
         vault, monkeypatch):
     """Same real harness, an UNRECORDED envelope: policy decides (none/ro).
@@ -519,6 +531,7 @@ def _origin(manager, labels, *, dies_on_remove=True):
     return manager
 
 
+@pytest.mark.trust_harness
 def test_recreate_rebuilds_with_the_origin_created_by(vault, monkeypatch):
     """The rebuild is stamped with the ORIGIN label, not the acting operator.
 
@@ -542,6 +555,7 @@ def test_recreate_rebuilds_with_the_origin_created_by(vault, monkeypatch):
                                      "workspace_mode": "rw"}]
 
 
+@pytest.mark.trust_harness
 def test_restart_forwards_the_origin_created_by(vault, monkeypatch):
     """``restart`` stops only, so the live label is still readable: forwarded."""
     _seed(vault, intent_snapshot={"network_mode": "bridge"})
@@ -557,6 +571,7 @@ def test_restart_forwards_the_origin_created_by(vault, monkeypatch):
     assert manager.start_kwargs == [{"network_mode": "bridge"}]
 
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("read", ["gone", "unreadable"])
 def test_recreate_with_the_container_already_gone_falls_back_to_the_operator(
         vault, monkeypatch, read):
@@ -582,6 +597,7 @@ def test_recreate_with_the_container_already_gone_falls_back_to_the_operator(
     assert manager.starts[0][4] == OPERATOR
 
 
+@pytest.mark.trust_harness
 def test_recreate_without_an_origin_label_falls_back_to_the_operator(
         vault, monkeypatch):
     # guard: passes with or without the fix -- a live container that carries no
@@ -598,6 +614,7 @@ def test_recreate_without_an_origin_label_falls_back_to_the_operator(
     assert manager.starts[0][4] == OPERATOR
 
 
+@pytest.mark.trust_harness
 def test_real_manager_recreate_stamps_the_origin_created_by(vault,
                                                            monkeypatch):
     """Same real harness: ``_fresh_start`` receives the ORIGIN + the envelope."""
@@ -617,6 +634,7 @@ def test_real_manager_recreate_stamps_the_origin_created_by(vault,
     assert captured["restored_envelope"] is True
 
 
+@pytest.mark.trust_harness
 def test_recreate_rebind_payload_carries_no_creator_field(vault, monkeypatch):
     """WHY the label -- and not the record -- has to carry the origin.
 

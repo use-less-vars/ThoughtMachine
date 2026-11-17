@@ -121,6 +121,7 @@ def _spy_on_primitive(monkeypatch):
 # 1 — the load gate
 # ──────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_load_gate_calls_ownership_primitive_with_requested_and_socket_scope(
     gate_server, monkeypatch
 ):
@@ -165,6 +166,7 @@ def test_load_gate_calls_ownership_primitive_with_requested_and_socket_scope(
 # 2 — new_session
 # ──────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_new_session_calls_ownership_primitive_with_requested_and_socket_scope(
     gate_server, monkeypatch
 ):
@@ -243,6 +245,7 @@ def _status_texts(*frames):
     return out
 
 
+@pytest.mark.trust_harness
 def test_bare_new_session_on_bound_socket_is_allowed_and_stays_in_scope(
     gate_server, monkeypatch
 ):
@@ -283,6 +286,7 @@ def test_bare_new_session_on_bound_socket_is_allowed_and_stays_in_scope(
     )
 
 
+@pytest.mark.trust_harness
 def test_apply_config_on_unscoped_connection_is_bootstrap_allowed(
     gate_server, monkeypatch
 ):
@@ -320,6 +324,7 @@ def test_apply_config_on_unscoped_connection_is_bootstrap_allowed(
     )
 
 
+@pytest.mark.trust_harness
 def test_apply_config_switch_on_bound_socket_is_refused(gate_server, monkeypatch):
     """socket bound to A + apply_config(workspace_path=B) -> primitive(path, A), refused."""
     app, tmp_home, _server_mod = gate_server
@@ -352,6 +357,7 @@ def test_apply_config_switch_on_bound_socket_is_refused(gate_server, monkeypatch
     )
 
 
+@pytest.mark.trust_harness
 def test_scopeless_cold_load_binds_to_the_sessions_workspace(gate_server, monkeypatch):
     """load_session WITHOUT workspace_id on a fresh socket -> resolves to A, allowed.
 

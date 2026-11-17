@@ -135,6 +135,7 @@ def poll_for_type(ws, expected_type: str, timeout: float = 5.0) -> list:
 
 class TestWebSocketLifecycle:
 
+    @pytest.mark.trust_harness
     def test_new_session_emits_five_events(self, pathed_server):
         """new_session → 5 events in order."""
         app, tmp_home = pathed_server
@@ -187,6 +188,7 @@ class TestWebSocketLifecycle:
         assert sm["type"] == "status_message"
         assert "Ready" in sm["text"]
 
+    @pytest.mark.trust_harness
     def test_continue_session_without_key_emits_error(self, pathed_server):
         """continue_session without API key → status_message about error."""
         app, tmp_home = pathed_server
@@ -220,6 +222,7 @@ class TestWebSocketLifecycle:
             f"{[m.get('text') for m in status_msgs]}"
         )
 
+    @pytest.mark.trust_harness
     def test_new_session_resolves_workspace_id(self, pathed_server):
         """new_session without workspace_id → session_loaded with resolved workspace_id.
         The server auto-registers the project root in the workspace registry
@@ -254,6 +257,7 @@ class TestWebSocketLifecycle:
         # Also verify the session_id is present
         assert isinstance(sl["session_id"], str) and len(sl["session_id"]) > 0
 
+    @pytest.mark.trust_harness
     def test_apply_config_api_key_not_configured(self, pathed_server):
         """apply_config with an API key → api_key_configured: False.
 

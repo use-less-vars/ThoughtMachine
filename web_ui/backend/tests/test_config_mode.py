@@ -63,6 +63,7 @@ def mock_thoughtmachine(monkeypatch):
 class TestSetMode:
     """Tests for the POST /api/config/mode endpoint."""
 
+    @pytest.mark.trust_harness
     def test_set_engineer_mode(self, mock_thoughtmachine):
         """Switching to engineer mode copies the engineer prompt to
         ``custom_system_prompt.txt`` and returns the expected response."""
@@ -77,6 +78,7 @@ class TestSetMode:
         assert "Write code" in content
         assert "not philosophise" in content
 
+    @pytest.mark.trust_harness
     def test_set_agent_mode_clears_custom_prompt(self, mock_thoughtmachine):
         """Switching to agent mode removes ``custom_system_prompt.txt``."""
         # First set engineer mode so the file exists
@@ -95,6 +97,7 @@ class TestSetMode:
             "custom_system_prompt.txt should be removed in agent mode"
         )
 
+    @pytest.mark.trust_harness
     def test_invalid_mode_returns_400(self, mock_thoughtmachine):
         """An unrecognised mode value should result in a 400 error."""
         response = client.post(
@@ -106,11 +109,13 @@ class TestSetMode:
         assert "engineer" in detail
         assert "custom" in detail
 
+    @pytest.mark.trust_harness
     def test_empty_mode_returns_400(self, mock_thoughtmachine):
         """An empty mode string should result in a 400 error."""
         response = client.post("/api/config/mode", json={"mode": ""})
         assert response.status_code == 400, response.text
 
+    @pytest.mark.trust_harness
     def test_mode_is_case_insensitive(self, mock_thoughtmachine):
         """Mode values should be accepted case-insensitively."""
         response = client.post(
@@ -122,6 +127,7 @@ class TestSetMode:
         custom_prompt = mock_thoughtmachine / "custom_system_prompt.txt"
         assert custom_prompt.exists()
 
+    @pytest.mark.trust_harness
     def test_legacy_full_maps_to_agent(self, mock_thoughtmachine):
         """Legacy "full" mode value should be accepted and mapped to
         "agent"."""
@@ -142,6 +148,7 @@ class TestSetMode:
             "custom_system_prompt.txt should be removed when mapping full -> agent"
         )
 
+    @pytest.mark.trust_harness
     def test_set_agent_mode_when_no_custom_prompt(self, mock_thoughtmachine):
         """Switching to agent mode when no custom prompt exists should
         still succeed (no-op)."""
@@ -161,12 +168,14 @@ class TestSetMode:
 class TestGetMode:
     """Tests for the GET /api/config/mode endpoint."""
 
+    @pytest.mark.trust_harness
     def test_get_mode_returns_agent_by_default(self, mock_thoughtmachine):
         """When no custom prompt exists, GET should return agent mode."""
         response = client.get("/api/config/mode")
         assert response.status_code == 200, response.text
         assert response.json() == {"mode": "agent"}
 
+    @pytest.mark.trust_harness
     def test_get_mode_returns_engineer_after_set(self, mock_thoughtmachine):
         """After switching to engineer mode, GET should return engineer."""
         client.post("/api/config/mode", json={"mode": "engineer"})
@@ -174,6 +183,7 @@ class TestGetMode:
         assert response.status_code == 200, response.text
         assert response.json() == {"mode": "engineer"}
 
+    @pytest.mark.trust_harness
     def test_get_mode_returns_agent_after_clearing(self, mock_thoughtmachine):
         """After switching back to agent mode, GET should return agent."""
         client.post("/api/config/mode", json={"mode": "engineer"})
@@ -182,6 +192,7 @@ class TestGetMode:
         assert response.status_code == 200, response.text
         assert response.json() == {"mode": "agent"}
 
+    @pytest.mark.trust_harness
     def test_get_mode_with_empty_custom_prompt(self, mock_thoughtmachine):
         """An empty ``custom_system_prompt.txt`` should be treated as
         agent mode."""

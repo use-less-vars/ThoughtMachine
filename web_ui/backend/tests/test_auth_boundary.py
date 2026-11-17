@@ -777,6 +777,7 @@ def _a_fresh_backend_from_the_harness():
         stop_fn()
 
 
+@pytest.mark.trust_harness
 def test_a_freshly_imported_boundary_carries_the_suite_trust_value():
     """The conftest import hook re-applies the allowance to the re-imported module.
 

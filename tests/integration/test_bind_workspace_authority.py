@@ -153,6 +153,7 @@ def _bridge_class():
 # 1 — the handshake pins the connection's declared workspace
 # ────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_handshake_with_project_binds_connection(bind_server, monkeypatch):
     """`?project=A` binds the connection to A, so a load that would adopt B is refused.
 
@@ -198,6 +199,7 @@ def test_handshake_with_project_binds_connection(bind_server, monkeypatch):
     )
 
 
+@pytest.mark.trust_harness
 def test_handshake_without_project_arrives_unbound(bind_server, monkeypatch):
     """No `?project=` -> no handshake binding; the load's own scope bootstraps.
 
@@ -235,6 +237,7 @@ def test_handshake_without_project_arrives_unbound(bind_server, monkeypatch):
 # 2 — the creation transition bootstraps through the authority
 # ────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_register_by_root_binds_connection(bind_server, monkeypatch):
     """`register_by_root()` creation binds the connection to the NEW workspace.
 
@@ -359,6 +362,7 @@ def test_bind_workspace_never_resets(bind_server, monkeypatch):
 # 4 — the cross-bind is closed
 # ────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_cross_workspace_load_refused(bind_server, monkeypatch):
     """An explicit load into another workspace cannot re-scope a handshake-bound socket."""
     app, tmp_home, server_mod = bind_server
@@ -402,6 +406,7 @@ def test_cross_workspace_load_refused(bind_server, monkeypatch):
 # 5 — ordering: a refused bind must not leak the project path
 # ────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.trust_harness
 def test_site1_refused_bind_does_not_leak_path(bind_server, monkeypatch):
     """`inverted-guard` site: refusal leaves `bridge._workspace_path` (and the path update) alone."""
     app, tmp_home, server_mod = bind_server

@@ -75,6 +75,7 @@ def client(server_module):
         yield test_client
 
 
+@pytest.mark.trust_harness
 def test_endpoint_entries_carry_execution_mode_only(client):
     resp = client.get("/api/resource-catalog")
     assert resp.status_code == 200

@@ -69,6 +69,7 @@ def _patch_vault(monkeypatch, tmp_path, report):
     return vault
 
 
+@pytest.mark.trust_harness
 def test_vault_status_endpoint_returns_issues(client, monkeypatch, tmp_path):
     """Warning/error drift flips ok=False and the issue shape is pinned."""
     report = {
@@ -122,6 +123,7 @@ def test_vault_status_endpoint_returns_issues(client, monkeypatch, tmp_path):
     assert body2["summary"] == {"error": 1, "warning": 0, "info": 0}
 
 
+@pytest.mark.trust_harness
 def test_vault_status_endpoint_only_info_is_ok(client, monkeypatch, tmp_path):
     """Info-only drift (pending safe-default backfill) does not flip ok."""
     report = {
@@ -150,6 +152,7 @@ def test_vault_status_endpoint_only_info_is_ok(client, monkeypatch, tmp_path):
     assert body["summary"] == {"error": 0, "warning": 0, "info": 1}
 
 
+@pytest.mark.trust_harness
 def test_vault_status_endpoint_unknown_file_is_warning(client, monkeypatch, tmp_path):
     """Real checker: an unknown vault-root file is a warning and flips ok."""
     vault = tmp_path / "vault"
@@ -172,6 +175,7 @@ def test_vault_status_endpoint_unknown_file_is_warning(client, monkeypatch, tmp_
     assert body["summary"]["warning"] >= 1
 
 
+@pytest.mark.trust_harness
 def test_vault_status_endpoint_no_secrets(client, monkeypatch, tmp_path):
     """Real checker on a tmp vault: raw config secrets never leak."""
     vault = tmp_path / "vault"
@@ -193,6 +197,7 @@ def test_vault_status_endpoint_no_secrets(client, monkeypatch, tmp_path):
     assert '"api_key"' not in resp.text
 
 
+@pytest.mark.trust_harness
 def test_vault_status_endpoint_abort_drifts(client, monkeypatch, tmp_path):
     """A DriftAbortError surfaces the partial report issues to the client."""
     from agent.config.vault_drift import DriftAbortError
@@ -238,6 +243,7 @@ def test_vault_status_endpoint_abort_drifts(client, monkeypatch, tmp_path):
         assert {"file", "severity", "message", "action"} <= set(issue.keys())
 
 
+@pytest.mark.trust_harness
 def test_vault_status_endpoint_unexpected_error(client, monkeypatch, tmp_path):
     """An unexpected checker failure returns ok=False with an empty issue list."""
     vault = tmp_path / "vault"

@@ -27,6 +27,7 @@ from pathlib import Path
 # Add project root so that imports work (same pattern as sibling tests).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
 from fastapi.testclient import TestClient
 
 from session.models import Session
@@ -40,6 +41,7 @@ from web_ui.backend.server import app
 from web_ui.backend.session_manager import SessionManager
 
 
+@pytest.mark.trust_harness
 def test_config_save_does_not_clobber_rest_written_sidecar(
     hermetic_vault, tmp_path, monkeypatch
 ):
@@ -132,6 +134,7 @@ def test_config_save_does_not_clobber_rest_written_sidecar(
     )
 
 
+@pytest.mark.trust_harness
 def test_stale_nonempty_p2_does_not_clobber_rest_written_sidecar(
     hermetic_vault, tmp_path, monkeypatch
 ):

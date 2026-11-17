@@ -157,6 +157,7 @@ def test_global_layer_then_agent_config(env):
         agent_config.unlink(missing_ok=True)
 
 
+@pytest.mark.trust_harness
 def test_agent_config_explicit_model_beats_provider_default_model(env):
     client, tmp_home, stop_fn = env
     agent_config = Path(tmp_home) / ".thoughtmachine" / "agent_config.json"
@@ -185,6 +186,7 @@ def test_agent_config_explicit_model_beats_provider_default_model(env):
         _delete_p1()
 
 
+@pytest.mark.trust_harness
 def test_workspace_defaults_beat_provider_layer(env):
     client, tmp_home, stop_fn = env
     _post_p1(client)
@@ -211,6 +213,7 @@ def test_workspace_defaults_beat_provider_layer(env):
         _delete_p1()
 
 
+@pytest.mark.trust_harness
 def test_session_layer_then_worker_overrides(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t5")
@@ -255,6 +258,7 @@ def test_session_layer_then_worker_overrides(env):
 # 6-10. UI truth
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_config_changed_event_carries_effective_permission_from_canonical_store(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t6")
@@ -288,6 +292,7 @@ def test_config_changed_event_carries_effective_permission_from_canonical_store(
     assert stored_perms["git"] == "write", stored_perms
 
 
+@pytest.mark.trust_harness
 def test_restart_reapplies_workspace_permission_ceiling_on_session_load(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t7")
@@ -322,6 +327,7 @@ def test_restart_reapplies_workspace_permission_ceiling_on_session_load(env):
         assert perms["filesystem"] == "read", perms
 
 
+@pytest.mark.trust_harness
 def test_rest_effective_permissions_serve_defaults_then_ceiled_grant(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t8")
@@ -361,6 +367,7 @@ def test_rest_effective_permissions_serve_defaults_then_ceiled_grant(env):
     assert ep2["effective_permissions"]["filesystem"] == "write", ep2
 
 
+@pytest.mark.trust_harness
 def test_workspace_summary_reflects_ui_permission_state(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t9")

@@ -181,6 +181,7 @@ def _patch(record_id, body, *, workspace_id=WS, actor="tester"):
 
 # ── Route: the ORIGIN is stamped on the rebuilt container ───────────────────
 
+@pytest.mark.trust_harness
 def test_recreate_stamps_the_origin_not_the_acting_operator(vault, monkeypatch):
     _seed(vault)
     manager = _install(monkeypatch, _OriginManager(
@@ -199,6 +200,7 @@ def test_recreate_stamps_the_origin_not_the_acting_operator(vault, monkeypatch):
     assert kinds == ["label_read", "remove"]
 
 
+@pytest.mark.trust_harness
 def test_origin_is_stamped_on_the_resize_failed_recovery_too(vault, monkeypatch):
     """The ``_resize_failed`` rollback rebuild also preserves the origin."""
     from infra import container_manager as cm
@@ -220,6 +222,7 @@ def test_origin_is_stamped_on_the_resize_failed_recovery_too(vault, monkeypatch)
                                   "agent:session:sess-X"]
 
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("case", ["missing", "blank", "unreadable"])
 def test_fallback_to_the_acting_operator_when_the_label_is_unavailable(
         vault, monkeypatch, case):

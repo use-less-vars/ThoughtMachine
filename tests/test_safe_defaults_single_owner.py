@@ -140,6 +140,7 @@ def client(server_module):
         yield test_client
 
 
+@pytest.mark.trust_harness
 def test_permission_defaults_endpoint_serves_safe_defaults(client):
     resp = client.get("/api/permission-defaults")
 

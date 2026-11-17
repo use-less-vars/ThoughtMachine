@@ -218,6 +218,7 @@ class TestContainersEndpointStatsFields:
         )
         return client.get("/api/workspace/ws-test/containers")
 
+    @pytest.mark.trust_harness
     def test_in_use_and_available(self, monkeypatch, container_vault):
         cr_api.create_record(
             "ws-test", "ephemeral", "workspace-owned",
@@ -230,6 +231,7 @@ class TestContainersEndpointStatsFields:
         assert data["containers_available"] == 3
         assert len(data["containers"]) == 1
 
+    @pytest.mark.trust_harness
     def test_full_cap_yields_zero_available(self, monkeypatch, container_vault):
         containers = [{"name": f"c{i}", "container_id": f"id{i}"} for i in range(4)]
         resp = self._get(monkeypatch, containers, cap=4)
@@ -237,6 +239,7 @@ class TestContainersEndpointStatsFields:
         assert data["containers_in_use"] == 4
         assert data["containers_available"] == 0
 
+    @pytest.mark.trust_harness
     def test_available_clamped_at_zero(self, monkeypatch, container_vault):
         containers = [{"name": f"c{i}", "container_id": f"id{i}"} for i in range(4)]
         resp = self._get(monkeypatch, containers, cap=2)
@@ -244,6 +247,7 @@ class TestContainersEndpointStatsFields:
         assert data["containers_in_use"] == 4
         assert data["containers_available"] == 0
 
+    @pytest.mark.trust_harness
     def test_no_containers(self, monkeypatch, container_vault):
         resp = self._get(monkeypatch, [], cap=4)
         data = resp.json()
@@ -251,6 +255,7 @@ class TestContainersEndpointStatsFields:
         assert data["containers_available"] == 4
         assert data["containers"] == []
 
+    @pytest.mark.trust_harness
     def test_missing_manager_404_preserved(self, monkeypatch):
         monkeypatch.setattr(
             server_module, "_make_container_manager",
@@ -260,6 +265,7 @@ class TestContainersEndpointStatsFields:
         assert resp.status_code == 404
         assert "not found" in resp.json()["error"]
 
+    @pytest.mark.trust_harness
     def test_list_failure_503_preserved(self, monkeypatch):
         class _Boom:
             def list_containers(self):

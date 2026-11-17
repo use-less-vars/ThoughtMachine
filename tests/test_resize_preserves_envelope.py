@@ -168,6 +168,7 @@ def _collect_audits(monkeypatch):
 
 # ── Route: a recorded envelope is handed to the recreate ────────────────────
 
+@pytest.mark.trust_harness
 def test_recorded_network_mode_is_restored_on_recreate(vault, monkeypatch):
     _seed(vault, intent_snapshot={"mem_limit": "256m",
                                   "network_mode": "bridge"})
@@ -185,6 +186,7 @@ def test_recorded_network_mode_is_restored_on_recreate(vault, monkeypatch):
                                      "network_mode": "bridge"}
 
 
+@pytest.mark.trust_harness
 def test_recorded_workspace_mode_is_restored_on_recreate(vault, monkeypatch):
     _seed(vault, intent_snapshot={"mem_limit": "256m",
                                   "workspace_mode": "rw"})
@@ -198,6 +200,7 @@ def test_recorded_workspace_mode_is_restored_on_recreate(vault, monkeypatch):
     assert manager.start_kwargs == [{"workspace_mode": "rw"}]
 
 
+@pytest.mark.trust_harness
 def test_both_recorded_axes_and_the_new_limits_coexist(vault, monkeypatch):
     _seed(vault, intent_snapshot={"mem_limit": "256m", "cpu_quota": 50000,
                                   "network_mode": "bridge",
@@ -219,6 +222,7 @@ def test_both_recorded_axes_and_the_new_limits_coexist(vault, monkeypatch):
                                      "workspace_mode": "rw"}]
 
 
+@pytest.mark.trust_harness
 @pytest.mark.parametrize("snapshot", [
     {"mem_limit": "256m"},
     {"mem_limit": "256m", "network_mode": "", "workspace_mode": ""},
@@ -238,6 +242,7 @@ def test_no_recorded_envelope_passes_no_override(vault, monkeypatch, snapshot):
     assert manager.start_kwargs == [{}]
 
 
+@pytest.mark.trust_harness
 def test_failed_recreate_rebuild_restores_the_recorded_envelope(
         vault, monkeypatch):
     """The ``_resize_failed`` recovery start also restores the envelope."""
@@ -314,6 +319,7 @@ def _bare_manager(monkeypatch, *, computed=("none", "ro"), record=None):
     return manager, captured
 
 
+@pytest.mark.trust_harness
 def test_start_override_reaches_the_allow_fresh_create_site(monkeypatch):
     manager, captured = _bare_manager(monkeypatch)
 
@@ -326,6 +332,7 @@ def test_start_override_reaches_the_allow_fresh_create_site(monkeypatch):
     assert captured["restored_envelope"] is True
 
 
+@pytest.mark.trust_harness
 def test_start_workspace_override_only(monkeypatch):
     manager, captured = _bare_manager(monkeypatch)
 
@@ -336,6 +343,7 @@ def test_start_workspace_override_only(monkeypatch):
     assert captured["restored_envelope"] is True
 
 
+@pytest.mark.trust_harness
 def test_start_without_override_keeps_the_fail_closed_policy(monkeypatch):
     """No override => the computed (most restrictive) envelope, unchanged."""
     manager, captured = _bare_manager(monkeypatch)
@@ -394,6 +402,7 @@ def _fresh_start_capture(monkeypatch, *, restored_envelope,
     return captured, audits
 
 
+@pytest.mark.trust_harness
 def test_restored_envelope_is_not_narrowed_by_admission(monkeypatch):
     captured, audits = _fresh_start_capture(monkeypatch,
                                             restored_envelope=True)
@@ -406,6 +415,7 @@ def test_restored_envelope_is_not_narrowed_by_admission(monkeypatch):
     assert "policy_narrowed_to=none" in audits[1][1]
 
 
+@pytest.mark.trust_harness
 def test_plain_create_still_applies_the_admission_narrowing(monkeypatch):
     captured, audits = _fresh_start_capture(monkeypatch,
                                             restored_envelope=False)

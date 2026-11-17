@@ -75,6 +75,7 @@ def client(server_module):
         yield test_client
 
 
+@pytest.mark.trust_harness
 def test_resource_catalog_returns_bare_array(client):
     """The response body IS the array — no {items: [...]} wrapper."""
     resp = client.get("/api/resource-catalog")
@@ -85,6 +86,7 @@ def test_resource_catalog_returns_bare_array(client):
     assert len(body) == 11
 
 
+@pytest.mark.trust_harness
 def test_resource_catalog_nine_resources_with_exact_keys(client):
     """Each entry carries exactly the 8 declared resource keys."""
     resp = client.get("/api/resource-catalog")
@@ -100,6 +102,7 @@ def test_resource_catalog_nine_resources_with_exact_keys(client):
             assert entry["required_workspace_switch"] is None
 
 
+@pytest.mark.trust_harness
 def test_resource_catalog_git_entry_exact_fields(client):
     """The git resource pins the dockerfile reference, tools and defaults."""
     resp = client.get("/api/resource-catalog")

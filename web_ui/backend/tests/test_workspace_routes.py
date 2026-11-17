@@ -70,6 +70,7 @@ def _seed_config(ws_dir, **overrides):
 
 
 class TestPutPermissionsAllowHostResources:
+    @pytest.mark.trust_harness
     def test_explicit_true_persists_and_is_reflected(self, fake_ws_dir):
         _seed_config(fake_ws_dir, allow_host_resources=False)
 
@@ -90,6 +91,7 @@ class TestPutPermissionsAllowHostResources:
         assert cfg["allow_host_resources"] is True
         assert cfg["permissions"] == VALID_PERMISSIONS
 
+    @pytest.mark.trust_harness
     def test_explicit_false_persists(self, fake_ws_dir):
         _seed_config(fake_ws_dir, allow_host_resources=True)
 
@@ -105,6 +107,7 @@ class TestPutPermissionsAllowHostResources:
         cfg = workspace_routes._load_workspace_config("ws-test")
         assert cfg["allow_host_resources"] is False
 
+    @pytest.mark.trust_harness
     def test_omitted_field_leaves_saved_value_untouched(self, fake_ws_dir):
         _seed_config(fake_ws_dir, allow_host_resources=False)
 
@@ -129,6 +132,7 @@ class TestPutPermissionsAllowHostResources:
             "allow_host_resources"
         ] is True
 
+    @pytest.mark.trust_harness
     def test_omitted_field_still_updates_permissions(self, fake_ws_dir):
         _seed_config(fake_ws_dir, allow_host_resources=True)
 
@@ -151,6 +155,7 @@ class TestPutPermissionsAllowHostResources:
 
 
 class TestGetPermissionsAllowHostResources:
+    @pytest.mark.trust_harness
     def test_get_reflects_persisted_value(self, fake_ws_dir):
         _seed_config(fake_ws_dir, allow_host_resources=True)
 
@@ -168,6 +173,7 @@ class TestGetPermissionsAllowHostResources:
 
 
 class TestPutPermissionsValidation:
+    @pytest.mark.trust_harness
     def test_unknown_resource_rejected_with_422(self, fake_ws_dir):
         _seed_config(fake_ws_dir)
 
@@ -180,6 +186,7 @@ class TestPutPermissionsValidation:
         errors = detail.get("errors", []) if isinstance(detail, dict) else []
         assert isinstance(errors, list) and errors
 
+    @pytest.mark.trust_harness
     def test_invalid_level_rejected_with_422(self, fake_ws_dir):
         _seed_config(fake_ws_dir)
 

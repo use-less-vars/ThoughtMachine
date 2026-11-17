@@ -23,6 +23,8 @@ container with a chosen ``.attrs``.
 
 from __future__ import annotations
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 import infra.container_create as cc
@@ -105,6 +107,7 @@ def _hardened_attrs():
 # ── Tests ───────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.trust_harness
 def test_conformant_container_reports_conformant(monkeypatch):
     """A fully hardened container reports ``conformant`` with no failed axes."""
     _install(monkeypatch, _FakeContainer(_hardened_attrs()))
@@ -117,6 +120,7 @@ def test_conformant_container_reports_conformant(monkeypatch):
     assert body["status"] == "running"
 
 
+@pytest.mark.trust_harness
 def test_weak_cap_drop_reports_drifted(monkeypatch):
     """A present-but-wrong cap_drop is REAL drift, not conformant."""
     recipe = cc._expected_hardening_recipe()
@@ -131,6 +135,7 @@ def test_weak_cap_drop_reports_drifted(monkeypatch):
     assert body["hardening"] == {"status": "drifted", "failed": ["cap_drop"]}
 
 
+@pytest.mark.trust_harness
 def test_unreadable_attrs_reports_unverified(monkeypatch):
     """Unreadable attrs must read as ``unverified``, NEVER ``conformant``."""
     _install(monkeypatch, _RaisingAttrs())
@@ -141,6 +146,7 @@ def test_unreadable_attrs_reports_unverified(monkeypatch):
     assert body["hardening"] == {"status": "unverified", "failed": []}
 
 
+@pytest.mark.trust_harness
 def test_unobtainable_container_reports_unverified(monkeypatch):
     """If the container object cannot be fetched, the verdict is ``unverified``."""
     class _RaisingGet:
