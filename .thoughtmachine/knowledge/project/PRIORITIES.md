@@ -461,3 +461,6 @@ different file, different name. Never rename one to the other.
 - **C89** — Session Autosave. Lossy crashes drop active conversational context and UI state. Needs periodic write-to-disk for session state (beyond just the final prompt).
 
 - **C90** — Exec Reaper SIGTERM. `ContainerExecTool`/`DockerCodeRunner` reaper kills the process group (rc=143) even on low memory. Workaround: run via `setsid` and ignore SIGTERM. See logs/5b_sigterm_finding.md.
+
+- **C90 (CRITICAL)** — Local Exec Reaper is now killing pytest runs at 3-27 seconds. `oom_kill=0`, memory is fine. It's killing the process group (exit 143). Local verification of large suites is impossible until this is fixed. 
+- **C92** — `agent/knowledge/codebase_indexer.py:38-39` installs module-level `SIGINT`/`SIGTERM` handlers on import. This is a latent defect that could hijack the server's signal handling.
