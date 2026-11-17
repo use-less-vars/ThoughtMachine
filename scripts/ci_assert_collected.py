@@ -9,7 +9,8 @@ expected minimum.
 It is dependency-free (standard library only) so it can run before the
 project's own dependencies are installed, and it is deliberately named without
 a ``test_`` prefix so pytest never collects it.  ``pyproject.toml`` also scopes
-collection to ``testpaths = ["tests"]``, which excludes ``scripts/`` entirely --
+collection to ``testpaths = ["tests", "web_ui/backend/tests"]``, which excludes
+``scripts/`` entirely --
 either mechanism alone keeps this file out of the suite.
 
 Usage
@@ -18,7 +19,7 @@ Usage
 
 Defaults target the primary Linux/macOS gate::
 
-    --expected 3827   # `-m "not docker and not e2e"` lower bound
+    --expected 7600   # `-m "not docker and not e2e"` floor (measured 7721)
     --marker   "not docker and not e2e"
 
 Passing one or more positional ``TARGET`` paths (files or directories) runs
@@ -28,8 +29,8 @@ small, self-contained node set.
 
 Recognised pytest summaries (checked in this order)::
 
-    3834/3839 tests collected (5 deselected) in 4.60s    -> 3834
-    3839 tests collected in 4.11s                        -> 3839
+    7721/7727 tests collected (6 deselected) in 6.93s    -> 7721
+    7727 tests collected in 6.93s                        -> 7727
     no tests collected in 0.10s                           -> 0
 
 Exit status is 0 when at least the expected number of tests is collected and 1
@@ -45,14 +46,38 @@ import subprocess
 import sys
 
 # Lower-bound baseline for the primary Linux/macOS gate: `-m "not docker and
-# not e2e"` must collect at least 3827 tests.  Measured 3834 live (3839 total,
-# 5 deselected); the headroom lets new tests land without editing the CI.
-DEFAULT_EXPECTED = 3827
+# not e2e"` must collect at least 7600 tests.  Measured 7721 live (7727 total,
+# 6 deselected) over `testpaths = ["tests", "web_ui/backend/tests"]`, so the
+# floor sits a couple of percent below the measurement.  The comparison is
+# `actual < expected`, so new tests never fail the gate; only a shrinking
+# collection does.
+# Floor raised by C91 to match actual test count. Update on every test addition.
+#
+# WHY THE FLOOR IS NOT THE MEASUREMENT.  Every count above was measured with
+# Python 3.12 (the only interpreter with this project's dependencies
+# installed), but the CI jobs running this script set
+# `env.PYTHON_VERSION: "3.14"` in .github/workflows/platform-matrix.yml.
+# Collected counts can differ between 3.12 and 3.14: a module guarded by a
+# `sys.version_info` check, or imported inside a try/except that starts
+# succeeding, changes the size of the collection.  A floor of exactly 7721
+# would therefore let a cross-version difference of one test fail the primary
+# gate on the very first pull request after this lands -- the repo freezes, and
+# the anti-vacuity guard becomes the reason nothing can merge.  A floor a
+# couple of percent lower still catches the failure it exists to catch (a
+# suite that silently collects zero, or a large block of tests that stopped
+# being collected) while tolerating interpreter noise.
+#
+# PIN IT AFTER THE FIRST REAL RUN.  The first green 3.14 CI run prints
+# `ci_assert_collected: expected=7600 actual=N`; N is the true 3.14 count and
+# the number to pin afterwards, minus the same couple of percent of headroom.
+# Until that run exists, 7600 is the largest floor defensible from the
+# measurements actually taken.
+DEFAULT_EXPECTED = 7600
 DEFAULT_MARKER = "not docker and not e2e"
 
-# "3834/3839 tests collected (5 deselected)" -> 3834 (the selected count).
+# "7721/7727 tests collected (6 deselected)" -> 7721 (the selected count).
 _DESELECTED_RE = re.compile(r"(\d+)/\d+\s+tests?\s+collected")
-# "3839 tests collected" -> 3839.
+# "7727 tests collected" -> 7727.
 _COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
 # "no tests collected" -> 0.
 _NONE_RE = re.compile(r"no\s+tests?\s+collected")

@@ -230,7 +230,7 @@ open item below.
 | `.github/workflows/contract-gate.yml` — "Contract Gate" | `contract-gate` | 1 of 1 | — |
 | `.github/workflows/cross-platform-smoke.yml` — "Cross-Platform Smoke" | `linux-install`, `windows-smoke`, `macos-launcher` | 3 of 3 | — |
 | `.github/workflows/first_start_ci.yml` — "First-Start CI" | `first-start` | 1 of 1 | — |
-| `.github/workflows/platform-matrix.yml` — "Platform Matrix" | `ubuntu-suite`, `linux-install-smoke`, `linux-e2e-auth`, `windows-import-smoke`, `windows-thin-pytest`, `web-ui-frontend-suite` | 6 of 7 | `web-ui-backend-suite` |
+| `.github/workflows/platform-matrix.yml` — "Platform Matrix" | `ubuntu-suite`, `linux-install-smoke`, `linux-e2e-auth`, `windows-import-smoke`, `windows-thin-pytest`, `web-ui-backend-suite`, `web-ui-frontend-suite` | 7 of 7 | — |
 | `.github/workflows/platform-matrix-macos.yml` — "Platform Matrix (macOS, advisory)" | `macos-suite`, `macos-install-smoke`, `macos-docker-probe` | 0 of 3 | all three |
 | `.github/workflows/python-version-matrix.yml` — "Python Version Matrix" | `unit-tests` (matrix over `python-version`), `installer-contract`, `windows-python-314` | 3 of 3 | — |
 
@@ -241,21 +241,22 @@ What the trigger blocks and job names add to that table:
   contract gate, while it does run the other five workflows. Those five run on `push` to `dev` and
   `master` and on `pull_request`.
 - `contract-gate` is the only workflow with any relationship to this document, and that relationship is
-  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of thirteen
+  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of fifteen
   test files** — no glob, no `-m` expression. Two consequences worth knowing: a new test that proves a
   contract does not join the gate by existing (it must be added to the workflow *and* cited here), and
-  the parity check described in the previous section is itself one of the thirteen, so it fails the
-  gate it is part of. Note the direction: the gate runs thirteen files and this ledger cites nine of
+  the parity check described in the previous section is itself one of the fifteen, so it fails the
+  gate it is part of. Note the direction: the gate runs fifteen files and this ledger cites nine of
   them, because the parity check enforces *cited ⊆ run*, not equality. The job carries
   `timeout-minutes: 10` and separately reports wall time against a stated 120-second budget; that
   budget is observed, not enforced.
 - `platform-matrix.yml`'s `linux-e2e-auth` job skips itself unless auth-relevant files changed, and the
   change detection is written to *run* rather than skip when it cannot decide. A skip in that job is
   therefore not evidence that the auth path was exercised.
-- Two advisory surfaces, both visible in the workflow text: `.github/workflows/platform-matrix-macos.yml`
-  labels itself "(macOS, advisory)" and all three of its jobs carry `continue-on-error: true`;
-  `.github/workflows/platform-matrix.yml`'s `web-ui-backend-suite` job is named "(advisory)" and also
-  carries `continue-on-error: true`. Those four of the eighteen jobs cannot fail their run.
+- One advisory surface, visible in the workflow text: `.github/workflows/platform-matrix-macos.yml`
+  labels itself "(macOS, advisory)" and all three of its jobs carry `continue-on-error: true`. Those
+  three of the eighteen jobs cannot fail their run. `.github/workflows/platform-matrix.yml`'s
+  `web-ui-backend-suite` job was the fourth until C91 made it BLOCKING (no `continue-on-error`, and
+  its name no longer carries the "(advisory)" suffix).
 
 **RESOLVED (partial):** 10 required status checks exist server-side on `dev`, evidenced by GitHub's own rejection message on direct push at `a869255d` and `544bd407`: `remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are expected.` The check *names* still require `gh api repos/{owner}/{repo}/branches/dev/protection` (operator-admin). Whether branch protection blocks the *merge button*, as opposed to being bypassable by direct push, is still unknown and needs the same `gh api` call.
 
