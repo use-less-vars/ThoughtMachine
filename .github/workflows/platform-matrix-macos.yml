@@ -10,9 +10,29 @@
 # removed from that file: no action versions changed, no new secrets, no new
 # inputs, no new conditionals.
 #
-# Anti-vacuity is unchanged: macos-suite still runs
-# scripts/ci_assert_collected.py first, with the same measured floor (3827,
-# marker "not docker and not e2e") it used inside platform-matrix.yml.
+# Anti-vacuity is unchanged in shape: macos-suite still runs
+# scripts/ci_assert_collected.py before the suite, with the same marker
+# ("not docker and not e2e") and the same testpaths (tests +
+# web_ui/backend/tests) as the required ubuntu-suite job in
+# platform-matrix.yml.
+#
+# The floor is NOT the 3827 it inherited. Measured on PR #401, 2026-11-18, the
+# job's own CI log printed:
+#
+#     ci_assert_collected: expected=3827 actual=7722
+#
+# i.e. the inherited figure sat 3895 collected tests below the real count, so
+# a collapse would have had to swallow most of the suite before the assert
+# noticed. 7722 is the same suite as the 7721 measured on Linux (Python 3.12):
+# macOS runs env.PYTHON_VERSION 3.14, and collection counts differ slightly
+# across versions. The floor is therefore 7600 -- the same a-couple-of-percent
+# margin below the measurement that ubuntu-suite uses, for the reason spelled
+# out under that job's assert step in platform-matrix.yml.
+#
+# A floor that is too HIGH here can never block a merge: macos-suite is
+# advisory (continue-on-error: true), so a red result is reported and ignored.
+# The reverse -- too low -- is the failure mode worth guarding, hence the
+# measurement above rather than the old number.
 #
 # macOS install note: install.sh supports Darwin (it runs the same prerequisite
 # and venv checks as on Linux, minus the Linux-only apt / docker-group steps),
@@ -65,7 +85,7 @@ jobs:
       - name: Assert collected test count (anti-vacuity)
         run: >
           python scripts/ci_assert_collected.py
-          --expected 3827
+          --expected 7600
           --marker "not docker and not e2e"
 
       - name: Run test suite
