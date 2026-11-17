@@ -1,5 +1,9 @@
 """Importing web_ui.backend.server must not hijack the process signal handlers.
 
+The same import-time discipline is enforced for the CLI edge: importing
+``agent.cli.rag_commands`` pulls in ``agent.knowledge.codebase_indexer``, which
+must not install SIGINT/SIGTERM handlers at module scope either.
+
 The server deliberately does NOT install SIGINT/SIGTERM handlers at import
 time: uvicorn overwrites the process signal handlers when its event loop
 starts, so import-time handlers would be clobbered anyway (and they would
@@ -56,6 +60,33 @@ def test_server_import_does_not_hijack_signal_handlers():
     """Importing web_ui.backend.server leaves SIGINT/SIGTERM at defaults."""
     result = subprocess.run(
         [sys.executable, "-c", _PROBE],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"probe failed (exit {result.returncode})\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "OK" in result.stdout
+
+
+_PROBE_CLI = """
+import signal
+
+import agent.cli.rag_commands  # noqa: F401  (must not hijack handlers)
+
+assert signal.getsignal(signal.SIGINT) is signal.default_int_handler, \\
+    "SIGINT handler hijacked by agent.cli.rag_commands import"
+assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL, \\
+    "SIGTERM handler hijacked by agent.cli.rag_commands import"
+print('OK')
+"""
+
+
+def test_cli_import_does_not_hijack_signal_handlers():
+    """Importing agent.cli.rag_commands leaves SIGINT/SIGTERM at defaults."""
+    result = subprocess.run(
+        [sys.executable, "-c", _PROBE_CLI],
         capture_output=True,
         text=True,
     )

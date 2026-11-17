@@ -16,8 +16,6 @@ import time
 from agent.config.models import AgentConfig
 import agent.knowledge.dependencies as deps
 import atexit
-import signal
-import sys
 
 # Global client for cleanup
 _chroma_client = None
@@ -30,13 +28,7 @@ def _cleanup_client():
         except Exception:
             pass
 
-def _signal_handler(sig, frame):
-    _cleanup_client()
-    sys.exit(0)
-
 atexit.register(_cleanup_client)
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
 from agent.logging import log
 
 
