@@ -411,6 +411,7 @@ def test_user_drift_refuses_when_live_user_differs(monkeypatch):
 # weaken this foreign-ownership refusal.
 
 
+@pytest.mark.trust_harness
 def test_foreign_owner_still_refuses(monkeypatch, tmp_path):
     """A record owned by a foreign workspace is still refused (403, not 404)."""
     from fastapi.testclient import TestClient

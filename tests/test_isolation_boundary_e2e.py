@@ -327,6 +327,7 @@ def _cmd_captured(pump, payload, stop_types, capfd, timeout=20.0):
 # T1 / CONTROL — is socket A really scoped to A, and can it pivot to B?
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_load_session_cannot_pivot_to_other_workspace(iso_server, capfd):
     app, tmp_home, _server_mod = iso_server
     client = H.make_client(app)
@@ -423,6 +424,7 @@ def test_load_session_cannot_pivot_to_other_workspace(iso_server, capfd):
 # T2 / CONTROL — delete_session matrix (a, b) + A deleting its OWN session (c)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_delete_session_cannot_remove_other_workspace_session(iso_server, capfd):
     app, tmp_home, _server_mod = iso_server
     client = H.make_client(app)
@@ -577,6 +579,7 @@ class _FakeLiveWorker:
         pass
 
 
+@pytest.mark.trust_harness
 def test_stop_worker_cannot_touch_other_workspace_worker(iso_server, capfd):
     app, tmp_home, _server_mod = iso_server
     client = H.make_client(app)
@@ -642,6 +645,7 @@ def test_stop_worker_cannot_touch_other_workspace_worker(iso_server, capfd):
 # T4 — close_session: a socket bound to A must not close B's session.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_close_session_cannot_kill_other_workspace_workers(iso_server, capfd):
     app, tmp_home, _server_mod = iso_server
     client = H.make_client(app)
@@ -704,6 +708,7 @@ def test_close_session_cannot_kill_other_workspace_workers(iso_server, capfd):
             worker_module._worker_registry.pop((sid_b, name, 1), None)
 
 
+@pytest.mark.trust_harness
 def test_a_legit_close_does_not_stop_b_workers(iso_server, capfd):
     """A legit close of A's OWN session must succeed and spare B's workers.
 
@@ -789,6 +794,7 @@ def test_a_legit_close_does_not_stop_b_workers(iso_server, capfd):
 # T5 / ATTACK 6 — re-scoping: can a bound socket switch its own workspace?
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_new_session_cannot_rescope_bound_socket(iso_server, capfd):
     app, tmp_home, _server_mod = iso_server
     client = H.make_client(app)
@@ -1005,6 +1011,7 @@ def _cmd_terminal(pump, payload, is_terminal, capfd, timeout=20.0):
     return events, reply, captured
 
 
+@pytest.mark.trust_harness
 def test_set_project_cannot_rescope_bound_socket(iso_server, capfd):
     """ATTACK 6 residual (a): set_project must not move a bound socket to B."""
     app, tmp_home, _server_mod = iso_server
@@ -1071,6 +1078,7 @@ def test_set_project_cannot_rescope_bound_socket(iso_server, capfd):
         _close_ws(cm)
 
 
+@pytest.mark.trust_harness
 def test_new_session_without_workspace_id_cannot_rescope(iso_server, capfd):
     """ATTACK 6 residual (b): the _project_path fallback must not re-scope.
 
@@ -1236,6 +1244,7 @@ def test_new_session_without_workspace_id_cannot_rescope(iso_server, capfd):
 # T8 - list_sessions must not enumerate other workspaces' sessions
 # ---------------------------------------------------------------------------
 
+@pytest.mark.trust_harness
 def test_list_sessions_does_not_enumerate_other_workspace_sessions(iso_server, capfd):
     app, tmp_home, _server_mod = iso_server
     client = H.make_client(app)
@@ -1304,6 +1313,7 @@ def _is_security_refusal(events):
     )
 
 
+@pytest.mark.trust_harness
 def test_unknown_security_response_request_id_refused(iso_server, capfd):
     """A security_response no socket is entitled to answer must be refused.
 
