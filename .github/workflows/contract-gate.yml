@@ -1,9 +1,13 @@
 # contract-gate.yml - the fast gate over the invariants named in docs/CONTRACTS.md.
 #
-# It runs ONLY the test files cited by the ledger, enumerated by hand (no glob, no
-# `-m` marker expression, never the whole suite). Docker, secrets and the image
-# cache of python-version-matrix.yml are deliberately absent: every file here is
-# hermetic, so this job should finish in well under the 2-minute budget.
+# It runs the test files cited by the ledger, enumerated by hand (no glob, no `-m`
+# marker expression, never the whole suite), plus two gate-only additions made by
+# C91 that the ledger does not cite: tests/security/test_git_hardening.py and
+# web_ui/backend/tests/test_auth_boundary.py. The parity test enforces
+# cited <= run, so an uncited extra file cannot turn this workflow red.
+# Docker, secrets and the image cache of python-version-matrix.yml are
+# deliberately absent: every file here is hermetic, so this job should finish in
+# well under the 2-minute budget.
 name: Contract Gate
 
 on:
@@ -58,7 +62,9 @@ jobs:
             tests/test_workspace_permissions.py \
             tests/test_gate_catalog_migration.py \
             tests/test_workspace_permission_vocab_unification.py \
-            tests/test_visual_grain_closure.py
+            tests/test_visual_grain_closure.py \
+            tests/security/test_git_hardening.py \
+            web_ui/backend/tests/test_auth_boundary.py
           status=$?
           end=$(date +%s)
           seconds=$((end - start))

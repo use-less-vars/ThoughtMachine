@@ -17,10 +17,26 @@
 # *collected* tests is lower than expected (a suite that silently collects
 # zero tests must not be able to report green).
 #
-# Measured collection counts (branch fix/git-host-fallback-closure):
-#   * total (gate floor) = 3827
-#   * -m "not docker and not e2e"                 = 3836 (5 deselected)
-#   * thin node set (4 files below)              = 77
+# Collection counts. Every figure marked "measured" was measured on branch
+# c91-ci-gate with:
+#   PYTHONPATH=/workspace/.venv/lib/python3.12/site-packages /usr/local/bin/python3.12
+# -- i.e. Python 3.12, the only interpreter here with the venv's dependencies
+# installed -- while env.PYTHON_VERSION below is "3.14". Collected counts can
+# differ between 3.12 and 3.14 for version-gated modules and import-time
+# conditionals, which is why every enforced floor sits a couple of percent
+# BELOW its measurement instead of exactly on it (see the note under the
+# ubuntu-suite assert step).
+#   * total collected (testpaths = tests + web_ui/backend/tests)
+#                                 = 7727  measured
+#   * -m "not docker and not e2e" = 7721  measured (7727 total, 6 deselected)
+#                                 = 7600  floor, enforced by ubuntu-suite
+#   * web_ui/backend/tests alone  = 305   measured
+#                                 = 300   floor, enforced by web-ui-backend-suite
+#   * thin node set (4 files below)
+#                                 = 83    measured on Linux
+#                                 = 77    floor, enforced by windows-thin-pytest
+#                                         NOT re-measured on Windows; the 77
+#                                         predates C91 and was left as it was.
 #
 # The macOS jobs (all advisory) moved to platform-matrix-macos.yml.
 # ---------------------------------------------------------------------------
@@ -66,10 +82,15 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
           python -m pip install -e .
 
+      # Floor 7600, not the 7721 measured on Python 3.12: this job runs
+      # env.PYTHON_VERSION 3.14, collection counts can differ across versions,
+      # and a floor equal to the measurement could fail the primary gate on its
+      # first PR and freeze the repo. The first green 3.14 run prints
+      # `expected=7600 actual=N`; pin N (minus a couple of percent) then.
       - name: Assert collected test count (anti-vacuity)
         run: >
           python scripts/ci_assert_collected.py
-          --expected 3827
+          --expected 7600
           --marker "not docker and not e2e"
 
       - name: Run test suite
@@ -351,7 +372,8 @@ jobs:
   # Windows: thin, self-contained pytest slice. These four modules were
   # selected because they exercise container registry / ownership / global
   # default logic without requiring Docker, so they are safe to run on a
-  # Windows runner. 76 tests are expected.
+  # Windows runner. The floor asserted below is 77; the set measured 83 on
+  # Linux and has NOT been re-measured on Windows.
   # -------------------------------------------------------------------------
   windows-thin-pytest:
     name: Windows - thin pytest slice
@@ -400,17 +422,21 @@ jobs:
             --timeout 600 -ra
 
   # -------------------------------------------------------------------------
-  # web_ui backend: full suite (advisory).
+  # web_ui backend: full suite (BLOCKING).
   #
-  # Scoped to web_ui/backend/tests only (the main testpaths suite does not
-  # collect it), so this job's anti-vacuity floor is 125, the number that
-  # directory currently collects. Advisory only: a failure never fails the
-  # workflow (continue-on-error).
+  # This job runs web_ui/backend/tests only, so its anti-vacuity floor is that
+  # directory's own collection count: 305 measured with
+  # `python scripts/ci_assert_collected.py web_ui/backend/tests/` (C91),
+  # enforced as 300. The previous floor of 125 could lose 180 of those 305
+  # tests and still assert OK.
+  #
+  # BLOCKING: no continue-on-error, so a red run fails this workflow. Promoted
+  # by C91: an advisory suite that is permanently red teaches nobody anything,
+  # but an advisory suite that is silently shrinking proves nothing either.
   # -------------------------------------------------------------------------
   web-ui-backend-suite:
-    name: web-ui-backend-suite (advisory)
+    name: web-ui-backend-suite
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -429,10 +455,13 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
           python -m pip install -e .
 
+      # Floor 300, measured 305 on Python 3.12 while this job runs 3.14; the
+      # margin absorbs cross-version collection drift. The first green 3.14 run
+      # prints `expected=300 actual=N`; pin N afterwards.
       - name: Assert collected test count (anti-vacuity)
         run: >
           python scripts/ci_assert_collected.py
-          --expected 125
+          --expected 300
           web_ui/backend/tests/
 
       - name: Run web-ui backend suite
