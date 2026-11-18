@@ -1018,7 +1018,17 @@ def _resolve_worker_thread(
     exactly one live candidate must exist; multiple live candidates raise
     ``_WorkerAmbiguityError`` (callers must pass ``instance_id``). No live
     candidate raises ``_WorkerAmbiguityError`` with a 'not running' message.
+
+    "Live" is :func:`worker_is_live`, NOT the thread's own ``is_alive()``: a
+    process-mode worker's supervisor thread is deliberately never started, so
+    its ``is_alive()`` is ``False`` for a worker whose body is a healthy child.
     """
+    # Function-local for the same reason every other worker_runtime import in
+    # this module is: this module is also loaded inside a worker's own process,
+    # and a module-level import would put a supervisor-only module in that
+    # graph.
+    from tools.workspace.worker_runtime import worker_is_live
+
     with _registry_lock:
         if instance_id is not None:
             # Exact 3-tuple lookup first, then a name+instance scan (session
@@ -1044,8 +1054,7 @@ def _resolve_worker_thread(
                 continue
             if session_id is not None and key[0] != session_id:
                 continue
-            alive = bool(getattr(thread, "is_alive", lambda: True)())
-            if not alive:
+            if not worker_is_live(thread):
                 continue
             candidates.append((key[0], iid, thread))
     if not candidates:

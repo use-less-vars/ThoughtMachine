@@ -379,6 +379,61 @@ def resolve_runtime_mode(environ: Optional[Mapping[str, str]] = None) -> str:
     )
 
 
+def worker_is_live(worker: Any) -> bool:
+    """Whether *worker* has a reachable body right now (best-effort predicate).
+
+    The ONE liveness predicate for both runtime modes, because the two modes
+    keep their bodies in different places and ``is_alive()`` answers about only
+    the wrong one of them for a process-mode worker:
+
+    1. **Unstamped or thread mode** -- the historical reading, byte for byte:
+       the worker's own ``is_alive()``. A worker with no ``is_alive`` at all
+       (a duck-typed stand-in) reads as LIVE, and a probe that raises reads as
+       LIVE, because this branch is the pre-existing behaviour and "I could not
+       ask" must stay "nothing has changed" for every caller that used to
+       assume a registered worker was alive. Fails OPEN.
+
+    2. **Stamped for a non-thread mode with NO handle** -- ``False``. The stamp
+       is the supervisor's own record that this worker's body lives in another
+       interpreter (:class:`WorkerRuntimeHandle` is the only writer), so a
+       stamped worker with no handle is a worker with no transport at all, and
+       therefore no reachable body. There is nothing to probe and nothing to
+       wait for. Fails CLOSED.
+
+    3. **Stamped for a non-thread mode WITH a handle** -- the handle's
+       :attr:`WorkerRuntimeHandle.alive`, compared by IDENTITY against
+       ``False``: only ``False`` is evidence of death. ``None`` ("no child
+       built yet", or a probe that could not be taken) is treated as live, so a
+       worker that simply has not been dispatched yet is never reported dead.
+       Fails OPEN.
+
+    The two fail-open directions are not slack: mis-reporting a live worker as
+    dead makes it unresolvable and unaddressable, which is the bug this
+    predicate exists to fix; mis-reporting a dead one as live costs one failed
+    dispatch, which the dispatch fence already reports honestly.
+
+    Never raises.
+    """
+    mode = getattr(worker, "_runtime_mode", None)
+    if mode is None or mode == MODE_THREAD:
+        # Historical reading: the in-process thread is (or was) the body.
+        probe = getattr(worker, "is_alive", None)
+        if not callable(probe):
+            return True
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001 - "could not ask" is not "it died"
+            return True
+    handle = getattr(worker, "_runtime_handle", None)
+    if handle is None:
+        # Stamped process, no transport => no reachable body.
+        return False
+    alive = getattr(handle, "alive", None)
+    # Identity, not truthiness: ``None`` is "child not built yet" and fails
+    # OPEN; ``False`` is the only death evidence.
+    return alive is not False
+
+
 #: What :meth:`WorkerRuntimeHandle.state` reports when it has neither a cached
 #: frame nor a readable ``status.json`` mirror. A status no worker can be in,
 #: so "I cannot see this worker" is never mistaken for a real state -- the same
@@ -777,6 +832,54 @@ class WorkerRuntimeHandle:
     def mode(self) -> str:
         """The mode this handle was built in."""
         return self._mode
+
+    @property
+    def alive(self) -> Optional[bool]:
+        """Whether the body this handle speaks for is still there.
+
+        Three possible answers, and the third one is the point: ``True`` and
+        ``False`` are evidence, ``None`` is the ABSENCE of evidence -- "this
+        handle cannot see the body" -- and is never to be read as death.
+
+        Thread mode asks the worker's own ``is_alive()``, because in thread
+        mode the worker's ``run()`` loop IS the body.
+
+        Process mode asks the child runtime, and only if one has been built.
+        ``None`` there means "no child yet" -- the runtime is created lazily by
+        :meth:`_ensure_process_runtime` on the first ``dispatch_query`` (§7),
+        and a liveness probe must never be the thing that spawns an OS process.
+        The same reasoning as :meth:`_assert_current` applies: a handle with no
+        runtime yet has not lost anything.
+
+        ``is_alive()`` is meaningless for this handle as a whole, which is why
+        the property exists instead of callers reaching through it. Under
+        ``MODE_PROCESS`` the supervisor's ``WorkerThread`` is *deliberately
+        never started* (C3-1: ``WorkerThread.start`` returns early so no second
+        body runs beside the child), so its ``is_alive()`` is ``False`` for a
+        worker whose child is perfectly healthy. Asking it would answer a
+        question about the wrong body and report every process-mode worker
+        dead.
+
+        Never raises: a probe that explodes is indistinguishable, from here,
+        from a probe that could not be taken, and ``None`` says exactly that.
+        """
+        if self._mode == MODE_THREAD:
+            probe = getattr(self._worker, "is_alive", None)
+            if not callable(probe):
+                return None
+            try:
+                return bool(probe())
+            except Exception:  # noqa: BLE001 - an unanswerable probe is no answer
+                return None
+        runtime = self._process_runtime
+        if runtime is None:
+            # No child yet is not a dead child: building one here would spawn
+            # an OS process from a probe.
+            return None
+        try:
+            return bool(runtime.alive)
+        except Exception:  # noqa: BLE001 - an unanswerable probe is no answer
+            return None
 
     @property
     def epoch(self) -> Optional[int]:
