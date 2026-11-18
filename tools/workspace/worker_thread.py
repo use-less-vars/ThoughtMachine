@@ -7044,18 +7044,28 @@ class Worker(ToolBase):
         return cap
 
     def _live_workers_in_session(self, session_key: str) -> int:
-        """
-        Count LIVE worker threads currently registered for ``session_key``.
+        """Count LIVE workers currently registered for ``session_key``.
 
-        Only threads whose ``is_alive()`` is True count toward the spawn cap;
-        dead (completed/stopped/errored) registry entries do not.
+        Liveness is runtime-mode dependent, so this cannot ask the thread
+        question: under the process substrate the body lives in a child
+        interpreter and the supervisor-side object's ``is_alive()`` is ``False``
+        even while that child is healthy and answering. ``worker_is_live`` is
+        the predicate that knows the difference, and it reproduces
+        ``is_alive()`` exactly for an unstamped/thread-mode worker.
+
+        Registry entries are RETAINED after terminal exit by design, so "it is
+        in the registry" is not "it counts": a retained-but-finished entry
+        must not hold a spawn slot open, and a live one must be counted.
         """
+        # Function-local like every other worker_runtime import in this module
+        # (this module is also loaded inside the child interpreter).
         from tools.workspace.worker import _registry_lock, _worker_registry
+        from tools.workspace.worker_runtime import worker_is_live
         count = 0
         with _registry_lock:
             for key, thread in _worker_registry.items():
                 sid = key[0]
-                if sid == session_key and thread.is_alive():
+                if sid == session_key and worker_is_live(thread):
                     count += 1
         return count
 
@@ -7181,6 +7191,12 @@ class Worker(ToolBase):
         # (see worker_self_reported) — anti-pattern member 4.
         spawn_started_at = time.time()
         from tools.workspace.worker import GATE_AVAILABLE, WorkerThread, _registry_lock, _worker_registry, check_required_categories, resolve_workspace_id
+        # Liveness for EVERY registry read below (dedupe, double-check, cap):
+        # ``worker_is_live`` asks the runtime-mode-correct question, and is
+        # byte-for-byte ``is_alive()`` for an unstamped/thread-mode worker.
+        # Function-local like every other worker_runtime import in this module
+        # (this module is also loaded inside the child interpreter).
+        from tools.workspace.worker_runtime import worker_is_live
         definition = self._find_worker(workers, self.worker_name)
         if definition is None:
             return {
@@ -7302,7 +7318,7 @@ class Worker(ToolBase):
             for key, t in list(_worker_registry.items()):
                 if key[0] == session_key and key[1] == self.worker_name:
                     iid = key[2] if len(key) >= 3 else 1
-                    if bool(getattr(t, "is_alive", lambda: True)()):
+                    if worker_is_live(t):
                         live_same.append((iid, t))
             if explicit_iid is not None:
                 match = [t for iid, t in live_same if iid == explicit_iid]
@@ -7935,7 +7951,11 @@ class Worker(ToolBase):
         # check (above) and this registration point.
         with _registry_lock:
             existing = _worker_registry.get((session_key, self.worker_name, spawn_iid))
-            if existing is not None and existing.is_alive():
+            # RETAINED entries are normal here (a finished worker keeps its
+            # entry so it stays reportable), so ``is_alive()`` would call a
+            # live process-mode predecessor dead and let the write below
+            # overwrite its key -- orphaning a running child.
+            if existing is not None and worker_is_live(existing):
                 # Another thread won the race — don't overwrite.
                 # With force this is not a lost race but a failed stop: the
                 # instance we asked to replace is still registered and alive
@@ -7973,7 +7993,7 @@ class Worker(ToolBase):
             live_now = sum(
                 1
                 for key, t in _worker_registry.items()
-                if key[0] == session_key and t.is_alive()
+                if key[0] == session_key and worker_is_live(t)
             )
             if live_now >= max_workers:
                 return {
