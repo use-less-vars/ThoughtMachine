@@ -29,6 +29,7 @@ Run:  python -m pytest tests/test_worker_presence_contract.py -q
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import tools.workspace.worker_thread as worker_thread_module
 from tools.workspace.worker_registry import WorkerRegistry
@@ -327,6 +328,83 @@ class TestRetentionPin(unittest.TestCase):
         # on a timeout trigger): a lookup is not the thing that evicts it.
         with self._registry._registry_lock:
             self.assertIn(entry, self._registry._worker_registry)
+
+
+# ===========================================================================
+# Only an EXACT ``MODE_PROCESS`` stamp takes the process branch (hardening)
+# ---------------------------------------------------------------------------
+# ``worker_is_live`` narrows to ``mode != MODE_PROCESS`` -> the historical
+# ``is_alive()`` reading. Everything else -- absent, thread, an unrecognised
+# value, or a duck-typed double's auto-attribute -- is read through
+# ``is_alive()`` alone and never through ``_runtime_handle``.
+# ===========================================================================
+
+
+class TestOnlyAnExactProcessStampTakesTheProcessBranch(unittest.TestCase):
+    """Unknown or fabricated stamps degrade to the legacy reading."""
+
+    def setUp(self) -> None:
+        self._registry = WorkerRegistry.get_instance()
+        with self._registry._registry_lock:
+            self._old_registry = dict(self._registry._worker_registry)
+            self._registry._worker_registry.clear()
+        self.addCleanup(self._restore_registry)
+
+    def _restore_registry(self) -> None:
+        with self._registry._registry_lock:
+            self._registry._worker_registry.clear()
+            self._registry._worker_registry.update(self._old_registry)
+
+    def test_bare_magicmock_registry_entry_reads_dead_and_is_not_counted(self):
+        # The measured regression: a bare ``MagicMock`` answers
+        # ``_runtime_mode`` with a Mock, so a predicate that only compared
+        # against ``None``/``MODE_THREAD`` read it as a process worker with a
+        # fabricated, live-looking handle -- and counted it toward the cap.
+        thread = mock.MagicMock()
+        thread.is_alive.return_value = False
+        # Precondition: the stamp exists without anyone having assigned it,
+        # which is exactly why an explicit vocabulary test is required.
+        self.assertNotIn(thread._runtime_mode, (None, MODE_THREAD, MODE_PROCESS))
+        with self._registry._registry_lock:
+            self._registry._worker_registry[(SESSION, "w1", 1)] = thread
+
+        self.assertIs(worker_is_live(thread), False)
+        self.assertEqual(
+            worker_thread_module.Worker._live_workers_in_session(object(), SESSION), 0
+        )
+
+    def test_unrecognised_mode_stamp_is_read_through_is_alive_only(self):
+        # A stamp from a build this one does not implement is not a stamp, so
+        # the handle is never consulted -- in either direction: a dead-looking
+        # handle cannot kill a live thread, and a live-looking one cannot
+        # resurrect a dead thread.
+        live_thread = _FakeWorker(
+            probe=True, mode="garbage", handle=_FakeHandle(alive=False)
+        )
+        dead_thread = _FakeWorker(
+            probe=False, mode="garbage", handle=_FakeHandle(alive=True)
+        )
+        self.assertIs(worker_is_live(live_thread), True)
+        self.assertIs(worker_is_live(dead_thread), False)
+
+        # Same rule for a double that was never stamped but auto-answers every
+        # attribute: its ``_runtime_handle.alive`` is a truthy Mock.
+        auto = mock.MagicMock()
+        auto.is_alive.return_value = False
+        self.assertTrue(auto._runtime_handle.alive)  # precondition: fabricated
+        self.assertIs(worker_is_live(auto), False)
+        auto.is_alive.return_value = True
+        self.assertIs(worker_is_live(auto), True)
+
+    def test_genuine_process_stamp_still_reads_live(self):
+        # Regression guard for the narrowed predicate: the ONE legal
+        # non-thread stamp must still reach the handle, or a healthy process
+        # worker whose supervisor thread was never started reads dead again.
+        thread = _FakeThread(
+            alive=False, mode=MODE_PROCESS, handle=_FakeHandle(alive=True)
+        )
+        self.assertIs(thread.is_alive(), False)
+        self.assertIs(worker_is_live(thread), True)
 
 
 if __name__ == "__main__":  # pragma: no cover

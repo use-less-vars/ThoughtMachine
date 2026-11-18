@@ -386,21 +386,21 @@ def worker_is_live(worker: Any) -> bool:
     keep their bodies in different places and ``is_alive()`` answers about only
     the wrong one of them for a process-mode worker:
 
-    1. **Unstamped or thread mode** -- the historical reading, byte for byte:
+    1. **Not stamped for process mode** -- the historical reading, byte for byte:
        the worker's own ``is_alive()``. A worker with no ``is_alive`` at all
        (a duck-typed stand-in) reads as LIVE, and a probe that raises reads as
        LIVE, because this branch is the pre-existing behaviour and "I could not
        ask" must stay "nothing has changed" for every caller that used to
        assume a registered worker was alive. Fails OPEN.
 
-    2. **Stamped for a non-thread mode with NO handle** -- ``False``. The stamp
+    2. **Stamped for process mode with NO handle** -- ``False``. The stamp
        is the supervisor's own record that this worker's body lives in another
        interpreter (:class:`WorkerRuntimeHandle` is the only writer), so a
        stamped worker with no handle is a worker with no transport at all, and
        therefore no reachable body. There is nothing to probe and nothing to
        wait for. Fails CLOSED.
 
-    3. **Stamped for a non-thread mode WITH a handle** -- the handle's
+    3. **Stamped for process mode WITH a handle** -- the handle's
        :attr:`WorkerRuntimeHandle.alive`, compared by IDENTITY against
        ``False``: only ``False`` is evidence of death. ``None`` ("no child
        built yet", or a probe that could not be taken) is treated as live, so a
@@ -415,7 +415,13 @@ def worker_is_live(worker: Any) -> bool:
     Never raises.
     """
     mode = getattr(worker, "_runtime_mode", None)
-    if mode is None or mode == MODE_THREAD:
+    # Only an EXACT ``MODE_PROCESS`` stamp may take the process branch. The one
+    # production writer (``WorkerRuntimeHandle.__init__``) refuses every value
+    # outside ``RUNTIME_MODES``, so anything else read here -- absent, thread, a
+    # duck-typed stand-in, a ``MagicMock`` attribute nobody assigned, a stamp
+    # from a build this one does not implement -- is NOT evidence of a child
+    # body and must degrade to the historical reading below.
+    if mode != MODE_PROCESS:
         # Historical reading: the in-process thread is (or was) the body.
         probe = getattr(worker, "is_alive", None)
         if not callable(probe):
