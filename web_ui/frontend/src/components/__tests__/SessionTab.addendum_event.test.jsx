@@ -294,3 +294,30 @@ describe('SessionTab — runtime_notice runtime event', () => {
     expect(warn.mock.calls.some((c) => String(c[0]).includes('runtime_notice'))).toBe(true);
   });
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// store slice: merge (events) vs replace (authoritative REST echo)
+// ──────────────────────────────────────────────────────────────────────────────
+describe('useStore addendumEntries — replace mode', () => {
+  it('keeps event convergence as a merge while an authoritative REST echo can retract', () => {
+    useStore.getState().receiveAddendumUpdated('sess-1', { entries: [E1, E2] });
+    expect(entryIds()).toEqual([E1.id, E2.id]);
+
+    // Default (event) mode: a shorter or empty payload can never retract
+    // anything, because a broadcast event is a convergence signal, not a diff —
+    // an out-of-order or duplicate delivery must stay harmless.
+    useStore.getState().receiveAddendumUpdated('sess-1', { entries: [] });
+    expect(entryIds()).toEqual([E1.id, E2.id]);
+
+    // Replace mode: the caller holds the authoritative FULL set, so a removal
+    // and then a clear are representable. Without this a cleared addendum would
+    // linger in the store slice forever.
+    useStore.getState().receiveAddendumUpdated('sess-1', { entries: [E2] }, { mode: 'replace' });
+    expect(entryIds()).toEqual([E2.id]);
+    expect(entries()[E2.id]).toEqual(E2);
+
+    useStore.getState().receiveAddendumUpdated('sess-1', { entries: [] }, { mode: 'replace' });
+    expect(entries()).toEqual({});
+  });
+});
+

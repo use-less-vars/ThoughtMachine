@@ -550,6 +550,20 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const [addendumRefusal, setAddendumRefusal] = useState(null)  // { reason, message } | null — the 409 channel
   const [addendumError, setAddendumError] = useState(null)      // every other non-2xx
   const [confirmClearAddendum, setConfirmClearAddendum] = useState(false)
+  // Effective-block preview (GET /addendum/effective): the block the NEXT turn
+  // actually receives, rendered by the same resolver a turn uses. Kept apart
+  // from addendumState because it is a derived view, never an authority.
+  const [addendumEffective, setAddendumEffective] = useState(null)
+  const [addendumEffectiveError, setAddendumEffectiveError] = useState(null)
+  // Bumped after every accepted mutation to re-fetch the preview: the REST write
+  // lands in the session STORE (not in a running agent's in-memory Session), so
+  // the preview is the only place the resolved block is visible.
+  const [addendumEpoch, setAddendumEpoch] = useState(0)
+  // Per-entry editing: PATCH/DELETE target ONE entry, so they carry their own
+  // busy flag and text buffer — the append composer must stay usable meanwhile.
+  const [editingAddendumId, setEditingAddendumId] = useState(null)
+  const [addendumEditText, setAddendumEditText] = useState('')
+  const [addendumEntryBusy, setAddendumEntryBusy] = useState(false)
 
   // Adopt a server payload without inventing numbers: fields the response does
   // not carry keep their previous value (DELETE and POST both return them, but
@@ -564,6 +578,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   }
 
   const addendumUrl = () => apiUrl(`/api/session/${encodeURIComponent(sessionId)}/addendum`)
+  const addendumEntryUrl = (entryId) =>
+    apiUrl(`/api/session/${encodeURIComponent(sessionId)}/addendum/entries/${encodeURIComponent(entryId)}`)
 
   // Load the entry list on mount and whenever the session changes.
   useEffect(() => {
@@ -571,6 +587,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     setAddendumError(null)
     setAddendumRefusal(null)
     setConfirmClearAddendum(false)
+    setEditingAddendumId(null)
+    setAddendumEditText('')
     if (!sessionId) {
       setAddendumState({ entries: [], total_chars: 0, budget_chars: null, max_entries: null })
       return () => { cancelled = true }
@@ -588,6 +606,34 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       })
     return () => { cancelled = true }
   }, [sessionId])
+
+  // Preview what the NEXT turn receives. The backend renders the block with the
+  // same resolver a turn uses, so the panel shows the RESOLVED text instead of
+  // re-deriving the framing, and refetches after every accepted mutation
+  // (`addendumEpoch`) — but only while the addendum is actually on screen.
+  useEffect(() => {
+    let cancelled = false
+    setAddendumEffectiveError(null)
+    if (!sessionId || activeTab !== 'live_view') {
+      setAddendumEffective(null)
+      return () => { cancelled = true }
+    }
+    fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/addendum/effective`))
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data = await res.json()
+        if (cancelled) return
+        // Only a payload that actually carries a rendered block becomes the
+        // preview: a partial answer must neither fabricate nor clear one.
+        setAddendumEffective(typeof data?.rendered_block === 'string' ? data : null)
+      })
+      .catch((err) => {
+        if (cancelled) return
+        setAddendumEffective(null)
+        setAddendumEffectiveError(`Failed to load effective addendum: ${err?.message || err}`)
+      })
+    return () => { cancelled = true }
+  }, [sessionId, activeTab, addendumEpoch])
 
   // Append one entry. `text` is sent exactly as typed — the boundary measures
   // it, so trimming here would misreport the budget.
@@ -627,7 +673,11 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       // and this entry reaches a turn only once that agent loaded/updated its
       // session from disk. Hence the store echo here is UI coherence, not
       // delivery to the model.
-      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries })
+      // mode:'replace' — the response carries the authoritative FULL set, and
+      // only replace can retract entries (a refusal or a removal otherwise
+      // leaves stale rows in the store slice).
+      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries }, { mode: 'replace' })
+      setAddendumEpoch((n) => n + 1)
       setAddendumText('')
     } catch (err) {
       setAddendumError(`Failed to add entry: ${err?.message || err}`)
@@ -651,14 +701,107 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         return
       }
       adoptAddendum(data)
-      // Same echo as the write. NOTE: receiveAddendumUpdated merges by entry id
-      // and never deletes, so the store cannot represent a clear — the list
-      // above is authoritative and the store slice only gains entries.
-      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries ?? [] })
+      // Same echo as the write, but this one MUST be replace: the point of a
+      // clear is that the set becomes empty, which a merge-by-id echo cannot
+      // represent.
+      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries ?? [] }, { mode: 'replace' })
+      setAddendumEpoch((n) => n + 1)
     } catch (err) {
       setAddendumError(`Failed to clear addendum: ${err?.message || err}`)
     } finally {
       setAddendumBusy(false)
+    }
+  }
+
+  // Edit ONE entry in place (PATCH). The boundary re-validates the whole set, so
+  // an edit can be refused on budget exactly like an append — same 409 channel,
+  // same "nothing was persisted" semantics, and the typed text is kept.
+  const handleAddendumEntryUpdate = async (entryId) => {
+    if (!sessionId || addendumEntryBusy) return
+    const text = addendumEditText
+    setAddendumEntryBusy(true)
+    setAddendumRefusal(null)
+    setAddendumError(null)
+    try {
+      const res = await fetch(addendumEntryUrl(entryId), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      })
+      const data = await res.json().catch(() => null)
+      if (res.status === 409) {
+        setAddendumRefusal({
+          reason: data?.reason ?? 'refused',
+          message: data?.message ?? 'addendum write refused',
+        })
+        if (Array.isArray(data?.entries)) adoptAddendum(data)
+        return
+      }
+      if (res.status === 404 || data?.status === 'not_found') {
+        // The entry went away underneath us (another client cleared it). Report
+        // it and re-fetch so the list reconciles instead of keeping a ghost row.
+        setAddendumError(`Failed to update entry: ${data?.message ?? `HTTP ${res.status}`}`)
+        setAddendumEpoch((n) => n + 1)
+        return
+      }
+      if (!res.ok || data?.status !== 'updated') {
+        setAddendumError(`Failed to update entry: HTTP ${res.status}`)
+        return
+      }
+      adoptAddendum(data)
+      // Same authoritative-set echo as the append: the PATCH response carries
+      // the full resulting set.
+      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries }, { mode: 'replace' })
+      setAddendumEpoch((n) => n + 1)
+      setEditingAddendumId(null)
+      setAddendumEditText('')
+    } catch (err) {
+      setAddendumError(`Failed to update entry: ${err?.message || err}`)
+    } finally {
+      setAddendumEntryBusy(false)
+    }
+  }
+
+  // Remove one entry (DELETE /addendum/entries/{id}). The response carries the
+  // resulting set plus `removed_id`, so the list is re-derived from the server
+  // rather than filtered locally.
+  const handleAddendumEntryRemove = async (entryId) => {
+    if (!sessionId || addendumEntryBusy) return
+    setAddendumEntryBusy(true)
+    setAddendumRefusal(null)
+    setAddendumError(null)
+    try {
+      const res = await fetch(addendumEntryUrl(entryId), { method: 'DELETE' })
+      const data = await res.json().catch(() => null)
+      if (res.status === 409) {
+        setAddendumRefusal({
+          reason: data?.reason ?? 'refused',
+          message: data?.message ?? 'addendum write refused',
+        })
+        if (Array.isArray(data?.entries)) adoptAddendum(data)
+        return
+      }
+      if (res.status === 404 || data?.status === 'not_found') {
+        setAddendumError(`Failed to remove entry: ${data?.message ?? `HTTP ${res.status}`}`)
+        setAddendumEpoch((n) => n + 1)
+        return
+      }
+      if (!res.ok || data?.status !== 'removed') {
+        setAddendumError(`Failed to remove entry: HTTP ${res.status}`)
+        return
+      }
+      adoptAddendum(data)
+      // A removal is exactly the case a merge-by-id echo cannot represent.
+      useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries ?? [] }, { mode: 'replace' })
+      setAddendumEpoch((n) => n + 1)
+      if (editingAddendumId === entryId) {
+        setEditingAddendumId(null)
+        setAddendumEditText('')
+      }
+    } catch (err) {
+      setAddendumError(`Failed to remove entry: ${err?.message || err}`)
+    } finally {
+      setAddendumEntryBusy(false)
     }
   }
 
@@ -962,6 +1105,60 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                     <div style={{ marginTop: '0.2rem', fontSize: '0.7rem', color: '#6c7086' }}>
                       {`${entry.ts} · ${entry.source}${entry.pinned ? ' · pinned' : ''}`}
                     </div>
+                    {/* Per-entry controls. Both act on ONE entry and both adopt
+                        the resulting set the server returns. */}
+                    {editingAddendumId === entry.id ? (
+                      <div style={{ marginTop: '0.3rem' }}>
+                        <textarea
+                          aria-label={`Edit addendum entry ${entry.id}`}
+                          value={addendumEditText}
+                          onChange={(e) => setAddendumEditText(e.target.value)}
+                          rows={3}
+                          style={{ ...inputStyle, resize: 'vertical' }}
+                        />
+                        <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.3rem' }}>
+                          <button
+                            type="button"
+                            className="btn btn-accent"
+                            disabled={addendumEntryBusy}
+                            onClick={() => handleAddendumEntryUpdate(entry.id)}
+                            style={{ fontSize: '0.75rem', padding: '0.2rem 0.6rem' }}
+                          >
+                            Save entry
+                          </button>
+                          <button
+                            type="button"
+                            className="btn"
+                            disabled={addendumEntryBusy}
+                            onClick={() => { setEditingAddendumId(null); setAddendumEditText('') }}
+                            style={{ fontSize: '0.75rem', padding: '0.2rem 0.6rem' }}
+                          >
+                            Cancel edit
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.3rem' }}>
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={addendumEntryBusy}
+                          onClick={() => { setEditingAddendumId(entry.id); setAddendumEditText(entry.text || '') }}
+                          style={{ fontSize: '0.75rem', padding: '0.2rem 0.6rem' }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={addendumEntryBusy}
+                          onClick={() => handleAddendumEntryRemove(entry.id)}
+                          style={{ fontSize: '0.75rem', padding: '0.2rem 0.6rem' }}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -1017,6 +1214,36 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                 )}
               </div>
             </form>
+
+            {/* What the NEXT turn receives, rendered by the turn's own resolver:
+                the panel never re-derives the framing, so the operator sees the
+                exact block (or the absence of one) the model will get. */}
+            <div style={{ marginTop: '0.75rem', borderTop: '1px solid #45475a', paddingTop: '0.5rem' }}>
+              <label style={labelStyle}><strong>Effective block (next query)</strong></label>
+              {addendumEffectiveError && (
+                <div data-testid="addendum-effective-error" style={{ color: '#f38ba8', fontSize: '0.75rem', margin: '0.25rem 0' }}>
+                  {addendumEffectiveError}
+                </div>
+              )}
+              {addendumEffective && (
+                <>
+                  <div data-testid="addendum-effective-meta" style={{ margin: '0.25rem 0', fontSize: '0.7rem', color: '#6c7086' }}>
+                    {`${addendumEffective.block_chars ?? 0} chars · applied ${addendumEffective.applied ?? 'next_query'} · resolved via ${addendumEffective.resolved_via ?? 'store'} · ${(addendumEffective.entries || []).length} / ${addendumEffective.max_entries ?? '—'} entries`}
+                  </div>
+                  {addendumEffective.diagnostics && (
+                    <div data-testid="addendum-effective-diagnostics" style={{ margin: '0 0 0.25rem 0', fontSize: '0.7rem', color: '#6c7086' }}>
+                      {`live bridges: ${addendumEffective.diagnostics.live_bridges ?? 0} · agent-bearing: ${addendumEffective.diagnostics.agent_bearing_bridges ?? 0} · same session object: ${addendumEffective.diagnostics.same_object ? 'yes' : 'no'}`}
+                    </div>
+                  )}
+                  <pre
+                    data-testid="addendum-effective-block"
+                    style={{ margin: 0, padding: '0.4rem 0.6rem', background: '#1e1e2e', border: '1px solid #45475a', borderRadius: '4px', color: '#cdd6f4', fontSize: '0.75rem', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '12rem', overflow: 'auto' }}
+                  >
+                    {addendumEffective.rendered_block}
+                  </pre>
+                </>
+              )}
+            </div>
           </div>
         </div>
       )}

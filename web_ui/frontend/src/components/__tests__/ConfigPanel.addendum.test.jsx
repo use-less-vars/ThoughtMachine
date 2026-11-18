@@ -14,6 +14,13 @@
  *     DELETE
  *   - the store echo (receiveAddendumUpdated) merges by entry id — it neither
  *     duplicates nor wipes the rendered rows
+ *   - the effective-block preview (GET /addendum/effective) renders the text the
+ *     backend RESOLVED for the next turn, and is refetched after a write rather
+ *     than reconstructed from the list
+ *   - one entry can be edited in place (PATCH) and removed (DELETE) on its own
+ *     URL, each adopting the server's resulting set
+ *   - the WS/event echo still merges by entry id, while the REST echoes use
+ *     mode:'replace' -- the only shape that can represent a clear or a removal
  *
  * The panel is a mirror, not an owner: it must never invent a char count, a
  * budget, or an entry.  These tests therefore assert against the payloads the
@@ -22,7 +29,7 @@
 
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor, act, within } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import ConfigPanel from '../ConfigPanel';
 import useStore from '../../store/useStore';
@@ -86,6 +93,28 @@ const clearedBody = () => ({
   session_id: SESSION,
 });
 
+// GET /api/session/{id}/addendum/effective payload shape: the RESOLVED block
+// plus the diagnostics the panel renders as a one-line note.
+const effectiveBody = (entries, renderedBlock) => ({
+  status: 'ok',
+  session_id: SESSION,
+  entries,
+  total_chars: entries.reduce((n, e) => n + (e.text || '').length, 0),
+  budget_chars: BUDGET,
+  max_entries: MAX_ENTRIES,
+  rendered_block: renderedBlock,
+  block_chars: renderedBlock.length,
+  applied: 'next_query',
+  resolved_via: 'live',
+  diagnostics: {
+    live_bridges: 1,
+    agent_bearing_bridges: 1,
+    session_object_id: 'obj-1',
+    agent_session_object_id: 'obj-1',
+    same_object: true,
+  },
+});
+
 const response = (status, body) => ({
   ok: status >= 200 && status < 300,
   status,
@@ -100,7 +129,7 @@ const response = (status, body) => ({
  * router keys on the URL and on init.method and records per-verb call counts.
  */
 function installFetch(handlers) {
-  const calls = { get: 0, post: 0, delete: 0, postBodies: [] };
+  const calls = { get: 0, post: 0, patch: 0, delete: 0, postBodies: [], patchBodies: [] };
   const fetchMock = vi.fn(async (url, init = {}) => {
     const target = String(url);
     const method = String(init.method || 'GET').toUpperCase();
@@ -108,14 +137,21 @@ function installFetch(handlers) {
       if (method === 'POST') {
         calls.post += 1;
         calls.postBodies.push(init.body ? JSON.parse(init.body) : null);
-        return handlers.post(calls.post);
+        return handlers.post(calls.post, target);
+      }
+      if (method === 'PATCH') {
+        calls.patch += 1;
+        calls.patchBodies.push(init.body ? JSON.parse(init.body) : null);
+        return handlers.patch(calls.patch, target);
       }
       if (method === 'DELETE') {
         calls.delete += 1;
-        return handlers.delete ? handlers.delete(calls.delete) : response(200, clearedBody());
+        return handlers.delete ? handlers.delete(calls.delete, target) : response(200, clearedBody());
       }
       calls.get += 1;
-      return handlers.get(calls.get);
+      // The list GET and the effective-block GET share the /addendum prefix, so
+      // the URL is handed to the handler (existing handlers ignore it).
+      return handlers.get(calls.get, target);
     }
     if (target.includes('/permissions')) return response(200, { raw: {} });
     if (target.includes('/api/tools')) return response(200, { tools: [] });
@@ -339,5 +375,137 @@ describe('ConfigPanel addendum', () => {
     await waitFor(() => expect(calls.delete).toBe(1));
     await waitFor(() => expect(screen.queryByTestId('addendum-list')).not.toBeInTheDocument());
     expect(screen.getByText('No addendum entries.')).toBeInTheDocument();
+  });
+
+  // ========================================================================
+  // Effective block preview
+  // ========================================================================
+  it('renders the block the backend RESOLVED for the next turn, and refetches it after a write', async () => {
+    const BLOCK_BEFORE = '[addendum]\nalways answer in metric units\nnever truncate tool output';
+    const BLOCK_AFTER = `${BLOCK_BEFORE}\nprefer boring solutions`;
+    let effectiveCalls = 0;
+    installFetch({
+      get: (n, url) => {
+        if (String(url).includes('/addendum/effective')) {
+          effectiveCalls += 1;
+          return effectiveCalls === 1
+            ? response(200, effectiveBody([E1, E2], BLOCK_BEFORE))
+            : response(200, effectiveBody([E1, E2, E3], BLOCK_AFTER));
+        }
+        return response(200, addendumBody([E1, E2], 53));
+      },
+      post: () =>
+        response(200, { status: 'accepted', entry: E3, ...addendumBody([E1, E2, E3], 82) }),
+    });
+    renderPanel();
+
+    // The panel shows the resolved text verbatim: it never re-derives framing.
+    await waitFor(() => expect(screen.getByTestId('addendum-effective-block')).toBeInTheDocument());
+    expect(screen.getByTestId('addendum-effective-block').textContent).toBe(BLOCK_BEFORE);
+    const meta = screen.getByTestId('addendum-effective-meta').textContent;
+    expect(meta).toContain('applied next_query');
+    expect(meta).toContain('resolved via live');
+    expect(meta).toContain('2 / 64 entries');
+    expect(screen.getByTestId('addendum-effective-diagnostics').textContent).toContain(
+      'same session object: yes'
+    );
+    expect(effectiveCalls).toBe(1);
+
+    submitText(E3.text);
+    await waitFor(() => expect(screen.getByTestId(`addendum-entry-${E3.id}`)).toBeInTheDocument());
+    // A REST write lands in the session STORE, not in a running agent, so the
+    // preview is re-fetched (never patched from the list).
+    await waitFor(() => expect(effectiveCalls).toBe(2));
+    await waitFor(() =>
+      expect(screen.getByTestId('addendum-effective-block').textContent).toBe(BLOCK_AFTER)
+    );
+  });
+
+  // ========================================================================
+  // Per-entry edit + remove
+  // ========================================================================
+  it('edits one entry in place with PATCH and adopts the server set', async () => {
+    const edited = { ...E1, text: 'always answer in SI units' };
+    const { calls } = installFetch({
+      get: () => response(200, addendumBody([E1, E2], 53)),
+      patch: (n, url) => {
+        expect(String(url)).toContain(`/addendum/entries/${E1.id}`);
+        return response(200, {
+          status: 'updated',
+          entry: edited,
+          ...addendumBody([edited, E2], 44),
+        });
+      },
+    });
+    renderPanel();
+
+    await waitFor(() => expect(screen.getByTestId(`addendum-entry-${E1.id}`)).toBeInTheDocument());
+    const row = screen.getByTestId(`addendum-entry-${E1.id}`);
+    fireEvent.click(within(row).getByRole('button', { name: 'Edit' }));
+
+    const editBox = screen.getByLabelText(`Edit addendum entry ${E1.id}`);
+    // Seeded from the entry's text so an edit starts from what was stored.
+    expect(editBox.value).toBe(E1.text);
+    fireEvent.change(editBox, { target: { value: edited.text } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save entry' }));
+
+    await waitFor(() => expect(calls.patch).toBe(1));
+    // Text goes out verbatim, exactly like an append.
+    expect(calls.patchBodies[0]).toEqual({ text: edited.text });
+    await waitFor(() =>
+      expect(screen.getByTestId(`addendum-entry-${E1.id}`).textContent).toContain(edited.text)
+    );
+    expect(totals().textContent).toBe(`44 / 100 chars \u00b7 2 / 64 entries`);
+    // The editor collapses once the server accepted the new text.
+    expect(screen.queryByLabelText(`Edit addendum entry ${E1.id}`)).not.toBeInTheDocument();
+    expect(screen.getByTestId(`addendum-entry-${E2.id}`)).toBeInTheDocument();
+  });
+
+  it('removes one entry on its own URL and drops the row (replace echo)', async () => {
+    let removed = 0;
+    installFetch({
+      get: () => response(200, addendumBody([E1, E2], 53)),
+      delete: (n, url) => {
+        removed += 1;
+        expect(String(url)).toContain(`/addendum/entries/${E1.id}`);
+        return response(200, {
+          status: 'removed',
+          removed_id: E1.id,
+          ...addendumBody([E2], E2.text.length),
+        });
+      },
+    });
+    renderPanel();
+
+    await waitFor(() => expect(screen.getByTestId(`addendum-entry-${E1.id}`)).toBeInTheDocument());
+    fireEvent.click(
+      within(screen.getByTestId(`addendum-entry-${E1.id}`)).getByRole('button', { name: 'Remove' })
+    );
+
+    await waitFor(() => expect(removed).toBe(1));
+    expect(screen.queryByTestId(`addendum-entry-${E1.id}`)).not.toBeInTheDocument();
+    expect(rows()).toHaveLength(1);
+    expect(totals().textContent).toBe(`${E2.text.length} / 100 chars \u00b7 1 / 64 entries`);
+    // A removal is not representable by a merge: the echo replaces the slice.
+    expect(Object.keys(useStore.getState().addendumEntries[SESSION])).toEqual([E2.id]);
+  });
+
+  it('makes a clear representable in the store slice (replace, not merge)', async () => {
+    installFetch({ get: () => response(200, addendumBody([E1], E1.text.length)) });
+    renderPanel();
+
+    await waitFor(() => expect(screen.getByTestId(`addendum-entry-${E1.id}`)).toBeInTheDocument());
+    // Seed the store slice the way a live event would, so the clear has
+    // something to retract.
+    act(() => {
+      useStore.getState().receiveAddendumUpdated(SESSION, { entries: [E1] });
+    });
+    expect(Object.keys(useStore.getState().addendumEntries[SESSION])).toEqual([E1.id]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear all' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm clear' }));
+
+    await waitFor(() => expect(screen.getByText('No addendum entries.')).toBeInTheDocument());
+    expect(useStore.getState().addendumEntries[SESSION]).toEqual({});
   });
 });

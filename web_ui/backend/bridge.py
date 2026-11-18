@@ -2584,67 +2584,77 @@ class WebAgentBridge:
             # so a switch-away / shutdown save can never collapse the stored
             # full grants with the ceiling-capped live config.
             persist_dump = self._config_dump_for_persistence()
-            if session is None:
-                # Fallback when no session is active — build from existing session data
-                loaded = self._loaded_session
-                session_id = loaded.session_id if loaded else str(uuid.uuid4())
-                session = Session(
-                    session_id=session_id,
-                    user_history=list(loaded.user_history) if loaded else [],
-                    workspace_id=self._workspace_id,
-                    metadata={
-                        'session_config': (
-                            {k: v for k, v in persist_dump.items()
-                             if k != 'session_permissions'}
-                            if persist_dump
-                            else {}
-                        ),
-                        'source': 'web_ui',
-                    }
-                )
-                # Carry the persisted session state that is NOT derivable from
-                # ``user_history``.  Rebuilding from history alone produced a
-                # Session with the DEFAULT (empty) addendum, and the save below
-                # then wrote that empty addendum over the stored one -- so an
-                # operator entry accepted by the addendum REST endpoint (or one
-                # written by the store's cold-path atomic mutation) was wiped by
-                # this end-of-turn save.  ``summary`` sits in the same position:
-                # it is session state, not conversation history.  Both are
-                # deep-copied so the saved Session never aliases the loaded
-                # one's dicts.
-                if loaded is not None:
-                    session.summary = copy.deepcopy(loaded.summary)
-                    session.addendum = copy.deepcopy(loaded.addendum)
-            else:
-                # Update existing session metadata
-                session.metadata.setdefault('session_config', {})
-                if persist_dump:
-                    # session_permissions is NOT a persistence-layer grant
-                    # source: the canonical, REST-owned store is the permission
-                    # sidecar (P1).  Strip the key so this uncapped dump can
-                    # never act as a shadow grants writer.
-                    session.metadata['session_config'] = {
-                        k: v for k, v in persist_dump.items()
-                        if k != 'session_permissions'
-                    }
-                session.metadata.setdefault('source', 'web_ui')
-
-            # Apply name: explicit arg > existing loaded session name > generated
-            if name:
-                session.metadata['name'] = name
-            elif self._loaded_session and self._loaded_session.metadata.get('name'):
-                session.metadata['name'] = self._loaded_session.metadata['name']
-            session.ensure_name()
-
-            # Delegate save to SessionManager.  Snapshot + write happen under
-            # the same lock the addendum routes take before mutating the live
-            # Session (see _session_state_lock): without it, a route that
-            # mutates the live object between this snapshot and this write
-            # would have its accepted entry overwritten by the stale copy.
+            # Snapshot + install are ONE critical section.  The fallback below
+            # deep-copies ``loaded.addendum``; taking that copy outside the lock
+            # let a concurrent REST write (the addendum routes mutate under this
+            # very lock) land between the copy and the rebind of
+            # ``_loaded_session``, so a stale snapshot was installed and the
+            # accepted entry silently dropped.  The lock is therefore taken
+            # BEFORE the read/copy and held through the rebind.  It is
+            # re-entrant, so the save below (which takes it again) cannot
+            # deadlock.
             with self._session_state_lock:
-                self._session_manager.save_session(session, session_config=None, name=None)
+                if session is None:
+                    # Fallback when no session is active — build from existing session data
+                    loaded = self._loaded_session
+                    session_id = loaded.session_id if loaded else str(uuid.uuid4())
+                    session = Session(
+                        session_id=session_id,
+                        user_history=list(loaded.user_history) if loaded else [],
+                        workspace_id=self._workspace_id,
+                        metadata={
+                            'session_config': (
+                                {k: v for k, v in persist_dump.items()
+                                 if k != 'session_permissions'}
+                                if persist_dump
+                                else {}
+                            ),
+                            'source': 'web_ui',
+                        }
+                    )
+                    # Carry the persisted session state that is NOT derivable from
+                    # ``user_history``.  Rebuilding from history alone produced a
+                    # Session with the DEFAULT (empty) addendum, and the save below
+                    # then wrote that empty addendum over the stored one -- so an
+                    # operator entry accepted by the addendum REST endpoint (or one
+                    # written by the store's cold-path atomic mutation) was wiped by
+                    # this end-of-turn save.  ``summary`` sits in the same position:
+                    # it is session state, not conversation history.  Both are
+                    # deep-copied so the saved Session never aliases the loaded
+                    # one's dicts.
+                    if loaded is not None:
+                        session.summary = copy.deepcopy(loaded.summary)
+                        session.addendum = copy.deepcopy(loaded.addendum)
+                else:
+                    # Update existing session metadata
+                    session.metadata.setdefault('session_config', {})
+                    if persist_dump:
+                        # session_permissions is NOT a persistence-layer grant
+                        # source: the canonical, REST-owned store is the permission
+                        # sidecar (P1).  Strip the key so this uncapped dump can
+                        # never act as a shadow grants writer.
+                        session.metadata['session_config'] = {
+                            k: v for k, v in persist_dump.items()
+                            if k != 'session_permissions'
+                        }
+                    session.metadata.setdefault('source', 'web_ui')
 
-            self._loaded_session = session
+                # Apply name: explicit arg > existing loaded session name > generated
+                if name:
+                    session.metadata['name'] = name
+                elif self._loaded_session and self._loaded_session.metadata.get('name'):
+                    session.metadata['name'] = self._loaded_session.metadata['name']
+                session.ensure_name()
+
+                # Delegate save to SessionManager.  Snapshot + write happen under
+                # the same lock the addendum routes take before mutating the live
+                # Session (see _session_state_lock): without it, a route that
+                # mutates the live object between this snapshot and this write
+                # would have its accepted entry overwritten by the stale copy.
+                with self._session_state_lock:
+                    self._session_manager.save_session(session, session_config=None, name=None)
+
+                self._loaded_session = session
 
             # ── Load persisted worker contexts for this workspace ──────────
             self._persisted_workers.clear()

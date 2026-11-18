@@ -426,9 +426,20 @@ const useStore = create((set) => ({
   // a late-arriving older set cannot resurrect evicted entries by position.
   // `entry_id`/`ts`/`source` ride along on the event but the authoritative
   // list is `entries`, so they are not stored separately.
-  receiveAddendumUpdated: (sessionId, payload) =>
+  //
+  // `mode` follows the receiveConversationChanged options idiom:
+  //   'merge'   (default) — fold the payload into the existing map, never
+  //               deleting. A broadcast event is a convergence signal, so a
+  //               duplicate or a late-arriving OLDER event must neither
+  //               duplicate an entry nor drop the ones only the newer event
+  //               knew about.
+  //   'replace' — the caller holds an AUTHORITATIVE full set (a REST response
+  //               it just received), so the map becomes exactly the payload's
+  //               entries. This is the only mode that can represent a clear or
+  //               a removal; `merge` by construction only ever adds.
+  receiveAddendumUpdated: (sessionId, payload, { mode = 'merge' } = {}) =>
     set((state) => {
-      const merged = { ...(state.addendumEntries[sessionId] || {}) }
+      const merged = mode === 'replace' ? {} : { ...(state.addendumEntries[sessionId] || {}) }
       for (const entry of payload?.entries || []) {
         // Entries are { id, ts, source, text, pinned }; skip anything without
         // an id rather than inventing a key that could collide.
