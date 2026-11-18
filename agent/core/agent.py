@@ -441,6 +441,55 @@ def _discard_session_main_pause(session_id: Optional[str], *, worker_mode: bool)
     return True
 
 
+def _discard_manual_only_worker_pause(
+    session_id: Optional[str], *, worker_mode: bool
+) -> list[str]:
+    """Release the operator's ``manual_only`` worker pauses at a user-turn start.
+
+    ``Worker(action="pause", worker_query="manual_only")`` latches every worker
+    it parks (``WorkerThread._manual_only_pause``) *and* records it
+    session-scoped (``tools.workspace.worker_thread._MANUAL_ONLY_PAUSED``).
+    Nothing in the agent's own repertoire releases that latch -- by design, the
+    agent has no resume action -- so without this the pause would outlive the
+    turn that requested it and the workers would stay parked across every later
+    turn.  The genuine "the operator is here again" event is the start of the
+    next OPERATOR turn, which is where this is called (``process_query``).
+
+    Worker (sub-)agent turns share the parent ``session_id`` (``WorkerThread``
+    builds its ``WorkerContext`` from it), so ``worker_mode`` turns must NOT
+    release it: a worker finishing its own turn is not an operator turn.
+
+    Deliberately independent of :func:`_discard_session_main_pause`: the
+    operator can pause their workers without pausing the main agent, so this
+    must not hide behind the session main-pause marker (which may never have
+    been set).
+
+    Returns the worker names actually resumed (``[]`` when there was nothing to
+    do).
+    """
+    if worker_mode or not session_id:
+        return []
+    # The record lives in the worker stack; if that module was never imported in
+    # this process it cannot have been populated, so skip the import.
+    module = sys.modules.get("tools.workspace.worker_thread")
+    if module is None:
+        return []
+    recorded = getattr(module, "_MANUAL_ONLY_PAUSED", None)
+    if not recorded or not recorded.get(session_id):
+        return []
+    resume_manual_only = getattr(module, "_resume_manual_only_paused", None)
+    if resume_manual_only is None:
+        return []
+    # Wrapped so a failed resume can never break the operator's turn.
+    try:
+        resumed = resume_manual_only(session_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        log('WARNING', 'core.agent',
+            f'process_query: releasing manual-only worker pauses failed: {exc}')
+        return []
+    return list(resumed or [])
+
+
 def _pause_aware_sleep(seconds: float) -> bool:
     """Sleep *seconds* on this thread, waking early when a pause is requested.
 
@@ -1492,6 +1541,13 @@ class Agent:
         # stranded main-pause marker here so join/wait_for_job stop reporting
         # "paused" for a pause that ended turns ago (see the helper).
         _discard_session_main_pause(
+            self.session_id,
+            worker_mode=bool(getattr(self.config, 'worker_mode', False)),
+        )
+        # ... and the operator's worker-scope pause, which is a sibling latch
+        # (not a subset): the operator may pause workers WITHOUT pausing the
+        # main agent, so it is released here in its own right (see the helper).
+        _discard_manual_only_worker_pause(
             self.session_id,
             worker_mode=bool(getattr(self.config, 'worker_mode', False)),
         )
