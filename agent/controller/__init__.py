@@ -13,6 +13,29 @@ from agent.core.state import ExecutionState
 from thoughtmachine.security import cancel_pending_prompts
 from tools.cancellation import bind_pause_event
 
+
+def _queue_payload(query, images=None):
+    """Build the query-queue item: ``(query, images)``.
+
+    The queue carries BOTH the query text and the optional image METADATA
+    list, so a payload can never be paired with the wrong turn.  Plain
+    sentinel strings ('[STOP]', '[RESET]', '[RESTART_AFTER_CONFIG]') are
+    still queued bare; :func:`_split_queue_payload` normalises both forms.
+    """
+    return (query, images)
+
+
+def _split_queue_payload(item):
+    """Inverse of :func:`_queue_payload`:: ``(query, images_or_None)``.
+
+    Accepts the legacy bare-string form (sentinel commands) and returns
+    ``(item, None)`` for it.
+    """
+    if isinstance(item, tuple) and len(item) == 2:
+        return item[0], item[1]
+    return item, None
+
+
 class AgentController:
     """
     Runs the agent in a background thread and provides thread‑safe control
@@ -171,7 +194,7 @@ class AgentController:
             log('DEBUG', 'core.controller',
                 f'update_config: stored for next start, provider={config.provider_type}')
 
-    def process_query(self, query: str) -> None:
+    def process_query(self, query: str, images: Optional[list] = None) -> None:
         """
         Unified entry point for submitting a query to the agent.
 
@@ -191,6 +214,9 @@ class AgentController:
 
         Args:
             query: The user query string.
+            images: Optional image METADATA list (id/media_type/width/height),
+                forwarded with the query to ``Agent.process_query``.  The
+                bytes never travel: they live in the process-wide image store.
         """
         self._cleanup_if_thread_dead()
 
@@ -208,7 +234,7 @@ class AgentController:
                 if getattr(self, '_session', None) is not None
                 else None
             )
-            self.query_queue.put(query)
+            self.query_queue.put(_queue_payload(query, images))
             # Daemon thread: if the agent hangs on a long LLM call during
             # shutdown, this allows the process to still exit without waiting.
             # The 5-second join in shutdown() is best-effort graceful exit.
@@ -227,7 +253,7 @@ class AgentController:
             log('DEBUG', 'core.controller',
                 f'process_query: continuing alive thread, query={query[:80]!r}...')
             self.resume()
-            self.query_queue.put(query)
+            self.query_queue.put(_queue_payload(query, images))
 
         else:
             # ── Scenario 3: Thread dead — restart fresh ──
@@ -248,14 +274,14 @@ class AgentController:
                 if getattr(self, '_session', None) is not None
                 else None
             )
-            self.query_queue.put(query)
+            self.query_queue.put(_queue_payload(query, images))
             self.thread = threading.Thread(target=self._run, daemon=True)
             self._running = True
             self.thread.start()
 
     # ── Deprecated wrappers ───────────────────────────────────────────────
 
-    def start(self, query: str, config: AgentConfig=None, session=None, preset_name: str=None, **overrides):
+    def start(self, query: str, config: AgentConfig=None, session=None, preset_name: str=None, images=None, **overrides):
         """
         Start the agent with the given query and configuration.
 
@@ -264,6 +290,8 @@ class AgentController:
             config: An AgentConfig instance (api_key, model, etc.). Mutually exclusive with preset_name.
             session: Optional Session instance to associate with this run (for history persistence).
             preset_name: Name of a preset to use instead of config. If provided, config is ignored.
+            images: Optional image METADATA list (id/media_type/width/height) travelling
+                with the query; the image bytes stay in the process-wide store.
             **overrides: Additional config overrides when using preset_name.
         """
         log('WARNING', 'core.controller', 'start() is deprecated. Use set_session() + process_query() instead.')
@@ -273,7 +301,7 @@ class AgentController:
         if self._running:
             if self.thread is not None and self.thread.is_alive() and self._keep_alive:
                 # Thread exists and is in keep-alive mode; route to continue_session.
-                self.continue_session(query)
+                self.continue_session(query, images=images)
                 return
             raise RuntimeError('Agent is already running. Stop it first.')
         self.stop_event.clear()
@@ -302,7 +330,7 @@ class AgentController:
         self._config = resolved_config
         self._session = session
         self.current_session_id = session.session_id if session is not None else None
-        self.query_queue.put(query)
+        self.query_queue.put(_queue_payload(query, images))
         # Daemon thread: if the agent hangs on a long LLM call during
         # shutdown, this allows the process to still exit without waiting.
         # The 5-second join in shutdown() is best-effort graceful exit.
@@ -349,8 +377,13 @@ class AgentController:
         log('DEBUG', 'core.controller', 'request_halt() called - truncating current turn only')
         self.halt_event.set()
 
-    def continue_session(self, query: str):
-        """Submit a new query to the already running agent."""
+    def continue_session(self, query: str, images=None):
+        """Submit a new query to the already running agent.
+
+        Args:
+            query: The user query string.
+            images: Optional image METADATA list travelling with the query.
+        """
         log('WARNING', 'core.controller', 'continue_session() is deprecated. Use process_query() instead.')
         log('DEBUG', 'core.controller', f"[CONTROLLER continue_session] self.agent={'exists' if hasattr(self, 'agent') and self.agent else 'MISSING'}, agent.id={id(self.agent) if hasattr(self, 'agent') and self.agent else 'N/A'}")
         log('DEBUG', 'core.controller', f"continue_session called: query='{query[:50]}...' is_running={self.is_running} pause_requested={self.pause_event.is_set()}")
@@ -369,7 +402,7 @@ class AgentController:
         if os.environ.get('PAUSE_DEBUG'):
             log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: calling resume() and queuing query')
         self.resume()
-        self.query_queue.put(query)
+        self.query_queue.put(_queue_payload(query, images))
         log('DEBUG', 'core.controller', f'Query queued, queue size approx {self.query_queue.qsize()}')
         if os.environ.get('PAUSE_DEBUG'):
             log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: query queued, queue size={self.query_queue.qsize()}')
@@ -751,7 +784,7 @@ class AgentController:
                     # Agent creation failed; wait for stop, reset, or config update
                     log('DEBUG', 'core.controller', '_run: No agent available, waiting in agentless idle loop')
                     try:
-                        query = self.query_queue.get(timeout=1.0)
+                        query, images = _split_queue_payload(self.query_queue.get(timeout=1.0))
                     except queue.Empty:
                         continue
                     if query in ('[RESET]', '[STOP]'):
@@ -811,7 +844,7 @@ class AgentController:
                     f'agent={self.agent is not None} | '
                     f'_processing_query={self._processing_query}')
                 try:
-                    query = self.query_queue.get(timeout=1.0)
+                    query, images = _split_queue_payload(self.query_queue.get(timeout=1.0))
                     log('INFO', 'core.controller', f"Got query from queue: '{query[:80]}...' (type={type(query).__name__})")
                     if thread_name != threading.current_thread().name:
                         log('WARNING', 'core.controller', f'THREAD MISMATCH! Expected={thread_name}, got={threading.current_thread().name}')
@@ -846,7 +879,7 @@ class AgentController:
                             log('INFO', 'core.controller', f'[CONTROLLER _run] about to call agent.process_query()')
                         else:
                             log('DEBUG', 'core.controller', "[CONTROLLER _run] agent has NO conversation attribute")
-                        for event in local_agent.process_query(query):
+                        for event in local_agent.process_query(query, images=images):
                             log('DEBUG', 'core.pause', f"POST-YIELD: event_type={event['type']}")
                             log('DEBUG', 'pipeline.controller', f"process_query_yield: type={event.get('type')}, turn={event.get('turn')}, stop_reason={event.get('stop_reason')}")
                             self._emit_event(event)

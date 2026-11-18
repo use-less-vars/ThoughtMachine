@@ -231,6 +231,52 @@ function SystemNoticeText({ content }) {
   )
 }
 
+/* ── Attached images on a user message ──
+ *
+ * The transcript NEVER carries image bytes: the server keeps metadata only
+ * ({id, media_type, width, height}) and the bytes live in its ephemeral
+ * ``agent.core.image_store``.  The pasted data URL is the browser's own copy,
+ * so ``localImagePreviews`` (attached by utils/pastedImagePreviews when the
+ * server echoes the message back) is the ONLY way a thumbnail can be shown.
+ * With no local copy the bubble renders a neutral placeholder rather than a
+ * broken <img>.
+ */
+function MessageImages({ msg }) {
+  const images = Array.isArray(msg.images) ? msg.images : []
+  if (images.length === 0) return null
+  const previews = Array.isArray(msg.localImagePreviews) ? msg.localImagePreviews : []
+  return (
+    <div className="message-images">
+      {images.map((img, i) => {
+        const mediaType = (img && img.media_type) || 'image'
+        const src = previews[i] || (img && typeof img.data_url === 'string' ? img.data_url : null)
+        if (!src) {
+          return (
+            <div
+              className="message-image-placeholder"
+              key={(img && img.id) || i}
+              data-testid="message-image-placeholder"
+              title={`${mediaType} — preview not available in this tab`}
+            >
+              <span className="message-image-placeholder-label">Image</span>
+            </div>
+          )
+        }
+        return (
+          <img
+            className="message-image-thumb"
+            key={(img && img.id) || i}
+            src={src}
+            alt={`Attached image ${i + 1}`}
+            title={mediaType}
+            data-testid="message-image-thumb"
+          />
+        )
+      })}
+    </div>
+  )
+}
+
 /* ── Route content based on role ── */
 function MessageContent({ msg }) {
   /* Summary results: dark golden, full markdown, no truncation */
@@ -276,7 +322,12 @@ function MessageContent({ msg }) {
         }
         return <SystemNoticeText content={msg.content} />
       }
-      return <p className="message-text">{msg.content}</p>
+      return (
+        <>
+          <p className="message-text">{msg.content}</p>
+          <MessageImages msg={msg} />
+        </>
+      )
   }
 }
 
@@ -324,7 +375,13 @@ const MessageBubble = React.memo(
     prev.msg.result === next.msg.result &&
     prev.msg.success === next.msg.success &&
     prev.msg.error === next.msg.error &&
-    prev.msg.status === next.msg.status
+    prev.msg.status === next.msg.status &&
+    // Attached images: both the server metadata list and the local thumbnail
+    // array arrive AFTER the first render of a message (images with the
+    // conversation replace, previews once the paste registry matches them), so
+    // an un-compared field would leave the bubble permanently image-less.
+    prev.msg.images === next.msg.images &&
+    prev.msg.localImagePreviews === next.msg.localImagePreviews
 )
 
 export { MessageBubble, MessageContent, CopyButton, stripSystemNoticeWrapper }

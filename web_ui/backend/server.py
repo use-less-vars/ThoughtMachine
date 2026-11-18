@@ -248,6 +248,25 @@ from web_ui.backend.config_manager import (
 # Singleton instance used throughout the WebSocket handlers.
 config_manager = ConfigManager()
 
+# ── Pasted images: the transport boundary ────────────────────────────────
+# The envelope's TOP-LEVEL ``images`` list is validated and base64-decoded
+# exactly once, here, by ``ingest_incoming_images``; the bytes go into the
+# process-wide ephemeral image store and only ``image_id`` metadata travels
+# below this module (bridge → controller → agent → provider adapter).
+# ``IMAGE_ONLY_QUERY_PLACEHOLDER`` is the text substituted for an empty query
+# on an image-only turn.
+from web_ui.backend.image_ingest import (
+    IMAGE_ONLY_QUERY_PLACEHOLDER,
+    ingest_incoming_images,
+)
+
+# ── WebSocket frame cap ──────────────────────────────────────────────────
+# 16 MiB is uvicorn 0.54.0's measured default (uvicorn/config.py:207); it is
+# stated explicitly here so the contract is not silently inherited from a
+# dependency whose default may change.  Do not lower or raise the effective
+# value: the frontend's downscaled pasted images must fit in one frame.
+WS_MAX_SIZE_BYTES = 16 * 1024 * 1024
+
 
 def save_global_defaults(cfg_dict: Dict[str, Any]) -> Path:
     """Persist a config payload as the global default (Path A of config ownership).
@@ -1552,9 +1571,22 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                 if command == "start_session":
                     query = msg.get("query", "")
                     config_dict = msg.get("config", {})
-                    if not query.strip():
-                        await ws.send_json({"type": "status_message", "text": "⚠ Query cannot be empty."})
+                    # Pasted images ride the envelope TOP LEVEL (a sibling of
+                    # command/query/config), never inside ``config``.  Ingest
+                    # decodes them once and hands back ids only; a rejected
+                    # image aborts the turn before any session is started.
+                    images, image_error = ingest_incoming_images(msg.get("images"))
+                    if image_error:
+                        await ws.send_json({"type": "status_message", "text": f"⚠ {image_error}"})
                         continue
+                    if not query.strip():
+                        # An image-only turn is legal: it gets the literal
+                        # placeholder text so every downstream layer still
+                        # sees a non-empty string query.
+                        if not images:
+                            await ws.send_json({"type": "status_message", "text": "⚠ Query cannot be empty."})
+                            continue
+                        query = IMAGE_ONLY_QUERY_PLACEHOLDER
 
                     # Translate frontend config format → AgentConfig format.
                     # Global config from agent_config.json provides defaults;
@@ -1577,13 +1609,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         f'query={query[:80]!r}...')
 
                     try:
-                        bridge.start(query, SessionConfig(**config_dict))
+                        bridge.start(query, SessionConfig(**config_dict), images=images)
                     except RuntimeError as exc:
                         # Controller may be stuck from a prior session; stop and retry
                         log('WARNING', 'server.ws', f'start_session: controller busy, retrying: {exc}')
                         await ws.send_json({"type": "status_message", "text": f"⚠ Controller busy — resetting: {exc}"})
                         bridge.stop()
-                        bridge.start(query, SessionConfig(**config_dict))
+                        bridge.start(query, SessionConfig(**config_dict), images=images)
                     except Exception as exc:
                         log('ERROR', 'server.ws', f'start_session: failed: {exc}\n{traceback.format_exc()}')
                         await ws.send_json({
@@ -1595,9 +1627,16 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "continue_session":
                     query = msg.get("query", "")
-                    if not query.strip():
-                        await ws.send_json({"type": "status_message", "text": "⚠ Query cannot be empty."})
+                    images, image_error = ingest_incoming_images(msg.get("images"))
+                    if image_error:
+                        await ws.send_json({"type": "status_message", "text": f"⚠ {image_error}"})
                         continue
+                    if not query.strip():
+                        # Image-only turn: same placeholder rule as start_session.
+                        if not images:
+                            await ws.send_json({"type": "status_message", "text": "⚠ Query cannot be empty."})
+                            continue
+                        query = IMAGE_ONLY_QUERY_PLACEHOLDER
 
                     # ── Log full bridge state at entry ──
                     log('INFO', 'server.ws',
@@ -1626,9 +1665,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                     log('INFO', 'server.ws',
                                         f'continue_session: injected mode={bridge._session_config.mode} from loaded session config')
                                 sc = SessionConfig(**config_dict)
-                                bridge.start(query, sc)
+                                bridge.start(query, sc, images=images)
                             else:
-                                bridge.start(query)
+                                bridge.start(query, images=images)
                         except Exception as exc:
                             await ws.send_json({
                                 "type": "status_message",
@@ -1645,7 +1684,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             config_dict = msg.get("config", {})
                             if config_dict:
                                 config_dict = config_manager.translate_frontend_config(config_dict)
-                            bridge.continue_session(query, config_dict)
+                            bridge.continue_session(query, config_dict, images=images)
                             log('INFO', 'server.ws',
                                 f'continue_session: CASE 2 - bridge.continue_session() returned OK')
                         except Exception as exc:
@@ -6519,6 +6558,10 @@ def main():
         port=args.port,
         reload=args.reload,
         log_level="info",
+        # Explicit rather than inherited: 16 MiB is uvicorn 0.54.0's default
+        # (config.py:207), but a pasted screenshot must fit in one frame, so
+        # the contract is stated here instead of depending on the dependency.
+        ws_max_size=WS_MAX_SIZE_BYTES,
     )
 
 if __name__ == "__main__":

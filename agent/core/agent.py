@@ -1533,9 +1533,14 @@ class Agent:
         pause_debug(f'request_pause -> enter_reading_mode(pause)')
         return self.enter_reading_mode('pause')
 
-    def process_query(self, query):
+    def process_query(self, query, images=None):
         """Process a user query, appending it to conversation and running the agent.
-        Yields events as dicts."""
+        Yields events as dicts.
+
+        ``images`` is an optional list of image METADATA dicts
+        (``id``/``media_type``/``width``/``height``); the bytes stay in
+        the process-wide image store, so only the ids travel with the message.
+        """
         # PHASE 2.1a: a new operator turn un-pauses the session.  Drop any
         # stranded main-pause marker here so join/wait_for_job stop reporting
         # "paused" for a pause that ended turns ago (see the helper).
@@ -1570,7 +1575,14 @@ class Agent:
             log('DEBUG', 'core.agent', f'process_query: query="{query[:80]}..." turn_display={self._display_turn}')
 
             # Add query to conversation FIRST so it's never lost, even on config failure
-            user_msg = {'role': 'user', 'content': query}
+            user_msg = {'role': 'user', 'content': query, 'images': images or []}
+            # The image store is process-wide and content-addressed, so the
+            # per-session collector (agent.core.image_gc) can only know what
+            # this session owns if the turn registers it.  This is the one
+            # place a turn's images join the conversation, whatever transport
+            # queued the query.
+            from agent.core import image_gc
+            image_gc.track_images(self.session_id, images)
             self._add_to_conversation(user_msg)
             estimated_tokens = self._estimate_tokens(user_msg)
             self.state.current_conversation_tokens += estimated_tokens

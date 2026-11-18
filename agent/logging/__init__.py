@@ -5,6 +5,7 @@ Records verbatim conversation between agent and LLM for analysis and replay.
 import json
 import logging as python_logging
 import os
+import re
 import threading
 
 from agent._log_root import get_log_root
@@ -37,6 +38,61 @@ from queue import Queue, Empty
 if TYPE_CHECKING:
     from agent.config import AgentConfig
 CURRENT_SESSION_VERSION = '1.0'
+
+# Matches inline base64 data URLs (pasted images) so logs can carry a short,
+# readable placeholder instead of the whole payload.
+_DATA_URL_RE = re.compile(r'data:([A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=]{32,})')
+
+# Hard cap for logged user queries (image data must never reach the log file).
+QUERY_LOG_LIMIT = 2000
+
+
+def _redact_data_urls(text: str) -> str:
+    """Replace base64 data-URL payloads in *text* with a redacted placeholder."""
+
+    def _replace(match: 're.Match[str]') -> str:
+        payload = match.group(2)
+        return f'data:{match.group(1)};base64,<redacted {len(payload)} chars>'
+
+    return _DATA_URL_RE.sub(_replace, text)
+
+
+def _bounded_text(value: Any, limit: int) -> Any:
+    """Redact inline image data in *value* and truncate it to *limit* chars.
+
+    Non-string values are returned unchanged; ``limit <= 0`` disables the
+    length truncation (data-URL redaction is always applied to strings).
+    """
+    if not isinstance(value, str):
+        return value
+    text = _redact_data_urls(value)
+    if limit > 0 and len(text) > limit:
+        return text[:limit] + f'... [truncated, total {len(text)} chars]'
+    return text
+
+
+def _mask_content_for_log(content: Any, limit: int=0) -> Any:
+    """Return a log-safe copy of an LLM message ``content`` value.
+
+    Multimodal content (a list of parts) is walked so that ``image_url`` parts
+    lose their payload, and plain text parts are bounded like any other string.
+    """
+    if isinstance(content, str):
+        return _bounded_text(content, limit)
+    if not isinstance(content, list):
+        return content
+    masked: List[Any] = []
+    for part in content:
+        if isinstance(part, dict) and part.get('type') == 'image_url':
+            masked.append({'type': 'image_url', 'image_url': {'url': '<image data>'}})
+        elif isinstance(part, dict) and isinstance(part.get('text'), str):
+            masked_part = part.copy()
+            masked_part['text'] = _bounded_text(part['text'], limit)
+            masked.append(masked_part)
+        else:
+            masked.append(part)
+    return masked
+
 
 class LogLevel(Enum):
     """Logging verbosity levels."""
@@ -299,7 +355,7 @@ class _AgentLogger:
 
     def log_agent_start(self, query: str, config_data: Dict[str, Any]):
         """Log agent startup."""
-        self._log_event(LogEventType.AGENT_START, LogLevel.INFO, 'Agent started', {'query': query, 'config': config_data, 'session_start_time': self.session_start_time.isoformat(), 'log_file': self.log_file_path})
+        self._log_event(LogEventType.AGENT_START, LogLevel.INFO, 'Agent started', {'query': _bounded_text(query, QUERY_LOG_LIMIT), 'config': config_data, 'session_start_time': self.session_start_time.isoformat(), 'log_file': self.log_file_path})
 
     def log_agent_end(self, end_type: str, reason: str='', final_content: Optional[str]=None):
         """Log agent completion."""
@@ -348,16 +404,28 @@ class _AgentLogger:
         period_seconds = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 60.0
         self.log_token_usage_trend(current_tokens=int(avg_total), trend=trend, period_seconds=period_seconds, metadata={'avg_input_tokens': avg_input, 'avg_output_tokens': avg_output, 'avg_total_tokens': avg_total, 'sample_size': len(self.recent_token_usage), 'input_tokens_history': inputs, 'output_tokens_history': outputs})
 
+    def _messages_for_log(self, messages: List[Dict[str, Any]]) -> List[Any]:
+        """Copy *messages* with inline image payloads masked out (no truncation)."""
+        logged: List[Any] = []
+        for msg in messages:
+            if isinstance(msg, dict) and 'content' in msg:
+                sanitized_msg = msg.copy()
+                sanitized_msg['content'] = _mask_content_for_log(msg.get('content'))
+                logged.append(sanitized_msg)
+            else:
+                logged.append(msg)
+        return logged
+
     def log_llm_request(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]):
         """Log LLM request being sent."""
         sanitized_messages = []
         for msg in messages:
             sanitized_msg = msg.copy()
             if 'content' in sanitized_msg:
-                sanitized_msg['content'] = self._truncate_string(sanitized_msg['content'], self.conversation_content_truncate)
+                sanitized_msg['content'] = _mask_content_for_log(sanitized_msg['content'], self.conversation_content_truncate)
             sanitized_messages.append(sanitized_msg)
         tool_names = [tool.get('function', {}).get('name', 'unknown') for tool in tools]
-        self._log_event(LogEventType.LLM_REQUEST, LogLevel.DEBUG, f'Sending LLM request with {len(messages)} messages and {len(tools)} tools', {'message_count': len(messages), 'tool_count': len(tools), 'tool_names': tool_names, 'messages': sanitized_messages, 'full_messages': messages if self.log_level == LogLevel.DEBUG else None, 'full_tools': tools if self.log_level == LogLevel.DEBUG else None}, self.current_turn)
+        self._log_event(LogEventType.LLM_REQUEST, LogLevel.DEBUG, f'Sending LLM request with {len(messages)} messages and {len(tools)} tools', {'message_count': len(messages), 'tool_count': len(tools), 'tool_names': tool_names, 'messages': sanitized_messages, 'full_messages': self._messages_for_log(messages) if self.log_level == LogLevel.DEBUG else None, 'full_tools': tools if self.log_level == LogLevel.DEBUG else None}, self.current_turn)
 
     def log_llm_response(self, content: str, reasoning: Optional[str], tool_calls: Optional[List[Dict[str, Any]]], usage: Dict[str, int], raw_response: Any=None):
         """Log LLM response received."""
