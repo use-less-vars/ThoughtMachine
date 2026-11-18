@@ -56,6 +56,8 @@ taken before this route's mutation and silently drop the accepted entry.
 from __future__ import annotations
 
 import copy
+import logging
+import sys
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -77,6 +79,8 @@ from web_ui.backend.event_forwarder import _active_tab_bridges
 # ── Router ───────────────────────────────────────────────────────────────────
 
 router = APIRouter(prefix="/api/session")
+
+logger = logging.getLogger(__name__)
 
 #: The only source this REST surface may write.  The mailbox writer (T-2b) is a
 #: different caller of the same write boundary; a client cannot name itself.
@@ -153,15 +157,58 @@ def _held_sessions(bridge, session_id: str) -> List[Any]:
     return held
 
 
+def _warm_registry_bridges(session_id: str) -> List[Any]:
+    """Live bridges the SERVER holds for *session_id* (its warm cache).
+
+    ``web_ui.backend.server._session_bridges`` is the process's warm bridge
+    cache: the object a reconnecting tab is handed and the one the agent's
+    end-of-turn save runs against.  A bridge is unregistered from
+    ``_active_tab_bridges`` when its tab's websocket disconnects, and the
+    warm-reuse path re-attaches the cached bridge WITHOUT registering it again --
+    so after an F5 the session is live in this process while the tab-set
+    registry knows nothing about it.  Reading only the tab set therefore
+    resolves such a session as cold, writes disk only, and lets the agent's next
+    end-of-turn save overwrite the record with a snapshot taken before the
+    write: the accepted entry is lost.  The warm cache is what closes that gap.
+
+    The server module is looked up in ``sys.modules`` and NEVER imported here:
+    it imports this router, so importing it from this module would be circular
+    (and it has heavy import-time side effects).  When it has not been imported
+    in this process there is no warm cache, so the answer is ``[]``.
+    """
+    server = sys.modules.get("web_ui.backend.server")
+    registry = getattr(server, "_session_bridges", None)
+    if not isinstance(registry, dict):
+        return []
+    bridge = registry.get(session_id)
+    return [bridge] if bridge is not None else []
+
+
 def _live_bridges(session_id: str) -> List[Tuple[Any, List[Any]]]:
     """``[(bridge, held_sessions), ...]`` for every bridge holding *session_id*.
 
-    A snapshot of the live set (``list(...)``) so a tab registering or
-    unregistering mid-request cannot change the set under the loop.  Bridges
-    with a running agent sort first: that is the copy the model is reading.
+    Both live registries are consulted, because a session can be live in this
+    process without being in either one alone: the tab set
+    (``_active_tab_bridges``) knows the bridges a connected tab is driving, and
+    the server's warm cache (``_warm_registry_bridges``) knows the bridges it
+    will hand back to a reconnecting tab -- and a bridge can be in the warm
+    cache while absent from the tab set (the warm-reuse path does not
+    re-register).  Missing the warm one makes an actually-live session resolve
+    as cold, which is exactly how an accepted addendum write gets lost.
+
+    A snapshot (``list(...)``) of both registries so a tab registering or
+    unregistering mid-request cannot change the set under the loop, and
+    de-duplicated by bridge identity so a bridge present in both contributes
+    once.  Bridges with a running agent sort first: that is the copy the model
+    is reading.
     """
+    candidates: List[Any] = []
+    for bridge in list(_active_tab_bridges) + _warm_registry_bridges(session_id):
+        if any(bridge is known for known in candidates):
+            continue
+        candidates.append(bridge)
     live: List[Tuple[Any, List[Any]]] = []
-    for bridge in list(_active_tab_bridges):
+    for bridge in candidates:
         held = _held_sessions(bridge, session_id)
         if held:
             live.append((bridge, held))
@@ -193,6 +240,10 @@ def _resolve_addendum_session(session_id: str):
     store = _get_store()
     bridges = _live_bridges(session_id)
     if bridges:
+        logger.info(
+            "addendum resolve: session=%s authority=live live_bridges=%s",
+            session_id, _count(bridges),
+        )
         return store, bridges, bridges[0][1][0]
     session = store.load_session(session_id)
     if session is None:
@@ -200,6 +251,10 @@ def _resolve_addendum_session(session_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session not found: {session_id}",
         )
+    logger.info(
+        "addendum resolve: session=%s authority=cold live_bridges=%s",
+        session_id, 0,
+    )
     return store, [], session
 
 
@@ -494,6 +549,21 @@ async def get_session_addendum_effective(
     try:
         _store, bridges, session = _resolve_addendum_session(session_id)
 
+        # Which registry the resolution came from.  A resolved bridge that is in
+        # the server's warm cache is the warm one -- the case this module used to
+        # miss entirely; otherwise only the connected tabs' set supplied it.
+        warm_registry = _warm_registry_bridges(session_id)
+        if not bridges:
+            registry_source = "none"
+        elif any(
+            bridge is warm
+            for bridge, _held in bridges
+            for warm in warm_registry
+        ):
+            registry_source = "warm"
+        else:
+            registry_source = "tab_set"
+
         # Imported here, not at module scope: this router must not pull the
         # agent package in at import time (it is imported by the web server).
         from agent.core.llm_client import render_addendum_block
@@ -517,6 +587,8 @@ async def get_session_addendum_effective(
             "applied": "next_query",
             "diagnostics": {
                 "live_bridges": _count(bridges),
+                "warm_registry_bridges": _count(warm_registry),
+                "registry_source": registry_source,
                 "agent_bearing_bridges": _count([
                     bridge for bridge, _held in bridges
                     if getattr(bridge, "_agent", None) is not None
