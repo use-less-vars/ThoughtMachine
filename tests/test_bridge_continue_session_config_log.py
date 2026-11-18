@@ -58,7 +58,7 @@ class _FakeController:
         self.continued = []
         self.pushed = []
 
-    def continue_session(self, query):
+    def continue_session(self, query, images=None):
         self.continued.append(query)
 
     def request_config_update(self, agent_config):
