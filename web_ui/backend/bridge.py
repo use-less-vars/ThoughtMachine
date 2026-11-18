@@ -546,6 +546,30 @@ def _subscribe_global(event_type, callback):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Query queue payloads
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _queue_payload(query: str, images: Optional[list] = None):
+    """Queue item for one query.
+
+    The queue is also the sentinel channel (``[STOP]``/``[RESET]``), so a plain
+    ``str`` stays the common case and only an image-bearing turn travels as a
+    ``(query, images)`` tuple.
+    """
+    if images:
+        return (query, list(images))
+    return query
+
+
+def _split_queue_payload(item):
+    """Inverse of ``_queue_payload``: ``(query, images_or_None)``."""
+    if isinstance(item, tuple) and len(item) == 2:
+        return item[0], item[1]
+    return item, None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1864,8 +1888,14 @@ class WebAgentBridge:
             # the failure so load_session() can decide how to handle it.
             raise RuntimeError(f"Could not build global agent config: {e}") from e
 
-    def start(self, query: str, session_config: Optional[SessionConfig] = None) -> None:
-        """Start a new agent session with the given SessionConfig."""
+    def start(self, query: str, session_config: Optional[SessionConfig] = None,
+              images: Optional[list] = None) -> None:
+        """Start a new agent session with the given SessionConfig.
+
+        ``images`` is the metadata list produced by the server's image ingest
+        (id/media_type/width/height); it is forwarded to the controller and
+        queued with the query.  Nothing here sees bytes or data URLs.
+        """
         # Log config source for debugging
         _sc = session_config or self._session_config
         log('INFO', 'server.bridge',
@@ -1943,7 +1973,7 @@ class WebAgentBridge:
             session_arg = self._loaded_session
             self._running = True
             self._session = session_arg
-            self._controller.start(query, agent_config, session=session_arg)
+            self._controller.start(query, agent_config, session=session_arg, images=images)
             self._loaded_session = None  # consumed
 
             # Immediately try to capture session from controller's agent
@@ -1992,7 +2022,7 @@ class WebAgentBridge:
         self._bind_session_id(session.session_id)
 
         # Queue the initial query
-        self._query_queue.put(query)
+        self._query_queue.put(_queue_payload(query, images))
 
         # Start background thread
         self._thread = threading.Thread(
@@ -2002,7 +2032,8 @@ class WebAgentBridge:
         )
         self._thread.start()
 
-    def continue_session(self, query: str, config_dict: Optional[Dict[str, Any]] = None) -> None:
+    def continue_session(self, query: str, config_dict: Optional[Dict[str, Any]] = None,
+                         images: Optional[list] = None) -> None:
         """
         Submit a follow‑up query to a running (or paused) agent.
 
@@ -2029,7 +2060,7 @@ class WebAgentBridge:
             # query).  If that happens, create a fresh controller and hand off
             # via process_query() so the session continues seamlessly.
             if self._controller.is_running:
-                self._controller.continue_session(query)
+                self._controller.continue_session(query, images=images)
                 return
             # ── Controller is dead — resurrect ──
             log('WARNING', 'server.bridge',
@@ -2042,13 +2073,13 @@ class WebAgentBridge:
                     self._session,
                     self._session_config.to_agent_config(workspace_path=self._workspace_path)
                 )
-                new_controller.process_query(query)
+                new_controller.process_query(query, images=images)
             self._controller = new_controller
             return
         if not self.is_running:
             raise RuntimeError("Bridge is not running. Start it first.")
         self.resume()
-        self._query_queue.put(query)
+        self._query_queue.put(_queue_payload(query, images))
 
     def pause(self) -> None:
         """Request the agent to pause after the current turn and pause all workers."""
@@ -3250,6 +3281,12 @@ class WebAgentBridge:
         # NOW save — all final messages are captured
         if sid:
             self.save_session()
+            # Persisting above already collected the images this session's
+            # post-prune history no longer references; the ids it still
+            # references stay in the store (they must resolve if this session is
+            # reopened in this process), so only the tracking record is dropped.
+            from agent.core import image_gc
+            image_gc.drop_session(sid)
             self._session_manager.close_session(sid)
             # Containers are now workspace-scoped (thoughtmachine.workspace_id
             # label) and survive session close; workspace cleanup is handled
@@ -3396,6 +3433,17 @@ class WebAgentBridge:
 
     def clear_loaded_session(self) -> None:
         """Clear the loaded session reference for a fresh start."""
+        # The conversation is being discarded, so this session must stop
+        # claiming the images it tracked: a stale claim would make every later
+        # collection skip those ids as "shared", keeping them resident for the
+        # life of the process.  The bytes themselves are left to the store's
+        # LRU cap -- the persisted transcript may still reference them.
+        from agent.core import image_gc
+        image_gc.drop_session(
+            self._session_id or (
+                self._loaded_session.session_id if self._loaded_session else None
+            )
+        )
         self._session = None
         self._loaded_session = None
         self._forwarder.broadcast(self._session_id, "conversation_changed", {
@@ -3831,7 +3879,7 @@ class WebAgentBridge:
 
                 # Wait for a query
                 try:
-                    query = self._query_queue.get(timeout=0.5)
+                    query, images = _split_queue_payload(self._query_queue.get(timeout=0.5))
                 except queue.Empty:
                     continue
 
@@ -3851,7 +3899,7 @@ class WebAgentBridge:
                 # the loop and preferred over the 'completed' default.
                 turn_stop_reason = None
                 try:
-                    for raw_event in self._agent.process_query(query):
+                    for raw_event in self._agent.process_query(query, images=images):
                         if self._stop_event.is_set():
                             break
 

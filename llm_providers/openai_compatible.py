@@ -4,6 +4,7 @@ Works with OpenAI, DeepSeek, OpenCode/Big Pickle, and any OpenAI-compatible API.
 """
 from typing import Dict, List, Any, Optional, AsyncIterator
 import asyncio
+import base64
 import json
 import time
 import os
@@ -15,10 +16,19 @@ except ImportError:  # pragma: no cover - SDK < 1.0
     class APITimeoutError(APIError):  # never raised by old SDKs
         pass
 import tiktoken
-from .base import LLMProvider, ProviderConfig, LLMResponse, _redact_headers
+from .base import (
+    LLMProvider,
+    ProviderConfig,
+    LLMResponse,
+    _redact_headers,
+    model_supports_images,
+)
 from agent.config.secret import reveal_secret
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
-from agent.core.ir import CanonicalToolCall
+from agent.core.ir import CanonicalToolCall, UnsupportedContentError
+from agent.core import image_store
+from agent.core.image_store import IMAGE_UNAVAILABLE_PLACEHOLDER
+from agent.core.token_counter import estimate_message_tokens
 from agent.core.stream_events import TextDelta, ReasoningDelta, ToolCallStart, ToolCallArgumentsDelta, ToolCallComplete, UsageUpdate, Interrupted, Done, StreamEvent
 from agent.logging import log
 
@@ -32,6 +42,118 @@ from agent.logging import log
 _RETRY_BACKOFF_BASE_SECONDS = 1.0
 _RETRY_BACKOFF_MAX_SECONDS = 8.0
 _RETRY_TOTAL_BUDGET_SECONDS = 30.0
+
+# Image ids already reported as unresolvable, so a transcript replayed on every
+# turn warns once per image instead of once per turn.
+_warned_missing_images = set()
+
+
+def _resolve_image_id(entry: Any) -> Optional[str]:
+    """Return the image id carried by one ``images`` entry.
+
+    Entries are ids (``str``); a dict with an ``id`` key is tolerated because
+    the frontend may hand over the richer upload descriptor instead.  The
+    legacy ``image_id`` key is accepted too so a transcript or message built
+    before the metadata key was renamed still resolves to its bytes rather
+    than silently degrading to the placeholder.
+    """
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        for key in ('id', 'image_id'):
+            candidate = entry.get(key)
+            if isinstance(candidate, str):
+                return candidate
+    return None
+
+
+def build_wire_messages(
+    messages: List[Dict[str, Any]],
+    *,
+    model: str,
+    supports_images: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
+    """Convert canonical messages into OpenAI chat-completions wire messages.
+
+    Canonical messages reference pasted images by id (``{"images": [id]}``);
+    the OpenAI wire format needs base64 data URLs in a content *block* list.
+    This function performs that translation and is the only place the image
+    bytes are touched on the way out.
+
+    * A message with no ``images`` key is passed through untouched (the list is
+      still rebuilt, so callers never mutate the caller's transcript).
+    * A message whose ``images`` are all resolvable becomes
+      ``content = [{'type': 'text', ...}] + [{'type': 'image_url', ...}, ...]``;
+      the text block is omitted when the prompt is empty, because OpenAI
+      rejects an empty text part.
+    * An image whose bytes are gone (evicted from the ephemeral store, or a
+      transcript replayed in a fresh process) is replaced by
+      ``IMAGE_UNAVAILABLE_PLACEHOLDER`` text and logged once, so the model is
+      told it cannot see the screenshot instead of the turn failing.
+
+    Args:
+        messages: Canonical messages.
+        model: Target model, used for the capability check and error message.
+        supports_images: Configured capability override; ``None`` falls back to
+            the model-name heuristic in ``base.model_supports_images``.
+
+    Returns:
+        A new list of messages in OpenAI wire format.
+
+    Raises:
+        UnsupportedContentError: A message carries images and the target model
+            is not known to accept them.
+    """
+    has_images = any(
+        isinstance(message, dict) and message.get('images') for message in messages
+    )
+    if has_images and not model_supports_images(model, supports_images):
+        raise UnsupportedContentError(
+            f'Model {model!r} does not accept image input: the conversation contains '
+            f'a pasted image. Remove the image or switch to a vision-capable model.'
+        )
+
+    wire_messages: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict) or 'images' not in message:
+            wire_messages.append(dict(message) if isinstance(message, dict) else message)
+            continue
+        wire_message = dict(message)
+        image_ids = wire_message.pop('images') or []
+        if not image_ids:
+            wire_messages.append(wire_message)
+            continue
+        content = wire_message.get('content')
+        text = content if isinstance(content, str) else ('' if content is None else str(content))
+        parts: List[Dict[str, Any]] = []
+        if text.strip():
+            parts.append({'type': 'text', 'text': text})
+        missing = []
+        for entry in image_ids:
+            image_id = _resolve_image_id(entry)
+            stored = image_store.get(image_id) if image_id else None
+            if stored is None:
+                missing.append(image_id or str(entry))
+                continue
+            data, media_type = stored
+            encoded = base64.b64encode(data).decode('ascii')
+            parts.append({
+                'type': 'image_url',
+                'image_url': {'url': f'data:{media_type};base64,{encoded}'},
+            })
+        for image_id in missing:
+            if image_id not in _warned_missing_images:
+                _warned_missing_images.add(image_id)
+                log(
+                    'WARNING',
+                    'llm.openai',
+                    f'Pasted image {image_id} is no longer in the image store; '
+                    f'sending placeholder text instead of image content',
+                )
+            parts.append({'type': 'text', 'text': IMAGE_UNAVAILABLE_PLACEHOLDER})
+        wire_message['content'] = parts
+        wire_messages.append(wire_message)
+    return wire_messages
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -276,7 +398,16 @@ class OpenAICompatibleProvider(LLMProvider):
             is_openrouter = self.config.base_url and 'openrouter' in self.config.base_url.lower()
             if is_stepfun or (is_openrouter and is_stepfun):
                 messages = self._normalize_stepfun_tool_calls(messages, is_openrouter=is_openrouter)
-            completion_kwargs = {'model': self.config.model, 'messages': messages}
+            # Pasted images are resolved (and a text-only model refused) here,
+            # at the last moment before the request leaves the provider.
+            completion_kwargs = {
+                'model': self.config.model,
+                'messages': build_wire_messages(
+                    messages,
+                    model=self.config.model,
+                    supports_images=getattr(self.config, 'supports_images', None),
+                ),
+            }
             completion_kwargs.update(kwargs)
             if 'temperature' not in completion_kwargs:
                 completion_kwargs['temperature'] = self.config.temperature
@@ -303,6 +434,15 @@ class OpenAICompatibleProvider(LLMProvider):
                 _mc = {k: v for k, v in _m.items() if k != 'id'}
                 if isinstance(_mc.get('content'), str) and len(_mc['content']) > 200:
                     _mc['content'] = _mc['content'][:200] + f'... [truncated, total {len(_mc["content"])} chars]'
+                elif isinstance(_mc.get('content'), list):
+                    # Image blocks carry base64 data URLs; never dump those into
+                    # a log line.
+                    _mc['content'] = [
+                        {'type': 'image_url', 'image_url': {'url': '<image data>'}}
+                        if isinstance(_part, dict) and _part.get('type') == 'image_url'
+                        else _part
+                        for _part in _mc['content']
+                    ]
                 _safe_messages.append(_mc)
             _log_payload = {
                 'model': completion_kwargs.get('model'),
@@ -429,6 +569,11 @@ class OpenAICompatibleProvider(LLMProvider):
             if hasattr(e, 'response'):
                 api_error.raw_response = e.response
             raise api_error
+        except UnsupportedContentError:
+            # A capability refusal is a caller error, not a provider failure:
+            # let it keep its type so the reason survives to the UI instead of
+            # being flattened into 'Unexpected error: ...'.
+            raise
         except Exception as e:
             if isinstance(e, APITimeoutError):
                 raise ProviderTimeoutError(f'Request timed out: {e}')
@@ -536,8 +681,16 @@ class OpenAICompatibleProvider(LLMProvider):
         is_openrouter = self.config.base_url and 'openrouter' in self.config.base_url.lower()
         if is_stepfun or (is_openrouter and is_stepfun):
             messages = self._normalize_stepfun_tool_calls(messages, is_openrouter=is_openrouter)
-        # Same request shape as chat_completion, plus streaming.
-        completion_kwargs = {'model': self.config.model, 'messages': messages}
+        # Same request shape as chat_completion, plus streaming - including the
+        # image resolution/capability gate.
+        completion_kwargs = {
+            'model': self.config.model,
+            'messages': build_wire_messages(
+                messages,
+                model=self.config.model,
+                supports_images=getattr(self.config, 'supports_images', None),
+            ),
+        }
         completion_kwargs.update(kwargs)
         if 'temperature' not in completion_kwargs:
             completion_kwargs['temperature'] = self.config.temperature
@@ -810,23 +963,25 @@ class OpenAICompatibleProvider(LLMProvider):
         return LLMResponse(content=content, reasoning=reasoning if reasoning else None, tool_calls=tool_calls, usage=usage, raw_response=raw_response, provider=self.provider_name, model=self.config.model, latency_ms=latency)
 
     def count_tokens(self, messages: List[Dict], tools: Optional[List]=None) -> int:
-        """Count tokens using tiktoken"""
+        """Count tokens using tiktoken
+
+        Per-message counts come from the shared estimator
+        (agent.core.token_counter.estimate_message_tokens), so a message with
+        pasted images is billed as its text plus a flat per-image allowance
+        rather than as the id characters, and the same message costs the same
+        here as in the context builder.
+        """
         if self.encoding is None:
             self._load_encoding()
-        if self.encoding is None:
-            text = ''
-            for msg in messages:
-                text += f"{msg.get('role', '')}: {msg.get('content', '')}\n"
-            if tools:
-                text += str(tools)
-            return len(text) // 4
         try:
-            text = ''
+            total = 0
             for msg in messages:
-                text += f"{msg.get('role', '')}: {msg.get('content', '')}\n"
+                total += estimate_message_tokens(msg, encoder=self.encoding)
+                # The wire format prefixes every message with its role.
+                total += estimate_message_tokens(f"{msg.get('role', '')}: ", encoder=self.encoding)
             if tools:
-                text += str(tools)
-            return len(self.encoding.encode(text))
+                total += estimate_message_tokens(str(tools), encoder=self.encoding)
+            return total
         except Exception as e:
             log('WARNING', 'llm.openai', f'Token counting failed: {e}')
             return 0

@@ -28,9 +28,32 @@ import ConfigPanel from './ConfigPanel'
 import SecurityDialog from './SecurityDialog'
 import SessionSidebar from './SessionSidebar'
 import { wsUrl } from '../apiBase'
+import { attachLocalImagePreviews } from '../utils/pastedImagePreviews'
 
 const CONFIG_PANEL_MIN_WIDTH = 200
 const CONFIG_PANEL_MAX_WIDTH = 500
+
+/* ── Command-envelope redaction for logs ──
+ *
+ * sendCommand logs every envelope it sends. Ordinary payloads are tiny, but a
+ * pasted-image turn carries the pictures THEMSELVES (base64, up to ~13 MiB of
+ * text for a full 4-image / 10 MiB turn). Logging that would flood devtools and
+ * copy raw picture bytes into any captured console log, so an `images` list is
+ * reduced to a shape-only summary. Every other field is logged verbatim, so
+ * debugging a command is unchanged.
+ */
+export function redactCommandForLog(envelope) {
+  if (!envelope || !Array.isArray(envelope.images)) return envelope
+  return {
+    ...envelope,
+    images: envelope.images.map((img) => ({
+      media_type: img?.media_type,
+      width: img?.width,
+      height: img?.height,
+      data_url: typeof img?.data_url === 'string' ? `<${img.data_url.length} chars>` : img?.data_url,
+    })),
+  }
+}
 const CONFIG_PANEL_DEFAULT_WIDTH = 280
 
 // ── Fix 3a: stable empty array + memoized equality for sessionMessages ──
@@ -320,7 +343,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       connectSessionWsRef.current?.()
       return
     }
-    console.log(`[SessionTab] Sending command: ${command}`, JSON.stringify({ command, ...payload }))
+    console.log(`[SessionTab] Sending command: ${command}`, JSON.stringify(redactCommandForLog({ command, ...payload })))
     ws.send(JSON.stringify({ command, ...payload }))
     // Fix 3a: force ChatPanel scroll to bottom when the user sends a query.
     // Scoped to the two query-send commands ONLY — sendCommand is generic and
@@ -699,10 +722,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         // Trust the server's is_system_notification flag — no index-based
         // fallback that could leak the flag to wrong messages (Bug 2 & 3).
         const serverMessages = msg.messages ?? [];
-        const mergedMessages = serverMessages.map((m) => ({
+        // Pasted-image previews: the server keeps metadata only, so re-attach
+        // the browser's own copy of each picture (drained from the paste
+        // registry — exactly once per echo) BEFORE the store replace.
+        const mergedMessages = attachLocalImagePreviews(serverMessages.map((m) => ({
           ...m,
           is_system_notification: m.is_system_notification || false,
-        }));
+        })));
         // TODO: Backend dedup tracked for cleanup sprint — the backend re-emits
         // "[SYSTEM NOTIFICATION] Configuration updated: provider_id=..." on every
         // query when a pending config is re-applied, even when the provider is

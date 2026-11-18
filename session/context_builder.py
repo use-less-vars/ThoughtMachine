@@ -91,18 +91,25 @@ class ContextBuilder(ABC):
         pass
 
     def _estimate_tokens(self, message: Dict[str, Any], encoder: Optional[tiktoken.Encoding]=None) -> int:
-        """Estimate token count for a message."""
+        """Estimate token count for a message.
+
+        Delegates to agent.core.token_counter.estimate_message_tokens, the one
+        estimator shared with the token counter, the worker context and the
+        provider adapters, so a message carrying pasted images is billed as
+        text plus a flat per-image allowance everywhere instead of as the JSON
+        text of the message dict.
+        """
         log('DEBUG', 'core.context_builder', f"_estimate_tokens called, message role: {message.get('role', 'unknown')}")
         content_preview = str(message.get('content', ''))[:100].replace('\n', ' ') if 'content' in message else 'no content'
         log('DEBUG', 'core.context_builder', f'  content preview: {content_preview}')
-        import json
+        # Imported lazily: this module is imported while the agent bootstraps.
+        from agent.core.token_counter import estimate_message_tokens
         if encoder is None:
             try:
                 encoder = tiktoken.get_encoding('cl100k_base')
             except Exception:
-                return len(json.dumps(message)) // 4
-        message_json = json.dumps(message)
-        token_count = len(encoder.encode(message_json))
+                encoder = None
+        token_count = estimate_message_tokens(message, encoder=encoder)
         log('DEBUG', 'core.context_builder', f'  estimated tokens: {token_count}')
         return token_count
 
