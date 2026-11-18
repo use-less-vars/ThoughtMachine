@@ -717,11 +717,15 @@ class WorkerRuntimeHandle:
         self,
         worker: Any,
         *,
-        mode: str = MODE_THREAD,
+        mode: str,
         session_id: Optional[str] = None,
         worker_name: Optional[str] = None,
         instance_id: Optional[int] = None,
     ) -> None:
+        # No default for ``mode``, deliberately: a default does not make
+        # the mode *known*, it makes it *guessed*. A caller that forgets must
+        # fail here, at construction, instead of having its worker silently
+        # declared a thread-mode worker that every reader then believes.
         if mode not in RUNTIME_MODES:
             raise InvalidRuntimeModeError(
                 f"mode must be one of {RUNTIME_MODES}, got {mode!r}"

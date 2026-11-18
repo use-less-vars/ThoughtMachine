@@ -1034,6 +1034,14 @@ def test_an_unknown_mode_is_refused_by_the_constructor_too():
         WorkerRuntimeHandle(FakeWorker(), mode="udp")
 
 
+def test_a_forgotten_mode_is_refused_by_the_constructor():
+    # ``mode`` has no default on purpose: a default would not make the mode
+    # known, only guessed. A caller that forgets must fail here, at
+    # construction, rather than have its worker silently declared a thread.
+    with pytest.raises(TypeError):
+        WorkerRuntimeHandle(FakeWorker())
+
+
 def test_the_seam_holds_a_real_worker_thread_that_was_never_started(tmp_path):
     # The duck-typed contract the handle relies on, pinned against the REAL
     # class rather than a fake: never started, no container, no process.
@@ -1066,4 +1074,4 @@ def test_the_seam_holds_a_real_worker_thread_that_was_never_started(tmp_path):
 
 def test_the_handle_holds_the_worker_it_was_given():
     worker = FakeWorker()
-    assert WorkerRuntimeHandle(worker)._worker is worker
+    assert WorkerRuntimeHandle(worker, mode=MODE_THREAD)._worker is worker
