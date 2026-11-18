@@ -18,8 +18,14 @@ from .base import LLMProvider, ProviderConfig, LLMResponse
 from agent.config.secret import reveal_secret
 from .tool_converter import ToolFormatConverter
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
-from agent.core.ir import UnsupportedContentError
+from agent.core.image_store import IMAGE_UNSUPPORTED_PLACEHOLDER
 from agent.logging import log
+
+# Images already reported as unsendable through this adapter, keyed by
+# ``(model, image_id)``.  A transcript is rebuilt on every turn, so without this
+# the warning would repeat once per image per turn.
+_warned_unsupported_images = set()
+
 
 class AnthropicProvider(LLMProvider):
     """
@@ -114,29 +120,86 @@ class AnthropicProvider(LLMProvider):
         return system_msg, anthropic_messages
 
     @staticmethod
-    def _reject_image_content(messages: List[Dict[str, Any]], model: str) -> None:
-        """Refuse a conversation that carries pasted images.
+    def _entry_id(entry: Any) -> str:
+        """Return the image id carried by one ``images`` entry.
 
-        This adapter does not build ``image`` content blocks, so an image id
-        would otherwise be dropped silently and the model would answer a
-        question about a screenshot it cannot see. Failing loudly is the
-        honest option; the image slices can add block support here later.
-
-        Raises:
-            UnsupportedContentError: any message has a non-empty ``images`` list.
+        Ids are plain strings; a dict with an ``id``/``image_id`` key is
+        tolerated because the frontend may hand over the richer upload
+        descriptor.  Mirrors ``openai_compatible._resolve_image_id``; the two
+        should move into ``agent.core.image_store`` together.
         """
-        if any(isinstance(msg, dict) and msg.get('images') for msg in messages):
-            raise UnsupportedContentError(
-                f'Model {model!r} cannot be sent pasted images through the Anthropic '
-                f'adapter, which does not build image content blocks. Remove the '
-                f'image or use an OpenAI-compatible vision model.'
+        if isinstance(entry, dict):
+            for key in ('id', 'image_id'):
+                candidate = entry.get(key)
+                if isinstance(candidate, str):
+                    return candidate
+        return str(entry)
+
+    @staticmethod
+    def _degrade_image_content(
+        messages: List[Dict[str, Any]], model: str
+    ) -> List[Dict[str, Any]]:
+        """Replace pasted images with placeholder text for this adapter.
+
+        ``image`` content blocks are not built here yet, so an id carried past
+        this point would be dropped silently and the model would answer a
+        question about a screenshot it never saw.  Refusing the conversation is
+        the worse option: the image stays in the persisted transcript and this
+        adapter is handed it again on every turn, so a single paste would make
+        the session permanently unusable.  The honest middle is to say so
+        in-band - ``IMAGE_UNSUPPORTED_PLACEHOLDER`` where the screenshot was -
+        and to log it once per image.
+
+        Args:
+            messages: Canonical messages.
+            model: Target model, for the warning only.
+
+        Returns:
+            A new list; the caller's transcript is never mutated and the image
+            bytes are left untouched in the image store.
+        """
+        if not any(isinstance(msg, dict) and msg.get('images') for msg in messages):
+            return messages
+        degraded: List[Dict[str, Any]] = []
+        for msg in messages:
+            if not isinstance(msg, dict) or not msg.get('images'):
+                degraded.append(msg)
+                continue
+            rewritten = dict(msg)
+            image_ids = rewritten.pop('images') or []
+            content = rewritten.get('content')
+            text = content if isinstance(content, str) else (
+                '' if content is None else str(content)
             )
+            placeholders = '\n\n'.join(
+                IMAGE_UNSUPPORTED_PLACEHOLDER for _ in image_ids
+            )
+            rewritten['content'] = (
+                f'{text}\n\n{placeholders}' if text.strip() else placeholders
+            )
+            for entry in image_ids:
+                image_id = AnthropicProvider._entry_id(entry)
+                key = (model, image_id)
+                if key in _warned_unsupported_images:
+                    continue
+                _warned_unsupported_images.add(key)
+                log(
+                    'WARNING',
+                    'llm.anthropic',
+                    f'Pasted image {image_id} is not being sent: the Anthropic adapter '
+                    f'does not build image content blocks yet, so model {model!r} is '
+                    f'told the screenshot cannot be viewed. Use an OpenAI-compatible '
+                    f'vision model to have it see the image.',
+                )
+            degraded.append(rewritten)
+        return degraded
 
     def chat_completion(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]]=None, **kwargs) -> LLMResponse:
         """Execute chat completion with Claude API"""
-        # Checked before the try block so the refusal keeps its own type instead
-        # of being flattened into 'Unexpected error: ...' below.
-        self._reject_image_content(messages, self.config.model)
+        # Images this adapter cannot express are replaced in-band rather than
+        # refused (see _degrade_image_content); the caller's transcript is left
+        # alone and the SDK still receives an ordinary text message.
+        messages = self._degrade_image_content(messages, self.config.model)
         start_time = time.time()
         try:
             system_msg, anthropic_messages = self._serialize_messages(messages)
@@ -174,9 +237,6 @@ class AnthropicProvider(LLMProvider):
             llm_response = self.parse_response(response, start_time)
             self.track_usage(llm_response)
             return llm_response
-        except UnsupportedContentError:
-            # Keep the capability refusal's own type (see _reject_image_content).
-            raise
         except RateLimitError as e:
             if os.environ.get('DEBUG_ANTHROPIC'):
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] RateLimitError: {e}')

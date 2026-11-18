@@ -27,7 +27,10 @@ from agent.config.secret import reveal_secret
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
 from agent.core.ir import CanonicalToolCall, UnsupportedContentError
 from agent.core import image_store
-from agent.core.image_store import IMAGE_UNAVAILABLE_PLACEHOLDER
+from agent.core.image_store import (
+    IMAGE_UNAVAILABLE_PLACEHOLDER,
+    IMAGE_UNSUPPORTED_PLACEHOLDER,
+)
 from agent.core.token_counter import estimate_message_tokens
 from agent.core.stream_events import TextDelta, ReasoningDelta, ToolCallStart, ToolCallArgumentsDelta, ToolCallComplete, UsageUpdate, Interrupted, Done, StreamEvent
 from agent.logging import log
@@ -47,6 +50,13 @@ _RETRY_TOTAL_BUDGET_SECONDS = 30.0
 # turn warns once per image instead of once per turn.
 _warned_missing_images = set()
 
+# Images already reported as unsendable to a given model, keyed by
+# ``(model, image_id)``.  Keyed by model as well as id because one image can be
+# unsendable to the current model and perfectly sendable after a switch to a
+# vision-capable one; the second case deserves its own (single) warning rather
+# than being suppressed by the first.
+_warned_unsupported_images = set()
+
 
 def _resolve_image_id(entry: Any) -> Optional[str]:
     """Return the image id carried by one ``images`` entry.
@@ -65,6 +75,27 @@ def _resolve_image_id(entry: Any) -> Optional[str]:
             if isinstance(candidate, str):
                 return candidate
     return None
+
+
+def _warn_unsendable_images(model: str, image_ids: List[Any]) -> None:
+    """Log, once per ``(model, image)``, that an image is being withheld.
+
+    The transcript is rebuilt on every turn, so an unguarded warning here would
+    fill the log with one line per image per turn for the life of the session.
+    """
+    for entry in image_ids:
+        image_id = _resolve_image_id(entry) or str(entry)
+        key = (model, image_id)
+        if key in _warned_unsupported_images:
+            continue
+        _warned_unsupported_images.add(key)
+        log(
+            'WARNING',
+            'llm.openai',
+            f'Pasted image {image_id} is not being sent: model {model!r} is not known '
+            f'to accept image input. The model is told the screenshot cannot be viewed. '
+            f'Switch to a vision-capable model to have it see the image.',
+        )
 
 
 def build_wire_messages(
@@ -90,28 +121,34 @@ def build_wire_messages(
       transcript replayed in a fresh process) is replaced by
       ``IMAGE_UNAVAILABLE_PLACEHOLDER`` text and logged once, so the model is
       told it cannot see the screenshot instead of the turn failing.
+    * An image the target model cannot receive is replaced by
+      ``IMAGE_UNSUPPORTED_PLACEHOLDER`` text and logged once per image per
+      model; its bytes are left in the store.  Refusing the conversation
+      instead - the behaviour this replaced - made a session permanently
+      unusable: the image stays in the persisted transcript, this function
+      runs on every turn, so every later turn rebuilt the same request and
+      raised the same error.  Withholding one image keeps the turn, the
+      session, and the option of switching to a vision-capable model.
 
     Args:
         messages: Canonical messages.
-        model: Target model, used for the capability check and error message.
+        model: Target model, used for the capability check and the warning.
         supports_images: Configured capability override; ``None`` falls back to
             the model-name heuristic in ``base.model_supports_images``.
 
     Returns:
         A new list of messages in OpenAI wire format.
 
-    Raises:
-        UnsupportedContentError: A message carries images and the target model
-            is not known to accept them.
+    Note:
+        Nothing here raises for image content.  There is no image a text-only
+        model can be sent and no conversation that has to be abandoned because
+        one is in it; the canonical messages are untouched, so the image is
+        still in the transcript and still resolvable from the store.
     """
-    has_images = any(
-        isinstance(message, dict) and message.get('images') for message in messages
-    )
-    if has_images and not model_supports_images(model, supports_images):
-        raise UnsupportedContentError(
-            f'Model {model!r} does not accept image input: the conversation contains '
-            f'a pasted image. Remove the image or switch to a vision-capable model.'
-        )
+    # A capability mismatch is degraded, never raised: this function rebuilds
+    # the whole persisted transcript on every turn, so a raise here outlives the
+    # paste that caused it and makes the session unusable for good.
+    accepts_images = model_supports_images(model, supports_images)
 
     wire_messages: List[Dict[str, Any]] = []
     for message in messages:
@@ -128,6 +165,18 @@ def build_wire_messages(
         parts: List[Dict[str, Any]] = []
         if text.strip():
             parts.append({'type': 'text', 'text': text})
+        if not accepts_images:
+            # The bytes are deliberately not read: they are not being sent, and
+            # leaving them in the store is what makes a later vision-capable
+            # turn able to replay the image.
+            parts.extend(
+                {'type': 'text', 'text': IMAGE_UNSUPPORTED_PLACEHOLDER}
+                for _ in image_ids
+            )
+            _warn_unsendable_images(model, image_ids)
+            wire_message['content'] = parts
+            wire_messages.append(wire_message)
+            continue
         missing = []
         for entry in image_ids:
             image_id = _resolve_image_id(entry)
@@ -398,8 +447,9 @@ class OpenAICompatibleProvider(LLMProvider):
             is_openrouter = self.config.base_url and 'openrouter' in self.config.base_url.lower()
             if is_stepfun or (is_openrouter and is_stepfun):
                 messages = self._normalize_stepfun_tool_calls(messages, is_openrouter=is_openrouter)
-            # Pasted images are resolved (and a text-only model refused) here,
-            # at the last moment before the request leaves the provider.
+            # Pasted images are resolved here, at the last moment before the
+            # request leaves the provider.  A model that cannot receive them is
+            # degraded, not refused: see build_wire_messages.
             completion_kwargs = {
                 'model': self.config.model,
                 'messages': build_wire_messages(
@@ -570,8 +620,11 @@ class OpenAICompatibleProvider(LLMProvider):
                 api_error.raw_response = e.response
             raise api_error
         except UnsupportedContentError:
-            # A capability refusal is a caller error, not a provider failure:
-            # let it keep its type so the reason survives to the UI instead of
+            # Defensive: an image capability mismatch is degraded inside
+            # build_wire_messages now, so this adapter no longer raises this
+            # itself.  Anything that still does (an adapter meeting content it
+            # genuinely cannot express) is a caller error, not a provider
+            # failure: keep its type so the reason survives to the UI instead of
             # being flattened into 'Unexpected error: ...'.
             raise
         except Exception as e:
@@ -682,7 +735,8 @@ class OpenAICompatibleProvider(LLMProvider):
         if is_stepfun or (is_openrouter and is_stepfun):
             messages = self._normalize_stepfun_tool_calls(messages, is_openrouter=is_openrouter)
         # Same request shape as chat_completion, plus streaming - including the
-        # image resolution/capability gate.
+        # image resolution and the capability degradation (see
+        # build_wire_messages).
         completion_kwargs = {
             'model': self.config.model,
             'messages': build_wire_messages(

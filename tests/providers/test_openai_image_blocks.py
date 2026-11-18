@@ -1,13 +1,17 @@
 """Tests for the OpenAI-compatible image path.
 
-Two things are checked here, both without touching the network:
+Three things are checked here, all without touching the network:
 
 * ``build_wire_messages`` turns a canonical message that references a pasted
   image by id into an OpenAI ``content`` block list carrying a base64 data URL,
   and substitutes placeholder text when the bytes are gone;
-* a model that is not known to accept images refuses the conversation with
-  ``UnsupportedContentError`` -- and that type reaches the caller instead of
-  being flattened into a ``ProviderError``.
+* an image the target model is not known to accept is *withheld* -- replaced by
+  ``IMAGE_UNSUPPORTED_PLACEHOLDER`` -- instead of the conversation being
+  refused.  Refusing it bricked the session: the image stays in the persisted
+  transcript and the wire messages are rebuilt on every turn, so the refusal
+  outlived the paste that caused it;
+* a withheld image is not consumed, so switching the same session to a
+  vision-capable model still sends it.
 """
 
 import base64
@@ -22,8 +26,11 @@ if str(_REPO_ROOT) not in sys.path:
 import pytest
 
 from agent.core import image_store
-from agent.core.image_store import IMAGE_UNAVAILABLE_PLACEHOLDER
-from agent.core.ir import UnsupportedContentError
+from agent.core.image_store import (
+    IMAGE_UNAVAILABLE_PLACEHOLDER,
+    IMAGE_UNSUPPORTED_PLACEHOLDER,
+)
+from llm_providers import openai_compatible
 from llm_providers.base import ProviderConfig, model_supports_images
 from llm_providers.openai_compatible import OpenAICompatibleProvider, build_wire_messages
 
@@ -32,9 +39,15 @@ _PNG_BYTES = b'\x89PNG\r\n\x1a\nfake-body'
 
 @pytest.fixture(autouse=True)
 def _clean_store():
+    # The "warn once per image" memories are module state: without clearing them
+    # the warn-once assertions would pass or fail depending on test order.
     image_store.reset()
+    openai_compatible._warned_missing_images.clear()
+    openai_compatible._warned_unsupported_images.clear()
     yield
     image_store.reset()
+    openai_compatible._warned_missing_images.clear()
+    openai_compatible._warned_unsupported_images.clear()
 
 
 @pytest.fixture
@@ -189,13 +202,102 @@ def test_a_partial_miss_keeps_the_images_that_survived(image_id):
 # ---------------------------------------------------------------------------
 
 
-def test_a_text_only_model_refuses_the_conversation(image_id):
-    with pytest.raises(UnsupportedContentError) as excinfo:
-        build_wire_messages(
-            [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-chat'
-        )
+def test_a_text_only_model_gets_a_placeholder_instead_of_a_refusal(image_id):
+    """The regression that bricked live sessions.
 
-    assert 'deepseek-chat' in str(excinfo.value)
+    The raise was not a per-turn failure: the image lives on in the persisted
+    transcript, so every later turn rebuilt the same request and raised again,
+    and the session could never be used for anything else.
+    """
+    wire = build_wire_messages(
+        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-v4-flash'
+    )
+
+    assert wire == [
+        {
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': 'look'},
+                {'type': 'text', 'text': IMAGE_UNSUPPORTED_PLACEHOLDER},
+            ],
+        }
+    ]
+
+
+def test_a_withheld_image_leaves_no_image_block_for_the_model_to_reject(image_id):
+    wire = build_wire_messages(
+        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-v4-flash'
+    )
+
+    assert 'images' not in wire[0]
+    assert [block['type'] for block in wire[0]['content']] == ['text', 'text']
+
+
+def test_an_image_only_turn_still_has_content_to_send(image_id):
+    # An empty content list is rejected by the API, so the placeholder has to
+    # stand on its own when there is no prompt to carry it.
+    wire = build_wire_messages(
+        [{'role': 'user', 'content': '', 'images': [image_id]}], model='deepseek-v4-flash'
+    )
+
+    assert wire[0]['content'] == [{'type': 'text', 'text': IMAGE_UNSUPPORTED_PLACEHOLDER}]
+
+
+def test_every_image_is_represented_by_its_own_placeholder():
+    first = image_store.put(b'first', 'image/png')
+    second = image_store.put(b'second', 'image/png')
+
+    wire = build_wire_messages(
+        [{'role': 'user', 'content': 'compare', 'images': [first, second]}],
+        model='deepseek-v4-flash',
+    )
+
+    assert wire[0]['content'] == [
+        {'type': 'text', 'text': 'compare'},
+        {'type': 'text', 'text': IMAGE_UNSUPPORTED_PLACEHOLDER},
+        {'type': 'text', 'text': IMAGE_UNSUPPORTED_PLACEHOLDER},
+    ]
+
+
+def test_withholding_an_image_does_not_consume_it(image_id):
+    """The bytes survive, so a later vision-capable turn can still send them."""
+    build_wire_messages(
+        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-v4-flash'
+    )
+
+    assert image_store.get(image_id) == (_PNG_BYTES, 'image/png')
+
+    wire = build_wire_messages(
+        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='gpt-4o'
+    )
+
+    assert [block['type'] for block in wire[0]['content']] == ['text', 'image_url']
+
+
+def test_the_callers_transcript_is_not_mutated_when_the_image_is_withheld(image_id):
+    messages = [{'role': 'user', 'content': 'look', 'images': [image_id]}]
+
+    build_wire_messages(messages, model='deepseek-v4-flash')
+
+    assert messages == [{'role': 'user', 'content': 'look', 'images': [image_id]}]
+
+
+def test_the_degradation_is_logged_once_per_image_not_once_per_turn(image_id, monkeypatch):
+    warnings = []
+
+    def _record(level, category, message):
+        if level == 'WARNING':
+            warnings.append(message)
+
+    monkeypatch.setattr(openai_compatible, 'log', _record)
+    messages = [{'role': 'user', 'content': 'look', 'images': [image_id]}]
+
+    for _ in range(3):
+        build_wire_messages(messages, model='deepseek-v4-flash')
+
+    assert len(warnings) == 1
+    assert image_id in warnings[0]
+    assert 'deepseek-v4-flash' in warnings[0]
 
 
 def test_the_gate_is_only_applied_when_images_are_present():
@@ -206,18 +308,20 @@ def test_the_gate_is_only_applied_when_images_are_present():
 
 def test_an_explicit_flag_overrides_the_model_name(image_id):
     # Opting a locally named vision model in ...
-    build_wire_messages(
+    opted_in = build_wire_messages(
         [{'role': 'user', 'content': 'look', 'images': [image_id]}],
         model='house-model-v3',
         supports_images=True,
     )
-    # ... and a known-vision name out.
-    with pytest.raises(UnsupportedContentError):
-        build_wire_messages(
-            [{'role': 'user', 'content': 'look', 'images': [image_id]}],
-            model='gpt-4o',
-            supports_images=False,
-        )
+    assert [block['type'] for block in opted_in[0]['content']] == ['text', 'image_url']
+
+    # ... and a known-vision name out: withheld, but the turn still happens.
+    opted_out = build_wire_messages(
+        [{'role': 'user', 'content': 'look', 'images': [image_id]}],
+        model='gpt-4o',
+        supports_images=False,
+    )
+    assert [block['type'] for block in opted_out[0]['content']] == ['text', 'text']
 
 
 def test_model_capability_hints():
@@ -235,16 +339,47 @@ def test_model_capability_hints():
 # ---------------------------------------------------------------------------
 
 
-def test_provider_refusal_keeps_its_type(provider, image_id, monkeypatch):
-    """The refusal must not be rewritten as ProviderError('Unexpected error: ...')."""
-    def _never_called(*args, **kwargs):  # pragma: no cover - the refusal is earlier
-        raise AssertionError('the SDK must not be called for an unsupported model')
+def test_a_transcript_carrying_an_unsendable_image_does_not_block_later_turns(
+    provider, image_id, monkeypatch
+):
+    """The outage, reproduced and then survived.
 
-    monkeypatch.setattr(provider.client.chat.completions, 'create', _never_called)
-    provider.config = ProviderConfig(api_key='test-key', model='deepseek-chat')
+    The paste stays in the transcript for good and the provider rebuilds the
+    whole transcript on every turn, so the point is not that the first turn
+    survives -- it is that the *third* one still reaches the SDK.
+    """
+    captured = {}
 
-    with pytest.raises(UnsupportedContentError):
-        provider.chat_completion([{'role': 'user', 'content': 'look', 'images': [image_id]}])
+    def _fake_create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='I cannot see images.', tool_calls=None),
+                    finish_reason='stop',
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    monkeypatch.setattr(provider.client.chat.completions, 'create', _fake_create)
+    provider.config = ProviderConfig(api_key='test-key', model='deepseek-v4-flash')
+
+    transcript = [
+        {'role': 'user', 'content': 'what is this?', 'images': [image_id]},
+        {'role': 'assistant', 'content': 'I cannot see images.'},
+        {'role': 'user', 'content': 'then just say hello'},
+    ]
+    response = provider.chat_completion(transcript)
+
+    assert response.content == 'I cannot see images.'
+    sent = captured['messages']
+    assert len(sent) == len(transcript)
+    assert all('images' not in message for message in sent)
+    sent_text = str(sent)
+    assert IMAGE_UNSUPPORTED_PLACEHOLDER in sent_text
+    assert 'image_url' not in sent_text
+    assert 'then just say hello' in sent_text
 
 
 def test_provider_counts_images_as_images(provider, image_id):

@@ -17,6 +17,7 @@ import pytest
 from agent.core import image_store
 from agent.core.image_store import (
     IMAGE_UNAVAILABLE_PLACEHOLDER,
+    IMAGE_UNSUPPORTED_PLACEHOLDER,
     MAX_BYTES,
     MAX_ENTRIES,
     ImageStore,
@@ -207,3 +208,10 @@ def test_module_functions_share_one_store():
 
 def test_placeholder_is_the_documented_text():
     assert IMAGE_UNAVAILABLE_PLACEHOLDER == '[screenshot — no longer available]'
+
+
+def test_the_unsupported_placeholder_is_the_documented_text():
+    assert (
+        IMAGE_UNSUPPORTED_PLACEHOLDER
+        == '[screenshot — this model cannot view images]'
+    )
