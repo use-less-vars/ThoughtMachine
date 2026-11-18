@@ -32,7 +32,6 @@ from tools.utils import model_to_openai_tool
 from tools.summarize_tool import SummarizeTool
 from tools.cancellation import _active_pause_event
 from agent.core.message import Message, is_system_notice_text, make_system_notice
-from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
 from agent.core.state import AgentState, ExecutionState, SessionState, TimeState
 from agent import events as ev
