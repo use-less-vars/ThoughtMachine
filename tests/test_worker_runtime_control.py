@@ -221,7 +221,9 @@ def test_cancel_refused_from_a_terminal_status(status: str) -> None:
 def test_handle_cancel_accepts_the_same_live_statuses(status: str) -> None:
     # Thread mode must answer exactly what the child answers, from the same set.
     worker = _FakeWorker(status=status)
-    handle = worker_runtime.WorkerRuntimeHandle(worker)
+    handle = worker_runtime.WorkerRuntimeHandle(
+        worker, mode=worker_runtime.MODE_THREAD
+    )
 
     assert handle.cancel() == "accepted"
     assert worker._turn_cancel.is_set() is True
@@ -230,7 +232,9 @@ def test_handle_cancel_accepts_the_same_live_statuses(status: str) -> None:
 @pytest.mark.parametrize("status", _REFUSING_STATUSES)
 def test_handle_cancel_refuses_the_same_terminal_statuses(status: str) -> None:
     worker = _FakeWorker(status=status)
-    handle = worker_runtime.WorkerRuntimeHandle(worker)
+    handle = worker_runtime.WorkerRuntimeHandle(
+        worker, mode=worker_runtime.MODE_THREAD
+    )
 
     assert handle.cancel() == "refused"
     assert worker._turn_cancel.is_set() is False
