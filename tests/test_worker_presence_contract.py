@@ -28,9 +28,13 @@ Run:  python -m pytest tests/test_worker_presence_contract.py -q
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
+import tools.workspace.worker as worker_module
+import tools.workspace.worker_runtime as worker_runtime_module
 import tools.workspace.worker_thread as worker_thread_module
 from tools.workspace.worker_registry import WorkerRegistry
 from tools.workspace.worker_runtime import (
@@ -405,6 +409,207 @@ class TestOnlyAnExactProcessStampTakesTheProcessBranch(unittest.TestCase):
         )
         self.assertIs(thread.is_alive(), False)
         self.assertIs(worker_is_live(thread), True)
+
+
+# ===========================================================================
+# SPAWN-LEVEL: what the four registry reads do with a live PROCESS worker
+# ---------------------------------------------------------------------------
+# The predicate is pinned above; this section pins the CALL SITES that use it.
+# Every one of them used to ask the registry entry its own ``is_alive()``, which
+# is ``False`` for a healthy process-mode worker (``WorkerThread.start``
+# returns early so no second body runs beside the child). A live child
+# therefore read as dead and was
+#
+#   * not recognised as an existing instance -> a duplicate spawn overwrote it;
+#   * not counted against the session cap    -> the cap never engaged.
+#
+# These drive the REAL ``_action_spawn`` (same harness shape as
+# ``tests/test_worker_cap.py``), with the workspace lookup, the thread
+# constructor, the container manager and the frame sink stubbed: no thread is
+# constructed, no child is forked, no Docker is touched, and nothing sleeps.
+# ===========================================================================
+
+#: Workspace id handed to the spawn (resolution itself is stubbed).
+WORKSPACE_ID = "ws-presence-contract"
+
+
+def _definition(name):
+    return {"name": name, "system_prompt": "You are a test worker."}
+
+
+class _LiveProcessPredecessor:
+    """A registry entry whose BODY is a live child: ``is_alive()`` is ``False``.
+
+    This is the production shape, not a contrivance: the supervisor thread of a
+    process-mode worker is never started, the handle is the transport, and the
+    handle says the child is healthy.
+    """
+
+    def __init__(self, name, instance_id=1, status="ready"):
+        self.status = status
+        self.instance_id = instance_id
+        self.instance_label = f"{name}#{instance_id}"
+        self._runtime_mode = MODE_PROCESS
+        self._runtime_handle = _FakeHandle(alive=True)
+        self._worker_ctx = None
+
+    def is_alive(self):
+        return False
+
+
+class _SpawnedThreadDouble:
+    """Stands in for the ``WorkerThread`` the spawn pipeline would construct."""
+
+    def __init__(self, **kwargs):
+        self.spawn_kwargs = dict(kwargs)
+        self.status = "ready"
+        self.instance_id = kwargs.get("instance_id")
+        self.instance_label = None
+        self._worker_ctx = None
+        self._generation = None
+
+    def is_alive(self):
+        return False
+
+    def start(self):  # pragma: no cover - reaching this is the failure
+        raise AssertionError(
+            "the spawn double was STARTED: a fresh worker was dispatched "
+            "instead of the live process predecessor being honoured"
+        )
+
+
+class _SpawnHarness(unittest.TestCase):
+    """Run the real ``_action_spawn`` against a fake-free workspace."""
+
+    def setUp(self) -> None:
+        self._registry = WorkerRegistry.get_instance()
+        with self._registry._registry_lock:
+            self._old_registry = dict(self._registry._worker_registry)
+            self._registry._worker_registry.clear()
+        self.addCleanup(self._restore_registry)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.workspace = Path(tmp.name)
+
+        # Workspace resolution is a vault lookup in production.
+        self._patch(worker_module, "_workspace_dir", lambda ws_id: self.workspace)
+        # The thread constructor (imported fresh inside ``_action_spawn``).
+        self._patch(worker_module, "WorkerThread", _SpawnedThreadDouble)
+        # No per-worker ContainerManager (Docker) is built at spawn time.
+        self._patch(worker_thread_module, "_CM", None)
+        # Attaching a real frame sink would build a parent event bus for a
+        # worker that is never dispatched here.
+        self._patch(
+            worker_runtime_module,
+            "attach_thread_frame_sink",
+            lambda worker: _FakeHandle(alive=True),
+        )
+
+    def _patch(self, target, attribute, value) -> None:
+        patcher = mock.patch.object(target, attribute, value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _restore_registry(self) -> None:
+        with self._registry._registry_lock:
+            self._registry._worker_registry.clear()
+            self._registry._worker_registry.update(self._old_registry)
+
+    def _seed(self, entry, thread) -> None:
+        with self._registry._registry_lock:
+            self._registry._worker_registry[entry] = thread
+
+    def _spawn(self, name, *, ws_id=WORKSPACE_ID, workers=None, **fields):
+        tool = worker_thread_module.Worker(
+            action="spawn", worker_name=name, session_id=SESSION, **fields
+        )
+        return tool._action_spawn(
+            workers=workers if workers is not None else [_definition(name)],
+            ws_id=ws_id,
+        )
+
+
+class TestNameOnlySpawnHonoursLiveProcessPredecessor(_SpawnHarness):
+    """A name-only spawn must reuse a live child, never replace it."""
+
+    def test_live_process_predecessor_is_not_overwritten_by_name_only_spawn(self):
+        key = (SESSION, "w1", 1)
+        incumbent = _LiveProcessPredecessor("w1")
+        self._seed(key, incumbent)
+        # Precondition: the supervisor-side object is NOT the body, so the old
+        # predicate reads this healthy worker as dead.
+        self.assertIs(incumbent.is_alive(), False)
+        self.assertIs(worker_is_live(incumbent), True)
+
+        result = self._spawn("w1")
+
+        # The envelope says "continue existing" (spawned=False, instance 1).
+        self.assertIs(result.get("spawned"), False)
+        self.assertEqual(result.get("instance_id"), 1)
+        self.assertIn("reusing", str(result.get("message", "")).lower())
+        # And the live incumbent is still the registry's value -- same object,
+        # not a replacement registered over its key.
+        with self._registry._registry_lock:
+            self.assertIs(self._registry._worker_registry[key], incumbent)
+
+
+class TestForceSpawnOverLiveProcessPredecessor(_SpawnHarness):
+    """A force spawn must refuse rather than orphan a running child."""
+
+    def test_force_spawn_over_live_process_predecessor_refuses(self):
+        key = (SESSION, "w1", 1)
+        incumbent = _LiveProcessPredecessor("w1")
+
+        # The incumbent appears only AFTER the early checks -- i.e. in the
+        # window the double-checked registration exists to close (another
+        # supervisor registered it between the early read and the lock).
+        def _seed_and_return_config(_tool):
+            self._seed(key, incumbent)
+            return {}
+
+        with mock.patch.object(
+            worker_thread_module.Worker, "_build_agent_config", _seed_and_return_config
+        ):
+            result = self._spawn("w1", force=True, instance_id=1)
+
+        self.assertIn("survived force-stop", str(result.get("error", "")))
+        self.assertEqual(result.get("instance_id"), 1)
+        # Left registered, so the instance is not orphaned and can still be
+        # stopped / checked by its owner.
+        with self._registry._registry_lock:
+            self.assertIs(self._registry._worker_registry[key], incumbent)
+
+
+class TestSpawnCapCountsLiveProcessWorkers(_SpawnHarness):
+    """Live child workers hold spawn slots open (they used to count as zero)."""
+
+    def test_spawn_cap_engages_for_live_process_workers(self):
+        # The cap is read from the tool's own config, never hardcoded.
+        cap = worker_thread_module.Worker(
+            action="spawn", worker_name="w9", session_id=SESSION
+        )._effective_max_workers()
+        self.assertGreaterEqual(cap, 2)
+
+        for i in range(1, cap):
+            self._seed((SESSION, f"w{i}", 1), _LiveProcessPredecessor(f"w{i}"))
+
+        # One below the cap: the spawn is NOT refused for the cap. It stops
+        # later, at the workspace lookup -- proving the cap check let it past.
+        below = self._spawn("w9", ws_id=None)
+        self.assertNotIn("spawn limit reached", str(below.get("error", "")))
+        self.assertEqual(
+            below.get("error"), "Cannot create worker: no workspace directory resolved."
+        )
+
+        # At the cap: refused, with the count the caller can act on.
+        self._seed(
+            (SESSION, f"w{cap}", 1), _LiveProcessPredecessor(f"w{cap}")
+        )
+        at_cap = self._spawn("w9", ws_id=None)
+        self.assertIn("spawn limit reached", str(at_cap.get("error", "")))
+        self.assertEqual(at_cap.get("max_workers"), cap)
+        self.assertEqual(at_cap.get("live_workers"), cap)
 
 
 if __name__ == "__main__":  # pragma: no cover
