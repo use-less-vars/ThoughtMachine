@@ -181,16 +181,23 @@ Measured at the last disk check (`wc -c` over the whole tree): `knowledge/` hold
 1,542,562 B in total, and **six** are ≥100 KB — four under `project/` (`archive_arch_a.md` 242.9 KB,
 `operator_observations.md` 152.3 KB, `architecture_audit_2026-09.md` 139.4 KB, `archive_arch_b.md`
 118.3 KB), one under `_archive/personal/` (`bugs_and_fixes.md` 131.3 KB), and one under `personal/`
-(`lessons_learned.md` 105.5 KB). `personal/` itself holds exactly two files: `handoffs.md` (74.7 KB)
-and `lessons_learned.md`. This section previously claimed thirteen files ≥100 KB split 7/5 between
-`personal/` and `archive/`, and sized the four `personal/` files at 150-460 KB; neither matched the
-disk. Grep `^## ` for headers; read the matching section; do not `cat` any of the six.
+(`lessons_learned.md` 185.2 KB (189,633 B)). `personal/` itself holds **26** entries, of which
+the three that matter are `bugs_and_fixes.md` (375.4 KB), `lessons_learned.md` (185.2 KB) and
+`handoffs.md` (74.7 KB); the rest are per-topic notes, dated `*_archive_*` files and `.bak-*`
+backups. Do not read `lessons_learned.md` in full: 189,633 bytes is roughly 47k tokens. Sizes
+re-measured at the Gen 69 housekeeping pass. This section previously claimed thirteen files ≥100 KB
+split 7/5 between `personal/` and `archive/`, and sized the four `personal/` files at 150-460 KB;
+neither matched the disk. Grep `^## ` for headers; read the matching section; do not `cat` any of
+the six.
 
-- **`lessons_learned.md`** (`personal/`, 105.5 KB) · Patterns and post-mortems. Read the
-  matching section when a pattern repeats.
+- **`lessons_learned.md`** (`personal/`, 185.2 KB) · Patterns and post-mortems. Read the
+  matching section when a pattern repeats. Do not read it in full: 189,633 bytes is roughly
+  47k tokens. Grep for a heading (`^## `) and read the matching section.
 - **`bugs_and_fixes.md`** (`_archive/personal/`, 131.3 KB) · Filed bugs and their
   fixes. Read before filing a bug that may be a recurrence. **Note the `_archive/`
-  prefix — it is not under `personal/`.**
+  prefix — it is not under `personal/`.** The 131.3 KB figure is the `_archive/` copy
+  (not re-measured at the Gen 69 pass); a separate, live `personal/bugs_and_fixes.md`
+  measures 375.4 KB (384,443 B).
 - **`handoffs.md`** (`personal/`, 74.7 KB) · Previous engineers' handoffs. Read
   the newest entry for state, older entries for provenance.
 - **`task_tracker.md`, `parking_lot.md`** · **Absent — not on disk** at the last

@@ -1,10 +1,12 @@
 # contract-gate.yml - the fast gate over the invariants named in docs/CONTRACTS.md.
 #
 # It runs the test files cited by the ledger, enumerated by hand (no glob, no `-m`
-# marker expression, never the whole suite), plus two gate-only additions made by
-# C91 that the ledger does not cite: tests/security/test_git_hardening.py and
-# web_ui/backend/tests/test_auth_boundary.py. The parity test enforces
-# cited <= run, so an uncited extra file cannot turn this workflow red.
+# marker expression, never the whole suite), plus three gate-only additions the
+# ledger does not cite: tests/security/test_git_hardening.py and
+# web_ui/backend/tests/test_auth_boundary.py (both added by C91), and
+# tests/test_verify_doc_citations.py, the mutation guard for the citation checker
+# wired in below. The parity test enforces cited <= run, so an uncited extra file
+# cannot turn this workflow red.
 # Docker, secrets and the image cache of python-version-matrix.yml are
 # deliberately absent: every file here is hermetic, so this job should finish in
 # well under the 2-minute budget.
@@ -56,6 +58,7 @@ jobs:
             tests/trust/test_gate_contract.py \
             tests/test_worker_is_a_real_process.py \
             tests/test_contracts_ledger_parity.py \
+            tests/test_verify_doc_citations.py \
             tests/test_ceiling_value_fail_closed.py \
             tests/test_ceiling_map_completeness.py \
             tests/test_permission_hierarchy.py \
@@ -70,6 +73,16 @@ jobs:
           seconds=$((end - start))
           echo "CONTRACT_GATE_SECONDS=${seconds}" >> "$GITHUB_ENV"
           exit $status
+
+      # The citation checker is wired over docs/CONTRACTS.md ONLY. It also parses
+      # docs/design-worker-lifecycle.md, which is knowingly red today: 76 failing
+      # citations (1 missing file, 20 out-of-bounds line numbers, 55 shorthand
+      # references that name no file in their own section). Gating it here would
+      # add a permanently failing step -- worse than no gate, because a red run
+      # that nobody can fix trains readers to ignore the gate. That spec is a
+      # tracked known gap, not a silent omission.
+      - name: "Citation check (only docs/CONTRACTS.md; the design spec is a known gap)"
+        run: python scripts/verify_doc_citations.py --doc docs/CONTRACTS.md
 
       - name: "Report pytest wall time (budget 120s; install time excluded)"
         if: always()

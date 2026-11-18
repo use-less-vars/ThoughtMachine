@@ -1018,7 +1018,17 @@ def _resolve_worker_thread(
     exactly one live candidate must exist; multiple live candidates raise
     ``_WorkerAmbiguityError`` (callers must pass ``instance_id``). No live
     candidate raises ``_WorkerAmbiguityError`` with a 'not running' message.
+
+    "Live" is :func:`worker_is_live`, NOT the thread's own ``is_alive()``: a
+    process-mode worker's supervisor thread is deliberately never started, so
+    its ``is_alive()`` is ``False`` for a worker whose body is a healthy child.
     """
+    # Function-local for the same reason every other worker_runtime import in
+    # this module is: this module is also loaded inside a worker's own process,
+    # and a module-level import would put a supervisor-only module in that
+    # graph.
+    from tools.workspace.worker_runtime import worker_is_live
+
     with _registry_lock:
         if instance_id is not None:
             # Exact 3-tuple lookup first, then a name+instance scan (session
@@ -1044,8 +1054,7 @@ def _resolve_worker_thread(
                 continue
             if session_id is not None and key[0] != session_id:
                 continue
-            alive = bool(getattr(thread, "is_alive", lambda: True)())
-            if not alive:
+            if not worker_is_live(thread):
                 continue
             candidates.append((key[0], iid, thread))
     if not candidates:
@@ -7035,18 +7044,28 @@ class Worker(ToolBase):
         return cap
 
     def _live_workers_in_session(self, session_key: str) -> int:
-        """
-        Count LIVE worker threads currently registered for ``session_key``.
+        """Count LIVE workers currently registered for ``session_key``.
 
-        Only threads whose ``is_alive()`` is True count toward the spawn cap;
-        dead (completed/stopped/errored) registry entries do not.
+        Liveness is runtime-mode dependent, so this cannot ask the thread
+        question: under the process substrate the body lives in a child
+        interpreter and the supervisor-side object's ``is_alive()`` is ``False``
+        even while that child is healthy and answering. ``worker_is_live`` is
+        the predicate that knows the difference, and it reproduces
+        ``is_alive()`` exactly for an unstamped/thread-mode worker.
+
+        Registry entries are RETAINED after terminal exit by design, so "it is
+        in the registry" is not "it counts": a retained-but-finished entry
+        must not hold a spawn slot open, and a live one must be counted.
         """
+        # Function-local like every other worker_runtime import in this module
+        # (this module is also loaded inside the child interpreter).
         from tools.workspace.worker import _registry_lock, _worker_registry
+        from tools.workspace.worker_runtime import worker_is_live
         count = 0
         with _registry_lock:
             for key, thread in _worker_registry.items():
                 sid = key[0]
-                if sid == session_key and thread.is_alive():
+                if sid == session_key and worker_is_live(thread):
                     count += 1
         return count
 
@@ -7172,6 +7191,12 @@ class Worker(ToolBase):
         # (see worker_self_reported) — anti-pattern member 4.
         spawn_started_at = time.time()
         from tools.workspace.worker import GATE_AVAILABLE, WorkerThread, _registry_lock, _worker_registry, check_required_categories, resolve_workspace_id
+        # Liveness for EVERY registry read below (dedupe, double-check, cap):
+        # ``worker_is_live`` asks the runtime-mode-correct question, and is
+        # byte-for-byte ``is_alive()`` for an unstamped/thread-mode worker.
+        # Function-local like every other worker_runtime import in this module
+        # (this module is also loaded inside the child interpreter).
+        from tools.workspace.worker_runtime import worker_is_live
         definition = self._find_worker(workers, self.worker_name)
         if definition is None:
             return {
@@ -7293,7 +7318,7 @@ class Worker(ToolBase):
             for key, t in list(_worker_registry.items()):
                 if key[0] == session_key and key[1] == self.worker_name:
                     iid = key[2] if len(key) >= 3 else 1
-                    if bool(getattr(t, "is_alive", lambda: True)()):
+                    if worker_is_live(t):
                         live_same.append((iid, t))
             if explicit_iid is not None:
                 match = [t for iid, t in live_same if iid == explicit_iid]
@@ -7926,7 +7951,11 @@ class Worker(ToolBase):
         # check (above) and this registration point.
         with _registry_lock:
             existing = _worker_registry.get((session_key, self.worker_name, spawn_iid))
-            if existing is not None and existing.is_alive():
+            # RETAINED entries are normal here (a finished worker keeps its
+            # entry so it stays reportable), so ``is_alive()`` would call a
+            # live process-mode predecessor dead and let the write below
+            # overwrite its key -- orphaning a running child.
+            if existing is not None and worker_is_live(existing):
                 # Another thread won the race — don't overwrite.
                 # With force this is not a lost race but a failed stop: the
                 # instance we asked to replace is still registered and alive
@@ -7964,7 +7993,7 @@ class Worker(ToolBase):
             live_now = sum(
                 1
                 for key, t in _worker_registry.items()
-                if key[0] == session_key and t.is_alive()
+                if key[0] == session_key and worker_is_live(t)
             )
             if live_now >= max_workers:
                 return {
@@ -8225,6 +8254,13 @@ class Worker(ToolBase):
         instance_id.
         """
         session_key = self.session_id or _NO_SESSION_KEY
+        # Liveness for EVERY ``alive`` field below: ``worker_is_live`` asks the
+        # runtime-mode-correct question. A process-mode worker's supervisor
+        # thread is deliberately never started, so ``is_alive()`` reports such a
+        # worker dead even while its child is healthy and answering. Function-
+        # local like every other worker_runtime import in this module (this
+        # module is also loaded inside the child interpreter).
+        from tools.workspace.worker_runtime import worker_is_live
         _get_worker_lifecycle_observer()  # best-effort: ensure observer subscription
         try:
             thread, sid, iid = _resolve_worker_thread(
@@ -8250,7 +8286,7 @@ class Worker(ToolBase):
                         "error": t.error,
                         "session_id": sid,
                         "note": "Worker is from a different session",
-                        "alive": t.is_alive(),
+                        "alive": worker_is_live(t),
                     }
                 # Multiple instances across sessions
                 instances = []
@@ -8261,7 +8297,7 @@ class Worker(ToolBase):
                         "current_task": t.current_task,
                         "last_heartbeat": t.last_heartbeat,
                         "error": t.error,
-                        "alive": t.is_alive(),
+                        "alive": worker_is_live(t),
                     })
                 return {
                     "worker_name": self.worker_name,
@@ -8304,7 +8340,7 @@ class Worker(ToolBase):
             "session_id": sid,
             "current_context_tokens": thread.get_current_context_tokens(),
             "max_context_tokens": thread.max_context_tokens,
-            "alive": thread.is_alive(),
+            "alive": worker_is_live(thread),
             "conversation_length": len(thread._worker_ctx.user_history) if thread._worker_ctx else 0,
             "last_heartbeat_age_s": age,
             "stale": stale,

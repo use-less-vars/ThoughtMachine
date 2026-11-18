@@ -16,7 +16,10 @@ string-based patch no longer reaches.
 
 import json
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from tools.workspace.worker_runtime import MODE_PROCESS
 
 MINE = "session-mine"
 FOREIGN = "session-foreign"
@@ -27,11 +30,21 @@ BASE_KWARGS = {
 
 
 def _fake_thread(name: str, current_task: str) -> MagicMock:
-    """Thread stub exposing exactly the attributes _query_running_workers reads."""
+    """Thread stub exposing exactly the attributes _query_running_workers reads.
+
+    Deliberately the PROCESS-mode shape, because that is where the ``alive``
+    field used to lie: the supervisor-side object's ``is_alive()`` is False (a
+    process-mode worker's body lives in a child interpreter and its supervisor
+    thread is never started) while the runtime handle reports that child alive.
+    Only ``worker_is_live`` answers True for this stub -- asking the thread
+    question answers False.
+    """
     t = MagicMock()
     t.worker_name = name
     t.status = "running"
-    t.is_alive.return_value = True
+    t.is_alive.return_value = False
+    t._runtime_mode = MODE_PROCESS
+    t._runtime_handle = SimpleNamespace(alive=True)
     t.current_task = current_task
     t.last_heartbeat = "2026-10-20T00:00:00Z"
     t.error = None
@@ -74,6 +87,9 @@ def test_running_workers_scoped_to_calling_session():
     assert workers[0]["name"] == "my-worker"
     assert workers[0]["session_id"] == MINE
     assert workers[0]["current_task"] == "my private task"
+    # Liveness is the runtime-mode-correct reading, not the launcher thread's:
+    # the stub's own is_alive() is False while its child body reports alive.
+    assert workers[0]["alive"] is True
     # The foreign worker's name and task never reach the payload.
     assert "FOREIGN SECRET TASK" not in json.dumps(result)
     assert "foreign-worker" not in json.dumps(result)

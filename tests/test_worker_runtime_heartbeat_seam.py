@@ -36,7 +36,11 @@ from datetime import datetime
 import pytest
 
 from agent.events import EventBus
-from tools.workspace.worker_runtime import WorkerRuntimeHandle, heartbeat_age_seconds
+from tools.workspace.worker_runtime import (
+    MODE_THREAD,
+    WorkerRuntimeHandle,
+    heartbeat_age_seconds,
+)
 from tools.workspace.worker_runtime_main import worker_runtime_main
 from tools.workspace.worker_runtime_protocol import (
     DIRECTION_FROM_RUNTIME,
@@ -158,7 +162,7 @@ def test_the_frame_sink_carries_a_heartbeat_from_the_child_to_the_parent():
         assert beat.status == "idle"
 
         # The parent half: the very same frame, through the real consumer.
-        handle = WorkerRuntimeHandle(object())
+        handle = WorkerRuntimeHandle(object(), mode=MODE_THREAD)
         handle.on_frame(beat)
         assert handle._last_heartbeat_at == pytest.approx(
             datetime.fromisoformat(_AT).timestamp()
