@@ -18,7 +18,12 @@ by the caller (the model hallucinating one, or an attacker injecting one into th
 reaches the tool as an authority fact.
 
 **Enforcement site:** `tools/base.py:85-88` — `ToolBase.session_id` (with the C68 comment at
-`tools/base.py:77-84` and the consumer at `tools/base.py:302-307`):
+`tools/base.py:77-84`), the reader that consumes the fact at `tools/base.py:308-313`
+(`session_id = getattr(self, 'session_id', None)`, then a `SessionRegistry` lookup), and the authority
+pair in `agent/core/tool_executor.py` that makes a caller-supplied value unreachable: the discard at
+`agent/core/tool_executor.py:489` (`tool_args.pop('session_id', None)`, before validation) and the
+injection at `agent/core/tool_executor.py:798-800` (`tool_args['session_id'] = session_id`, from the
+executor's own authenticated value):
 
 ```python
     session_id: SkipJsonSchema[Optional[str]] = Field(
@@ -205,6 +210,13 @@ file green. The literal value `MODE_PROCESS` is not asserted anywhere — see Kn
    and logged nothing. The mapping now exists (`security/security_gate.py:221`), a mapping-less
    resource warns instead of skipping silently (`security/security_gate.py:363-377`), and
    `tests/test_ceiling_map_completeness.py` fails if any catalog resource loses its mapping.
+7. **The design spec is not citation-checked (GAP, tracked).** Every citation in this ledger is now
+   machine-checked: the gate runs `scripts/verify_doc_citations.py --doc docs/CONTRACTS.md`. The
+   narrative design spec `docs/design-worker-lifecycle.md` is not yet checked, and it has 76 failing
+   citations today — 1 missing file (a backticked negative mention the parser reads as a citation), 20
+   out-of-bounds line numbers and 55 shorthand references that name no file in their own section. It is
+   therefore a tracked known gap rather than a silent omission, and the checker already accepts
+   `--doc docs/design-worker-lifecycle.md` for whoever closes it.
 
 ## How this document stays honest
 
@@ -241,11 +253,11 @@ What the trigger blocks and job names add to that table:
   contract gate, while it does run the other five workflows. Those five run on `push` to `dev` and
   `master` and on `pull_request`.
 - `contract-gate` is the only workflow with any relationship to this document, and that relationship is
-  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of fifteen
+  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of sixteen
   test files** — no glob, no `-m` expression. Two consequences worth knowing: a new test that proves a
   contract does not join the gate by existing (it must be added to the workflow *and* cited here), and
-  the parity check described in the previous section is itself one of the fifteen, so it fails the
-  gate it is part of. Note the direction: the gate runs fifteen files and this ledger cites nine of
+  the parity check described in the previous section is itself one of the sixteen, so it fails the
+  gate it is part of. Note the direction: the gate runs sixteen files and this ledger cites nine of
   them, because the parity check enforces *cited ⊆ run*, not equality. The job carries
   `timeout-minutes: 10` and separately reports wall time against a stated 120-second budget; that
   budget is observed, not enforced.
