@@ -8918,16 +8918,22 @@ class Worker(ToolBase):
                     continue
                 if self.worker_name is not None and key[1] != self.worker_name:
                     continue
-                alive = bool(getattr(thread, "is_alive", lambda: True)())
-                if not alive:
-                    continue
                 if not want_all:
                     continue
                 if manual_only:
+                    # Recorded BEFORE the liveness test, and not at the caller:
+                    # the operator's latch must be true even when the thread's
+                    # loop happens not to be running at this instant.
                     try:
                         thread._manual_only_pause = True
                     except Exception:
                         pass
+                alive = bool(getattr(thread, "is_alive", lambda: True)())
+                if not alive:
+                    log("WARNING", "tools.worker",
+                        f"pause requested for worker '{key[1]}' but its loop is not "
+                        f"alive \u2014 operator intent recorded, loop not running")
+                    continue
                 try:
                     thread.pause()
                 except Exception:
