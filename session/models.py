@@ -30,6 +30,15 @@ _SESSION_INITIALISED_FLAG = '_tm_session_initialised'
 # caps the entry count separately at 64 (R3).
 DEFAULT_ADDENDUM_BUDGET_CHARS = 8000
 DEFAULT_ADDENDUM_MAX_ENTRIES = 64
+# Cap bounds: they bound a corrupted / hand-edited record so a session can never
+# become permanently write-refused (a cap of 0 refuses every write forever).
+# The budget floor is 1, not a "sensible" 256: only a non-positive budget refuses
+# every write unconditionally, while a small persisted cap (250) is legal and must
+# survive a load unchanged.
+MIN_ADDENDUM_BUDGET_CHARS = 1
+MAX_ADDENDUM_BUDGET_CHARS = 1_000_000
+MIN_ADDENDUM_MAX_ENTRIES = 1
+MAX_ADDENDUM_MAX_ENTRIES = 10_000
 # R4: `tool` is NOT a legal source -- C2 forbids the model writing its own
 # memory, so no entry in this wave could legitimately carry it.
 ADDENDUM_SOURCES = ('operator', 'mailbox')
@@ -225,6 +234,16 @@ def normalize_addendum(raw: Any) -> Dict[str, Any]:
             f'[addendum] budget_chars={budget_chars!r} is not an int; '
             f'using {DEFAULT_ADDENDUM_BUDGET_CHARS}')
 
+    # Self-heal: an in-range budget is kept, an out-of-range one is RESET to the
+    # default (not clamped to a boundary), so a corrupted record is repaired
+    # rather than left permanently write-refused.
+    if not (MIN_ADDENDUM_BUDGET_CHARS <= addendum['budget_chars'] <= MAX_ADDENDUM_BUDGET_CHARS):
+        log('WARNING', 'core.session',
+            f"[addendum] budget_chars={addendum['budget_chars']!r} is outside the "
+            f'accepted range [{MIN_ADDENDUM_BUDGET_CHARS}, {MAX_ADDENDUM_BUDGET_CHARS}]; '
+            f'using {DEFAULT_ADDENDUM_BUDGET_CHARS}')
+        addendum['budget_chars'] = DEFAULT_ADDENDUM_BUDGET_CHARS
+
     max_entries = raw.get('max_entries', DEFAULT_ADDENDUM_MAX_ENTRIES)
     if isinstance(max_entries, int) and not isinstance(max_entries, bool):
         addendum['max_entries'] = max_entries
@@ -232,6 +251,14 @@ def normalize_addendum(raw: Any) -> Dict[str, Any]:
         log('WARNING', 'core.session',
             f'[addendum] max_entries={max_entries!r} is not an int; '
             f'using {DEFAULT_ADDENDUM_MAX_ENTRIES}')
+
+    # Self-heal, same rule as budget_chars above.
+    if not (MIN_ADDENDUM_MAX_ENTRIES <= addendum['max_entries'] <= MAX_ADDENDUM_MAX_ENTRIES):
+        log('WARNING', 'core.session',
+            f"[addendum] max_entries={addendum['max_entries']!r} is outside the "
+            f'accepted range [{MIN_ADDENDUM_MAX_ENTRIES}, {MAX_ADDENDUM_MAX_ENTRIES}]; '
+            f'using {DEFAULT_ADDENDUM_MAX_ENTRIES}')
+        addendum['max_entries'] = DEFAULT_ADDENDUM_MAX_ENTRIES
 
     return addendum
 

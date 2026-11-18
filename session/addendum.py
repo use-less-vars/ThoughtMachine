@@ -50,6 +50,10 @@ DROP_REJECTED_BY_SCHEMA = 'rejected_by_schema'
 #: keeps the refusal atomic: nothing is persisted and nothing is enqueued.
 DROP_BUDGET_EXCEEDED = 'budget_exceeded'
 DROP_MAX_ENTRIES_EXCEEDED = 'max_entries_exceeded'
+#: A mutation that targets ONE entry by id, where no entry carries that id. The
+#: id came from the caller, so this is a caller/serialisation error (the
+#: transport renders it as a 404), never a write refused for size.
+DROP_ENTRY_NOT_FOUND = 'entry_not_found'
 
 
 def _now_iso() -> str:
@@ -153,6 +157,56 @@ def _dropped(session, reason: str, message: str, notify: bool = True, **extra) -
             'message': message, 'entries': [], **extra}
 
 
+def _find_entry_index(entries, entry_id):
+    """Position of the entry carrying ``entry_id``, or ``None`` when absent.
+
+    Identity is the stored id alone. ``==`` is used rather than a dict lookup so
+    an unhashable ``entry_id`` from a request body is simply "not found" instead
+    of raising inside the boundary.
+    """
+    for index, item in enumerate(entries):
+        if item['id'] == entry_id:
+            return index
+    return None
+
+
+def _commit_mutation(session, normalized: dict, entries: list, entry: dict,
+                     notify: bool, log_detail: str, boundary: dict, **extra) -> dict:
+    """Persist ``entries`` on ``session``, notify the queue, return the result.
+
+    The ONE commit tail shared by every mutation (append / update / remove), so
+    the boundaries cannot drift on what "persisted" means: the previous addendum
+    dict is preserved (a later version's unknown top-level key is not erased),
+    the normalised caps are restated, the resulting entry set is committed IN
+    PLACE on the session, and only THEN is the notification enqueued.
+
+    ``entry`` is the entry the mutation is about (the accepted one, or -- for a
+    removal -- the entry that was removed, which is what makes the
+    ``addendum_updated`` payload name the entry that disappeared); ``boundary``
+    is the number dict the caller already measured; ``**extra`` are result-only
+    fields (``removed_id``), appended exactly as ``_dropped`` appends its
+    boundary numbers.
+    """
+    current = getattr(session, 'addendum', None)
+    persisted = dict(current) if isinstance(current, dict) else {}
+    persisted['entries'] = entries
+    persisted['budget_chars'] = normalized['budget_chars']
+    persisted['max_entries'] = normalized['max_entries']
+    session.addendum = persisted
+
+    if notify:
+        _enqueue(session, _updated_payload(session, entry, entries))
+    log('DEBUG', 'core.addendum', log_detail)
+    return {'status': 'ok', 'entry': entry, 'reason': None,
+            'entries': [dict(item) for item in entries],
+            'attempted_chars': boundary['attempted_chars'],
+            'budget_chars': normalized['budget_chars'],
+            'attempted_entries': boundary['attempted_entries'],
+            'max_entries': normalized['max_entries'],
+            'total_chars': boundary['total_chars'],
+            **extra}
+
+
 def write_addendum_entry(session, text, source: str = 'operator',
                          notify: bool = True) -> dict:
     """Append exactly ONE entry to ``session``'s addendum and notify the queue.
@@ -249,32 +303,164 @@ def write_addendum_entry(session, text, source: str = 'operator',
                 f"{normalized['max_entries']} entries",
                 notify=notify, **boundary)
 
-        # Persist on the session's addendum, keeping any key this module does not
-        # know about so a later version's field is not silently erased.
-        current = getattr(session, 'addendum', None)
-        persisted = dict(current) if isinstance(current, dict) else {}
-        persisted['entries'] = entries
-        persisted['budget_chars'] = normalized['budget_chars']
-        persisted['max_entries'] = normalized['max_entries']
-        session.addendum = persisted
-
+        # Persist + notify + build the result through the shared commit tail (the
+        # same tail every mutation uses).
         stored = dict(entries[-1])
-        if notify:
-            _enqueue(session, _updated_payload(session, stored, entries))
-        log('DEBUG', 'core.addendum',
-            f"[addendum] appended entry {stored['id']} from {source} (entries={len(entries)})")
-        return {'status': 'ok', 'entry': stored, 'reason': None,
-                'entries': [dict(item) for item in entries],
-                'attempted_chars': total_chars,
-                'budget_chars': normalized['budget_chars'],
-                'attempted_entries': len(entries),
-                'max_entries': normalized['max_entries'],
-                'total_chars': total_chars,
-                'notified': notify}
+        return _commit_mutation(
+            session, normalized, entries, stored, notify,
+            f"[addendum] appended entry {stored['id']} from {source} "
+            f'(entries={len(entries)})',
+            {'attempted_chars': total_chars,
+             'attempted_entries': len(entries),
+             'total_chars': total_chars},
+            notified=notify)
     except Exception as exc:
         # The slice-1 contract, restated for the write path: a failed write is
         # reported, never raised into the caller's turn.
         log('ERROR', 'core.addendum', f'[addendum] write failed unexpectedly: {exc}')
+        return {'status': 'dropped', 'entry': None, 'reason': 'exception', 'entries': []}
+
+
+def update_addendum_entry(session, entry_id, text, source: str = 'operator',
+                          notify: bool = True) -> dict:
+    """Replace the TEXT of the entry with ``entry_id``, in place.
+
+    An entry's ``id``, ``ts``, ``pinned`` and ``source`` are its identity and are
+    PRESERVED; only ``text`` changes. No new field is introduced: slice-1's entry
+    normaliser drops unknown keys, so a new field would silently vanish on the
+    next read.
+
+    Refusals are the append path's, in the same order -- ``no_session``,
+    ``invalid_source``, ``invalid_text``, ``empty_text`` -- followed by
+    ``entry_not_found`` and then the budget check. The update is ALL-OR-NOTHING:
+    on any refusal the stored entry text is byte-identical to what it was.
+
+    The budget total is the RESULTING set with the old text SWAPPED OUT, not
+    added to (an entry's own text is never counted twice), which is what lets a
+    too-long entry be shortened on an addendum that is already full.
+
+    Returns the same shape as :func:`write_addendum_entry`; ``entry`` is the
+    updated entry and ``entries`` the full resulting set.
+    """
+    try:
+        if session is None:
+            return _dropped(None, DROP_NO_SESSION,
+                            'no session to update the addendum entry in')
+        if source not in ADDENDUM_SOURCES:
+            return _dropped(session, DROP_INVALID_SOURCE,
+                            f"source {source!r} is not one of {ADDENDUM_SOURCES}")
+        if not isinstance(text, str):
+            return _dropped(session, DROP_INVALID_TEXT,
+                            f'addendum text must be a string, got {type(text).__name__}')
+        if not text.strip():
+            return _dropped(session, DROP_EMPTY_TEXT, 'addendum text is empty')
+
+        addendum = normalize_addendum(getattr(session, 'addendum', None))
+        existing_entries = addendum['entries']
+        target = _find_entry_index(existing_entries, entry_id)
+        if target is None:
+            return _dropped(session, DROP_ENTRY_NOT_FOUND,
+                            f'no addendum entry with id {entry_id!r}',
+                            notify=notify)
+
+        # Swap the text into a COPY of the stored entry, so the old text is
+        # replaced rather than appended to.
+        replacement = dict(existing_entries[target])
+        replacement['text'] = text
+        candidate = dict(addendum)
+        candidate['entries'] = (existing_entries[:target] + [replacement]
+                                + existing_entries[target + 1:])
+        # Validate through slice-1's own normaliser, exactly as the append does:
+        # if it does not survive that, it is not a legal entry.
+        normalized = normalize_addendum(candidate)
+        entries = normalized['entries']
+        if len(entries) != len(existing_entries):
+            return _dropped(session, DROP_REJECTED_BY_SCHEMA,
+                            f'entry rejected by the addendum schema: {replacement!r}',
+                            notify=notify)
+
+        # --- budget enforcement, same verdict and same numbers as the append ---
+        # Measured on the RESULTING set, in which the replaced entry already
+        # carries the new text: the swap is the measurement, so an update can
+        # never be charged for both the old and the new text.
+        total_chars = sum(len(item['text']) for item in entries)
+        prior_chars = sum(len(item['text']) for item in existing_entries)
+        boundary = {
+            'attempted_chars': total_chars,
+            'budget_chars': normalized['budget_chars'],
+            'attempted_entries': len(entries),
+            'max_entries': normalized['max_entries'],
+            'total_chars': prior_chars,
+        }
+        if total_chars > normalized['budget_chars']:
+            return _dropped(
+                session, DROP_BUDGET_EXCEEDED,
+                f"addendum budget exceeded: {total_chars} > "
+                f"{normalized['budget_chars']} chars",
+                notify=notify, **boundary)
+
+        stored = dict(entries[target])
+        return _commit_mutation(
+            session, normalized, entries, stored, notify,
+            f"[addendum] updated entry {stored['id']} from {source} "
+            f'(entries={len(entries)})',
+            {'attempted_chars': total_chars,
+             'attempted_entries': len(entries),
+             'total_chars': total_chars},
+            notified=notify)
+    except Exception as exc:
+        log('ERROR', 'core.addendum', f'[addendum] update failed unexpectedly: {exc}')
+        return {'status': 'dropped', 'entry': None, 'reason': 'exception', 'entries': []}
+
+
+def remove_addendum_entry(session, entry_id, notify: bool = True) -> dict:
+    """Remove the entry with ``entry_id`` from ``session``'s addendum.
+
+    Refusals: ``no_session``, then ``entry_not_found``. There is NO budget check:
+    a removal only ever shrinks the measured set, so it cannot be the operation
+    that exceeds a cap -- and removing entries is the RECOVERY path, the way a
+    set that is already over budget (for whatever reason) becomes writable again.
+
+    Returns the append path's shape, plus ``removed_id``: ``entry`` is the
+    removed entry (so the ``addendum_updated`` payload names the entry that
+    disappeared) and ``entries`` the remaining set, with the updated totals.
+    """
+    try:
+        if session is None:
+            return _dropped(None, DROP_NO_SESSION,
+                            'no session to remove the addendum entry from')
+
+        addendum = normalize_addendum(getattr(session, 'addendum', None))
+        existing_entries = addendum['entries']
+        target = _find_entry_index(existing_entries, entry_id)
+        if target is None:
+            return _dropped(session, DROP_ENTRY_NOT_FOUND,
+                            f'no addendum entry with id {entry_id!r}',
+                            notify=notify)
+
+        removed = dict(existing_entries[target])
+        candidate = dict(addendum)
+        candidate['entries'] = (existing_entries[:target]
+                                + existing_entries[target + 1:])
+        normalized = normalize_addendum(candidate)
+        entries = normalized['entries']
+        if len(entries) != len(existing_entries) - 1:
+            return _dropped(session, DROP_REJECTED_BY_SCHEMA,
+                            f'entry rejected by the addendum schema: {removed!r}',
+                            notify=notify)
+
+        total_chars = sum(len(item['text']) for item in entries)
+        return _commit_mutation(
+            session, normalized, entries, removed, notify,
+            f"[addendum] removed entry {removed['id']} "
+            f'(entries={len(entries)})',
+            {'attempted_chars': total_chars,
+             'attempted_entries': len(entries),
+             'total_chars': total_chars},
+            removed_id=removed['id'],
+            notified=notify)
+    except Exception as exc:
+        log('ERROR', 'core.addendum', f'[addendum] remove failed unexpectedly: {exc}')
         return {'status': 'dropped', 'entry': None, 'reason': 'exception', 'entries': []}
 
 
