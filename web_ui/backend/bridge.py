@@ -2074,7 +2074,9 @@ class WebAgentBridge:
                         # concludes its turn instead of being truncated, so
                         # there is nothing to skip here any more.
                         try:
-                            thread.pause()
+                            # Operator (Pause button) pause: operator-OWNED --
+                            # a later query must not silently release it.
+                            thread.pause(manual_only=True)
                             log('INFO', 'server.bridge', f'Worker paused: {wname}')
                         except Exception as exc:
                             log('WARNING', 'server.bridge', f'Failed to pause worker {wname}: {exc}')

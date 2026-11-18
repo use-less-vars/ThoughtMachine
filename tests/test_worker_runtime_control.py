@@ -76,7 +76,7 @@ class _FakeWorker:
     def stop(self) -> object:
         return self._verb("stop")
 
-    def pause(self) -> object:
+    def pause(self, *, manual_only: bool = False) -> object:
         return self._verb("pause")
 
     def resume(self) -> object:

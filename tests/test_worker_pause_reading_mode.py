@@ -243,7 +243,7 @@ class _FakeWorkerThread:
         self.pause_calls = 0
         self.resume_calls = 0
 
-    def pause(self) -> None:
+    def pause(self, *, manual_only: bool = False) -> None:
         self.pause_calls += 1
 
     def resume(self) -> bool:

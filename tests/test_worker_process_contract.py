@@ -92,7 +92,7 @@ def build_contract_fake_worker(*, hang: bool = False, **ignored) -> threading.Th
             self._stop.set()
             return True
 
-        def pause(self) -> bool:
+        def pause(self, *, manual_only: bool = False) -> bool:
             self.status = "paused"
             return True
 

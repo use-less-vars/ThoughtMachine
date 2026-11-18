@@ -657,7 +657,7 @@ class _FakeWlmSupervisor:
     def completed_query_ids(self):
         return list(self._completed)
 
-    def pause(self):
+    def pause(self, *, manual_only: bool = False):
         self.pause_calls.append(True)
 
     def resume(self):

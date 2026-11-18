@@ -59,7 +59,7 @@ class _BlockingPauseWorker:
         self.release = threading.Event()
         self.pause_calls = 0
 
-    def pause(self) -> None:
+    def pause(self, *, manual_only: bool = False) -> None:
         self.pause_calls += 1
         self.entered.set()
         self.release.wait(20.0)

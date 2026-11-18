@@ -2436,20 +2436,29 @@ class WorkerThread(threading.Thread):
         # restriction just by asking another question.  The park flags move to
         # the running position ONLY on this path; an ordinary query leaves them
         # exactly as it found them.
+        # The ONE exception to "a new query is the resume" is an
+        # OPERATOR-OWNED pause (``_manual_only_pause``): only an explicit
+        # resume() releases that, so the block below holds instead.
         _qp_agent = getattr(self, "_agent", None)
         _qp_state = getattr(_qp_agent, "state", None)
         if _qp_state is not None and getattr(_qp_state, "restriction_reason", None) == "pause":
-            try:
-                _qp_agent.leave_reading_mode("pause")
-            except Exception as exc:
-                log("WARNING", "tools.worker",
-                    f"Implicit unpause failed for worker '{self.worker_name}': {exc}")
-            self._park_event.clear()
-            self._resume_event.set()
-            log("DEBUG", "tools.worker",
-                f"Implicit unpause for worker '{self.worker_name}': new query resumes a "
-                f"pause-restricted worker (one query = resume; owner-scoped 'pause' "
-                f"release, park flags -> running)")
+            if getattr(self, "_manual_only_pause", False):
+                log("INFO", "tools.worker",
+                    f"[CONTROL_PLANE_PAUSE_HOLD] event=implicit_unpause_held "
+                    f"reason=manual_only worker={self.worker_name} "
+                    f"session_id={self.session_id}")
+            else:
+                try:
+                    _qp_agent.leave_reading_mode("pause")
+                except Exception as exc:
+                    log("WARNING", "tools.worker",
+                        f"Implicit unpause failed for worker '{self.worker_name}': {exc}")
+                self._park_event.clear()
+                self._resume_event.set()
+                log("INFO", "tools.worker",
+                    f"[CONTROL_PLANE_PAUSE_RELEASED] event=implicit_unpause "
+                    f"reason=new_query worker={self.worker_name} "
+                    f"session_id={self.session_id}")
         # Workspace Lifecycle Manager fast path (feature-flagged, default off)
         try:
             used, reply = self._process_query_via_wlm(query, timeout=timeout)
@@ -2796,8 +2805,14 @@ class WorkerThread(threading.Thread):
             log("WARNING", "tools.worker",
                 f"Execution termination failed for worker '{self.worker_name}': {exc}")
 
-    def pause(self) -> None:
-        """Signal the worker to pause after completing its current task."""
+    def pause(self, *, manual_only: bool = False) -> None:
+        """Signal the worker to pause after completing its current task.
+
+        ``manual_only`` marks the pause OPERATOR-OWNED: only an explicit
+        :meth:`resume` releases it, not a later query.  The default (``False``)
+        keeps every existing caller unchanged -- a proxied / join-target pause
+        in particular must stay auto-resumable.
+        """
         wlm = getattr(self, "_wlm", None)
         if self._wlm_flag_enabled() and wlm is not None:
             try:
@@ -2807,6 +2822,13 @@ class WorkerThread(threading.Thread):
                     f"WLM pause delegation failed for worker '{self.worker_name}': {exc}")
         self._park_event.set()
         self._resume_event.clear()
+        if manual_only:
+            # Recorded here, not at the caller: every reader of the marker (query
+            # routing, status files, spawn dedupe) must see an operator pause.
+            try:
+                self._manual_only_pause = True
+            except Exception:
+                pass
         # Reading mode: a paused worker's agent must stop calling tools and
         # conclude with a Respond, exactly like the main agent's Pause button.
         # Guarded -- _agent is None before spawn and after teardown.
