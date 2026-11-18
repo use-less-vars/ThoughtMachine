@@ -815,6 +815,15 @@ class CheckSystem(ToolBase):
 
     def _query_running_workers(self) -> dict:
         """Return list of currently running workers with status details."""
+        # Liveness is runtime-mode dependent, so the ``alive`` field below cannot
+        # ask the thread question: under the process substrate the body lives in
+        # a child interpreter and the supervisor-side object's ``is_alive()`` is
+        # False even while that child is healthy and answering -- which is
+        # exactly what made this field report alive=false for workers that
+        # demonstrably reply to queries. ``worker_is_live`` is the ONE predicate
+        # that knows the difference, and it reproduces ``is_alive()`` exactly for
+        # an unstamped/thread-mode worker.
+        from tools.workspace.worker_runtime import worker_is_live
         # The registry is process-global: scope to this session (fail-closed) so
         # another session's worker name / current_task never leaks into the payload.
         session_id = self.session_id or ""
@@ -828,7 +837,7 @@ class CheckSystem(ToolBase):
                         "name": key[1] if isinstance(key, tuple) else str(key),
                         "session_id": key[0] if isinstance(key, tuple) else None,
                         "status": thread.status,
-                        "alive": thread.is_alive(),
+                        "alive": worker_is_live(thread),
                         "current_task": thread.current_task,
                         "last_heartbeat": thread.last_heartbeat,
                         "error": thread.error,

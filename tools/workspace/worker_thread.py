@@ -8254,6 +8254,13 @@ class Worker(ToolBase):
         instance_id.
         """
         session_key = self.session_id or _NO_SESSION_KEY
+        # Liveness for EVERY ``alive`` field below: ``worker_is_live`` asks the
+        # runtime-mode-correct question. A process-mode worker's supervisor
+        # thread is deliberately never started, so ``is_alive()`` reports such a
+        # worker dead even while its child is healthy and answering. Function-
+        # local like every other worker_runtime import in this module (this
+        # module is also loaded inside the child interpreter).
+        from tools.workspace.worker_runtime import worker_is_live
         _get_worker_lifecycle_observer()  # best-effort: ensure observer subscription
         try:
             thread, sid, iid = _resolve_worker_thread(
@@ -8279,7 +8286,7 @@ class Worker(ToolBase):
                         "error": t.error,
                         "session_id": sid,
                         "note": "Worker is from a different session",
-                        "alive": t.is_alive(),
+                        "alive": worker_is_live(t),
                     }
                 # Multiple instances across sessions
                 instances = []
@@ -8290,7 +8297,7 @@ class Worker(ToolBase):
                         "current_task": t.current_task,
                         "last_heartbeat": t.last_heartbeat,
                         "error": t.error,
-                        "alive": t.is_alive(),
+                        "alive": worker_is_live(t),
                     })
                 return {
                     "worker_name": self.worker_name,
@@ -8333,7 +8340,7 @@ class Worker(ToolBase):
             "session_id": sid,
             "current_context_tokens": thread.get_current_context_tokens(),
             "max_context_tokens": thread.max_context_tokens,
-            "alive": thread.is_alive(),
+            "alive": worker_is_live(thread),
             "conversation_length": len(thread._worker_ctx.user_history) if thread._worker_ctx else 0,
             "last_heartbeat_age_s": age,
             "stale": stale,
