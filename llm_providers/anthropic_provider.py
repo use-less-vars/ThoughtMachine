@@ -18,6 +18,7 @@ from .base import LLMProvider, ProviderConfig, LLMResponse
 from agent.config.secret import reveal_secret
 from .tool_converter import ToolFormatConverter
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
+from agent.core.ir import UnsupportedContentError
 from agent.logging import log
 
 class AnthropicProvider(LLMProvider):
@@ -112,8 +113,30 @@ class AnthropicProvider(LLMProvider):
                 anthropic_messages.append({'role': 'user' if role == 'user' else 'assistant', 'content': msg.get('content', '')})
         return system_msg, anthropic_messages
 
+    @staticmethod
+    def _reject_image_content(messages: List[Dict[str, Any]], model: str) -> None:
+        """Refuse a conversation that carries pasted images.
+
+        This adapter does not build ``image`` content blocks, so an image id
+        would otherwise be dropped silently and the model would answer a
+        question about a screenshot it cannot see. Failing loudly is the
+        honest option; the image slices can add block support here later.
+
+        Raises:
+            UnsupportedContentError: any message has a non-empty ``images`` list.
+        """
+        if any(isinstance(msg, dict) and msg.get('images') for msg in messages):
+            raise UnsupportedContentError(
+                f'Model {model!r} cannot be sent pasted images through the Anthropic '
+                f'adapter, which does not build image content blocks. Remove the '
+                f'image or use an OpenAI-compatible vision model.'
+            )
+
     def chat_completion(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]]=None, **kwargs) -> LLMResponse:
         """Execute chat completion with Claude API"""
+        # Checked before the try block so the refusal keeps its own type instead
+        # of being flattened into 'Unexpected error: ...' below.
+        self._reject_image_content(messages, self.config.model)
         start_time = time.time()
         try:
             system_msg, anthropic_messages = self._serialize_messages(messages)
@@ -151,6 +174,9 @@ class AnthropicProvider(LLMProvider):
             llm_response = self.parse_response(response, start_time)
             self.track_usage(llm_response)
             return llm_response
+        except UnsupportedContentError:
+            # Keep the capability refusal's own type (see _reject_image_content).
+            raise
         except RateLimitError as e:
             if os.environ.get('DEBUG_ANTHROPIC'):
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] RateLimitError: {e}')

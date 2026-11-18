@@ -108,7 +108,9 @@ class ProviderFactory:
             temperature=config.get("temperature", 0.7),
             timeout=config.get("timeout", 120),
             max_retries=config.get("max_retries", 3),
-            extra_headers=config.get("extra_headers", {})
+            extra_headers=config.get("extra_headers", {}),
+            # None => decide from the model name (base.model_supports_images).
+            supports_images=config.get("supports_images")
         )
 
         # Instantiate provider

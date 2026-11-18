@@ -43,6 +43,57 @@ def _redact_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
         # Redaction must never break provider construction.
         return dict(headers) if isinstance(headers, dict) else {}
 
+
+#: Model-name substrings known to accept image input.
+#:
+#: Only used when the provider config does not state ``supports_images``
+#: explicitly: an unknown model is assumed to be text-only, so a pasted
+#: screenshot is refused with a clear message instead of being sent to a
+#: model that would reject - or silently ignore - the image blocks.
+VISION_MODEL_HINTS = (
+    'gpt-4o',
+    'gpt-4.1',
+    'gpt-4-turbo',
+    'gpt-4-vision',
+    'chatgpt-4o',
+    'claude-3',
+    'claude-4',
+    'claude-sonnet-4',
+    'claude-opus-4',
+    'claude-haiku-4',
+    'gemini',
+    'pixtral',
+    'llava',
+    'internvl',
+    'qwen-vl',
+    'qwen2-vl',
+    'qwen2.5-vl',
+    'deepseek-vl',
+    'glm-4v',
+    'vision',
+)
+
+
+def model_supports_images(model: Optional[str], explicit: Optional[bool] = None) -> bool:
+    """Decide whether *model* can be sent image content.
+
+    Args:
+        model: The provider's model identifier (may be empty/None).
+        explicit: A configured capability flag. When not None it wins over
+            any name-based guess - self-hosted deployments frequently serve a
+            vision model under a local name, and opaque names must be able to
+            opt in (or a known-vision name opt out).
+
+    Returns:
+        True when images may be sent to this model.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    if not model:
+        return False
+    lowered = str(model).lower()
+    return any(hint in lowered for hint in VISION_MODEL_HINTS)
+
 @dataclass
 class LLMResponse:
     """Normalized response from any LLM provider"""
@@ -70,6 +121,10 @@ class ProviderConfig:
     timeout: int = 120
     max_retries: int = 3
     extra_headers: Dict[str, str] = None
+    #: Whether this model accepts image input. ``None`` means "decide from the
+    #: model name" (see model_supports_images); True/False pins the answer for
+    #: self-hosted or opaque model names.
+    supports_images: Optional[bool] = None
     
     def __post_init__(self):
         if self.extra_headers is None:
