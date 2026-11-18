@@ -546,6 +546,22 @@ def run_layer(name: str, mode: Optional[str], workspace_dir: Path) -> LayerResul
         _cleanup(handle, workspace_dir, before, lines, worker)
         return out
 
+    if child_pid is None:
+        # No witness named the child at all (``pid witnesses read: 0/4``).
+        # On Linux the liveness test below used to reject that by accident --
+        # ``Path("/proc/None").is_dir()`` is False, so the ``and`` failed --
+        # but on a platform without procfs that conjunct is skipped and
+        # ``child_alive`` alone reported PROVEN with nothing measured.  An
+        # unnamed child is not evidence, on every platform, so say so here
+        # instead of relying on ``/proc/None`` not existing.
+        lines.append(
+            f"  finding: no witness could name the child's pid -- {NOT_MEASURED}; "
+            "an unnamed child cannot be proof"
+        )
+        out.exit_code = EXIT_UNMEASURED
+        _cleanup(handle, workspace_dir, before, lines, worker)
+        return out
+
     live = bool(substrate.get("child_alive")) and Path(f"/proc/{child_pid}").is_dir() if Path("/proc").is_dir() else bool(substrate.get("child_alive"))
     same = substrate.get("same_process")
     lines.append(f"  child_pid={child_pid} parent_pid={parent_pid} same_process={same!r} child_alive={substrate.get('child_alive')!r}")
