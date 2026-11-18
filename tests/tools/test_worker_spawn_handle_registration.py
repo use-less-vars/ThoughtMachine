@@ -132,7 +132,7 @@ class FakeWorker:
     def stop(self) -> None:
         self.verbs.append("stop")
 
-    def pause(self) -> None:
+    def pause(self, *, manual_only: bool = False) -> None:
         self.verbs.append("pause")
 
     def resume(self) -> bool:

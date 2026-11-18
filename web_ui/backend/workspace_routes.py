@@ -1907,7 +1907,9 @@ async def pause_worker(
     # status writer in this same process.
     for thread in matched:
         try:
-            thread.pause()
+            # Operator (REST) pause: operator-OWNED -- a later query must not
+            # silently release it (only the resume route does).
+            thread.pause(manual_only=True)
         except Exception:
             pass  # File-based pause will still work
 
