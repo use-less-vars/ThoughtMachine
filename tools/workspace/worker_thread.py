@@ -1233,6 +1233,120 @@ def _resume_proxied_join_targets(session_id: Optional[str]) -> list[str]:
     return resumed
 
 
+def _record_manual_only_pause(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: int = 1,
+) -> None:
+    """Remember a worker an OPERATOR latched with ``manual_only`` for *session_id*.
+
+    ``_manual_only_pause`` lives and dies with one thread object, so the latch
+    alone cannot answer the question the durability fix depends on: "did the
+    operator pause this session's worker?".  This record is that answer, kept
+    per session and released only by :func:`_resume_manual_only_paused`.
+
+    Idempotent (a set of ``(worker_name, instance_id)`` triples) and defensive:
+    bookkeeping must never break the pause that triggered it.
+    """
+    if not session_id:
+        return
+    try:
+        with _MANUAL_ONLY_PAUSED_LOCK:
+            _MANUAL_ONLY_PAUSED.setdefault(session_id, set()).add(
+                (worker_name, int(instance_id))
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Manual-only pause: could not record worker '%s': %s",
+            worker_name,
+            exc,
+        )
+
+
+def _resume_manual_only_paused(session_id: Optional[str]) -> list[str]:
+    """Release every OPERATOR ``manual_only`` pause recorded for *session_id*.
+
+    The counterpart of :func:`_record_manual_only_pause`, called at a real
+    USER-turn boundary.  A manual pause is deliberately durable across agent
+    turns -- that is what "pause until user turn" means -- but the next turn
+    the OPERATOR actually types ends it, exactly as it ends the session main
+    pause (``Agent._discard_session_main_pause``).  Nothing an agent does can
+    reach this function: the agent has no resume action.
+
+    The record is popped under the lock before any resume happens (the lock is
+    never held across ``resume()``), so a repeat call is a no-op and a slow or
+    failing resume cannot wedge the bookkeeping.
+
+    Every target is independent and defensive: a missing/dead/ambiguous worker
+    (``_WorkerAmbiguityError``) is skipped, a killed worker refuses its own
+    resume, and a detached worker is an operator stop that is left alone.  A
+    worker whose loop has not yet observed the park is still resumed -- the
+    latch must be released even while ``status`` has not caught up.  Never
+    raises; returns the worker names actually resumed.
+    """
+    if not session_id:
+        return []
+    with _MANUAL_ONLY_PAUSED_LOCK:
+        targets = _MANUAL_ONLY_PAUSED.pop(session_id, set())
+    resumed: list[str] = []
+    for worker_name, instance_id in sorted(targets):
+        try:
+            thread, _sid, _iid = _resolve_worker_thread(
+                worker_name,
+                instance_id=instance_id,
+                session_id=session_id,
+            )
+        except _WorkerAmbiguityError as exc:
+            logger.info(
+                "Manual-only pause: leaving worker '%s' instance %s alone: %s",
+                worker_name,
+                instance_id,
+                exc,
+            )
+            continue
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Manual-only pause: could not resolve worker '%s' to resume it: %s",
+                worker_name,
+                exc,
+            )
+            continue
+        status = getattr(thread, "status", None)
+        if getattr(thread, "_detach_requested", False) or status in (
+            "detached",
+            "detaching",
+            "killed",
+            "killing",
+        ):
+            logger.info(
+                "Manual-only pause: not resuming worker '%s' (status=%s)",
+                worker_name,
+                status,
+            )
+            continue
+        try:
+            if thread.resume():
+                resumed.append(worker_name)
+                logger.info(
+                    "Manual-only pause: resumed worker '%s' at the user-turn "
+                    "boundary (session '%s')",
+                    worker_name,
+                    session_id,
+                )
+            else:
+                logger.info(
+                    "Manual-only pause: worker '%s' refused resume (killed); left as is",
+                    worker_name,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Manual-only pause: resume failed for worker '%s': %s",
+                worker_name,
+                exc,
+            )
+    return resumed
+
+
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
 # ---------------------------------------------------------------------------
@@ -2822,13 +2936,25 @@ class WorkerThread(threading.Thread):
                     f"WLM pause delegation failed for worker '{self.worker_name}': {exc}")
         self._park_event.set()
         self._resume_event.clear()
-        if manual_only:
+        if manual_only or getattr(self, "_manual_only_pause", False):
             # Recorded here, not at the caller: every reader of the marker (query
             # routing, status files, spawn dedupe) must see an operator pause.
             try:
                 self._manual_only_pause = True
             except Exception:
                 pass
+            # ... and recorded SESSION-scoped too, so the latch has a release
+            # path that survives this thread object (``_manual_only_pause``
+            # alone would otherwise live and die with it).  The attribute test
+            # above is load-bearing, not belt-and-braces: the ``pause`` TOOL
+            # action stamps the marker itself and then calls ``pause()`` with
+            # no kwarg, so a kwarg-only test here would leave that latch with
+            # no release path at all.
+            _record_manual_only_pause(
+                getattr(self, "session_id", None) or _NO_SESSION_KEY,
+                self.worker_name,
+                getattr(self, "instance_id", 1) or 1,
+            )
         # Reading mode: a paused worker's agent must stop calling tools and
         # conclude with a Respond, exactly like the main agent's Pause button.
         # Guarded -- _agent is None before spawn and after teardown.
@@ -5906,6 +6032,18 @@ _SESSION_MAIN_PAUSED: set[str] = set()
 _PROXIED_JOIN_TARGETS: dict[str, set[tuple[str, int]]] = {}
 _PROXIED_JOIN_TARGETS_LOCK = threading.Lock()
 
+# The OPERATOR ``manual_only`` pauses this process applied, per session id:
+# ``{session_id: {(worker_name, instance_id), ...}}``.  ``_manual_only_pause``
+# is a latch on one live thread object, so it is lost with that object and
+# says nothing to a caller that only holds the session id; this record is the
+# session-scoped side of the same fact.  Written by ``WorkerThread.pause`` (and
+# so by every manual-only pause path, including the ``pause`` TOOL action) and
+# popped -- never swept -- by ``_resume_manual_only_paused`` at a real user-turn
+# boundary.  The lock guards the dict mutation only, never held across
+# ``resume()``.
+_MANUAL_ONLY_PAUSED: dict[str, set[tuple[str, int]]] = {}
+_MANUAL_ONLY_PAUSED_LOCK = threading.Lock()
+
 
 # ============================================================================
 # workspace capabilities (CAPABILITIES_AVAILABLE, resolve_workspace_id, _load_template_workers, _workspace_dir)  (moved verbatim from tools.workspace.worker; W4 facade extraction)
@@ -8257,6 +8395,32 @@ class Worker(ToolBase):
             fallback=DEFAULT_REQUEST_SECONDS,
         )
 
+        # OPERATOR PAUSE IS NOT A STATUS. ``thread.pause()`` sets the park event
+        # and ``_manual_only_pause`` *immediately*, but the thread's run loop
+        # only writes ``status = "paused"`` when it next reaches its safe
+        # boundary -- possibly one model turn later. Testing the latch inside the
+        # ``status == "paused"`` branch below therefore left a window in which
+        # the operator's pause was invisible: the query was DELIVERED, the
+        # implicit unpause cleared the latch, and the pause "did nothing". The
+        # latch is tested here, on its own, ABOVE every status branch, so it
+        # refuses delivery whatever ``status`` currently says.
+        if getattr(thread, "_manual_only_pause", False):
+            paused_envelope = {
+                "status": "paused",
+                "message": "Worker is manually paused",
+                "worker_name": self.worker_name,
+                "session_id": self.session_id or "",
+            }
+            if self.context is not None:
+                # The query was NOT sent, so the context was not delivered
+                # either -- say so instead of dropping it silently.
+                paused_envelope["context_note"] = (
+                    "context was NOT delivered: the worker is manually paused "
+                    "and the query was not sent. Re-send it with the query "
+                    "once the worker is resumed."
+                )
+            return paused_envelope
+
         # PHASE 2.1b: a submission against a DETACHED worker is QUEUED and
         # returns immediately -- it does NOT resume the worker. Resuming is
         # operator-initiated only (docs/design-worker-lifecycle.md, "Queries
@@ -8339,25 +8503,10 @@ class Worker(ToolBase):
         if thread.status == "paused":
             # A paused worker must never be queried destructively (BUG 3):
             # the old behavior blocked up to 300s, then stopped the worker
-            # and reclaimed its containers. Manual-only pauses reject the
-            # query immediately (non-destructively); normal pauses are
-            # auto-resumed and the query proceeds normally below.
-            if getattr(thread, "_manual_only_pause", False):
-                paused_envelope = {
-                    "status": "paused",
-                    "message": "Worker is manually paused",
-                    "worker_name": self.worker_name,
-                    "session_id": self.session_id or "",
-                }
-                if self.context is not None:
-                    # The query was NOT sent, so the context was not delivered
-                    # either -- say so instead of dropping it silently.
-                    paused_envelope["context_note"] = (
-                        "context was NOT delivered: the worker is manually paused "
-                        "and the query was not sent. Re-send it with the query "
-                        "once the worker is resumed."
-                    )
-                return paused_envelope
+            # and reclaimed its containers. Manual-only pauses were already
+            # rejected ABOVE (the latch is not a status, so it cannot be
+            # tested here); a NORMAL pause is auto-resumed and the query
+            # proceeds normally below.
             try:
                 _resume_outcome = thread.resume()
             except Exception as exc:
