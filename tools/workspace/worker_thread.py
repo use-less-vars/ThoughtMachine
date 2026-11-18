@@ -1347,6 +1347,43 @@ def _resume_manual_only_paused(session_id: Optional[str]) -> list[str]:
     return resumed
 
 
+def _is_manual_only_paused(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: Optional[int] = None,
+) -> bool:
+    """True when an OPERATOR ``manual_only`` pause is RECORDED for this worker.
+
+    The single source of truth is :data:`_MANUAL_ONLY_PAUSED` -- the very
+    registry :func:`_record_manual_only_pause` writes and
+    :func:`_resume_manual_only_paused` pops.  It is read from there, and never
+    off the thread object, for two reasons:
+
+    * single-sourcing: one latch, one place to write it, one place to release
+      it, so a query can only be refused while the pause is genuinely recorded
+      (and only until the user-turn boundary releases it);
+    * it is inert for anything that cannot be a member of that set.  A test
+      double / ``MagicMock`` answers truthily to *every* attribute, so an
+      attribute test fired on doubles that were never paused; set membership
+      cannot be faked by attribute access.
+
+    Key shape is the one :func:`_record_manual_only_pause` writes:
+    ``{session_id: {(worker_name, int(instance_id)), ...}}``.
+
+    Defensive by construction: a missing or malformed entry answers ``False``
+    (deliver the query).  Bookkeeping must never be able to wedge a worker --
+    the release path, not the read, is what clears a real record.
+    """
+    try:
+        with _MANUAL_ONLY_PAUSED_LOCK:
+            targets = _MANUAL_ONLY_PAUSED.get(session_id or _NO_SESSION_KEY)
+            if not targets:
+                return False
+            return (worker_name, int(instance_id or 1)) in targets
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
 # ---------------------------------------------------------------------------
@@ -8404,7 +8441,15 @@ class Worker(ToolBase):
         # implicit unpause cleared the latch, and the pause "did nothing". The
         # latch is tested here, on its own, ABOVE every status branch, so it
         # refuses delivery whatever ``status`` currently says.
-        if getattr(thread, "_manual_only_pause", False):
+        #
+        # The latch is read from the SESSION registry (``_MANUAL_ONLY_PAUSED``:
+        # written by ``_record_manual_only_pause``, popped by
+        # ``_resume_manual_only_paused``), never off the thread object. The
+        # registry is the single source of truth for an OPERATOR pause, and a
+        # test double can never be a member of it -- a ``MagicMock`` answers
+        # truthily to every attribute, which is how an attribute read made this
+        # guard fire on doubles that were never paused.
+        if _is_manual_only_paused(_sid, self.worker_name, iid):
             paused_envelope = {
                 "status": "paused",
                 "message": "Worker is manually paused",
