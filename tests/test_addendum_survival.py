@@ -9,9 +9,12 @@ this path is stubbed:
   * the session is a real ``session.models.Session`` whose addendum went through
     the real ``normalize_addendum`` (slice 1);
   * the agent is a real ``Agent``, constructed the same way
-    ``tests/test_agent_stop_midstream.py`` does, so the addendum is composed into
-    ``user_history[0]`` by the real ``LLMClient.ensure_system_prompt``
-    (``agent/core/llm_client.py:222-227``);
+    ``tests/test_agent_stop_midstream.py`` does.  Construction resolves the BASE
+    system prompt only (``LLMClient.ensure_system_prompt``); the addendum is NOT
+    baked into ``user_history`` - it is composed onto each OUTGOING request by
+    ``compose_addendum_into_messages`` (``agent/core/llm_client.py``) from the
+    turn loop (``agent/core/agent.py``, ``process_query``), and
+    ``_next_request_context`` below mirrors that composition step;
   * the tool call is dispatched by the real
     ``ToolExecutor._execute_single_tool`` -- the function containing the
     ``SummarizeTool`` branch at ``agent/core/tool_executor.py:704-705`` -- which
@@ -21,7 +24,13 @@ this path is stubbed:
     ``agent/core/agent.py:1726-1728``;
   * the "next request" is the real request-time build at
     ``agent/core/agent.py:1297-1298``: ``context_builder.build(conversation)``
-    followed by ``ContextBuilder._cleanup_orphaned_tool_messages``.
+    followed by ``ContextBuilder._cleanup_orphaned_tool_messages`` and then the
+    per-request addendum composition the turn loop performs.
+
+The point of the slice is that compaction rewrites *history* while the addendum
+rides on the *payload*: a summary can prune turns, reorder summaries and drop
+the original user message, and the block still arrives because it never lived in
+the history to begin with.
 
 Two compactions live in ONE test (rather than a twice-parametrised test) because
 the second must run on the state the first produced: ``user_history`` is
@@ -36,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.config.models import AgentConfig
 from agent.core.agent import Agent
-from agent.core.llm_client import ADDENDUM_HEADING
+from agent.core.llm_client import ADDENDUM_HEADING, compose_addendum_into_messages
 from session.context_builder import ContextBuilder
 from session.models import Session, normalize_addendum
 from tools.summarize_tool import SummarizeTool
@@ -119,13 +128,27 @@ def _run_real_compaction(agent, session, summary_text, keep_recent_turns=KEEP_RE
 
 
 def _next_request_context(agent):
-    """agent/core/agent.py:1297-1298 -- what the next LLM request is built from."""
+    """What the next LLM request is built from (agent/core/agent.py, process_query).
+
+    Build, clean, compose -- in that order.  The last step is the per-request
+    addendum composition, which copies the system message instead of mutating
+    the builder's output (that output aliases ``session.user_history``).
+    """
     messages = agent.context_builder.build(agent.conversation)
-    return ContextBuilder._cleanup_orphaned_tool_messages(messages)
+    messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
+    return compose_addendum_into_messages(messages, agent.session)
 
 
 def _texts(messages):
     return [str(message.get('content', '')) for message in messages]
+
+
+def _history_carries_no_addendum(session):
+    """True when no stored history message holds the block (anti-baking)."""
+    return not any(
+        ADDENDUM_HEADING in str(message.get('content', ''))
+        for message in session.user_history
+    )
 
 
 def _assert_compaction_happened(context, agent, stage):
@@ -178,8 +201,11 @@ def test_addendum_survives_two_real_summarize_tool_compactions():
     session = _make_session(TURNS_BEFORE_FIRST_COMPACTION)
     agent = _make_agent(session)
 
-    # The addendum reached the system prompt at construction time (slice 2).
+    # The addendum reaches the system prompt of the very next request (slice 2).
     _assert_addendum_survives(_next_request_context(agent), agent, 'before any compaction')
+    assert _history_carries_no_addendum(session), (
+        'the addendum was baked into user_history; it must ride on the request only'
+    )
 
     # --- Compaction 1 -------------------------------------------------------
     context = _run_real_compaction(agent, session, SUMMARY_ONE)
@@ -203,3 +229,9 @@ def test_addendum_survives_two_real_summarize_tool_compactions():
                     if str(m.get('content', '')).startswith('Summary of previous conversation:'))
     assert SUMMARY_TWO in replayed
     assert SUMMARY_ONE not in replayed
+
+    # Nothing on the history side ever learned to carry the block, before or
+    # after two compactions.
+    assert _history_carries_no_addendum(session), (
+        'compaction baking the addendum into history would freeze the entry set'
+    )

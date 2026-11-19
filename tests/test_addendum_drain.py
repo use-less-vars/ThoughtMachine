@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import agent.core.stream_events as stream_events_module
 from agent.config.models import AgentConfig
 from agent.core.agent import Agent
-from agent.core.llm_client import ADDENDUM_HEADING
+from agent.core.llm_client import ADDENDUM_HEADING, compose_addendum_into_messages
 from agent.core.stream_events import Done, TextDelta
 from session.addendum import AddendumQueue, write_addendum_entry
 from session.context_builder import ContextBuilder
@@ -101,9 +101,15 @@ def _make_agent(session):
 
 
 def _build_request(agent):
-    """agent/core/agent.py:1297-1298 -- what the next LLM request is built from."""
+    """The payload the turn loop sends: build, clean, then compose the addendum.
+
+    Mirrors ``Agent.process_query`` (agent/core/agent.py): the addendum is
+    applied to the OUTGOING message list on every request and never to the
+    stored conversation, which is why building a request is side-effect free.
+    """
     messages = agent.context_builder.build(agent.conversation)
-    return ContextBuilder._cleanup_orphaned_tool_messages(messages)
+    messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
+    return compose_addendum_into_messages(messages, agent.session)
 
 
 def _types(events):
@@ -411,8 +417,9 @@ def test_p3_in_flight_request_unchanged_and_next_request_differs_only_in_system(
     session = _make_session()
     agent = _make_agent(session)
 
-    # The request this turn already sent (agent/core/agent.py:1297-1298).
-    snapshot = copy.deepcopy(_build_request(agent))
+    # The request this turn already sent, captured as the bytes that went out.
+    in_flight = _build_request(agent)
+    snapshot = copy.deepcopy(in_flight)
     assert [message.get('role') for message in snapshot] == ['system', 'user', 'assistant']
     assert ADDENDUM_HEADING not in snapshot[0]['content'], 'the addendum predates the write'
 
@@ -420,13 +427,16 @@ def test_p3_in_flight_request_unchanged_and_next_request_differs_only_in_system(
     assert result['status'] == 'ok'
 
     # P3: a Tier-1 write must not retroactively alter the request in flight.
-    assert _build_request(agent) == snapshot, (
+    assert in_flight == snapshot, (
         'the write changed the in-flight request; it must only affect the next turn'
     )
+    # ...and nothing is baked into the stored conversation, so a later build
+    # cannot resurrect it either.
+    assert ADDENDUM_HEADING not in session.user_history[0]['content'], (
+        'composing wrote the block back into the stored history'
+    )
 
-    # The refresh is the once-per-turn call at agent/core/agent.py:1181.
-    agent.conversation = agent.llm_client.ensure_system_prompt(agent.conversation)
-
+    # No refresh call, no restart: the very next build composes the new entry.
     next_request = _build_request(agent)
     assert next_request[0]['role'] == 'system'
     assert next_request[0]['content'] != snapshot[0]['content'], (

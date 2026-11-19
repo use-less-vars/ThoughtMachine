@@ -28,7 +28,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 import web_ui.backend.session_routes as session_routes
-from agent.core.llm_client import ADDENDUM_HEADING, LLMClient
+from agent.core.llm_client import (
+    ADDENDUM_HEADING,
+    LLMClient,
+    compose_addendum_into_messages,
+)
 from llm_providers.factory import ProviderFactory
 from session.models import Session
 from web_ui.backend.server import app
@@ -179,14 +183,22 @@ def _make_config(system_prompt: str = BASE_PROMPT):
 
 
 def _compose_system_prompt(monkeypatch, session) -> str:
-    """Run the REAL composition point (``LLMClient.ensure_system_prompt``)."""
+    """Run the REAL composition point (``compose_addendum_into_messages``).
+
+    The base prompt still comes from ``LLMClient.ensure_system_prompt``, but the
+    addendum no longer enters there: it is composed onto the OUTGOING message
+    list on every turn (``process_query``, agent/core/agent.py:1800), so the
+    durable stored prompt stays addendum-free.
+    """
     monkeypatch.setattr(
         ProviderFactory,
         "create_provider",
         staticmethod(lambda **kwargs: _RecordingProvider()),
     )
     llm = LLMClient(_make_config(), session=session)
-    conversation = llm.ensure_system_prompt([{"role": "user", "content": "hello"}])
+    conversation = compose_addendum_into_messages(
+        llm.ensure_system_prompt([{"role": "user", "content": "hello"}]), session
+    )
     system_messages = [m for m in conversation if m.get("role") == "system"]
     assert len(system_messages) == 1, "exactly one system message expected"
     return system_messages[0]["content"]

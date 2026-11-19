@@ -6,14 +6,24 @@ module gives it a ``worktree_root`` of its own -- ``<workspace>/.worktrees/
 <session-id>`` -- so worker file operations cannot collide with the main
 agent's checkout.
 
-Everything here is deliberately FAIL-OPEN and side-effect-scoped:
+Everything here is deliberately FAIL-OPEN, and the side effect is WIDER than
+the worktree directory:
 
-* the only filesystem writes are the worktree directory and the git
+* the worktree is created ON A BRANCH (``wt/<session>``) instead of detached,
+  because a detached worktree leaves every commit the worker makes dangling.
+  That writes a branch ref under the repository's SHARED ``.git/refs/heads``:
+  the ref is visible from the main checkout and pushable from there, so it is
+  NOT private to the worker.  The worktree is checked out on ``wt/<session>``
+  precisely so the worker can commit at all;
+* the other filesystem writes are the worktree directory and the git
   administrative files ``git worktree add`` itself creates;
+* a re-summoned session keeps whatever branch its existing worktree is already
+  on: reuse short-circuits before any git call, so the branch is never
+  re-pointed;
 * every precondition that cannot be proven (no session id, no workspace root,
-  no ``.git``, git missing, git failing) logs a warning and returns ``None``,
-  which leaves the caller on the workspace root -- exactly the pre-existing
-  behaviour.
+  no ``.git``, a session id that yields no usable branch name, git missing, git
+  failing) logs a warning and returns ``None``, which leaves the caller on the
+  workspace root -- exactly the pre-existing behaviour.
 
 The helper is a plain function taking an injectable ``git_runner`` so the
 decision logic is testable without a git binary (the execution container has
@@ -39,6 +49,9 @@ WORKTREES_DIRNAME = ".worktrees"
 GitRunner = Callable[[List[str], str], int]
 
 _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+#: Branch (namespace) the worker worktrees are checked out on: ``wt/<session>``.
+_BRANCH_PREFIX = "wt"
 
 
 def _resolve_workspace_id(workspace_root: str) -> Optional[str]:
@@ -110,6 +123,34 @@ def session_worktree_name(session_id: Optional[str]) -> Optional[str]:
     return name
 
 
+def _is_usable_branch_component(name: str) -> bool:
+    """Whether *name* is something ``git`` accepts as a branch component.
+
+    Fail-closed: ``git`` refuses ``..``, a leading ``-`` (it would be parsed as
+    an option), a trailing ``.`` and a ``.lock`` suffix, and an over-long ref
+    makes ``git`` fail anyway -- all of which must be rejected HERE so the
+    caller falls back instead of guessing.
+    """
+    if not name or len(name) > 200:
+        return False
+    if ".." in name or name.endswith((".", ".lock")):
+        return False
+    return not name.startswith("-")
+
+
+def worktree_branch_name(session_id: Optional[str]) -> Optional[str]:
+    """Return the branch the worktree is checked out on, or ``None``.
+
+    ``None`` means the session id yields no name ``git`` would accept as a
+    branch: the caller must then NOT create a worktree (a detached one would
+    let the worker's commits dangle) and fall back to the workspace root.
+    """
+    name = session_worktree_name(session_id)
+    if name is None or not _is_usable_branch_component(name):
+        return None
+    return f"{_BRANCH_PREFIX}/{name}"
+
+
 def resolve_worker_worktree_root(
     workspace_root: Optional[str],
     session_id: Optional[str],
@@ -166,8 +207,24 @@ def resolve_worker_worktree_root(
     runner = git_runner or _host_git_runner(
         root, session_id if isinstance(session_id, str) else "", effective_permissions
     )
+    branch = worktree_branch_name(session_id)
+    if branch is None:
+        logger.warning(
+            "Worker worktree default skipped: unusable branch name for session %r",
+            session_id,
+        )
+        return None
+
     try:
-        status = runner(["worktree", "add", "--detach", worktree], root)
+        # On a BRANCH, never ``--detach``: a detached worktree lets the worker
+        # commit onto nothing.  ``-b`` fails when the ref already exists (a
+        # removed worktree leaves its branch behind), so re-attach to the
+        # existing branch instead of giving up.
+        status = runner(["worktree", "add", "-b", branch, worktree], root)
+        if status != 0 and runner(
+            ["rev-parse", "--verify", f"refs/heads/{branch}"], root
+        ) == 0:
+            status = runner(["worktree", "add", worktree, branch], root)
     except Exception as exc:  # a runner must never break the spawn boundary
         logger.warning(
             "Worker worktree default skipped: git worktree add raised (%s)", exc
@@ -176,8 +233,9 @@ def resolve_worker_worktree_root(
 
     if status != 0:
         logger.warning(
-            "Worker worktree default skipped: 'git worktree add %s' exited %s",
-            worktree, status,
+            "Worker worktree default skipped: 'git worktree add' for branch %s "
+            "at %s exited %s",
+            branch, worktree, status,
         )
         return None
 
