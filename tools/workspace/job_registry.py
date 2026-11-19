@@ -176,7 +176,8 @@ class WorkerJobRegistry:
             return copy.deepcopy(job)
 
     def terminalize(self, job_id: str, status: str = "paused",
-                    envelope=None) -> Optional[dict]:
+                    envelope=None, *, worker_name=None, session_id=None,
+                    instance_id=None) -> Optional[dict]:
         """Terminate a job with a non-completed terminal status (no-op if already terminal).
 
         Used when a job is interrupted (e.g. Pause All while the worker is
@@ -184,10 +185,20 @@ class WorkerJobRegistry:
         must not later be completed or restarted. Creates the record on
         demand (like ``complete``) so synchronous query paths that carry a
         query_id also get a terminal record.
+
+        ``worker_name``/``session_id``/``instance_id`` are RECORDED so a
+        later ownership check can attribute the job to the caller that
+        created it: a record created on demand takes them verbatim, and an
+        existing record only adopts a field that is still empty/None (an
+        identity already on the record is never overwritten). Nothing is
+        enforced here -- this method does not police ownership. Omitting
+        them yields an unattributed record (``session_id == ""``,
+        ``worker_name``/``instance_id`` ``None``).
         """
         with self._lock:
             existing = self._jobs.get(job_id)
             if existing is not None and existing.get("status") in TERMINAL_STATUSES:
+                self._adopt_identity_locked(existing, worker_name, session_id, instance_id)
                 return copy.deepcopy(existing)
             job = existing
             if job is None:
@@ -195,9 +206,9 @@ class WorkerJobRegistry:
                 now = _now_iso()
                 job = {
                     "job_id": job_id,
-                    "worker_name": None,
-                    "session_id": "",
-                    "instance_id": None,
+                    "worker_name": worker_name,
+                    "session_id": session_id or "",
+                    "instance_id": instance_id,
                     "status": "submitted",
                     "created_at": now,
                     "updated_at": now,
@@ -206,6 +217,8 @@ class WorkerJobRegistry:
                     "result": None,
                 }
                 self._jobs[job_id] = job
+            else:
+                self._adopt_identity_locked(job, worker_name, session_id, instance_id)
             job["status"] = status
             if envelope is not None:
                 job["result"] = copy.deepcopy(envelope) if isinstance(envelope, dict) else envelope
@@ -218,26 +231,36 @@ class WorkerJobRegistry:
             job["updated_at"] = job["completed_at"]
             return copy.deepcopy(job)
 
-    def complete(self, job_id: str, envelope) -> Optional[dict]:
+    def complete(self, job_id: str, envelope, *, worker_name=None,
+                 session_id=None, instance_id=None) -> Optional[dict]:
         """Store the final result envelope for a job (status -> completed).
 
         Creates the record on demand so jobs that were never explicitly
         registered (e.g. synchronous query paths that still carry a
         query_id) still end up with a completed record. Jobs that already
         reached a terminal status are left untouched.
+
+        ``worker_name``/``session_id``/``instance_id`` are RECORDED so a
+        later ownership check can attribute the job to the caller that
+        created it: a record created on demand takes them verbatim, and an
+        existing record only adopts a field that is still empty/None (an
+        identity already on the record is never overwritten). Nothing is
+        enforced here. Omitting them yields an unattributed record
+        (``session_id == ""``, ``worker_name``/``instance_id`` ``None``).
         """
         with self._lock:
             job = self._jobs.get(job_id)
             if job is not None and job.get("status") in TERMINAL_STATUSES:
+                self._adopt_identity_locked(job, worker_name, session_id, instance_id)
                 return copy.deepcopy(job)
             if job is None:
                 self._evict_if_needed_locked()
                 now = _now_iso()
                 job = {
                     "job_id": job_id,
-                    "worker_name": None,
-                    "session_id": "",
-                    "instance_id": None,
+                    "worker_name": worker_name,
+                    "session_id": session_id or "",
+                    "instance_id": instance_id,
                     "status": "submitted",
                     "created_at": now,
                     "updated_at": now,
@@ -246,6 +269,8 @@ class WorkerJobRegistry:
                     "result": None,
                 }
                 self._jobs[job_id] = job
+            else:
+                self._adopt_identity_locked(job, worker_name, session_id, instance_id)
             job["status"] = "completed"
             job["result"] = copy.deepcopy(envelope) if isinstance(envelope, dict) else envelope
             job["preview"] = (
@@ -280,6 +305,24 @@ class WorkerJobRegistry:
             return out
 
     # -- internals -----------------------------------------------------
+
+    def _adopt_identity_locked(self, job: dict, worker_name, session_id,
+                               instance_id) -> None:
+        """Fill identity fields that are still empty/None; never overwrite.
+
+        Mirrors ``register()``: a record created on demand by
+        ``complete()``/``terminalize()`` may carry no worker attribution, and
+        ``jobs()`` filters on worker_name/instance_id, so a later caller that
+        knows the identity may backfill it -- but a value already present is
+        authoritative and is left alone. Caller must hold ``self._lock``.
+        """
+        for key, value in (
+            ("worker_name", worker_name),
+            ("session_id", session_id or ""),
+            ("instance_id", instance_id),
+        ):
+            if not job.get(key) and value:
+                job[key] = value
 
     def _evict_if_needed_locked(self) -> None:
         """Evict oldest jobs (by created_at) when the store is at capacity."""
