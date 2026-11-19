@@ -48,6 +48,30 @@ Tests (c) need NO git binary: they exercise the refusal/fall-through guard
 itself by pinning ``SandboxedExecution``, so they RUN everywhere -- including
 sandboxes without git -- and the refusal branch is genuinely executed there.
 That is the point: the switch must bite on the machine that has no git, too.
+
+CONSTRUCTION PATHS (why the guard had to be re-armed)
+----------------------------------------------------
+The guard used to read ``self._resolved_workspace_path`` and nothing else, but
+``GitReadTool.execute()`` RESETS that attribute on entry and only re-populates
+it from a session-registry lookup. Every caller that binds the deprecated
+``workspace_path=`` (which is exactly what ``ToolExecutor`` injects from
+``config.workspace_path``) therefore reached the guard with the attribute
+``None``: the guard was consulted but DISARMED, and the commit went out with
+``core.hooksPath=/dev/null`` + ``--no-verify``.
+``GitReadTool._host_commit_hook_dirs`` fixes that by resolving the workspace at
+commit time with one fixed precedence -- an explicitly bound ``workspace_path``
+FIRST (the caller's declaration of which workspace this commit belongs to),
+falling back to ``_resolve_workspace_root`` (worktree root -> registered
+workspace -> deprecated ``workspace_path``) -- and by honouring ``repo_root``
+and the directories between it and the workspace root. The declared root
+deliberately beats the narrower ``worktree_root``: security code must never
+re-target itself at a different repository than the one named, and the wider
+root is strictly more fail-closed because the ancestor walk still reaches a
+``.githooks`` inside a narrower worktree.
+``test_refusal_armed_on_every_construction_path*`` below pins that fix on EVERY
+construction path production code uses, not just the one that happened to arm
+the attribute -- otherwise a test could pass while a sibling path stays
+fail-open.
 """
 import json
 import os
@@ -144,13 +168,25 @@ def _workspace_with_rogue_hook(tmp_path):
     repo = workspace / "repo"
     repo.mkdir(parents=True)
     _git_ok(repo, "init", "-q")
-    # Repo-LOCAL identity: the tool ignores ambient/global config, so commits
-    # must not depend on it.
-    _git_ok(repo, "config", "user.name", "Test User")
-    _git_ok(repo, "config", "user.email", "test@example.com")
+    # Repo-LOCAL identity, written straight into ``.git/config`` (no git
+    # subprocess just to configure a commit): the tool ignores ambient/global
+    # config (GIT_CONFIG_GLOBAL=/dev/null), so the commit identity has to be
+    # repo-local or the tool's commit fails for a reason that has nothing to do
+    # with the hook guard.
+    git_config = repo / ".git" / "config"
+    git_config.write_text(
+        git_config.read_text(encoding="utf-8")
+        + "[user]\n\tname = TM Test\n\temail = tm@example.invalid\n",
+        encoding="utf-8",
+    )
     (repo / "hello.txt").write_text("hi\n")
     _git_ok(repo, "add", "hello.txt")
     _git_ok(repo, "commit", "-m", "base commit")
+    # Make the working tree DIRTY after the base commit. Without this the tool's
+    # commit has nothing to record, git exits 1 with EMPTY stderr ("nothing to
+    # commit" goes to stdout) and the control test would fail -- or, worse, pass
+    # its "no failure" assertion while proving nothing about committing.
+    (repo / "hello.txt").write_text("hi\nsecond line\n")
 
     githooks = workspace / ".githooks"
     githooks.mkdir(parents=True, exist_ok=True)
@@ -160,18 +196,61 @@ def _workspace_with_rogue_hook(tmp_path):
     return workspace, repo, repo / "marker.txt"
 
 
+def _commit_kwargs(workspace, repo, message="host switch commit", file_path="hello.txt"):
+    """Arguments of a commit tool bound to the deprecated ``workspace_path=``.
+
+    ``workspace_path`` is an INFRASTRUCTURE field: ``ToolExecutor`` always sets
+    it from ``config.workspace_path`` (agent/core/tool_executor.py:530), and no
+    session-registry entry is involved on that path -- which is exactly why
+    ``execute()`` leaves ``_resolved_workspace_path`` unset and why the guard
+    used to be armed only by accident.
+    """
+    return {
+        "operation": "commit",
+        "message": message,
+        "file_path": file_path,
+        "working_dir": str(repo),
+        "workspace_path": str(workspace),
+        "workspace_id": HOST_TEST_WS,
+        "session_permissions": {"git": "write", "filesystem": "write"},
+        "effective_permissions": {"git": "write", "filesystem": "write"},
+    }
+
+
 def _commit_tool(workspace, repo, message="host switch commit", file_path="hello.txt"):
     """A commit tool bound to the direct ``workspace_path=`` (host) path."""
-    return GitWriteTool(
-        operation="commit",
-        message=message,
-        file_path=file_path,
-        working_dir=str(repo),
-        workspace_path=str(workspace),
-        workspace_id=HOST_TEST_WS,
-        session_permissions={"git": "write", "filesystem": "write"},
-        effective_permissions={"git": "write", "filesystem": "write"},
-    )
+    return GitWriteTool(**_commit_kwargs(workspace, repo, message, file_path))
+
+
+def _executor_injected_kwargs(workspace, repo):
+    """The kwargs ``ToolExecutor._execute_single_tool`` actually builds.
+
+    Mirrors agent/core/tool_executor.py: ``workspace_path`` comes from
+    ``config.workspace_path`` (L530), ``session_permissions`` from the resolved
+    profile (L737-741), ``workspace_id`` from the gate (L746), and
+    ``session_id`` is injected only because the tool declares the field
+    (L799-800) -- empty here, i.e. a sessionless caller, which is the case that
+    leaves the registry lookup with nothing to return.
+    """
+    kwargs = _commit_kwargs(workspace, repo)
+    kwargs["tool"] = "GitWriteTool"
+    kwargs["session_id"] = ""
+    return kwargs
+
+
+def _construction_paths(workspace, repo):
+    """Every distinct way production code builds a git commit tool.
+
+    Factories, so one path's per-call state can never leak into the next.
+    """
+    kwargs = _commit_kwargs(workspace, repo)
+    return {
+        "direct_constructor": lambda: GitWriteTool(**kwargs),
+        "pydantic_model_validate": lambda: GitWriteTool.model_validate(dict(kwargs)),
+        "tool_executor_injection": lambda: GitWriteTool(
+            **_executor_injected_kwargs(workspace, repo)
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +277,184 @@ def test_host_commit_is_refused_when_githooks_pre_commit_present(tmp_path):
     assert not marker.exists(), (
         "the configured .githooks/pre-commit EXECUTED on the host path: the "
         "kill switch advertises hooks it then neutralizes"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (a2) workspace PRECEDENCE: the declared workspace outranks ambient discovery
+# ---------------------------------------------------------------------------
+
+
+def test_declared_workspace_beats_a_narrower_worktree_root(tmp_path, monkeypatch):
+    """An explicitly bound ``workspace_path`` must not be narrowed or replaced.
+
+    ``_resolve_workspace_root()`` prefers ``worktree_root`` over the declared
+    ``workspace_path``. That is right for path-anchored file tools but wrong
+    here: resolving through it would judge a commit into the DECLARED workspace
+    against a different directory, so a hook configured for the workspace could
+    be missed -- and, on a git-equipped runner, a worktree-bound session could
+    manufacture a refusal out of another checkout's hook. The declared root is
+    also the WIDER one, so honouring it is strictly more fail-closed; phase 2
+    pins that a hook in the narrower root is still found by the ancestor walk.
+    """
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (workspace / ".githooks").mkdir()
+    (workspace / ".githooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    # A narrower root INSIDE the declared workspace, with no hooks of its own.
+    narrow = workspace / ".worktrees" / "feat"
+    narrow.mkdir(parents=True)
+
+    monkeypatch.setattr("tools.git_info_tool.SandboxedExecution", _ForbiddenExecutor)
+    _ForbiddenExecutor.constructed = 0
+
+    kwargs = dict(_commit_kwargs(workspace, repo))
+    kwargs["worktree_root"] = str(narrow)
+    tool = GitWriteTool(**kwargs)
+
+    assert tool._resolved_workspace_path is None, (
+        "this test is only meaningful while the guard arms itself first"
+    )
+    rc, out, err = tool._exec_host_raw(repo, ["commit", "-m", "x"])
+
+    assert (rc, out) == (1, ""), (
+        f"the guard did not refuse for the DECLARED workspace: {(rc, out, err)!r}"
+    )
+    assert err == REFUSAL, f"refusal is no longer byte-identical: {err!r}"
+    assert Path(tool._resolved_workspace_path).resolve() == workspace.resolve(), (
+        "the guard resolved to "
+        f"{tool._resolved_workspace_path!r} instead of the declared workspace "
+        f"{str(workspace)!r}: it re-targeted itself at a narrower root"
+    )
+    assert _ForbiddenExecutor.constructed == 0, "an executor was constructed"
+
+    # Phase 2: a hook inside the NARROWER root must still be caught -- the fix
+    # must not trade one blind spot for another.
+    clean_workspace = tmp_path / "workspace2"
+    inner = clean_workspace / ".worktrees" / "feat"
+    inner_repo = inner / "repo"
+    inner_repo.mkdir(parents=True)
+    (inner / ".githooks").mkdir()
+    (inner / ".githooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+
+    kwargs = dict(_commit_kwargs(clean_workspace, inner_repo))
+    kwargs["worktree_root"] = str(inner)
+    nested = GitWriteTool(**kwargs)
+    rc, out, err = nested._exec_host_raw(inner_repo, ["commit", "-m", "x"])
+
+    assert (rc, out) == (1, ""), (
+        "a .githooks between repo_root and the declared workspace root was "
+        f"MISSED: {(rc, out, err)!r}"
+    )
+    assert err == REFUSAL
+
+
+def test_ambient_checkout_does_not_re_target_the_guard(tmp_path, monkeypatch):
+    """Another repository on the machine must not decide this commit's verdict.
+
+    The guard resolves its workspace late, and ``_resolve_workspace_root``
+    prefers ``worktree_root``/the session registry over the declared
+    ``workspace_path``. If that precedence leaked into the guard, a repository
+    the process merely HAPPENS to be sitting in (``decoy`` below: a checkout
+    with a configured hook, like any real project checkout) could decide the
+    verdict for a commit that belongs to a hook-free declared workspace. It
+    must not: the declared workspace decides, the decoy is never probed, and
+    the only git process started is the commit itself.
+
+    WHY NO PATH SHIM: the most literal "git is installed" world is a fake
+    ``git`` early on PATH, but pytest's hermetic HOME/vault lives under a
+    ``noexec`` /tmp (``tests/conftest.py`` redirects HOME there at import
+    time), so nothing written there can be executed and ``shutil.which`` would
+    not even see it. The property is therefore proven at the ONE seam through
+    which this module can reach git -- ``SandboxedExecution``, constructed in
+    exactly one place in git_info_tool -- where a recorder sees every
+    invocation, including a ``rev-parse --show-toplevel`` discovery call. That
+    is the same evidence a shim log would give, and it holds on every machine,
+    git installed or not.
+    """
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+
+    decoy = tmp_path / "real-checkout"
+    (decoy / ".githooks").mkdir(parents=True)
+    (decoy / ".githooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+
+    monkeypatch.setattr("tools.git_info_tool.SandboxedExecution", _RecordingExecutor)
+
+    for name, build in _construction_paths(workspace, repo).items():
+        _RecordingExecutor.instances = []
+        tool = build()
+
+        rc, out, err = tool._exec_host_raw(repo, ["commit", "-m", "x"])
+
+        assert "refusing commit" not in (err or ""), (
+            f"{name}: the DECOY checkout's hook manufactured a refusal: "
+            f"{(rc, out, err)!r}"
+        )
+        assert rc == 0 and out == "ok", (
+            f"{name}: the guard did not fall through: {(rc, out, err)!r}"
+        )
+        assert decoy.resolve() not in tool._host_commit_hook_dirs(repo), (
+            f"{name}: the guard probed the decoy checkout -- it re-targeted itself"
+        )
+        assert Path(tool._resolved_workspace_path).resolve() == workspace.resolve(), (
+            f"{name}: resolved to {tool._resolved_workspace_path!r} instead of the "
+            f"declared workspace {str(workspace)!r}"
+        )
+        assert len(_RecordingExecutor.instances) == 1, (
+            f"{name}: the guard started {len(_RecordingExecutor.instances)} git "
+            "processes; only the commit itself may be started"
+        )
+        argv = _RecordingExecutor.instances[0].argv
+        assert "rev-parse" not in argv and "--show-toplevel" not in argv, (
+            f"{name}: the guard asked git to discover the repository: {argv!r} -- "
+            "that answer can name a different checkout than the declared workspace"
+        )
+
+
+def test_refusal_happens_before_any_git_process(tmp_path, monkeypatch):
+    """Hooks in the DECLARED workspace: refused, with no git process started.
+
+    Instrumented rather than stubbed: ``_RecordingExecutor`` would happily run
+    the commit, so an EMPTY instance list proves the refusal came BEFORE git
+    machinery, not that git happened to fail. A hook-free decoy checkout is
+    present to show the refusal is attributable to the declared workspace
+    alone -- the decoy cannot cause it and cannot mask it.
+    """
+    workspace = tmp_path / "workspace"
+    (workspace / ".githooks").mkdir(parents=True)
+    (workspace / ".githooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    repo = workspace / "repo"
+    repo.mkdir()
+
+    clean_decoy = tmp_path / "real-checkout"
+    clean_decoy.mkdir()
+
+    _RecordingExecutor.instances = []
+    monkeypatch.setattr("tools.git_info_tool.SandboxedExecution", _RecordingExecutor)
+
+    for name, build in _construction_paths(workspace, repo).items():
+        tool = build()
+        assert getattr(tool, "_resolved_workspace_path", None) is None, (
+            f"{name}: expected the guard to arm itself"
+        )
+
+        rc, out, err = tool._exec_host_raw(repo, ["commit", "-m", "x"])
+
+        assert (rc, out) == (1, ""), (
+            f"{name}: expected a fail-closed tuple, got {(rc, out, err)!r}"
+        )
+        assert err == REFUSAL, f"{name}: refusal is no longer byte-identical: {err!r}"
+        assert Path(tool._resolved_workspace_path).resolve() == workspace.resolve(), (
+            f"{name}: armed {tool._resolved_workspace_path!r}, not the declared "
+            f"workspace {str(workspace)!r}"
+        )
+
+    assert _RecordingExecutor.instances == [], (
+        "git was started although hooks were configured: the refusal must come "
+        "first, not after a git process has run"
     )
 
 
@@ -363,3 +620,101 @@ def test_guard_does_not_refuse_non_commit_operations(tmp_path, monkeypatch):
     assert len(_RecordingExecutor.instances) == 1
     argv = _RecordingExecutor.instances[0].argv
     assert argv[-1] == "status" and "--no-verify" not in argv
+
+
+# ---------------------------------------------------------------------------
+# (d) the guard is ARMED on every construction path (the fail-open regression)
+# ---------------------------------------------------------------------------
+
+
+def test_refusal_armed_on_every_construction_path(tmp_path, monkeypatch):
+    """Hooks configured -> EVERY construction path refuses, with no git at all.
+
+    This is the regression test for the fail-open: the guard used to read only
+    ``self._resolved_workspace_path``, which ``execute()`` resets, so callers
+    that bind the deprecated ``workspace_path=`` (what ``ToolExecutor`` injects
+    from ``config.workspace_path``) reached the guard DISARMED and the commit
+    went out with ``core.hooksPath=/dev/null`` + ``--no-verify``. The assertion
+    that the attribute is still ``None`` on entry is the point: the guard must
+    arm itself, not wait to be armed.
+
+    Needs no git binary -- and that is deliberate: a machine without git must
+    still be shown to fail closed.
+    """
+    workspace = tmp_path / "workspace"
+    (workspace / ".githooks").mkdir(parents=True)
+    (workspace / ".githooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+    repo = workspace / "repo"
+    repo.mkdir()
+
+    _ForbiddenExecutor.constructed = 0
+    monkeypatch.setattr(
+        "tools.git_info_tool.SandboxedExecution", _ForbiddenExecutor
+    )
+
+    paths = _construction_paths(workspace, repo)
+    assert set(paths) == {
+        "direct_constructor",
+        "pydantic_model_validate",
+        "tool_executor_injection",
+    }
+
+    for name, build in paths.items():
+        tool = build()
+        assert getattr(tool, "_resolved_workspace_path", None) is None, (
+            f"{name}: this construction path is supposed to reach the guard "
+            "with NO resolved workspace -- otherwise it does not exercise the "
+            "self-arming fix at all"
+        )
+
+        rc, out, err = tool._exec_host_raw(repo, ["commit", "-m", "x"])
+
+        assert (rc, out) == (1, ""), (
+            f"{name}: expected a fail-closed tuple, got {(rc, out, err)!r} -- "
+            "the guard was DISARMED on this construction path"
+        )
+        assert err == REFUSAL, f"{name}: refusal is no longer byte-identical: {err!r}"
+        assert Path(tool._resolved_workspace_path).resolve() == workspace.resolve(), (
+            f"{name}: the guard did not arm the workspace it actually probed"
+        )
+
+    assert _ForbiddenExecutor.constructed == 0, (
+        "an executor was constructed: the refusal must happen before any git "
+        "machinery, on every construction path"
+    )
+
+
+@requires_git
+def test_refusal_armed_on_every_construction_path_end_to_end(tmp_path):
+    """Same guarantee, end to end: the REFUSAL surfaces, no generic git failure.
+
+    A generic ``Git command failed`` would also be "not a commit", so the
+    documented refusal is asserted verbatim, HEAD is asserted unmoved, and the
+    rogue hook is asserted never to have run -- for every construction path.
+    """
+    workspace, repo, marker = _workspace_with_rogue_hook(tmp_path)
+    head_before = _git_ok(repo, "rev-parse", "HEAD").strip()
+
+    for name, build in _construction_paths(workspace, repo).items():
+        result = build().execute()
+
+        assert REFUSAL in result, (
+            f"{name}: expected the documented refusal, got {result!r}"
+        )
+        assert "Git command failed (exit code 1)" in result, (
+            f"{name}: the refusal did not come back through the fail-closed "
+            f"tuple path: {result!r}"
+        )
+        assert "execution_mode: host" in result, (
+            f"{name}: the refusal was not attributed to host execution: {result!r}"
+        )
+
+    assert "host switch commit" not in _git_ok(repo, "log", "--format=%s")
+    assert _git_ok(repo, "rev-parse", "HEAD").strip() == head_before, (
+        "HEAD moved although every commit was refused"
+    )
+    assert not marker.exists(), (
+        "the configured .githooks/pre-commit EXECUTED on the host path: the "
+        "kill switch advertises hooks it then neutralizes"
+    )
+
