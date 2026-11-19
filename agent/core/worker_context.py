@@ -136,17 +136,16 @@ class WorkerContext:
         Returns:
             Estimated token count (int).
         """
-        import json
+        from agent.core.token_counter import estimate_message_tokens
+
         try:
             import tiktoken
             encoder = tiktoken.get_encoding('cl100k_base')
-            total = 0
-            for msg in self.user_history:
-                total += len(encoder.encode(json.dumps(msg)))
-            return total
         except Exception:
-            # Fallback: rough character-based estimate
-            return sum(len(json.dumps(msg)) // 4 for msg in self.user_history)
+            encoder = None
+        return sum(
+            estimate_message_tokens(msg, encoder=encoder) for msg in self.user_history
+        )
 
     # ── Compaction after summarization ─────────────────
 

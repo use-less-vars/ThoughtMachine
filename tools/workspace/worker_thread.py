@@ -1018,7 +1018,17 @@ def _resolve_worker_thread(
     exactly one live candidate must exist; multiple live candidates raise
     ``_WorkerAmbiguityError`` (callers must pass ``instance_id``). No live
     candidate raises ``_WorkerAmbiguityError`` with a 'not running' message.
+
+    "Live" is :func:`worker_is_live`, NOT the thread's own ``is_alive()``: a
+    process-mode worker's supervisor thread is deliberately never started, so
+    its ``is_alive()`` is ``False`` for a worker whose body is a healthy child.
     """
+    # Function-local for the same reason every other worker_runtime import in
+    # this module is: this module is also loaded inside a worker's own process,
+    # and a module-level import would put a supervisor-only module in that
+    # graph.
+    from tools.workspace.worker_runtime import worker_is_live
+
     with _registry_lock:
         if instance_id is not None:
             # Exact 3-tuple lookup first, then a name+instance scan (session
@@ -1044,8 +1054,7 @@ def _resolve_worker_thread(
                 continue
             if session_id is not None and key[0] != session_id:
                 continue
-            alive = bool(getattr(thread, "is_alive", lambda: True)())
-            if not alive:
+            if not worker_is_live(thread):
                 continue
             candidates.append((key[0], iid, thread))
     if not candidates:
@@ -1227,6 +1236,120 @@ def _resume_proxied_join_targets(session_id: Optional[str]) -> list[str]:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
                 "Main-pause proxy: resume failed for worker '%s': %s",
+                worker_name,
+                exc,
+            )
+    return resumed
+
+
+def _record_manual_only_pause(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: int = 1,
+) -> None:
+    """Remember a worker an OPERATOR latched with ``manual_only`` for *session_id*.
+
+    ``_manual_only_pause`` lives and dies with one thread object, so the latch
+    alone cannot answer the question the durability fix depends on: "did the
+    operator pause this session's worker?".  This record is that answer, kept
+    per session and released only by :func:`_resume_manual_only_paused`.
+
+    Idempotent (a set of ``(worker_name, instance_id)`` triples) and defensive:
+    bookkeeping must never break the pause that triggered it.
+    """
+    if not session_id:
+        return
+    try:
+        with _MANUAL_ONLY_PAUSED_LOCK:
+            _MANUAL_ONLY_PAUSED.setdefault(session_id, set()).add(
+                (worker_name, int(instance_id))
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Manual-only pause: could not record worker '%s': %s",
+            worker_name,
+            exc,
+        )
+
+
+def _resume_manual_only_paused(session_id: Optional[str]) -> list[str]:
+    """Release every OPERATOR ``manual_only`` pause recorded for *session_id*.
+
+    The counterpart of :func:`_record_manual_only_pause`, called at a real
+    USER-turn boundary.  A manual pause is deliberately durable across agent
+    turns -- that is what "pause until user turn" means -- but the next turn
+    the OPERATOR actually types ends it, exactly as it ends the session main
+    pause (``Agent._discard_session_main_pause``).  Nothing an agent does can
+    reach this function: the agent has no resume action.
+
+    The record is popped under the lock before any resume happens (the lock is
+    never held across ``resume()``), so a repeat call is a no-op and a slow or
+    failing resume cannot wedge the bookkeeping.
+
+    Every target is independent and defensive: a missing/dead/ambiguous worker
+    (``_WorkerAmbiguityError``) is skipped, a killed worker refuses its own
+    resume, and a detached worker is an operator stop that is left alone.  A
+    worker whose loop has not yet observed the park is still resumed -- the
+    latch must be released even while ``status`` has not caught up.  Never
+    raises; returns the worker names actually resumed.
+    """
+    if not session_id:
+        return []
+    with _MANUAL_ONLY_PAUSED_LOCK:
+        targets = _MANUAL_ONLY_PAUSED.pop(session_id, set())
+    resumed: list[str] = []
+    for worker_name, instance_id in sorted(targets):
+        try:
+            thread, _sid, _iid = _resolve_worker_thread(
+                worker_name,
+                instance_id=instance_id,
+                session_id=session_id,
+            )
+        except _WorkerAmbiguityError as exc:
+            logger.info(
+                "Manual-only pause: leaving worker '%s' instance %s alone: %s",
+                worker_name,
+                instance_id,
+                exc,
+            )
+            continue
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Manual-only pause: could not resolve worker '%s' to resume it: %s",
+                worker_name,
+                exc,
+            )
+            continue
+        status = getattr(thread, "status", None)
+        if getattr(thread, "_detach_requested", False) or status in (
+            "detached",
+            "detaching",
+            "killed",
+            "killing",
+        ):
+            logger.info(
+                "Manual-only pause: not resuming worker '%s' (status=%s)",
+                worker_name,
+                status,
+            )
+            continue
+        try:
+            if thread.resume():
+                resumed.append(worker_name)
+                logger.info(
+                    "Manual-only pause: resumed worker '%s' at the user-turn "
+                    "boundary (session '%s')",
+                    worker_name,
+                    session_id,
+                )
+            else:
+                logger.info(
+                    "Manual-only pause: worker '%s' refused resume (killed); left as is",
+                    worker_name,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Manual-only pause: resume failed for worker '%s': %s",
                 worker_name,
                 exc,
             )
@@ -2436,20 +2559,29 @@ class WorkerThread(threading.Thread):
         # restriction just by asking another question.  The park flags move to
         # the running position ONLY on this path; an ordinary query leaves them
         # exactly as it found them.
+        # The ONE exception to "a new query is the resume" is an
+        # OPERATOR-OWNED pause (``_manual_only_pause``): only an explicit
+        # resume() releases that, so the block below holds instead.
         _qp_agent = getattr(self, "_agent", None)
         _qp_state = getattr(_qp_agent, "state", None)
         if _qp_state is not None and getattr(_qp_state, "restriction_reason", None) == "pause":
-            try:
-                _qp_agent.leave_reading_mode("pause")
-            except Exception as exc:
-                log("WARNING", "tools.worker",
-                    f"Implicit unpause failed for worker '{self.worker_name}': {exc}")
-            self._park_event.clear()
-            self._resume_event.set()
-            log("DEBUG", "tools.worker",
-                f"Implicit unpause for worker '{self.worker_name}': new query resumes a "
-                f"pause-restricted worker (one query = resume; owner-scoped 'pause' "
-                f"release, park flags -> running)")
+            if getattr(self, "_manual_only_pause", False):
+                log("INFO", "tools.worker",
+                    f"[CONTROL_PLANE_PAUSE_HOLD] event=implicit_unpause_held "
+                    f"reason=manual_only worker={self.worker_name} "
+                    f"session_id={self.session_id}")
+            else:
+                try:
+                    _qp_agent.leave_reading_mode("pause")
+                except Exception as exc:
+                    log("WARNING", "tools.worker",
+                        f"Implicit unpause failed for worker '{self.worker_name}': {exc}")
+                self._park_event.clear()
+                self._resume_event.set()
+                log("INFO", "tools.worker",
+                    f"[CONTROL_PLANE_PAUSE_RELEASED] event=implicit_unpause "
+                    f"reason=new_query worker={self.worker_name} "
+                    f"session_id={self.session_id}")
         # Workspace Lifecycle Manager fast path (feature-flagged, default off)
         try:
             used, reply = self._process_query_via_wlm(query, timeout=timeout)
@@ -2796,8 +2928,14 @@ class WorkerThread(threading.Thread):
             log("WARNING", "tools.worker",
                 f"Execution termination failed for worker '{self.worker_name}': {exc}")
 
-    def pause(self) -> None:
-        """Signal the worker to pause after completing its current task."""
+    def pause(self, *, manual_only: bool = False) -> None:
+        """Signal the worker to pause after completing its current task.
+
+        ``manual_only`` marks the pause OPERATOR-OWNED: only an explicit
+        :meth:`resume` releases it, not a later query.  The default (``False``)
+        keeps every existing caller unchanged -- a proxied / join-target pause
+        in particular must stay auto-resumable.
+        """
         wlm = getattr(self, "_wlm", None)
         if self._wlm_flag_enabled() and wlm is not None:
             try:
@@ -2807,6 +2945,25 @@ class WorkerThread(threading.Thread):
                     f"WLM pause delegation failed for worker '{self.worker_name}': {exc}")
         self._park_event.set()
         self._resume_event.clear()
+        if manual_only or getattr(self, "_manual_only_pause", False):
+            # Recorded here, not at the caller: every reader of the marker (query
+            # routing, status files, spawn dedupe) must see an operator pause.
+            try:
+                self._manual_only_pause = True
+            except Exception:
+                pass
+            # ... and recorded SESSION-scoped too, so the latch has a release
+            # path that survives this thread object (``_manual_only_pause``
+            # alone would otherwise live and die with it).  The attribute test
+            # above is load-bearing, not belt-and-braces: the ``pause`` TOOL
+            # action stamps the marker itself and then calls ``pause()`` with
+            # no kwarg, so a kwarg-only test here would leave that latch with
+            # no release path at all.
+            _record_manual_only_pause(
+                getattr(self, "session_id", None) or _NO_SESSION_KEY,
+                self.worker_name,
+                getattr(self, "instance_id", 1) or 1,
+            )
         # Reading mode: a paused worker's agent must stop calling tools and
         # conclude with a Respond, exactly like the main agent's Pause button.
         # Guarded -- _agent is None before spawn and after teardown.
@@ -5884,6 +6041,18 @@ _SESSION_MAIN_PAUSED: set[str] = set()
 _PROXIED_JOIN_TARGETS: dict[str, set[tuple[str, int]]] = {}
 _PROXIED_JOIN_TARGETS_LOCK = threading.Lock()
 
+# The OPERATOR ``manual_only`` pauses this process applied, per session id:
+# ``{session_id: {(worker_name, instance_id), ...}}``.  ``_manual_only_pause``
+# is a latch on one live thread object, so it is lost with that object and
+# says nothing to a caller that only holds the session id; this record is the
+# session-scoped side of the same fact.  Written by ``WorkerThread.pause`` (and
+# so by every manual-only pause path, including the ``pause`` TOOL action) and
+# popped -- never swept -- by ``_resume_manual_only_paused`` at a real user-turn
+# boundary.  The lock guards the dict mutation only, never held across
+# ``resume()``.
+_MANUAL_ONLY_PAUSED: dict[str, set[tuple[str, int]]] = {}
+_MANUAL_ONLY_PAUSED_LOCK = threading.Lock()
+
 
 # ============================================================================
 # workspace capabilities (CAPABILITIES_AVAILABLE, resolve_workspace_id, _load_template_workers, _workspace_dir)  (moved verbatim from tools.workspace.worker; W4 facade extraction)
@@ -6875,18 +7044,28 @@ class Worker(ToolBase):
         return cap
 
     def _live_workers_in_session(self, session_key: str) -> int:
-        """
-        Count LIVE worker threads currently registered for ``session_key``.
+        """Count LIVE workers currently registered for ``session_key``.
 
-        Only threads whose ``is_alive()`` is True count toward the spawn cap;
-        dead (completed/stopped/errored) registry entries do not.
+        Liveness is runtime-mode dependent, so this cannot ask the thread
+        question: under the process substrate the body lives in a child
+        interpreter and the supervisor-side object's ``is_alive()`` is ``False``
+        even while that child is healthy and answering. ``worker_is_live`` is
+        the predicate that knows the difference, and it reproduces
+        ``is_alive()`` exactly for an unstamped/thread-mode worker.
+
+        Registry entries are RETAINED after terminal exit by design, so "it is
+        in the registry" is not "it counts": a retained-but-finished entry
+        must not hold a spawn slot open, and a live one must be counted.
         """
+        # Function-local like every other worker_runtime import in this module
+        # (this module is also loaded inside the child interpreter).
         from tools.workspace.worker import _registry_lock, _worker_registry
+        from tools.workspace.worker_runtime import worker_is_live
         count = 0
         with _registry_lock:
             for key, thread in _worker_registry.items():
                 sid = key[0]
-                if sid == session_key and thread.is_alive():
+                if sid == session_key and worker_is_live(thread):
                     count += 1
         return count
 
@@ -7012,6 +7191,12 @@ class Worker(ToolBase):
         # (see worker_self_reported) — anti-pattern member 4.
         spawn_started_at = time.time()
         from tools.workspace.worker import GATE_AVAILABLE, WorkerThread, _registry_lock, _worker_registry, check_required_categories, resolve_workspace_id
+        # Liveness for EVERY registry read below (dedupe, double-check, cap):
+        # ``worker_is_live`` asks the runtime-mode-correct question, and is
+        # byte-for-byte ``is_alive()`` for an unstamped/thread-mode worker.
+        # Function-local like every other worker_runtime import in this module
+        # (this module is also loaded inside the child interpreter).
+        from tools.workspace.worker_runtime import worker_is_live
         definition = self._find_worker(workers, self.worker_name)
         if definition is None:
             return {
@@ -7133,7 +7318,7 @@ class Worker(ToolBase):
             for key, t in list(_worker_registry.items()):
                 if key[0] == session_key and key[1] == self.worker_name:
                     iid = key[2] if len(key) >= 3 else 1
-                    if bool(getattr(t, "is_alive", lambda: True)()):
+                    if worker_is_live(t):
                         live_same.append((iid, t))
             if explicit_iid is not None:
                 match = [t for iid, t in live_same if iid == explicit_iid]
@@ -7766,7 +7951,11 @@ class Worker(ToolBase):
         # check (above) and this registration point.
         with _registry_lock:
             existing = _worker_registry.get((session_key, self.worker_name, spawn_iid))
-            if existing is not None and existing.is_alive():
+            # RETAINED entries are normal here (a finished worker keeps its
+            # entry so it stays reportable), so ``is_alive()`` would call a
+            # live process-mode predecessor dead and let the write below
+            # overwrite its key -- orphaning a running child.
+            if existing is not None and worker_is_live(existing):
                 # Another thread won the race — don't overwrite.
                 # With force this is not a lost race but a failed stop: the
                 # instance we asked to replace is still registered and alive
@@ -7804,7 +7993,7 @@ class Worker(ToolBase):
             live_now = sum(
                 1
                 for key, t in _worker_registry.items()
-                if key[0] == session_key and t.is_alive()
+                if key[0] == session_key and worker_is_live(t)
             )
             if live_now >= max_workers:
                 return {
@@ -8065,6 +8254,13 @@ class Worker(ToolBase):
         instance_id.
         """
         session_key = self.session_id or _NO_SESSION_KEY
+        # Liveness for EVERY ``alive`` field below: ``worker_is_live`` asks the
+        # runtime-mode-correct question. A process-mode worker's supervisor
+        # thread is deliberately never started, so ``is_alive()`` reports such a
+        # worker dead even while its child is healthy and answering. Function-
+        # local like every other worker_runtime import in this module (this
+        # module is also loaded inside the child interpreter).
+        from tools.workspace.worker_runtime import worker_is_live
         _get_worker_lifecycle_observer()  # best-effort: ensure observer subscription
         try:
             thread, sid, iid = _resolve_worker_thread(
@@ -8090,7 +8286,7 @@ class Worker(ToolBase):
                         "error": t.error,
                         "session_id": sid,
                         "note": "Worker is from a different session",
-                        "alive": t.is_alive(),
+                        "alive": worker_is_live(t),
                     }
                 # Multiple instances across sessions
                 instances = []
@@ -8101,7 +8297,7 @@ class Worker(ToolBase):
                         "current_task": t.current_task,
                         "last_heartbeat": t.last_heartbeat,
                         "error": t.error,
-                        "alive": t.is_alive(),
+                        "alive": worker_is_live(t),
                     })
                 return {
                     "worker_name": self.worker_name,
@@ -8144,7 +8340,7 @@ class Worker(ToolBase):
             "session_id": sid,
             "current_context_tokens": thread.get_current_context_tokens(),
             "max_context_tokens": thread.max_context_tokens,
-            "alive": thread.is_alive(),
+            "alive": worker_is_live(thread),
             "conversation_length": len(thread._worker_ctx.user_history) if thread._worker_ctx else 0,
             "last_heartbeat_age_s": age,
             "stale": stale,
@@ -8235,6 +8431,32 @@ class Worker(ToolBase):
             fallback=DEFAULT_REQUEST_SECONDS,
         )
 
+        # OPERATOR PAUSE IS NOT A STATUS. ``thread.pause()`` sets the park event
+        # and ``_manual_only_pause`` *immediately*, but the thread's run loop
+        # only writes ``status = "paused"`` when it next reaches its safe
+        # boundary -- possibly one model turn later. Testing the latch inside the
+        # ``status == "paused"`` branch below therefore left a window in which
+        # the operator's pause was invisible: the query was DELIVERED, the
+        # implicit unpause cleared the latch, and the pause "did nothing". The
+        # latch is tested here, on its own, ABOVE every status branch, so it
+        # refuses delivery whatever ``status`` currently says.
+        if getattr(thread, "_manual_only_pause", False):
+            paused_envelope = {
+                "status": "paused",
+                "message": "Worker is manually paused",
+                "worker_name": self.worker_name,
+                "session_id": self.session_id or "",
+            }
+            if self.context is not None:
+                # The query was NOT sent, so the context was not delivered
+                # either -- say so instead of dropping it silently.
+                paused_envelope["context_note"] = (
+                    "context was NOT delivered: the worker is manually paused "
+                    "and the query was not sent. Re-send it with the query "
+                    "once the worker is resumed."
+                )
+            return paused_envelope
+
         # PHASE 2.1b: a submission against a DETACHED worker is QUEUED and
         # returns immediately -- it does NOT resume the worker. Resuming is
         # operator-initiated only (docs/design-worker-lifecycle.md, "Queries
@@ -8317,25 +8539,10 @@ class Worker(ToolBase):
         if thread.status == "paused":
             # A paused worker must never be queried destructively (BUG 3):
             # the old behavior blocked up to 300s, then stopped the worker
-            # and reclaimed its containers. Manual-only pauses reject the
-            # query immediately (non-destructively); normal pauses are
-            # auto-resumed and the query proceeds normally below.
-            if getattr(thread, "_manual_only_pause", False):
-                paused_envelope = {
-                    "status": "paused",
-                    "message": "Worker is manually paused",
-                    "worker_name": self.worker_name,
-                    "session_id": self.session_id or "",
-                }
-                if self.context is not None:
-                    # The query was NOT sent, so the context was not delivered
-                    # either -- say so instead of dropping it silently.
-                    paused_envelope["context_note"] = (
-                        "context was NOT delivered: the worker is manually paused "
-                        "and the query was not sent. Re-send it with the query "
-                        "once the worker is resumed."
-                    )
-                return paused_envelope
+            # and reclaimed its containers. Manual-only pauses were already
+            # rejected ABOVE (the latch is not a status, so it cannot be
+            # tested here); a NORMAL pause is auto-resumed and the query
+            # proceeds normally below.
             try:
                 _resume_outcome = thread.resume()
             except Exception as exc:
@@ -8918,16 +9125,22 @@ class Worker(ToolBase):
                     continue
                 if self.worker_name is not None and key[1] != self.worker_name:
                     continue
-                alive = bool(getattr(thread, "is_alive", lambda: True)())
-                if not alive:
-                    continue
                 if not want_all:
                     continue
                 if manual_only:
+                    # Recorded BEFORE the liveness test, and not at the caller:
+                    # the operator's latch must be true even when the thread's
+                    # loop happens not to be running at this instant.
                     try:
                         thread._manual_only_pause = True
                     except Exception:
                         pass
+                alive = bool(getattr(thread, "is_alive", lambda: True)())
+                if not alive:
+                    log("WARNING", "tools.worker",
+                        f"pause requested for worker '{key[1]}' but its loop is not "
+                        f"alive \u2014 operator intent recorded, loop not running")
+                    continue
                 try:
                     thread.pause()
                 except Exception:

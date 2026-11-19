@@ -462,6 +462,16 @@ class FileSystemSessionStore(SessionStore):
         try:
             with FileLock(str(new_path)):
                 _atomic_write_json(new_path, data)
+            # The image store is process-wide, but the bytes a session put in it
+            # become garbage as soon as the history that references them is
+            # pruned or capped away.  `data['user_history']` is the history as
+            # just persisted (post-prune, post-cap), so it is exactly the set of
+            # images that must survive; the per-session collector releases the
+            # rest of THIS session's images and never another session's (see
+            # agent/core/image_gc.py).  After the write, so a failed save never
+            # costs the caller an image.
+            from agent.core import image_gc
+            image_gc.gc_session(session.session_id, data.get('user_history') or [])
             logger.debug(f"[SessionStore] Session {session.session_id} saved to {new_path}")
             # Invalidate path cache so subsequent _find_session_path re-scans
             self._invalidate_path_cache(session.session_id)

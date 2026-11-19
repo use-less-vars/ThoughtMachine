@@ -8,6 +8,77 @@ import tiktoken
 from typing import Optional, List, Dict, Any
 from agent.logging import log
 
+#: Flat token allowance for one pasted image.
+#:
+#: Images are not text: their size on the wire depends on resolution and
+#: encoding, not on the prompt, so no encoder can measure them. Providers
+#: bill a picture as a fixed tile budget; 1024 is the conservative upper end
+#: of that range for a typical pasted screenshot and keeps the context
+#: manager from silently overrunning the window.
+IMAGE_TOKEN_ESTIMATE = 1024
+
+# Module-level encoder, shared by the free functions below. Loaded lazily so
+# importing this module stays cheap and a missing/broken tiktoken install
+# degrades to the len//4 heuristic instead of failing the import.
+_module_encoder = None
+_module_encoder_loaded = False
+
+
+def _get_module_encoder():
+    """Get or initialize the encoder used by the module-level estimators."""
+    global _module_encoder, _module_encoder_loaded
+    if not _module_encoder_loaded:
+        try:
+            _module_encoder = tiktoken.get_encoding('cl100k_base')
+        except Exception:
+            _module_encoder = None
+        _module_encoder_loaded = True
+    return _module_encoder
+
+
+def _estimate_text_tokens(text: str, encoder=None) -> int:
+    """Tokenise a plain string, falling back to len//4 without tiktoken."""
+    if encoder is None:
+        encoder = _get_module_encoder()
+    if encoder is not None:
+        return len(encoder.encode(text))
+    return len(text) // 4
+
+
+def estimate_message_tokens(message, encoder=None) -> int:
+    """Estimate the token cost of a single canonical message.
+
+    Counts the message's text content and adds a flat per-image allowance for
+    each entry in its ``images`` list. The message dict is deliberately *not*
+    JSON-serialised: a message carries image *ids* rather than image bytes, so
+    serialising it would bill a handful of hex characters as if they were the
+    screenshot, and the real cost of a picture is not a function of its id.
+
+    Structural keys (``role``, ``tool_call_id``, ...) are not counted; the
+    estimate is a cheap lower bound used for budgeting, not a billing figure.
+
+    Args:
+        message: A message dict, or anything else (stringified and tokenised).
+        encoder: Optional pre-loaded tiktoken encoder; a lazily created
+            cl100k_base encoder is used when omitted.
+
+    Returns:
+        Estimated token count.
+    """
+    if not isinstance(message, dict):
+        return _estimate_text_tokens(str(message), encoder)
+    total = 0
+    content = message.get('content')
+    if isinstance(content, str):
+        if content:
+            total += _estimate_text_tokens(content, encoder)
+    elif content is not None:
+        total += _estimate_text_tokens(str(content), encoder)
+    images = message.get('images') or []
+    total += IMAGE_TOKEN_ESTIMATE * len(images)
+    return total
+
+
 class TokenCounter:
     """Handles token estimation, context window management, and token formatting."""
 
@@ -43,9 +114,10 @@ class TokenCounter:
         # Per-message logging removed to reduce noise (was 2+ lines per message)
         encoder = self._get_encoder()
         if isinstance(text_or_message, dict):
-            text = json.dumps(text_or_message)
-        else:
-            text = str(text_or_message)
+            # Delegates so that pasted images are billed as images instead of
+            # as the JSON text of their ids (see estimate_message_tokens).
+            return estimate_message_tokens(text_or_message, encoder=encoder)
+        text = str(text_or_message)
         if encoder is not None:
             tokens = encoder.encode(text)
             return len(tokens)

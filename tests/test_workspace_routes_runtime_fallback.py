@@ -60,7 +60,7 @@ class _FakeHandle:
     def kill(self) -> object:
         return True
 
-    def pause(self) -> object:
+    def pause(self, *, manual_only: bool = False) -> object:
         return True
 
     def resume(self) -> object:

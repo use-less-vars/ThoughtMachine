@@ -32,7 +32,6 @@ from tools.utils import model_to_openai_tool
 from tools.summarize_tool import SummarizeTool
 from tools.cancellation import _active_pause_event
 from agent.core.message import Message, is_system_notice_text, make_system_notice
-from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
 from agent.core.state import AgentState, ExecutionState, SessionState, TimeState
 from agent import events as ev
@@ -439,6 +438,55 @@ def _discard_session_main_pause(session_id: Optional[str], *, worker_mode: bool)
         except Exception as exc:  # pragma: no cover - defensive
             log('WARNING', 'core.agent', f'process_query: lifting proxied worker pauses failed: {exc}')
     return True
+
+
+def _discard_manual_only_worker_pause(
+    session_id: Optional[str], *, worker_mode: bool
+) -> list[str]:
+    """Release the operator's ``manual_only`` worker pauses at a user-turn start.
+
+    ``Worker(action="pause", worker_query="manual_only")`` latches every worker
+    it parks (``WorkerThread._manual_only_pause``) *and* records it
+    session-scoped (``tools.workspace.worker_thread._MANUAL_ONLY_PAUSED``).
+    Nothing in the agent's own repertoire releases that latch -- by design, the
+    agent has no resume action -- so without this the pause would outlive the
+    turn that requested it and the workers would stay parked across every later
+    turn.  The genuine "the operator is here again" event is the start of the
+    next OPERATOR turn, which is where this is called (``process_query``).
+
+    Worker (sub-)agent turns share the parent ``session_id`` (``WorkerThread``
+    builds its ``WorkerContext`` from it), so ``worker_mode`` turns must NOT
+    release it: a worker finishing its own turn is not an operator turn.
+
+    Deliberately independent of :func:`_discard_session_main_pause`: the
+    operator can pause their workers without pausing the main agent, so this
+    must not hide behind the session main-pause marker (which may never have
+    been set).
+
+    Returns the worker names actually resumed (``[]`` when there was nothing to
+    do).
+    """
+    if worker_mode or not session_id:
+        return []
+    # The record lives in the worker stack; if that module was never imported in
+    # this process it cannot have been populated, so skip the import.
+    module = sys.modules.get("tools.workspace.worker_thread")
+    if module is None:
+        return []
+    recorded = getattr(module, "_MANUAL_ONLY_PAUSED", None)
+    if not recorded or not recorded.get(session_id):
+        return []
+    resume_manual_only = getattr(module, "_resume_manual_only_paused", None)
+    if resume_manual_only is None:
+        return []
+    # Wrapped so a failed resume can never break the operator's turn.
+    try:
+        resumed = resume_manual_only(session_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        log('WARNING', 'core.agent',
+            f'process_query: releasing manual-only worker pauses failed: {exc}')
+        return []
+    return list(resumed or [])
 
 
 def _pause_aware_sleep(seconds: float) -> bool:
@@ -1485,13 +1533,25 @@ class Agent:
         pause_debug(f'request_pause -> enter_reading_mode(pause)')
         return self.enter_reading_mode('pause')
 
-    def process_query(self, query):
+    def process_query(self, query, images=None):
         """Process a user query, appending it to conversation and running the agent.
-        Yields events as dicts."""
+        Yields events as dicts.
+
+        ``images`` is an optional list of image METADATA dicts
+        (``id``/``media_type``/``width``/``height``); the bytes stay in
+        the process-wide image store, so only the ids travel with the message.
+        """
         # PHASE 2.1a: a new operator turn un-pauses the session.  Drop any
         # stranded main-pause marker here so join/wait_for_job stop reporting
         # "paused" for a pause that ended turns ago (see the helper).
         _discard_session_main_pause(
+            self.session_id,
+            worker_mode=bool(getattr(self.config, 'worker_mode', False)),
+        )
+        # ... and the operator's worker-scope pause, which is a sibling latch
+        # (not a subset): the operator may pause workers WITHOUT pausing the
+        # main agent, so it is released here in its own right (see the helper).
+        _discard_manual_only_worker_pause(
             self.session_id,
             worker_mode=bool(getattr(self.config, 'worker_mode', False)),
         )
@@ -1515,7 +1575,14 @@ class Agent:
             log('DEBUG', 'core.agent', f'process_query: query="{query[:80]}..." turn_display={self._display_turn}')
 
             # Add query to conversation FIRST so it's never lost, even on config failure
-            user_msg = {'role': 'user', 'content': query}
+            user_msg = {'role': 'user', 'content': query, 'images': images or []}
+            # The image store is process-wide and content-addressed, so the
+            # per-session collector (agent.core.image_gc) can only know what
+            # this session owns if the turn registers it.  This is the one
+            # place a turn's images join the conversation, whatever transport
+            # queued the query.
+            from agent.core import image_gc
+            image_gc.track_images(self.session_id, images)
             self._add_to_conversation(user_msg)
             estimated_tokens = self._estimate_tokens(user_msg)
             self.state.current_conversation_tokens += estimated_tokens

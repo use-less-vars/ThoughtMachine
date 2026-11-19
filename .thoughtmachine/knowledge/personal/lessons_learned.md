@@ -1125,3 +1125,78 @@ Fix: the marker fixture now propagates the suite value too, and arms **every liv
 4. **Unattributed edit to `conftest.py`.** A fresh worker found the TASK 1 fix already on disk (mtime 21 s after the prior worker's checkpoint) and correctly refused to claim it. Provenance unknown — possibly an out-of-band session or a re-dispatched run after the backend crash. The code was verified by reading it and by the fact that `suite_trust_value()` is called on all 298 marked tests without `NameError`, then committed. **Lesson: verify an unattributed edit by reading it and by finding a call path that exercises it, not by trusting its sha or its author's account.**
 5. Minor, unfixed: `import gc` was inserted after `import importlib.machinery`, so the import block is no longer isort-ordered — will trip a lint gate if one runs.
 
+
+## 2026-11-18 — ## Problems I had live — agent/worker/tooling shortcomings o...
+
+## Problems I had live — agent/worker/tooling shortcomings observed 2026-11-18
+
+Written up for the engineers, per the standing request to report anything that makes working harder.
+
+### 1. `Worker(action="query")` is unusable after a `final` result (worst one)
+Every `spawn` that returns `status: final` tears the instance down. The very next `action="query"` fails with `Worker 'default' is not running`, even though `instance_id` was in hand and nothing signalled termination. Effect: **a multi-step task cannot be continued conversationally**; each follow-up is a cold start, so I re-send ~1-2k tokens of briefing per turn and the worker re-reads files it already understood. Three of my five spawns this session were cold re-briefs of work the previous turn had just finished. Suggested: keep a `final` instance parkable for a follow-up window, or make `query` auto-respawn with the prior context, or at minimum say so in the error text (`not running — spawn again`) instead of making the caller guess.
+- Related: `timeout` results keep the instance alive (`query` works), `final` results do not. That is backwards from what a caller expects — the successful one is the reusable one.
+
+### 2. `git` is absent inside the Docker execution container
+The worker cannot run `git diff`/`git log`/`git status`, so any "show me your diff" instruction has to be satisfied from the host side with `git_read`. Two consequences: (a) the worker cannot self-check that it changed only what it was asked to change, which is exactly the check a committing agent wants before trusting a patch; (b) I had to spend a round trip doing the review myself. Workers are told not to run git anyway, but the absence also blocks the read-only uses.
+
+### 3. `git_read show_file` vs worktrees is fragile
+`show_file` with `working_dir=<workspace root>` and `path=".worktrees/<name>/tests/x.py"` returned *"working-tree path ... is absent from the working tree"* for a file that plainly existed on disk (untracked, so no HEAD fallback). The same call with `working_dir=".worktrees/<name>"` and a path relative to the worktree worked. The relative-path rule is documented for file tools; it is not obvious that it applies to `show_file`'s `path` argument *in addition to* `working_dir`, or that the two must be consistent. Suggest validating and erroring with the expected form rather than "absent from the working tree".
+
+### 4. `/tmp` inside DockerCodeRunner does not persist between calls
+Confirmed again (a file written in one call was gone in the next). Every measurement has to be produced and consumed inside a single call, which interacts badly with the reaper (#5) and with output-trimming. A persistent scratch dir (e.g. `/home/agent/tmp`, which did survive) should be the documented default.
+
+### 5. The C90 reaper plus the block quota makes verification a one-shot
+Processes die at ~3-27 s, so "run the thing, look at the output, then run the thing again" is not possible in one worker turn; each run must be a single self-contained command, and a timeout in step 2 silently voids the evidence of step 1. This shaped several instructions I gave (baseline-and-after inside one invocation, instead of two clean runs). Worth an explicit "one command per invocation" hint in the worker's own system prompt, since a worker that chains commands produces evidence it cannot stand behind.
+
+### 6. Knowledge base files are huge
+`bugs_and_fixes` is ~93k tokens and `task_tracker` ~37k. `mode=append` works but every future `mode=read` is unaffordable, and there is no cheap "how big is this domain" signal except the warning after writing. Archiving exists but the warning does not suggest it by name. A per-append hint ("consider `mode=archive older_than_days=30`") would make this self-correcting.
+
+### What went *right* (so it does not get lost)
+- The worker's `meta` channels are genuinely good: `needs_direction` and `struggles` carried the real design question twice, and `tool_issues` carried the missing-git fact. Reading `meta` before `content` changed my next instruction both times.
+- A worker that reports a *measured* negative result ("7 bindings, 7 failures, 0 clean resolutions") is worth far more than one that reports success. I only got that because the brief asked for a controlled experiment; that should be a routine ask, not a lucky one.
+
+## 2026-11-18 — ## MEASURED 2026-11-18 — `Worker(action="query")` is broken ...
+
+## MEASURED 2026-11-18 — `Worker(action="query")` is broken by DEFAULT and the workaround is `instance_id`
+
+I ran the discriminator instead of arguing, on the same live worker, seconds apart:
+- `Worker(action="query", instance_id=1, worker_query="…")` → `{"content": "SECOND", "elapsed_seconds": 1.4}`. Works.
+- `Worker(action="query", worker_query="…")` (name-only, the default shape) → `{"error": "Worker 'default' is not running"}`. Fails.
+
+The instance survived `final` and is fully dispatchable. The failure is entirely `_resolve_worker_thread`'s name-only path (`worker_thread.py:1047-1052`): `is_alive()` is False forever for a process-mode worker (the facade never starts its thread — `:3224-3250`), so the resolver raises `"Worker 'X' is not running"` before `_action_query:8372` can reach its correctly mode-aware `worker_is_dispatchable` gate (`:1817-1855`). The exact-key path (`:1029-1031`) has no liveness test, which is why `instance_id` sidesteps it.
+
+### PRACTICAL RULES FOR AGENTS (use these now)
+1. **Always pass `instance_id` on `action="query"`.** Capture it from the spawn result (`"instance_id": 1`). Without it a follow-up to a live worker fails with a false "not running".
+2. Therefore multi-turn worker conversations WORK and are cheap (my probe: 1.4s, 0 tool calls, context preserved). Do not assume every follow-up needs a cold re-brief; that belief cost this session a lot of redundant briefing.
+3. `token_usage` in the envelope is not a delta — a worker that answered "OK" in 1.3s reported 55196. Do not use it to reason about cost per query.
+4. When a supervisor says a worker "is not running", distrust it: cross-check `action="check"`/`list` and retry with the explicit `instance_id` before believing it.
+
+### METHODOLOGICAL LESSON (the real one)
+My previous conclusion ("completion destroys the instance, so every follow-up is a cold re-brief") was an *inference from a symptom*, and it was wrong in a way that made me over-brief every worker for the whole session. The A/B above took 2 tool calls and 6 seconds. **Rule: before reporting a mechanism, find the cheapest call that would falsify it and run it.** A/B the suspected branch (here: explicit key vs name-only) rather than reasoning from one failing path.
+
+### FOR THE ENGINEERS: "problems I had live"
+- The default `query` shape is unusable against a live process-mode worker, and the error text (`"not running"`) actively misleads — it sends you hunting for a lifecycle bug when the object is healthy. Fix: resolver returns the handle; liveness is ONE mode-aware predicate applied at dispatch; the error should report mode + what was observed, never a bare "not running".
+- `WORKER_RUNTIME_MODE` is an ambient env var, so neither the caller nor the agent can see the mode in any envelope. Exposing `"runtime_mode": "process"` in the spawn/query/check envelopes would have prevented this whole misdiagnosis (mine and, plausibly, more than one human's).
+- Class/file/registry naming (`WorkerThread`, `worker_thread.py`, registry of `WorkerThread`) describes the opt-in mode, not the default. A facade whose `is_alive()` is intentionally always False needs that stated at the class site, or the method should not exist on the facade at all.
+
+## 2026-11-18 — ## 2026-11-18 "A kill is not an environment law" — and how t...
+
+## 2026-11-18 "A kill is not an environment law" — and how to tell cost from kill
+
+A worker concluded from its own SIGTERMs that "long pytest runs are impossible in this sandbox: every pytest process is killed at 8-20s", and shrank its scope accordingly. An INDEPENDENT worker then ran a 33-second suite to completion, and a later A/B showed the "unrunnable" file was green all along on both trees. The generalisation was false; the observations were real. Two rules follow:
+
+1. **Never promote one kill to an environment property.** The reaper is real (C90) but intermittent, and the same command can die once and pass on retry. Retry ONCE verbatim: same result = deterministic, different result = transient. Report dot count + elapsed, never just "killed".
+2. **Distinguish fixed cost from a kill with `--durations=5`.** "Dot printed, summary never came, died at 6s" reads like a hang and is usually a teardown paying a timeout budget. `5.00s teardown <test>` for a body that ran in <5ms is the tell. A green dot followed by death is evidence the TEST passed; it is not evidence about the rest of the file.
+3. **Measure before believing a colleague's scope cut.** A worker that has just been killed adjusts its plan defensively and will over-report impossibility. The cheap fix is a second worker with no sunk cost and one honest command. This session: implementer said "unrunnable", independent said "34 passed in 1.02s", truth was "green, slow teardown".
+4. **Mutation-test the briefing, not just the code.** For any regression test, require the implementer to state what makes it fail on the OLD code, and then check that claim by reverting the fix in one line (`worker_is_live` -> `lambda t: bool(t.is_alive())`) and re-running. Here all three new spawn tests failed as required. Without that step a "new test" is a comment with a green tick.
+5. **MagicMock impersonates domain state.** `getattr(mock, "_runtime_mode", None)` returns a Mock, not None, so a predicate branching on "anything that is not thread mode" silently classified every mock as a process worker with a live handle. The fix is not to stamp the mocks (that hides the trap from the next author) but to compare against the EXACT vocabulary value (`mode != MODE_PROCESS`) so unknown and fabricated stamps degrade to the legacy branch. Corollary for review: a predicate that branches on "not X" is a predicate that accepts every value nobody has thought of yet.
+
+## 2026-11-19 — Gen 69 Final Offboarding (Infra 66)
+
+**The Detached HEAD Trap:** `git_write worktree_add(branch=X)` silently ignores the branch name and creates a detached HEAD worktree. When you commit, the commit exists but there is no branch pointer, so `git push -u origin X` fails with `src refspec X does not match any`. Fix: inside the worktree, always run `git checkout -b X` before pushing.
+
+**The Local Reaper is Test Teardown:** C90 is not a blind wall-clock killer. A 33-second single-invocation test passed. The local SIGTERM killer (exit 143 at 3-27s) is caused by test files that spawn process-mode workers and fail to reap them properly, causing the exec process group to kill the parent pytest. The fix is not a CI timeout tweak; it is the mode-aware verb layer (`worker_is_live()`, `stop()`, `wait()`) implemented in PR #411.
+
+**The is_alive() Lie:** In MODE_PROCESS, the supervisor's thread is intentionally never started. `thread.is_alive()` is always False. Six different places in the codebase used `is_alive()` to decide if a worker was dead, causing orphan spawns and lying status panels. The fix is `worker_is_live()` which checks the runtime handle, not the thread.
+
+**The Timeout Race:** If a child process replies with `status='timeout'` at the exact moment the parent's `future.result()` times out, the parent raises `WorkerRuntimeLost` instead of `WorkerQueryTimeout`. The `dispatch_query` must inspect `reply.envelope['status']` and map it to the correct exception.

@@ -222,6 +222,7 @@ class TestQueryActionTimeout(unittest.TestCase):
             "Worker 'w-query' did not respond within 300.0s"
         )
         fake._last_elapsed.return_value = None
+        fake._manual_only_pause = False  # explicit: bare MagicMock auto-creates truthy attrs
         with _registry_lock:
             _worker_registry[("s1", "w-query", 1)] = fake
         try:
@@ -657,7 +658,7 @@ class _FakeWlmSupervisor:
     def completed_query_ids(self):
         return list(self._completed)
 
-    def pause(self):
+    def pause(self, *, manual_only: bool = False):
         self.pause_calls.append(True)
 
     def resume(self):

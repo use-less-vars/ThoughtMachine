@@ -55,7 +55,7 @@ class _FakeHandle:
     def stop(self) -> object:
         return self._verb("stop")
 
-    def pause(self) -> object:
+    def pause(self, *, manual_only: bool = False) -> object:
         return self._verb("pause")
 
     def resume(self) -> object:
@@ -395,7 +395,9 @@ def test_detaching_is_terminal_for_cancel() -> None:
     # -- it belongs with the other terminal statuses.
     assert "detaching" in worker_runtime.CANCEL_TERMINAL_STATUSES
     worker = SimpleNamespace(status="detaching", _turn_cancel=threading.Event())
-    handle = worker_runtime.WorkerRuntimeHandle(worker)
+    handle = worker_runtime.WorkerRuntimeHandle(
+        worker, mode=worker_runtime.MODE_THREAD
+    )
 
     assert handle.cancel() == "refused"
     assert worker._turn_cancel.is_set() is False

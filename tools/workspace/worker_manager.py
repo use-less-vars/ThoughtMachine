@@ -861,7 +861,12 @@ class WorkerManager:
     def _control_worker(
         self, action: str, session_id: str, worker_name: str, instance_id: int = 1
     ) -> Dict[str, Any]:
-        """Run a zero-arg control method on a registered thread."""
+        """Run a control method on a registered thread.
+
+        Every action is called zero-arg except ``"pause"``, which is an
+        OPERATOR action and is therefore called ``manual_only=True`` so a later
+        query cannot silently release it (only ``resume()`` does).
+        """
         thread = self.get_worker(session_id, worker_name, instance_id=instance_id)
         if thread is None:
             return {
@@ -877,7 +882,12 @@ class WorkerManager:
                     worker_name, instance_id, action
                 )
             )
-        method()
+        if action == "pause":
+            # Manager-initiated pause is an OPERATOR action: mark it owned, so
+            # a later query does not silently release it (only resume does).
+            method(manual_only=True)
+        else:
+            method()
         return {
             "found": True,
             "action": action,

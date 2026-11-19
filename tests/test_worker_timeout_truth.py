@@ -266,6 +266,7 @@ class TestQueryActionEffectiveTimeout(unittest.TestCase):
         fake._timeout_seconds = 60
         fake.send_query.return_value = "reply"
         fake._last_elapsed.return_value = None
+        fake._manual_only_pause = False  # explicit: bare MagicMock auto-creates truthy attrs
         key = ("s1", "w-query", 1)
         with _registry_lock:
             _worker_registry[key] = fake
@@ -286,6 +287,7 @@ class TestQueryActionEffectiveTimeout(unittest.TestCase):
         fake.send_query.side_effect = TimeoutError(
             "Worker 'w-query' did not respond within 120.0s"
         )
+        fake._manual_only_pause = False  # explicit: bare MagicMock auto-creates truthy attrs
         key = ("s1", "w-query", 1)
         with _registry_lock:
             _worker_registry[key] = fake

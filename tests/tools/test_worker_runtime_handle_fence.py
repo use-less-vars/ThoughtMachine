@@ -127,7 +127,7 @@ def registry():
 
 
 def test_epoch_is_captured_at_construction(registry):
-    handle = WorkerRuntimeHandle(FakeWorker(generation=7))
+    handle = WorkerRuntimeHandle(FakeWorker(generation=7), mode=MODE_THREAD)
 
     assert handle.epoch == 7
     assert handle.mode == MODE_THREAD
@@ -138,7 +138,7 @@ def test_epoch_is_captured_at_construction(registry):
 
 def test_unchanged_epoch_dispatches_and_returns_the_reply(registry):
     worker = FakeWorker(generation=7)
-    handle = WorkerRuntimeHandle(worker)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD)
 
     assert handle.dispatch_query("hello", timeout=5.0) == "thread reply"
     assert worker.sent == [("hello", 5.0)]
@@ -146,7 +146,7 @@ def test_unchanged_epoch_dispatches_and_returns_the_reply(registry):
 
 def test_live_worker_does_not_trip_the_fence(registry):
     worker = LiveWorker(generation=7)
-    handle = WorkerRuntimeHandle(worker)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD)
 
     assert handle.dispatch_query("hello") == "thread reply"
     assert worker.sent == [("hello", 120.0)]
@@ -157,7 +157,7 @@ def test_live_worker_does_not_trip_the_fence(registry):
 
 def test_bumped_epoch_raises_and_never_reaches_the_worker(registry):
     worker = FakeWorker(generation=7)
-    handle = WorkerRuntimeHandle(worker)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD)
     worker._generation = 8
 
     with pytest.raises(StaleWorkerFence) as excinfo:
@@ -178,7 +178,7 @@ def test_bumped_epoch_raises_and_never_reaches_the_worker(registry):
 
 def test_dead_worker_raises_and_never_reaches_the_worker(registry):
     worker = DeadWorker(generation=7)
-    handle = WorkerRuntimeHandle(worker)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD)
 
     with pytest.raises(StaleWorkerFence) as excinfo:
         handle.dispatch_query("hello")
@@ -193,7 +193,7 @@ def test_dead_worker_raises_and_never_reaches_the_worker(registry):
 def test_registry_evidence_of_a_newer_epoch_raises(registry):
     registry.register_worker(SESSION, WORKER, object(), INSTANCE, epoch=9)
     worker = FakeWorker(generation=7)
-    handle = WorkerRuntimeHandle(worker)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD)
 
     with pytest.raises(StaleWorkerFence) as excinfo:
         handle.dispatch_query("hello")
@@ -207,7 +207,7 @@ def test_registry_evidence_of_a_newer_epoch_raises(registry):
 def test_registry_evidence_fences_a_handle_that_knows_no_epoch(registry):
     registry.register_worker(SESSION, WORKER, object(), INSTANCE, epoch=9)
     worker = FakeWorker(generation=None)
-    handle = WorkerRuntimeHandle(worker)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD)
 
     assert handle.epoch is None
     with pytest.raises(StaleWorkerFence) as excinfo:
@@ -220,7 +220,7 @@ def test_registry_evidence_fences_a_handle_that_knows_no_epoch(registry):
 
 def test_no_registry_evidence_fails_open(registry):
     worker = FakeWorker(generation=7)
-    handle = WorkerRuntimeHandle(worker)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD)
 
     assert handle.dispatch_query("hello") == "thread reply"
     assert worker.sent == [("hello", 120.0)]
@@ -246,7 +246,7 @@ def test_stored_epoch_for_finds_a_none_session_seeded_through_register_worker(
 def test_fence_sees_evidence_written_under_a_none_session(registry):
     registry.register_worker(None, WORKER, object(), INSTANCE, epoch=5)
     worker = FakeWorker(generation=1, session_id=None)
-    handle = WorkerRuntimeHandle(worker, session_id=None)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD, session_id=None)
 
     with pytest.raises(StaleWorkerFence) as excinfo:
         handle.dispatch_query("hello")
@@ -260,7 +260,7 @@ def test_fence_sees_evidence_written_under_a_none_session(registry):
 def test_fence_ignores_evidence_that_is_not_newer_under_a_none_session(registry):
     registry.register_worker(None, WORKER, object(), INSTANCE, epoch=1)
     worker = FakeWorker(generation=1, session_id=None)
-    handle = WorkerRuntimeHandle(worker, session_id=None)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD, session_id=None)
 
     assert handle.epoch == 1
     assert handle.dispatch_query("hello") == "thread reply"
@@ -273,7 +273,7 @@ def test_fence_ignores_evidence_that_is_not_newer_under_a_none_session(registry)
 @pytest.mark.parametrize("raw", [None, True, False, "7", 3.0])
 def test_non_int_generation_is_unknown_and_dispatches(registry, raw):
     worker = FakeWorker(generation=raw)
-    handle = WorkerRuntimeHandle(worker)
+    handle = WorkerRuntimeHandle(worker, mode=MODE_THREAD)
 
     assert handle.epoch is None
     assert handle.epoch == _epoch_or_none(raw) == _coerce_epoch(raw)

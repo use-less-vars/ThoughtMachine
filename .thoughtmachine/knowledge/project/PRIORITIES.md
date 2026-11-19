@@ -413,13 +413,30 @@ different file, different name. Never rename one to the other.
   exists, but an active C25 does, and **the Active list wins.** The block stays as
   historical text; do not delete it.
 
-- **Tool defects noted (C32 class, not scheduled).** `git_read show_file` ignores its `ref`
-  argument and silently returns HEAD; `git_read ls_tree` ignores `prefix` and dumps the
-  whole tree; `Worker(action="spawn")` rejects a call that omits `worker_name` although
-  its documentation says it defaults. The first two are the dangerous ones: reads of
-  authority files that quietly answer a different question than the one asked. A fourth
-  report — worker briefings arriving stripped — is filed as **C45** in the Generation 64
-  section above, and is no longer "under probe and not filed".
+- **Tool defects noted (C32 class, not scheduled) — partly retracted at the Gen 69 housekeeping
+  pass.** The `show_file` half of the note below did not reproduce: `git_read
+  show_file(source='committed', ref='49ab4e5a', path='docs/design-worker-presence.md')` honoured
+  the `ref` and reported which source it used — the file exists at that commit and not at dev
+  HEAD, and the content returned matched the commit. The `ls_tree`/`prefix` claim was not re-tested
+  and still stands unverified. Original wording, kept as historical text:
+  > `git_read show_file` ignores its `ref` argument and silently returns HEAD; `git_read ls_tree`
+  > ignores `prefix` and dumps the whole tree; `Worker(action="spawn")` rejects a call that omits
+  > `worker_name` although its documentation says it defaults. The first two are the dangerous
+  > ones: reads of authority files that quietly answer a different question than the one asked. A
+  > fourth report — worker briefings arriving stripped — is filed as **C45** in the Generation 64
+  > section above, and is no longer "under probe and not filed".
+
+- **The `docs/CONTRACTS.md` row request is a design pass, not housekeeping (Gen 69 finding — ruling
+  needed).** A Gen 69 punch list asked for `docs/CONTRACTS.md` to grow rows for C76 / C81 /
+  C82-C86 / C90 / C92. That file has **no C-id row index**: measured at 293 lines, its headings are
+  "Contract 1", "Contract 2", "Contract 3", "Known gaps", "How this document stays honest" and
+  "What CI actually runs — and what this document does not claim", and the only two literal C-ids in
+  the whole file are C68 at line 20 and C91 at line 270. It is also machine-checked by
+  `tests/test_contracts_ledger_parity.py`, which requires every backticked path in it to exist and
+  to appear in the pytest list in `.github/workflows/contract-gate.yml` — so adding claim rows is
+  not a formatting exercise. Adding such rows is a **design pass** (each claim needs an enforcement
+  site plus a mutation-proof test), not housekeeping. C81 and C82-C85 appear nowhere in this file,
+  so there is no prior scope to transcribe. Ruling needed.
 
 ## Archived (pre-Gen 42 brain dump — do not read as current work)
 
@@ -437,6 +454,13 @@ different file, different name. Never rename one to the other.
 
 - **C14: `visual_tool.py` missing cancellation reporting.** **Open.** An interrupted render drops the `reason` and returns `"visual: the renderer exited with code None."` to the model. This looks like a renderer crash, not an operator cancel, causing the model to hallucinate a failure. Teardown runs correctly (pinned by test). Fix: detect `status == "interrupted"` and return a clear cancellation message. (Discovered during C11').
 
+- **Known and deliberately preserved (Gen 69 housekeeping pass).** The reuse of the live ids
+  C35/C36 by the Archive block below, and the double-printing of C74-C77 (a long form, then a
+  short form a few lines later), are KNOWN and are preserved on purpose as historical record, per
+  the ruling in the Numbering block above ("archived entries are a historical record"). Do not
+  delete or renumber them, and do not read an id as a key: quote titles, not ids. The collision is
+  documented, not resolved.
+
 - **C35: Prove the Host Port is sealed.** **Open.** Create a CI test (AST scan or grep) that proves subprocess and docker invocations only occur inside the approved wrappers. No tool may bypass the kill switch.
 - **C36: Verify Worker Trust Boundary.** **Open.** Write a test proving that a worker is bound to its session workspace_id and cannot execute tools using permissions of a different session if borrowed.
 
@@ -445,12 +469,12 @@ different file, different name. Never rename one to the other.
 
 - **C74** — `tools/mcp_client.py` bypasses the host-port chokepoint. (~11 other unadjudicated `import subprocess` sites).
 - **C75** — The AST no-tool-wrapping guard is parked, not enforced. 3 of its 4 own tests fail on an untouched checkout.
-- **C76** — `TRUST_TEST_HARNESS` is ON for the entire suite. Permission tests run against an open gate.
+- **C76** — **CLOSED (Gen 69 housekeeping pass).** The flag is no longer on for the whole suite. The shipped default is `TRUST_TEST_HARNESS = False` at `web_ui/backend/auth_boundary.py:229`, and `conftest.py:160-183` forces the closed value session-wide through `set_suite_trust_value(False)` / `enable_test_harness_trust(False)`. A test opts in by name with `@pytest.mark.trust_harness`, declared at `conftest.py:215-221` and gated at `conftest.py:276`; at least 9 root-tree test files already carry it. This line was true when it was written — the session-wide grant it describes has since been replaced by per-test opt-in — so it is stale, not mistaken.
 - **C77** — `web_ui/backend/tests/test_bridge_dedup.py` poisons `sys.modules` at collection, causing real-bridge tests to skip.
 
 - **C74** — `tools/mcp_client.py` bypasses the host-port chokepoint.
 - **C75** — The AST no-tool-wrapping guard is parked, not enforced.
-- **C76** — `TRUST_TEST_HARNESS` is ON for the entire suite.
+- **C76** — **CLOSED (Gen 69).** No longer suite-wide: default `TRUST_TEST_HARNESS = False` (`web_ui/backend/auth_boundary.py:229`), closed session-wide by `conftest.py:160-183`; per-test opt-in via `@pytest.mark.trust_harness` (`conftest.py:215-221`, gated at `conftest.py:276`).
 - **C77** — `test_bridge_dedup.py` poisons `sys.modules` at collection.
 - **C78** — Preflight diagnostics truth: two port probes, FAIL weight on advisory output.
 - **C79** — Undeclared load-bearing config key (`git_allow_worktree_commits`) and worker worktree bootstrap failure (crash loop).
@@ -461,6 +485,13 @@ different file, different name. Never rename one to the other.
 - **C89** — Session Autosave. Lossy crashes drop active conversational context and UI state. Needs periodic write-to-disk for session state (beyond just the final prompt).
 
 - **C90** — Exec Reaper SIGTERM. `ContainerExecTool`/`DockerCodeRunner` reaper kills the process group (rc=143) even on low memory. Workaround: run via `setsid` and ignore SIGTERM. See logs/5b_sigterm_finding.md.
+  **Later observation — the former `C90 (CRITICAL)` escalation, merged into this entry at the
+  Gen 69 housekeeping pass:** Local Exec Reaper is now killing pytest runs at 3-27 seconds.
+  `oom_kill=0`, memory is fine. It's killing the process group (exit 143). Local verification of
+  large suites is impossible until this is fixed.
+  **Workaround correction (measured, Gen 69 housekeeping pass):** `setsid` is not available in
+  this container, so the workaround as written cannot be used. The practical rule is instead: run
+  each verification as one self-contained command, and retry once if it dies without a summary
+  line. `logs/5b_sigterm_finding.md` still stands as the original evidence.
 
-- **C90 (CRITICAL)** — Local Exec Reaper is now killing pytest runs at 3-27 seconds. `oom_kill=0`, memory is fine. It's killing the process group (exit 143). Local verification of large suites is impossible until this is fixed. 
 - **C92** — `agent/knowledge/codebase_indexer.py:38-39` installs module-level `SIGINT`/`SIGTERM` handlers on import. This is a latent defect that could hijack the server's signal handling.

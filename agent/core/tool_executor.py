@@ -11,7 +11,14 @@ import tiktoken
 from pydantic import ValidationError
 from agent.logging import log
 from agent.logging.lifecycle import log_tool_call_raw
-from fast_json_repair import loads as repair_loads
+try:
+    from fast_json_repair import loads as repair_loads
+except ImportError:  # pragma: no cover - optional dependency
+    # Fast path unavailable (package not installed): fall back to the standard
+    # parser so a missing optional dependency never breaks importing the tool
+    # executor.  Malformed model JSON then simply fails like plain json.loads.
+    def repair_loads(s):
+        return json.loads(s)
 from agent.core.turn_transaction import TurnTransaction
 from tools.respond import Respond
 from tools.summarize_tool import SummarizeTool

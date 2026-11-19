@@ -113,7 +113,7 @@ class _FakeThread:
     def send_query(self, query, timeout=None):
         return "reply-ok"
 
-    def pause(self):
+    def pause(self, *, manual_only: bool = False):
         self.status = "paused"
 
     def resume(self):
