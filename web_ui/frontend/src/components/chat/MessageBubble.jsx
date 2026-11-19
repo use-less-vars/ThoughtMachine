@@ -234,29 +234,52 @@ function SystemNoticeText({ content }) {
 /* ── Attached images on a user message ──
  *
  * The transcript NEVER carries image bytes: the server keeps metadata only
- * ({id, media_type, width, height}) and the bytes live in its ephemeral
- * ``agent.core.image_store``.  The pasted data URL is the browser's own copy,
- * so ``localImagePreviews`` (attached by utils/pastedImagePreviews when the
- * server echoes the message back) is the ONLY way a thumbnail can be shown.
- * With no local copy the bubble renders a neutral placeholder rather than a
- * broken <img>.
+ * ({id, media_type, width, height}) and serves the bytes itself from
+ * ``GET /api/session/{session_id}/image/{image_id}``.  Cookie auth is
+ * SameSite=Strict, so a plain <img src> authenticates — no bearer token, no
+ * fetch+blob dance.
+ *
+ * Two sources, in that order:
+ *   1. ``localImagePreviews`` — the browser's own copy of a just-pasted picture,
+ *      re-attached by utils/pastedImagePreviews on EVERY echo of the row, so a
+ *      picture paints instantly (and keeps painting after re-renders).
+ *   2. the durable route above — works after a reload, in another tab, and once
+ *      the preview registry has evicted the picture.
+ *
+ * The placeholder is a LAST resort: it appears only when neither source can be
+ * shown (no preview AND no durable url) or when the durable image actually
+ * failed to load.
  */
-function MessageImages({ msg }) {
+
+/** Durable byte URL for one server image id. */
+function durableImageSrc(sessionId, imageId) {
+  if (!sessionId || imageId === undefined || imageId === null || imageId === '') return null
+  return `/api/session/${encodeURIComponent(sessionId)}/image/${encodeURIComponent(imageId)}`
+}
+
+function MessageImages({ msg, sessionId }) {
   const images = Array.isArray(msg.images) ? msg.images : []
-  if (images.length === 0) return null
   const previews = Array.isArray(msg.localImagePreviews) ? msg.localImagePreviews : []
+  /* Load failures are tracked by the URL that failed, so a later render with a
+   * different source (a preview for a durable url that 404'd, or a new message
+   * re-using this bubble instance) is not poisoned by an older failure. */
+  const [failedSrc, setFailedSrc] = useState({})
+  if (images.length === 0) return null
+  const markFailed = (src) =>
+    setFailedSrc((prev) => (prev[src] ? prev : { ...prev, [src]: true }))
   return (
     <div className="message-images">
       {images.map((img, i) => {
         const mediaType = (img && img.media_type) || 'image'
-        const src = previews[i] || (img && typeof img.data_url === 'string' ? img.data_url : null)
-        if (!src) {
+        const key = (img && img.id) || i
+        const src = previews[i] || durableImageSrc(sessionId, img && img.id) || null
+        if (!src || failedSrc[src]) {
           return (
             <div
               className="message-image-placeholder"
-              key={(img && img.id) || i}
+              key={key}
               data-testid="message-image-placeholder"
-              title={`${mediaType} — preview not available in this tab`}
+              title={`${mediaType} — image unavailable`}
             >
               <span className="message-image-placeholder-label">Image</span>
             </div>
@@ -265,11 +288,12 @@ function MessageImages({ msg }) {
         return (
           <img
             className="message-image-thumb"
-            key={(img && img.id) || i}
+            key={key}
             src={src}
             alt={`Attached image ${i + 1}`}
             title={mediaType}
             data-testid="message-image-thumb"
+            onError={() => markFailed(src)}
           />
         )
       })}
@@ -278,7 +302,7 @@ function MessageImages({ msg }) {
 }
 
 /* ── Route content based on role ── */
-function MessageContent({ msg }) {
+function MessageContent({ msg, sessionId }) {
   /* Summary results: dark golden, full markdown, no truncation */
   if (msg.is_summary) {
     return <SummaryContent content={msg.content} />
@@ -325,7 +349,7 @@ function MessageContent({ msg }) {
       return (
         <>
           <p className="message-text">{msg.content}</p>
-          <MessageImages msg={msg} />
+          <MessageImages msg={msg} sessionId={sessionId} />
         </>
       )
   }
@@ -333,7 +357,7 @@ function MessageContent({ msg }) {
 
 /* ── Single bubble ── */
 const MessageBubble = React.memo(
-  function MessageBubble({ msg, index }) {
+  function MessageBubble({ msg, index, sessionId }) {
   /* ── System notifications are stored as 'user' role with is_system_notification flag ── */
   const effectiveRole = (msg.is_final && !msg.is_system_notification)
     ? (msg.response_type === 'question' ? 'question' : 'final')
@@ -353,12 +377,14 @@ const MessageBubble = React.memo(
         {style.label}
         <CopyButton text={copyText} label="📋" />
       </div>
-      <MessageContent msg={msg} />
+      <MessageContent msg={msg} sessionId={sessionId} />
     </div>
   )
   },
   (prev, next) =>
     prev.index === next.index &&
+    // The session id is the prefix of every durable image url.
+    prev.sessionId === next.sessionId &&
     prev.msg.content === next.msg.content &&
     prev.msg.role === next.msg.role &&
     prev.msg.reasoning_content === next.msg.reasoning_content &&

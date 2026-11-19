@@ -1582,7 +1582,11 @@ class Agent:
             # place a turn's images join the conversation, whatever transport
             # queued the query.
             from agent.core import image_gc
-            image_gc.track_images(self.session_id, images)
+            image_gc.track_images(
+                self.session_id,
+                images,
+                getattr(getattr(self, '_session', None), 'workspace_id', None),
+            )
             self._add_to_conversation(user_msg)
             estimated_tokens = self._estimate_tokens(user_msg)
             self.state.current_conversation_tokens += estimated_tokens

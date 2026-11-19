@@ -10,6 +10,7 @@ Tests cover:
 - Session listing and deletion
 """
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
+from agent.core import image_files
 from session.store import FileSystemSessionStore
 
 
@@ -291,6 +293,229 @@ class TestDeleteSession:
         # The owning workspace can still delete it.
         assert store.delete_session(session_id, workspace_id="ws-b") is True
         assert store.load_session(session_id, workspace_id="ws-b") is None
+
+
+# --- Delete Session Image Cleanup ---
+#
+# Deleting a session must reclaim the durable image bytes only THAT session
+# owned: the ids its history named, MINUS whatever the surviving transcripts of
+# the same workspace still mention.  The ordering inside delete_session is the
+# whole point -- candidates are captured while the file is still readable, the
+# file is removed, and only then is the workspace re-scanned -- so these tests
+# drive the real SessionStore and the real image store against a throw-away
+# vault root instead of mocking either half.  Contract: a file goes only when
+# no surviving session of the same workspace references it; an id another
+# session still references survives; an identically-named file in ANOTHER
+# workspace is never touched; an unknown workspace or a scan that could not
+# read every transcript deletes NOTHING; and exactly one INFO line is logged
+# per deletion, including the zero-removed case.
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"png-payload" * 4
+
+
+@pytest.fixture
+def image_vault(tmp_path, monkeypatch):
+    """Point the vault at a throw-away directory for the duration of a test."""
+    root = tmp_path / "vault"
+    root.mkdir()
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(root))
+    return root
+
+
+@pytest.fixture
+def vault_store(image_vault):
+    """A real store writing into the throw-away vault."""
+    return FileSystemSessionStore(
+        sessions_dir=str(image_vault / "legacy-sessions"),
+        state_dir=str(image_vault / "state"),
+        enable_session_history_pruning=False,
+    )
+
+
+def _image_files_of(vault: Path, workspace_id: str, image_id: str):
+    """Every stored file of *image_id* in *workspace_id* (0 or 1 in practice)."""
+    images_dir = vault / "workspaces" / workspace_id / "images"
+    return sorted(images_dir.glob(f"{image_id}.*")) if images_dir.is_dir() else []
+
+
+def _image_stored(vault: Path, workspace_id: str, image_id: str) -> bool:
+    """Whether the bytes of *image_id* are still on disk in *workspace_id*."""
+    return bool(_image_files_of(vault, workspace_id, image_id))
+
+
+def _save_image_session(store, session_id: str, history: list,
+                        workspace_id="ws-a", name: str = "Images"):
+    """Persist a real session (a real ``Session``, via the real store).
+
+    Saved into *workspace_id* by default: a scoped ``delete_session`` only
+    scans that one workspace's directory, so a record parked in the
+    workspace-agnostic legacy directory would not be found by it at all.
+    """
+    from session.models import Session
+
+    session = Session(session_id=session_id, user_history=history,
+                      metadata={"name": name}, workspace_id=workspace_id)
+    store.save_session(session, workspace_id=workspace_id)
+    return session
+
+
+def _cleanup_info_lines(caplog):
+    """The image-cleanup INFO lines this test logged (one per deletion)."""
+    return [record for record in caplog.records
+            if record.levelno == logging.INFO
+            and "Image cleanup" in record.getMessage()]
+
+
+class TestDeleteSessionImageCleanup:
+    def test_deleting_a_session_unlinks_the_images_only_it_referenced(
+        self, image_vault, vault_store
+    ):
+        """The ids the deleted session's history named are removed from disk."""
+        first = image_files.save_image("ws-a", "image/png", PNG)
+        second = image_files.save_image("ws-a", "image/png", PNG)
+        _save_image_session(vault_store, "s1",
+                            [{"role": "user", "images": [{"id": first}, {"id": second}]}])
+        assert _image_stored(image_vault, "ws-a", first)
+        assert _image_stored(image_vault, "ws-a", second)
+
+        assert vault_store.delete_session("s1", workspace_id="ws-a") is True
+
+        assert not _image_stored(image_vault, "ws-a", first)
+        assert not _image_stored(image_vault, "ws-a", second)
+
+    def test_an_id_a_surviving_session_references_survives(
+        self, image_vault, vault_store
+    ):
+        """An id another session of the SAME workspace still names is kept."""
+        shared = image_files.save_image("ws-a", "image/png", PNG)
+        private = image_files.save_image("ws-a", "image/png", PNG)
+        _save_image_session(vault_store, "s1",
+                            [{"role": "user", "images": [{"id": shared},
+                                                         {"id": private}]}],
+                            workspace_id="ws-a", name="Doomed")
+        _save_image_session(vault_store, "s2",
+                            [{"role": "user", "images": [{"id": shared}]}],
+                            workspace_id="ws-a", name="Survivor")
+
+        assert vault_store.delete_session("s1", workspace_id="ws-a") is True
+
+        assert _image_stored(image_vault, "ws-a", shared)
+        # ... and the doomed session's own, unreferenced id really was reclaimed,
+        # so this is a real survivor rather than a no-op prune.
+        assert not _image_stored(image_vault, "ws-a", private)
+        assert vault_store.load_session("s2", workspace_id="ws-a") is not None
+
+    def test_an_identically_named_image_in_another_workspace_is_untouched(
+        self, image_vault, vault_store
+    ):
+        """The same id stored in ws-b is not reachable from a ws-a delete."""
+        image_id = image_files.save_image("ws-a", "image/png", PNG)
+        other_images = image_vault / "workspaces" / "ws-b" / "images"
+        other_images.mkdir(parents=True, exist_ok=True)
+        (other_images / f"{image_id}.png").write_bytes(PNG)
+        _save_image_session(vault_store, "s1",
+                            [{"role": "user", "images": [{"id": image_id}]}])
+
+        assert vault_store.delete_session("s1", workspace_id="ws-a") is True
+
+        assert not _image_stored(image_vault, "ws-a", image_id)
+        assert _image_stored(image_vault, "ws-b", image_id)
+
+    def test_an_unknown_workspace_retains_the_images_and_still_deletes_the_json(
+        self, image_vault, vault_store, caplog
+    ):
+        """A legacy record with no workspace stamp deletes no bytes, only JSON."""
+        image_id = image_files.save_image("ws-a", "image/png", PNG)
+        _save_image_session(vault_store, "legacy-1",
+                           [{"role": "user", "images": [{"id": image_id}]}],
+                            workspace_id=None)
+
+        with caplog.at_level(logging.INFO):
+            assert vault_store.delete_session("legacy-1") is True
+
+        assert vault_store.load_session("legacy-1") is None
+        assert _image_stored(image_vault, "ws-a", image_id)
+        lines = _cleanup_info_lines(caplog)
+        assert len(lines) == 1, [record.getMessage() for record in lines]
+        message = lines[0].getMessage()
+        assert "scanned 1 candidate id(s)" in message
+        assert "workspace unknown" in message
+        assert "retained" in message
+
+    def test_exactly_one_info_line_per_deletion_including_the_zero_case(
+        self, image_vault, vault_store, caplog
+    ):
+        """One INFO line per deletion, and the zero-removed case is not silent."""
+        image_id = image_files.save_image("ws-a", "image/png", PNG)
+        _save_image_session(vault_store, "s1",
+                            [{"role": "user", "images": [{"id": image_id}]}],
+                            name="WithImage")
+
+        with caplog.at_level(logging.INFO):
+            assert vault_store.delete_session("s1", workspace_id="ws-a") is True
+
+        lines = _cleanup_info_lines(caplog)
+        assert len(lines) == 1, [record.getMessage() for record in lines]
+        assert "scanned 1 candidate id(s)" in lines[0].getMessage()
+        assert "removed 1 file(s)" in lines[0].getMessage()
+        assert f"freed {len(PNG)} B" in lines[0].getMessage()
+
+        # Zero-removed case: a session that named no image id at all.
+        caplog.clear()
+        _save_image_session(vault_store, "s2", [{"role": "user", "content": "no images"}],
+                            name="NoImage")
+
+        with caplog.at_level(logging.INFO):
+            assert vault_store.delete_session("s2", workspace_id="ws-a") is True
+
+        lines = _cleanup_info_lines(caplog)
+        assert len(lines) == 1, [record.getMessage() for record in lines]
+        assert "scanned 0 candidate id(s), removed 0 file(s), freed 0 B" in lines[0].getMessage()
+
+    def test_an_incomplete_scan_removes_no_image_file_and_warns(
+        self, image_vault, vault_store, caplog
+    ):
+        """An unreadable transcript makes the scan partial: delete NOTHING."""
+        image_id = image_files.save_image("ws-a", "image/png", PNG)
+        _save_image_session(vault_store, "s1",
+                            [{"role": "user", "images": [{"id": image_id}]}])
+        broken = image_vault / "workspaces" / "ws-a" / "sessions" / "truncated.json"
+        broken.write_text('{"session_id": "s2", "user_history": [', encoding="utf-8")
+
+        with caplog.at_level(logging.INFO):
+            assert vault_store.delete_session("s1", workspace_id="ws-a") is True
+
+        assert _image_stored(image_vault, "ws-a", image_id)
+        assert vault_store.load_session("s1", workspace_id="ws-a") is None
+        warnings = [record for record in caplog.records
+                    if record.levelno == logging.WARNING
+                    and "Image pruning skipped" in record.getMessage()]
+        assert len(warnings) == 1, [record.getMessage() for record in caplog.records]
+        warning = warnings[0].getMessage()
+        assert "ws-a" in warning
+        assert "1 candidate id(s) withheld" in warning
+        assert len(_cleanup_info_lines(caplog)) == 1
+
+    def test_the_return_contract_is_unchanged(self, image_vault, vault_store):
+        """True/False exactly as before: cleanup never changes the answer."""
+        image_id = image_files.save_image("ws-a", "image/png", PNG)
+        _save_image_session(vault_store, "s1",
+                            [{"role": "user", "images": [{"id": image_id}]}])
+
+        # A scoped delete cannot reach another workspace, and touches no bytes.
+        assert vault_store.delete_session("s1", workspace_id="ws-b") is False
+        assert _image_stored(image_vault, "ws-a", image_id)
+
+        # The owning workspace deletes it, once.
+        assert vault_store.delete_session("s1", workspace_id="ws-a") is True
+        assert vault_store.delete_session("s1", workspace_id="ws-a") is False
+        assert vault_store.delete_session("never-existed", workspace_id="ws-a") is False
+
+        # The unscoped (legacy sweep) form still reports True/False unchanged.
+        _save_image_session(vault_store, "s2", [{"role": "user", "content": "plain"}],
+                            workspace_id=None, name="Legacy")
+        assert vault_store.delete_session("s2") is True
+        assert vault_store.delete_session("s2") is False
 
 
 # --- Get Session Path Tests ---

@@ -130,6 +130,69 @@ function foldToolRows(list, incoming) {
   return next
 }
 
+/* ── Image attachments survive a 'replace' ──
+ *
+ * The backend re-broadcasts the FULL history on every `conversation_version`
+ * bump (user_query, tool_call, tool_result, turn, agent_responded), so a row that
+ * arrives WITHOUT its image attachments must not lose the ones an earlier echo
+ * of the same row carried.  Rows are matched on the identity the transcript
+ * actually has: `role` + `content` (+ `tool_call_id` when present); the image
+ * ids cannot be the key here because the row that needs rescuing is precisely
+ * the one arriving without them.
+ *
+ * ONLY the two image fields are rescued.  Nothing else is.
+ */
+function imageAttachments(msg) {
+  if (!msg) return null
+  const images = Array.isArray(msg.images) && msg.images.length > 0 ? msg.images : null
+  const localImagePreviews = Array.isArray(msg.localImagePreviews)
+    ? msg.localImagePreviews
+    : null
+  if (!images && !localImagePreviews) return null
+  return { images, localImagePreviews }
+}
+
+function messageIdentity(msg) {
+  if (!msg) return null
+  const role = typeof msg.role === 'string' ? msg.role : ''
+  const content = typeof msg.content === 'string' ? msg.content : ''
+  return `${role}\u0000${pairId(msg) || ''}\u0000${content}`
+}
+
+// Give every incoming row back the image attachments its previous echo carried.
+// Returns `incoming` itself when nothing needed rescuing (no needless churn).
+function preserveImageAttachments(incoming, prev) {
+  const pool = new Map()
+  for (const msg of prev || []) {
+    const carried = imageAttachments(msg)
+    if (!carried) continue
+    const key = messageIdentity(msg)
+    if (!pool.has(key)) pool.set(key, [])
+    pool.get(key).push(carried)
+  }
+  if (pool.size === 0) return incoming
+  let out = incoming
+  for (let i = 0; i < incoming.length; i += 1) {
+    const msg = incoming[i]
+    const queue = pool.get(messageIdentity(msg))
+    if (!queue || queue.length === 0) continue
+    const carried = queue[0]
+    const needsImages = !(Array.isArray(msg.images) && msg.images.length > 0)
+    const needsPreviews = !Array.isArray(msg.localImagePreviews)
+    if (!needsImages && !needsPreviews) continue
+    const patch = {}
+    if (needsImages && carried.images) patch.images = carried.images
+    if (needsPreviews && carried.localImagePreviews) {
+      patch.localImagePreviews = carried.localImagePreviews
+    }
+    if (Object.keys(patch).length === 0) continue
+    queue.shift() // one previous row rescues at most one incoming row
+    if (out === incoming) out = incoming.slice()
+    out[i] = { ...msg, ...patch }
+  }
+  return out
+}
+
 // Normalize a tools list to plain names: string entries stay as-is,
 // object entries (e.g. { name, enabled }) become their name.
 function normalizeTools(tools) {
@@ -367,7 +430,11 @@ const useStore = create((set) => ({
           : [];
         // The payload is authoritative, so discarded rows never fold into it —
         // but the payload itself may carry both phases of one call.
-        next = [...foldToolRows([], incoming), ...preserved];
+        // Image attachments are the ONE exception (see
+        // preserveImageAttachments): a re-broadcast row keeps the pictures its
+        // earlier echo carried instead of dropping them on the floor.
+        const folded = foldToolRows([], incoming);
+        next = [...preserveImageAttachments(folded, prev), ...preserved];
       }
       return { sessionMessages: { ...state.sessionMessages, [sessionId]: next } };
     }),

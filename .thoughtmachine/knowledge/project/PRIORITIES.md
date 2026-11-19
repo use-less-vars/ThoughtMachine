@@ -240,7 +240,12 @@ different file, different name. Never rename one to the other.
   until then, because the archived entry is a historical note, not a specification.
 
 - **C45: worker briefing is stripped before turn 1.**
-  **Open** — bug, high. `agent/core/llm_client.py:201` `ensure_system_prompt()` deletes, in
+  **Done (pending a CI-green confirmation).** The brief now rides a `role="user"` message
+  and the sanitizer has nothing to delete; the process-mode hole and the test gap are both
+  closed. The original report is kept below, unedited — the file's rule is that a corrected
+  item says so in place — and the evidence, including which premises moved, is in the
+  **Correction** at the end of this entry.
+  **Open (as filed)** — bug, high. `agent/core/llm_client.py:201` `ensure_system_prompt()` deletes, in
   place on `session.user_history`, every `role="system"` message whose content does not start
   with `"Summary of previous conversation:"`. It runs at `Agent.__init__` (`agent.py:554`) and
   every turn (`agent.py:1562`). Worker briefings are appended as exactly such a system message
@@ -256,6 +261,29 @@ different file, different name. Never rename one to the other.
   new survivor prefix to `ensure_system_prompt` — that rule guards token explosion elsewhere.
   The regression test must run the real `ensure_system_prompt()` over the history the worker
   actually builds. Cited at `25be340a`; the fix's first step is to re-verify each line number.
+  **Correction (Gen 70 — closed).** Every window was re-read at dev@`7bf3f1ab`, and the
+  mechanism described above no longer exists:
+  (1) **The brief is not a system message at all.** `initial_context_message()`
+      (`tools/workspace/worker_thread.py:1669-1690`) returns
+      `{"role": "user", "content": "Initial context: " + <json>}`, and its docstring names
+      the exact sanitizer pass it dodges (`agent/core/llm_client.py:229-234`). The erasure
+      path had no input left to erase.
+  (2) **The process-mode hole is closed.** `_OPTIONAL_KWARGS`
+      (`tools/workspace/worker_runtime_process.py:115-127`) carries
+      `("initial_context", "_initial_context")`, commented "Without this line the child
+      interpreter builds a worker with no brief at all." The child no longer constructs
+      `WorkerThread` with `_initial_context=None`.
+  (3) **The test gap is closed.**
+      `tests/test_worker_timeout_audit.py::TestBriefingSurvivesRealSystemPromptSanitizer::test_briefing_survives_real_ensure_system_prompt`
+      (1082-1113) runs the REAL `LLMClient.ensure_system_prompt()` over the history the
+      worker actually builds, and asserts that only the real system prompt keeps
+      `role="system"` — i.e. it fails if the brief is dropped again.
+  (4) **The "fix direction" recorded above is what shipped, not a plan.** Carrying the
+      brief on the first `user` message was done; no new survivor prefix was added to
+      `ensure_system_prompt`.
+  **Status is "Done (pending a CI-green confirmation)" deliberately: no merge SHA is
+  claimed.** The change was read on a working tree, not on a commit, and this file does not
+  cite a SHA it has not seen.
 
 - **C46: host-port kill-switch scan root is the wrong shape (class fix, not a point fix).**
   **Open.** C42's guard scans `tools/**` only. `thoughtmachine/doctor.py` has `import subprocess`
@@ -267,6 +295,15 @@ different file, different name. Never rename one to the other.
   written reason AND a reachability pin (a test that fails the day it becomes reachable).
   **Separately decide** whether `thoughtmachine/**` enters C42 scope or gets its own named
   allowlist. Do not widen C42 inside the C42 commit; that scope decision belongs here.
+  **Correction (Gen 70 — re-scoped to the scan-root half only).** Half of this entry has
+  landed: the reachability audit of `thoughtmachine/doctor.py` exists, and its reachability
+  pin exists. What is still open is the SCAN ROOT. `tests/test_host_port_kill_switch.py:53`
+  still reads `SCAN_ROOTS = ("tools",)`, so `thoughtmachine/**` has import coverage (from
+  `tests/test_tool_import_declaration_match.py`) but **no kill-switch reachability
+  coverage**: a module under `thoughtmachine/` can reach the host process surface without
+  the AST guard ever considering it. The remaining scope is exactly the named decision this
+  entry was filed to force — does `thoughtmachine/**` enter C42's scope, or get its own
+  named allowlist — and it still stays out of the C42 commit.
 
 - **C47: onboarding bundle is a stale snapshot, not a living artifact (delivered on this branch).**
   **Open** — delivered on `feat/gen64-taskB-c47-onboarding`; the entry stays open only until
@@ -438,44 +475,20 @@ different file, different name. Never rename one to the other.
   site plus a mutation-proof test), not housekeeping. C81 and C82-C85 appear nowhere in this file,
   so there is no prior scope to transcribe. Ruling needed.
 
-## Archived (pre-Gen 42 brain dump — do not read as current work)
+## Live items recovered from the Archive block (Gen 70 restructure)
 
-- **W11 (Resource Composition):** Bins (granular permissions), Dynamic Imports,
-  Host vs. Container execution flags.
-- **W12 (Worker Instances):** Physical UI for workers, Sleep/Join async tools,
-  editable Modes.
-- **W13 (Credentials & MCP):** Scoped vault injection, MCP connections,
-  Network allowlists.
-- **W14 (Tima Rebrand):** The final naming migration.
-- **UI Polish:** Session tab syncing, breadcrumb fix, tab persistence (F5 bug),
-  resource panel scrollbar.
+These thirteen entries were live, unscoped-for-deletion work that sat BELOW the
+`## Archived` heading and were therefore invisible to `scripts/gen_handoff.py`, which used to
+slice the file at that heading. Nothing about their content changed here: the bodies below are
+moved verbatim, only their position moved. They are still open unless the body says otherwise.
 
 - **C12: `cancellation.interrupt()` sticky-fallback trap.** **Open.** Calling `interrupt()` with no bound token arms a per-thread fallback event. `unbind()` does not clear it, so every subsequent `is_interrupted()` on that thread reads True permanently. This poisons the thread for the rest of the process (found during C11). Fix: clear the fallback on `unbind()`.
 
 - **C14: `visual_tool.py` missing cancellation reporting.** **Open.** An interrupted render drops the `reason` and returns `"visual: the renderer exited with code None."` to the model. This looks like a renderer crash, not an operator cancel, causing the model to hallucinate a failure. Teardown runs correctly (pinned by test). Fix: detect `status == "interrupted"` and return a clear cancellation message. (Discovered during C11').
 
-- **Known and deliberately preserved (Gen 69 housekeeping pass).** The reuse of the live ids
-  C35/C36 by the Archive block below, and the double-printing of C74-C77 (a long form, then a
-  short form a few lines later), are KNOWN and are preserved on purpose as historical record, per
-  the ruling in the Numbering block above ("archived entries are a historical record"). Do not
-  delete or renumber them, and do not read an id as a key: quote titles, not ids. The collision is
-  documented, not resolved.
-
-- **C35: Prove the Host Port is sealed.** **Open.** Create a CI test (AST scan or grep) that proves subprocess and docker invocations only occur inside the approved wrappers. No tool may bypass the kill switch.
-- **C36: Verify Worker Trust Boundary.** **Open.** Write a test proving that a worker is bound to its session workspace_id and cannot execute tools using permissions of a different session if borrowed.
-
-- **C35: Prove the Host Port is sealed.** **Open.** Create a CI test (AST scan or grep) that proves subprocess and docker invocations only occur inside the approved wrappers. No tool may bypass the kill switch.
-- **C36: Verify Worker Trust Boundary.** **Open.** Write a test proving that a worker is bound to its session workspace_id and cannot execute tools using permissions of a different session if borrowed.
-
 - **C74** — `tools/mcp_client.py` bypasses the host-port chokepoint. (~11 other unadjudicated `import subprocess` sites).
 - **C75** — The AST no-tool-wrapping guard is parked, not enforced. 3 of its 4 own tests fail on an untouched checkout.
-- **C76** — **CLOSED (Gen 69 housekeeping pass).** The flag is no longer on for the whole suite. The shipped default is `TRUST_TEST_HARNESS = False` at `web_ui/backend/auth_boundary.py:229`, and `conftest.py:160-183` forces the closed value session-wide through `set_suite_trust_value(False)` / `enable_test_harness_trust(False)`. A test opts in by name with `@pytest.mark.trust_harness`, declared at `conftest.py:215-221` and gated at `conftest.py:276`; at least 9 root-tree test files already carry it. This line was true when it was written — the session-wide grant it describes has since been replaced by per-test opt-in — so it is stale, not mistaken.
 - **C77** — `web_ui/backend/tests/test_bridge_dedup.py` poisons `sys.modules` at collection, causing real-bridge tests to skip.
-
-- **C74** — `tools/mcp_client.py` bypasses the host-port chokepoint.
-- **C75** — The AST no-tool-wrapping guard is parked, not enforced.
-- **C76** — **CLOSED (Gen 69).** No longer suite-wide: default `TRUST_TEST_HARNESS = False` (`web_ui/backend/auth_boundary.py:229`), closed session-wide by `conftest.py:160-183`; per-test opt-in via `@pytest.mark.trust_harness` (`conftest.py:215-221`, gated at `conftest.py:276`).
-- **C77** — `test_bridge_dedup.py` poisons `sys.modules` at collection.
 - **C78** — Preflight diagnostics truth: two port probes, FAIL weight on advisory output.
 - **C79** — Undeclared load-bearing config key (`git_allow_worktree_commits`) and worker worktree bootstrap failure (crash loop).
 - **C80** — `terminate_all` skips subprocesses with no pid during shutdown.
@@ -495,3 +508,51 @@ different file, different name. Never rename one to the other.
   line. `logs/5b_sigterm_finding.md` still stands as the original evidence.
 
 - **C92** — `agent/knowledge/codebase_indexer.py:38-39` installs module-level `SIGINT`/`SIGTERM` handlers on import. This is a latent defect that could hijack the server's signal handling.
+
+## Filed Gen 70 (verification debt)
+
+Debt found while repairing the generator's own blind spot, filed rather than fixed.
+
+- **C95: The onboarding router is pinned to a SHA that is not dev.** **Open.** `tests/test_onboarding_bundle_contract.py:93` holds `PINNED_DEV_SHA = "3eef2b56"`, and `HANDOFF.md`/`MAIN_ONBOARDING.md` quote `dev@3eef2b56` as the current dev tip. Measured this generation: the real dev tip is `7bf3f1ab5c6602f6fe07828937cfdce618311a8d`. The pin is documented as deliberate coupling (comment at :91-92), so this is not a simple stale literal — either the router is meant to describe a frozen point and the prose must say so, or it is meant to describe dev HEAD and the pin must be refreshed. Ruling needed; not changed here.
+
+- **C96: The handoff generator was reading a truncated file, so the live queue was smaller than the file.** **Open.** `scripts/gen_handoff.py` sliced `PRIORITIES.md` at `## Archived` before parsing, so every open item below that heading was dropped: measured 28 open ids from the pre-archive slice against 41 from the whole file (13 invisible: C12, C14, C74, C75, C77, C78, C79, C80, C86, C88, C89, C90, C92). The generator now parses the whole file and the movers are re-headed above. Two halves remain: (a) the C33 half of the same class — its slice and its vocab — was left unrepaired; (b) this entry stays open until the repair has a merge SHA. Do not close it on the strength of a working tree.
+
+- **C97: Claim repair outranks code repair.** **Open.** In this generation the file's own claims were wrong more often than the code was: C45 was recorded open for six generations after the mechanism it describes was already pinned working, and C46 described a guard that does not exist in the scope it named. Both were settled by reading code, not by writing it. Standing rule for the next runner: read the cited file before scheduling the work, and repair the entry before repairing code that may not be broken.
+
+- **C98: The knowledge base advertises domains it cannot serve.** **Open.** The KB tool's domain list names surfaces that do not resolve for an agent session; `MAIN_ONBOARDING` and `project/MAIN_ONBOARDING` were both rejected. Workaround that works: `git_read show_file(source='committed'|'working', path=...)`, which reports which source it used. Not repaired here — the domain list and the readable set must be reconciled, and that is a tool-surface change, not a doc edit.
+
+## Archived (pre-Gen 42 brain dump — do not read as current work)
+
+- **W11 (Resource Composition):** Bins (granular permissions), Dynamic Imports,
+  Host vs. Container execution flags.
+- **W12 (Worker Instances):** Physical UI for workers, Sleep/Join async tools,
+  editable Modes.
+- **W13 (Credentials & MCP):** Scoped vault injection, MCP connections,
+  Network allowlists.
+- **W14 (Tima Rebrand):** The final naming migration.
+- **UI Polish:** Session tab syncing, breadcrumb fix, tab persistence (F5 bug),
+  resource panel scrollbar.
+
+- **Known and deliberately preserved (Gen 69 housekeeping pass).** The reuse of the live ids
+  C35/C36 by the Archive block below, and the double-printing of C74-C77 (a long form, then a
+  short form a few lines later), are KNOWN and are preserved on purpose as historical record, per
+  the ruling in the Numbering block above ("archived entries are a historical record"). Do not
+  delete or renumber them, and do not read an id as a key: quote titles, not ids. The collision is
+  documented, not resolved.
+  **Correction (Gen 70 restructure):** the C12/C14 bodies and the C74/C75/C77 long forms have
+  moved UP, out of this block, because they were live work rather than history (see
+  `## Live items recovered from the Archive block`). What remains below is the C35/C36 historical
+  pair and the CLOSED C76 pair. The C35/C36 lines still read `**Open.**` because that is what the
+  record said when it was written — they are record, not status, and the live C35/C36 entries in
+  the Active list are the status. `scripts/gen_handoff.py` de-duplicates by id (first occurrence
+  wins), so the copies below never reach the generated handoff; that masking is why the double
+  printing was survivable, and it is also why it went unnoticed.
+
+- **C35: Prove the Host Port is sealed.** **Open.** Create a CI test (AST scan or grep) that proves subprocess and docker invocations only occur inside the approved wrappers. No tool may bypass the kill switch.
+- **C36: Verify Worker Trust Boundary.** **Open.** Write a test proving that a worker is bound to its session workspace_id and cannot execute tools using permissions of a different session if borrowed.
+
+- **C35: Prove the Host Port is sealed.** **Open.** Create a CI test (AST scan or grep) that proves subprocess and docker invocations only occur inside the approved wrappers. No tool may bypass the kill switch.
+- **C36: Verify Worker Trust Boundary.** **Open.** Write a test proving that a worker is bound to its session workspace_id and cannot execute tools using permissions of a different session if borrowed.
+
+- **C76** — **CLOSED (Gen 69 housekeeping pass).** The flag is no longer on for the whole suite. The shipped default is `TRUST_TEST_HARNESS = False` at `web_ui/backend/auth_boundary.py:229`, and `conftest.py:160-183` forces the closed value session-wide through `set_suite_trust_value(False)` / `enable_test_harness_trust(False)`. A test opts in by name with `@pytest.mark.trust_harness`, declared at `conftest.py:215-221` and gated at `conftest.py:276`; at least 9 root-tree test files already carry it. This line was true when it was written — the session-wide grant it describes has since been replaced by per-test opt-in — so it is stale, not mistaken.
+- **C76** — **CLOSED (Gen 69).** No longer suite-wide: default `TRUST_TEST_HARNESS = False` (`web_ui/backend/auth_boundary.py:229`), closed session-wide by `conftest.py:160-183`; per-test opt-in via `@pytest.mark.trust_harness` (`conftest.py:215-221`, gated at `conftest.py:276`).

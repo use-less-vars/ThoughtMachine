@@ -19,6 +19,7 @@ from agent.config.secret import reveal_secret
 from .tool_converter import ToolFormatConverter
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
 from agent.core.image_store import IMAGE_UNSUPPORTED_PLACEHOLDER
+from agent.core.ir import UnsupportedContentError
 from agent.logging import log
 
 # Images already reported as unsendable through this adapter, keyed by
@@ -237,6 +238,9 @@ class AnthropicProvider(LLMProvider):
             llm_response = self.parse_response(response, start_time)
             self.track_usage(llm_response)
             return llm_response
+        except UnsupportedContentError:
+            # Keep the capability refusal's own type (see _reject_image_content).
+            raise
         except RateLimitError as e:
             if os.environ.get('DEBUG_ANTHROPIC'):
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] RateLimitError: {e}')

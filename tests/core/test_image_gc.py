@@ -13,6 +13,8 @@ Everything is in-memory: no provider, no network, no real session files beyond
 ``tmp_path``.
 """
 
+import json
+import logging
 import sys
 from pathlib import Path
 
@@ -22,7 +24,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import pytest
 
-from agent.core import image_gc, image_store
+from agent.core import image_files, image_gc, image_store
 
 
 @pytest.fixture(autouse=True)
@@ -43,6 +45,37 @@ def _stored(data: bytes) -> str:
 def _user_message(*ids):
     """A user message referencing *ids* -- the shape the transcript persists."""
     return {'role': 'user', 'content': 'what is wrong here?', 'images': list(ids)}
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"png-payload" * 4
+
+WORKSPACE = 'ws-close'
+
+
+@pytest.fixture
+def vault(tmp_path, monkeypatch):
+    """Point the vault at a throw-away directory for the duration of a test.
+
+    ``image_files`` resolves the vault root itself, so a test that lets
+    ``drop_session`` reach the reference scan MUST take this fixture -- the
+    default root is the real user vault.
+    """
+    root = tmp_path / "vault"
+    root.mkdir()
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(root))
+    return root
+
+
+def _write_session(vault: Path, workspace_id: str, session_id: str, history: list) -> Path:
+    """Write one session record the way the store lays it out on disk."""
+    sessions_dir = vault / "workspaces" / workspace_id / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    path = sessions_dir / f"{session_id}.json"
+    path.write_text(
+        json.dumps({"session_id": session_id, "user_history": history}),
+        encoding="utf-8",
+    )
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +312,89 @@ def test_reset_forgets_every_session():
 
     assert image_gc.tracked_ids('sess-a') == set()
     assert image_gc.tracked_ids('sess-b') == set()
+
+
+# ---------------------------------------------------------------------------
+# session close: byte reclamation (``drop_session`` -> ``_unlink_over``)
+#
+# The in-memory tracking is gone once a session closes, so the only authority
+# left is what the workspace's persisted transcripts say.  Deletion is
+# therefore conservative in both directions: an unknown workspace deletes
+# nothing, and a scan that could not read every transcript deletes nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_close_reclaims_an_image_no_persisted_transcript_references(vault):
+    """An unreferenced file of a closing session is unlinked; the count is honest."""
+    orphan = image_files.save_image(WORKSPACE, "image/png", PNG)
+    image_gc.track_images('sess-a', [orphan], workspace_id=WORKSPACE)
+
+    image_gc.drop_session('sess-a', workspace_id=WORKSPACE)
+
+    assert image_files.load_image(WORKSPACE, orphan) is None
+    assert image_gc.tracked_ids('sess-a') == set()
+
+    # Only files that actually existed are counted.
+    second = image_files.save_image(WORKSPACE, "image/png", PNG)
+    assert image_gc._unlink_over(WORKSPACE, [second]) == 1
+    assert image_gc._unlink_over(WORKSPACE, [second]) == 0
+
+
+def test_close_without_a_workspace_keeps_the_bytes(vault):
+    """Backward compatibility: no workspace known, explicit or stored, no unlink."""
+    implicit = image_files.save_image(WORKSPACE, "image/png", PNG)
+    explicit_none = image_files.save_image(WORKSPACE, "image/png", PNG)
+    image_gc.track_images('sess-omitted', [implicit])
+    image_gc.track_images('sess-explicit', [explicit_none])
+
+    image_gc.drop_session('sess-omitted')  # argument omitted entirely
+    image_gc.drop_session('sess-explicit', workspace_id=None)
+
+    assert image_gc.tracked_ids('sess-omitted') == set()
+    assert image_gc.tracked_ids('sess-explicit') == set()
+    assert image_files.load_image(WORKSPACE, implicit) == PNG
+    assert image_files.load_image(WORKSPACE, explicit_none) == PNG
+
+
+def test_close_keeps_an_image_a_persisted_transcript_still_references(vault):
+    kept = image_files.save_image(WORKSPACE, "image/png", PNG)
+    _write_session(vault, WORKSPACE, 'sess-other', [_user_message(kept)])
+    image_gc.track_images('sess-a', [kept], workspace_id=WORKSPACE)
+
+    image_gc.drop_session('sess-a', workspace_id=WORKSPACE)
+
+    assert image_files.load_image(WORKSPACE, kept) == PNG
+    assert image_gc.tracked_ids('sess-a') == set()
+
+
+def test_close_keeps_everything_when_a_transcript_cannot_be_read(vault, caplog):
+    """An incomplete scan may UNDER-count, so it keeps all candidates."""
+    orphan = image_files.save_image(WORKSPACE, "image/png", PNG)
+    broken = vault / "workspaces" / WORKSPACE / "sessions" / "broken.json"
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_text("{not json", encoding="utf-8")
+    image_gc.track_images('sess-a', [orphan], workspace_id=WORKSPACE)
+
+    with caplog.at_level(logging.WARNING, logger="agent.core.image_gc"):
+        image_gc.drop_session('sess-a', workspace_id=WORKSPACE)
+
+    assert image_files.load_image(WORKSPACE, orphan) == PNG
+    assert any(
+        record.levelno == logging.WARNING and 'could not be read' in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_gc_session_never_unlinks_a_durable_file(vault):
+    """gc_session runs on EVERY turn: it collects the store, never disk."""
+    dropped = image_files.save_image(WORKSPACE, "image/png", PNG)
+    image_gc.track_images('sess-a', [dropped], workspace_id=WORKSPACE)
+
+    released = image_gc.gc_session('sess-a', [])
+
+    assert released == 0  # never in the in-memory store, so nothing to release
+    assert image_gc.tracked_ids('sess-a') == set()
+    assert image_files.load_image(WORKSPACE, dropped) == PNG
 
 
 # ---------------------------------------------------------------------------

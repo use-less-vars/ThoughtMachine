@@ -21,12 +21,14 @@ import thoughtmachine.workspace_lifecycle as wl
 
 WS_ID = "ws-lifecycle-test"
 SID = "sess-000000-lifecycle"
+IMAGE_NAME = "img-deadbeef.png"
 
 EXPECTED_STEPS = [
     "user_containers",
     "resource_containers_and_image",
     "package_volume",
     "workspace_sessions",
+    "workspace_images",
     "workspace_vault_dir",
     "registry_unregister",
 ]
@@ -49,11 +51,15 @@ def vault(tmp_path, monkeypatch):
     return vault_path
 
 
-def _make_workspace(vault, ws_id=WS_ID, with_session=True):
-    """Seed a workspace vault dir (config, workers, notes, session file)."""
+def _make_workspace(vault, ws_id=WS_ID, with_session=True, with_images=True):
+    """Seed a workspace vault dir (config, workers, notes, session, images)."""
     ws_dir = vault / "workspaces" / ws_id
     sessions_dir = ws_dir / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
+    if with_images:
+        images_dir = ws_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        (images_dir / IMAGE_NAME).write_bytes(b"png-bytes")
     (ws_dir / "config.json").write_text(
         json.dumps({"name": ws_id}), encoding="utf-8"
     )
@@ -321,6 +327,34 @@ class TestFullDelete:
         assert "package_volume" not in report["removed"]
         assert not (vault / "workspaces" / WS_ID).exists()
 
+    def test_workspace_images_are_deleted_and_reported(
+        self, vault, tmp_path, monkeypatch
+    ):
+        """Pasted-image bytes are their own reported step, not the vault dir."""
+        ws_dir = _make_workspace(vault, with_session=True)
+        images_dir = ws_dir / "images"
+        assert (images_dir / IMAGE_NAME).exists()
+        _patch_deps(monkeypatch, tmp_path)
+
+        report = wl.delete_workspace(WS_ID)
+
+        assert report["errors"] == []
+        assert "workspace_images" in report["removed"]
+        assert "workspace_images" not in report["skipped"]
+        assert not images_dir.exists()
+
+    def test_missing_images_dir_is_skipped(self, vault, tmp_path, monkeypatch):
+        """No stored images → workspace_images skipped, not an error."""
+        _make_workspace(vault, with_session=False, with_images=False)
+        _patch_deps(monkeypatch, tmp_path)
+
+        report = wl.delete_workspace(WS_ID)
+
+        assert report["errors"] == []
+        assert "workspace_images" in report["skipped"]
+        assert "workspace_images" not in report["removed"]
+        assert not (vault / "workspaces" / WS_ID).exists()
+
 
 class TestSessionBookkeeping:
     def test_foreign_current_session_marker_is_kept(self, vault, tmp_path, monkeypatch):
@@ -379,3 +413,24 @@ class TestSymlinkSafety:
         assert (real_dir / "payload.txt").read_text(encoding="utf-8") == "payload"
         # The symlink itself is still there (nothing was deleted).
         assert link.is_symlink()
+
+    def test_symlinked_images_dir_is_refused(self, vault, tmp_path, monkeypatch):
+        """A symlinked ``images`` dir is never followed; the step errors out."""
+        real_dir = tmp_path / "real-images"
+        real_dir.mkdir(parents=True, exist_ok=True)
+        (real_dir / "payload.png").write_bytes(b"payload")
+
+        ws_dir = _make_workspace(vault, with_session=True, with_images=False)
+        link = ws_dir / "images"
+        link.symlink_to(real_dir, target_is_directory=True)
+
+        _patch_deps(monkeypatch, tmp_path)
+
+        report = wl.delete_workspace(WS_ID)
+
+        errors = {e["step"]: e["error"] for e in report["errors"]}
+        assert "workspace_images" in errors
+        assert "refusing to delete symlink" in errors["workspace_images"]
+        assert "workspace_images" not in report["removed"]
+        # The real target and its payload are untouched.
+        assert (real_dir / "payload.png").read_bytes() == b"payload"
