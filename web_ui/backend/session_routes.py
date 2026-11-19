@@ -8,18 +8,22 @@ Provides:
 - DELETE /api/session/{session_id}    — delete a session
 - GET    /api/session/{session_id}/permissions  — stored raw + computed effective session permissions
 - PUT    /api/session/{session_id}/permissions  — atomically replace the stored raw session permissions
+- GET    /api/session/{session_id}/image/{image_id}  — bytes of one pasted image this session owns
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ValidationError
 
+from agent.core import image_files
 from session.store import FileSystemSessionStore
 from session.session_registry import SessionRegistry
 from agent.logging import log
@@ -44,6 +48,7 @@ from thoughtmachine.workspace_capabilities import (
 )
 
 from web_ui.backend.config_manager import ConfigManager
+from web_ui.backend.event_forwarder import _active_tab_bridges
 from web_ui.backend.session_manager import SessionManager
 
 # ── Router ──────────────────────────────────────────────────────────────────
@@ -592,4 +597,228 @@ async def put_session_permissions(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to save session permissions: {exc}",
+        )
+
+
+# ── GET /api/session/{session_id}/image/{image_id} ────────────────────────────
+# The bytes of a pasted screenshot are the one thing the websocket transport does
+# NOT carry (see ``web_ui/backend/image_ingest.py``): the envelope ships ids plus
+# metadata, and this route is how the browser turns an id back into pixels.
+# Because it serves bytes, the two binds below ARE the security contract, and
+# both are resolved from server-side state — never from request input:
+#
+# 1. Workspace.  The session's OWN workspace, through the one authoritative
+#    resolver the rest of the backend uses
+#    (``FileSystemSessionStore.load_session_workspace_id``).  A ``workspace_id``
+#    query parameter is deliberately NOT accepted: cookie auth proves *some*
+#    session, and a client-supplied workspace is the client-claim class.
+# 2. Reference.  The id must appear in that session's OWN history.  A valid
+#    session id plus a borrowed (or guessed) image id is still a 404, so the
+#    bytes of another session are unreachable even inside one workspace.
+#
+# Every miss is the SAME 404 with the same detail — unknown session, unknown id,
+# malformed id, unreadable path: the caller is never told which bind failed.
+
+
+def _held_sessions(bridge: Any, session_id: str) -> List[Any]:
+    """Every ``Session`` object *bridge* currently holds for *session_id*.
+
+    Ordered by authority, most authoritative first: the running agent's own
+    session (the object its turn loop and model read), then the bridge's
+    ``_session``, then ``_loaded_session`` (the object the next ``start()`` will
+    run).  De-duplicated by identity, so a bridge that aliases the same Session
+    three ways contributes it once.
+    """
+    candidates = [
+        getattr(getattr(bridge, "_agent", None), "session", None),
+        getattr(bridge, "_session", None),
+        getattr(bridge, "_loaded_session", None),
+    ]
+    held: List[Any] = []
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if getattr(candidate, "session_id", None) != session_id:
+            continue
+        if any(candidate is existing for existing in held):
+            continue
+        held.append(candidate)
+    return held
+
+
+def _live_bridges(session_id: str) -> List[Any]:
+    """Live bridges holding *session_id*, the agent-bearing one first.
+
+    Both live registries are consulted, because a session can be live in this
+    process without being in either one alone: the tab set
+    (``_active_tab_bridges``) knows the bridges a connected tab is driving, and
+    the server's warm cache (``web_ui.backend.server._session_bridges``) knows
+    the bridges it will hand back to a reconnecting tab — and a bridge can sit in
+    the warm cache while absent from the tab set, because the warm-reuse path
+    re-attaches the cached bridge without re-registering it.
+
+    The server module is looked up in ``sys.modules`` and NEVER imported here:
+    it imports this router, so importing it back would be circular (and it has
+    heavy import-time side effects).  When it has not been imported in this
+    process there is no warm cache and the tab set is the whole answer.
+
+    Both registries are snapshotted (``list(...)``) and de-duplicated by bridge
+    identity, so a tab connecting or disconnecting mid-request cannot change the
+    set under the loop.
+    """
+    server = sys.modules.get("web_ui.backend.server")
+    registry = getattr(server, "_session_bridges", None)
+    warm: List[Any] = []
+    if isinstance(registry, dict):
+        cached = registry.get(session_id)
+        if cached is not None:
+            warm.append(cached)
+    candidates: List[Any] = []
+    for bridge in warm + list(_active_tab_bridges):
+        if any(bridge is known for known in candidates):
+            continue
+        candidates.append(bridge)
+    live = [bridge for bridge in candidates if _held_sessions(bridge, session_id)]
+    live.sort(key=lambda bridge: getattr(bridge, "_agent", None) is None)
+    return live
+
+
+#: Module logger for server-side diagnostics.  Nothing logged through it is
+#: ever rendered to a client -- see ``_image_not_found``.
+logger = logging.getLogger(__name__)
+
+
+def _image_not_found(reason: str, session_id: str, image_id: str) -> HTTPException:
+    """Build THE 404 every image miss returns, and record *why* server-side.
+
+    Every miss -- unknown session, unknown id, malformed id, another
+    workspace's id, an id this session never referenced, an id whose file is
+    gone -- must be observationally identical: same status, same body
+    (``{"detail": "not found"}``), no distinguishing detail string.  Two
+    different refusals would turn the route into an oracle for which sessions
+    and which ids exist elsewhere.  Hence one constructor, used by every miss
+    branch, so they cannot drift apart.
+
+    The real reason is not discarded, only kept server-side: ``reason`` is a
+    coarse category (``unknown-session``, ``malformed-image-id``,
+    ``id-not-referenced``, ``image-unreadable``), never a message from the
+    store, and no filesystem path is ever logged -- an absolute path in a log a
+    support bundle might carry is a leak of its own.
+
+    Args:
+        reason: Category naming which check failed.
+        session_id: The session the caller asked about.
+        image_id: The id the caller asked about.
+    """
+    logger.info(
+        "session image miss (%s) session=%r image=%r", reason, session_id, image_id,
+    )
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="not found",
+    )
+
+
+def _session_workspace_id(
+    session_id: str, bridges: List[Any], store: FileSystemSessionStore,
+) -> Optional[str]:
+    """The workspace that owns *session_id*; resolved server-side only.
+
+    The store is the durability authority and answers first.  Its ``None`` is
+    not "unknown, guess": it means no persisted record names a workspace yet —
+    the window between a brand-new session's first turn and its first save — and
+    then the live binding answers, which is process-side state too
+    (``WebAgentBridge._workspace_id`` is written by the single binding authority
+    ``bind_workspace``, never by a request body).  Request input reaches neither
+    branch.
+    """
+    try:
+        workspace_id = store.load_session_workspace_id(session_id)
+    except Exception as exc:
+        log('WARNING', 'session_routes',
+            f'Could not resolve the workspace of session {session_id}: {exc}')
+        workspace_id = None
+    if workspace_id:
+        return workspace_id
+    for bridge in bridges:
+        candidate = getattr(bridge, "_workspace_id", None)
+        if candidate:
+            return candidate
+    return None
+
+
+@router.get("/{session_id}/image/{image_id}")
+async def get_session_image(session_id: str, image_id: str) -> Response:
+    """Serve one pasted image's bytes, double-bound to session and workspace.
+
+    ``200`` with the image's own media type, or ``404`` for any miss — see the
+    section comment above for why every miss looks identical.
+
+    The session's history is read live-first: the user message that carries a
+    freshly ingested id is appended to the running session object, and only the
+    end-of-turn save puts the same id on disk, so the store alone would 404 a
+    thumbnail the user is already looking at.
+    """
+    try:
+        store = _get_store()
+        # A malformed id names no file by construction (the store's own shape
+        # check refuses it), so refuse it here rather than asking the store a
+        # question whose answer is already known -- and give it its own reason
+        # category in the log.
+        if not image_files.IMAGE_ID_RE.match(image_id):
+            raise _image_not_found("malformed-image-id", session_id, image_id)
+        bridges = _live_bridges(session_id)
+        histories: List[Any] = []
+        for bridge in bridges:
+            for held in _held_sessions(bridge, session_id):
+                history = getattr(held, "user_history", None)
+                if history:
+                    histories.append(history)
+        if not histories:
+            session = store.load_session(session_id)
+            if session is None:
+                raise _image_not_found("unknown-session", session_id, image_id)
+            histories = [session.user_history]
+
+        referenced: set = set()
+        for history in histories:
+            referenced |= image_files.referenced_ids_from_history(history)
+        if image_id not in referenced:
+            raise _image_not_found("id-not-referenced", session_id, image_id)
+
+        workspace_id = _session_workspace_id(session_id, bridges, store)
+        media_type = (
+            image_files.media_type_of(workspace_id, image_id) if workspace_id else None
+        )
+        data = image_files.load_image(workspace_id, image_id) if workspace_id else None
+        if media_type is None or data is None:
+            # One bucket on purpose: the store reports "no file under this
+            # workspace" identically for a deleted file and for another
+            # workspace's file, and inventing a distinction here would have to
+            # come from asking a question the store cannot answer.
+            raise _image_not_found("image-unreadable", session_id, image_id)
+        # The first binary response in this codebase: state every header rather
+        # than inheriting a framework default.  ``immutable`` is earned by the
+        # id, not assumed -- ids are minted per ingest and the bytes behind one
+        # never change, so a cached copy can never go stale.
+        headers = {
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, max-age=3600, immutable",
+            "Content-Disposition": "inline",
+            "Content-Length": str(len(data)),
+        }
+        return Response(content=data, media_type=media_type, headers=headers)
+    except HTTPException:
+        raise
+    except Exception:
+        # Generic body on purpose: the exception text can carry store internals
+        # and absolute paths, which are exactly what this route's 404s are
+        # careful never to reveal.  The real cause is recorded server-side and
+        # never rendered to the client (see ``logger`` above).
+        logger.exception(
+            "session image read failed session=%r image=%r", session_id, image_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to read image",
         )

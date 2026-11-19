@@ -570,6 +570,9 @@ def _safeguard_workspace_dir(base: Path) -> None:
         capabilities.json, Dockerfile, domain_allowlist.json,
         workers.json, mcp_servers.json
 
+    Allowed directories:
+        workers, sessions, images (the durable pasted-image store)
+
     This is a read-only check — no items are deleted or moved.
     """
     allowed = {
@@ -584,6 +587,7 @@ def _safeguard_workspace_dir(base: Path) -> None:
         "mcp_servers.json",
         "workspace_identity.json",
         "sessions",
+        "images",
     }
     if not base.is_dir():
         return

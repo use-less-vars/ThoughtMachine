@@ -16,10 +16,12 @@ independently-reported step order:
                                      drop its entries from ``open_sessions.json``
                                      / the ``.current_session`` marker
                                      (``session.store.FileSystemSessionStore``)
-5. ``workspace_vault_dir``         — delete ``<vault_root>/workspaces/<id>``
+5. ``workspace_images``            — delete the workspace's stored pasted-image
+                                     bytes (``<vault_root>/workspaces/<id>/images``)
+6. ``workspace_vault_dir``         — delete ``<vault_root>/workspaces/<id>``
                                      (also holds worker state, container notes,
                                      capabilities, config)
-6. ``registry_unregister``         — remove the entry from the workspace
+7. ``registry_unregister``         — remove the entry from the workspace
                                      registry (``WorkspaceRegistry``)
 
 The registry ``root_path`` is captured into the report for reference but is
@@ -55,6 +57,7 @@ _STEP_USER_CONTAINERS = "user_containers"
 _STEP_RESOURCE_CLEANUP = "resource_containers_and_image"
 _STEP_PACKAGE_VOLUME = "package_volume"
 _STEP_WORKSPACE_SESSIONS = "workspace_sessions"
+_STEP_WORKSPACE_IMAGES = "workspace_images"
 _STEP_WORKSPACE_VAULT_DIR = "workspace_vault_dir"
 _STEP_REGISTRY_UNREGISTER = "registry_unregister"
 
@@ -63,6 +66,7 @@ _CLEANUP_STEPS = (
     _STEP_RESOURCE_CLEANUP,
     _STEP_PACKAGE_VOLUME,
     _STEP_WORKSPACE_SESSIONS,
+    _STEP_WORKSPACE_IMAGES,
     _STEP_WORKSPACE_VAULT_DIR,
     _STEP_REGISTRY_UNREGISTER,
 )
@@ -107,6 +111,11 @@ def _workspace_vault_dir(workspace_id: str) -> Path:
 def _sessions_dir(workspace_id: str) -> Path:
     """The workspace's session directory inside the vault."""
     return _workspace_vault_dir(workspace_id) / "sessions"
+
+
+def _images_dir(workspace_id: str) -> Path:
+    """The workspace's stored pasted-image directory inside the vault."""
+    return _workspace_vault_dir(workspace_id) / "images"
 
 
 def _package_volume_name(workspace_id: str) -> str:
@@ -233,6 +242,23 @@ def _cleanup_workspace_sessions(workspace_id: str) -> bool:
     return False
 
 
+def _cleanup_workspace_images(workspace_id: str) -> bool:
+    """Delete the workspace's stored pasted-image bytes (never follows symlinks).
+
+    Its own step, immediately ahead of ``workspace_vault_dir`` -- which would
+    otherwise take the same directory with it.  Reported separately because
+    the image bytes are the largest and most private thing a workspace leaves
+    behind: a teardown that fails on a later step must not leave them in place,
+    and when the deletion does fail the report must name the images rather than
+    blame "the vault directory" wholesale.
+    """
+    target = _images_dir(workspace_id)
+    if not target.exists():
+        return False
+    _rmtree_one_shot(target)
+    return True
+
+
 def _cleanup_workspace_vault_dir(workspace_id: str) -> bool:
     """Delete the workspace's vault directory (never follows symlinks)."""
     target = _workspace_vault_dir(workspace_id)
@@ -309,6 +335,7 @@ def delete_workspace(workspace_id: str, *, dry_run: bool = False) -> dict:
         ),
         (_STEP_PACKAGE_VOLUME, lambda: _cleanup_package_volume(workspace_id)),
         (_STEP_WORKSPACE_SESSIONS, lambda: _cleanup_workspace_sessions(workspace_id)),
+        (_STEP_WORKSPACE_IMAGES, lambda: _cleanup_workspace_images(workspace_id)),
         (_STEP_WORKSPACE_VAULT_DIR, lambda: _cleanup_workspace_vault_dir(workspace_id)),
         (
             _STEP_REGISTRY_UNREGISTER,

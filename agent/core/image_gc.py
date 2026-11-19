@@ -23,10 +23,13 @@ loses them along with the store's contents, and nothing here is persisted.
 """
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Dict, Iterable, Optional, Set
 
 from agent.core import image_store
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "track_images",
@@ -39,6 +42,12 @@ __all__ = [
 
 #: session_id -> ids this session put into the store.
 _sessions: Dict[str, Set[str]] = {}
+
+#: session_id -> workspace that session belongs to, so a close can find the
+#: directory holding the durable bytes.  Only a caller that knows the
+#: workspace records anything here.  Lifetime is exactly ``_sessions``':
+#: in-memory only, dropped with the session, cleared by :func:`reset`.
+_workspaces: Dict[str, str] = {}
 
 #: Guards ``_sessions`` (the image store has its own lock).
 _lock = threading.RLock()
@@ -62,7 +71,11 @@ def _image_id(entry: Any) -> Optional[str]:
     return None
 
 
-def track_images(session_id: Optional[str], images: Any) -> None:
+def track_images(
+    session_id: Optional[str],
+    images: Any,
+    workspace_id: Optional[str] = None,
+) -> None:
     """Record that *session_id* holds the images in *images* in the store.
 
     Idempotent: tracking the same id twice (a replayed turn, the same
@@ -72,6 +85,11 @@ def track_images(session_id: Optional[str], images: Any) -> None:
         session_id: Owning session; a falsy id tracks nothing.
         images: The turn's image metadata -- ids or ``{"id": ...}`` dicts.
             ``None``/empty is a no-op.
+        workspace_id: Workspace owning the session, remembered only so that
+            :func:`drop_session` can find the durable image directory when the
+            session closes.  Default ``None`` records nothing, so a caller
+            that does not know the workspace (or predates this parameter)
+            keeps working and simply never unlinks anything.
     """
     if not session_id or not images:
         return
@@ -80,6 +98,8 @@ def track_images(session_id: Optional[str], images: Any) -> None:
         return
     with _lock:
         _sessions.setdefault(session_id, set()).update(ids)
+        if workspace_id:
+            _workspaces[session_id] = workspace_id
 
 
 def tracked_ids(session_id: Optional[str]) -> Set[str]:
@@ -90,17 +110,82 @@ def tracked_ids(session_id: Optional[str]) -> Set[str]:
         return set(_sessions.get(session_id, ()))
 
 
-def drop_session(session_id: Optional[str]) -> None:
-    """Stop tracking *session_id* without touching the store.
+def drop_session(
+    session_id: Optional[str],
+    workspace_id: Optional[str] = None,
+) -> None:
+    """Stop tracking *session_id* and reclaim its unreferenced image bytes.
 
-    Used when a session closes: the images its saved transcript still
-    references must stay resolvable in this process, so they are left to the
-    store's LRU cap rather than released here.
+    Used when a session closes.  The ids the session put into the store are
+    forgotten, and the durable files behind them are deleted -- but only the
+    ones no persisted transcript of the workspace still mentions (see
+    :func:`_unlink_over`, which deletes nothing at all when it cannot read
+    every transcript).  Images the saved history still references must stay
+    resolvable, so they are left alone.
+
+    Args:
+        session_id: Closing session; a falsy id does nothing.
+        workspace_id: Workspace holding the durable files.  Explicit wins over
+            the one recorded by :func:`track_images`; with neither, nothing is
+            unlinked -- an unknown workspace is never guessed.
     """
     if not session_id:
         return
     with _lock:
-        _sessions.pop(session_id, None)
+        tracked = _sessions.pop(session_id, None)
+        stored_workspace = _workspaces.pop(session_id, None)
+    _unlink_over(workspace_id or stored_workspace, tracked or ())
+
+
+def _unlink_over(workspace_id: Optional[str], candidates: Iterable[Any]) -> int:
+    """Delete the durable files of *candidates* that nothing references.
+
+    The reference authority is the workspace's persisted transcripts: at close
+    time the in-memory tracking is gone, so ``scan_workspace_references`` is
+    what can still say whether an id is live anywhere in the workspace.
+
+    Deletion is all-or-nothing per call.  If even one persisted transcript
+    cannot be read, the scan's set may UNDER-count, so every candidate is kept
+    rather than acting on a partial view.
+
+    Args:
+        workspace_id: Workspace whose image directory to collect; falsy means
+            "unknown", which deletes nothing.
+        candidates: Ids the closing session had tracked.
+
+    Returns:
+        The number of files actually unlinked.
+    """
+    if not workspace_id:
+        return 0
+    image_ids = {entry for entry in candidates or () if isinstance(entry, str) and entry}
+    if not image_ids:
+        return 0
+    # Imported here, not at module scope: ``agent.core.image_files`` imports
+    # this module at import time, so a top-level import would be circular.
+    from agent.core import image_files
+
+    try:
+        referenced, complete = image_files.scan_workspace_references(workspace_id)
+    except Exception:  # defensive only: the scan is documented never to raise
+        logger.warning(
+            "Skipping image collection for workspace %s: reference scan failed",
+            workspace_id, exc_info=True,
+        )
+        return 0
+    if not complete:
+        logger.warning(
+            "Keeping %d image file(s) in workspace %s: at least one persisted "
+            "transcript could not be read, so an unreferenced id cannot be "
+            "called dead",
+            len(image_ids), workspace_id,
+        )
+        return 0
+    removed = 0
+    for image_id in image_ids - referenced:
+        if image_files.delete_image(workspace_id, image_id):
+            removed += 1
+    return removed
 
 
 def live_image_ids(history: Iterable[Any]) -> Set[str]:
@@ -136,6 +221,14 @@ def gc_session(session_id: Optional[str], history: Iterable[Any]) -> int:
     Ids still tracked by another session are never released: the store is
     content-addressed, so two sessions pasting the same screenshot share one
     entry and one session's collection must not blank the other's image.
+
+    Deliberately does NOT delete durable image files, and must not be made to:
+    it runs inside ``save_session`` on EVERY turn, so (i) rescanning the
+    workspace's session files here would cost O(all sessions) per turn, and
+    (ii) the transcript holding the reference is the very file being written,
+    so unlinking against it would race the authoritative reference.  Bytes are
+    reclaimed at session close (:func:`drop_session`) or by the TTL sweep in
+    ``agent.core.image_files`` -- never mid-turn.
 
     Args:
         session_id: Session being collected; a falsy id collects nothing.
@@ -176,3 +269,4 @@ def reset() -> None:
     """
     with _lock:
         _sessions.clear()
+        _workspaces.clear()

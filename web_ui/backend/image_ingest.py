@@ -9,24 +9,31 @@ The WebSocket envelope may carry a TOP-LEVEL ``images`` list (a sibling of
          "width": 1280, "height": 720}]}
 
 ``ingest_incoming_images`` is the boundary: it parses and validates the
-payloads, decodes them once, stores the bytes in the process-wide ephemeral
-``agent.core.image_store`` and returns METADATA ONLY
+payloads, decodes them once, has the workspace's DURABLE store
+(``agent.core.image_files``) mint an opaque image id and write the bytes,
+then caches the same id and bytes in the
+process-wide ``agent.core.image_store`` and returns METADATA ONLY
 (``id``/``media_type``/``width``/``height``).  Nothing below this module
 ever sees a ``data_url`` or base64 text -- the provider adapter resolves the id
 back to bytes when it builds the wire request.
 
+The id is minted here, once, and names BOTH layers, so the file on disk and the
+cache entry are the same thing.  It is not derived from the content: identical
+bytes pasted into two workspaces produce two ids and two files.
+
 Rejection is total: a bad image anywhere in the list rejects the turn and
-releases every image this call had already stored, so a partially-ingested
-payload cannot leak entries into the store.
+releases everything this call had already stored -- cache entry and durable
+file -- so a partially-ingested payload cannot leak entries or files.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import logging
 from typing import Any, List, Optional, Sequence, Tuple
 
-from agent.core import image_store
+from agent.core import image_files, image_store
 
 __all__ = [
     "ALLOWED_MEDIA_TYPES",
@@ -55,6 +62,10 @@ ALLOWED_MEDIA_TYPES = ("image/png", "image/jpeg", "image/webp")
 
 #: Text substituted for the query when the operator sent images with no text.
 IMAGE_ONLY_QUERY_PLACEHOLDER = "[Image attached]"
+
+#: Ingest is a boundary: a durability failure is logged here, never raised into
+#: the WebSocket handler.
+logger = logging.getLogger(__name__)
 
 
 def _encoded_upper_bound(max_bytes: int) -> int:
@@ -96,16 +107,22 @@ def _parse_data_url(data_url: Any) -> Tuple[Optional[str], Optional[str], Option
 def ingest_incoming_images(
     raw: Any,
     *,
+    workspace_id: Optional[str] = None,
     max_images: int = MAX_IMAGES,
     max_bytes: int = MAX_IMAGE_BYTES,
     max_total_bytes: int = MAX_TOTAL_IMAGE_BYTES,
     allowed_media_types: Sequence[str] = ALLOWED_MEDIA_TYPES,
 ) -> Tuple[List[dict], Optional[str]]:
-    """Validate and store the envelope's ``images`` list.
+    """Validate, persist and cache the envelope's ``images`` list.
 
     Args:
         raw: The raw top-level ``images`` value from the envelope.  ``None`` or
             an empty list is the no-images case.
+        workspace_id: The workspace this turn belongs to -- the isolation
+            boundary of the durable store.  Without one the bytes are only
+            cached in this process (there is no directory to address), which
+            degrades to the old ephemeral behaviour rather than rejecting the
+            turn; every real ingest path passes it.
         max_images: Maximum number of images accepted in one turn.
         max_bytes: Maximum DECODED size of one image.
         max_total_bytes: Maximum DECODED size summed over every image of the
@@ -115,8 +132,9 @@ def ingest_incoming_images(
     Returns:
         ``(metadata, None)`` on success, where ``metadata`` is a list of
         ``{"id", "media_type", "width", "height"}`` dicts whose bytes
-        are already in ``agent.core.image_store``; or ``([], reason)`` on
-        rejection, in which case nothing this call stored is left behind.
+        are already in ``agent.core.image_store`` and, when a workspace was
+        given, on disk under it; or ``([], reason)`` on rejection, in which
+        case nothing this call stored is left behind.
     """
     if raw is None:
         return [], None
@@ -133,12 +151,19 @@ def ingest_incoming_images(
 
     def _reject(reason: str) -> Tuple[List[dict], Optional[str]]:
         # Release everything this call already stored -- including the
-        # duplicates of a repeated image (one put == one refcount).
+        # duplicates of a repeated image (one put == one refcount) -- and drop
+        # its durable copy, so a rejected turn leaves neither a cache entry nor
+        # an orphan file behind.
         for image_id in stored_ids:
             try:
                 image_store.release(image_id)
             except Exception:  # pragma: no cover - release never raises
                 pass
+            if workspace_id:
+                try:
+                    image_files.delete_image(workspace_id, image_id)
+                except Exception:  # pragma: no cover - delete never raises
+                    pass
         stored_ids.clear()
         return [], reason
 
@@ -193,7 +218,25 @@ def ingest_incoming_images(
                 f"(maximum {max_total_bytes // (1024 * 1024)} MB per message)"
             )
 
-        image_id = image_store.put(data, media_type)
+        # ONE id names both layers: the file on disk and the cache entry.  The
+        # durable store mints it, because it owns the file name.
+        image_id: Optional[str] = None
+        if workspace_id:
+            try:
+                image_id = image_files.save_image(workspace_id, media_type, data)
+            except (OSError, ValueError) as exc:
+                # Persisting is durability, not the turn itself: the in-memory
+                # copy still serves this request, so a disk problem degrades to
+                # the previous ephemeral behaviour instead of failing the user's
+                # turn.
+                logger.warning(
+                    "Could not persist pasted image for workspace %r: %s",
+                    workspace_id, exc,
+                )
+        if image_id is None:
+            # No workspace (or the write failed): cache-only, still one id.
+            image_id = image_files.mint_image_id()
+        image_store.put(data, media_type, image_id=image_id)
         stored_ids.append(image_id)
         total_bytes += len(data)
         metadata.append({

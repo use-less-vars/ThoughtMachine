@@ -392,6 +392,50 @@ describe('receiveConversationChanged', () => {
       { role: 'assistant', content: 'c' },
     ]);
   });
+
+  // The backend re-broadcasts the FULL history on every conversation_version
+  // bump. A row that comes back WITHOUT its image attachments must keep the
+  // ones its earlier echo carried, or the thumbnail dies mid-turn.
+  it('replace keeps image attachments on a re-broadcast row that arrives without them', () => {
+    const images = [{ id: 'img-1', media_type: 'image/png', width: 40, height: 30 }];
+    const previews = ['data:image/png;base64,AAAA'];
+    useStore.getState().receiveConversationChanged('s1', [
+      { role: 'user', content: 'look', images, localImagePreviews: previews },
+      { role: 'assistant', content: 'ok' },
+    ]);
+
+    // Re-broadcast: the user row has lost both of its image fields.
+    useStore.getState().receiveConversationChanged('s1', [
+      { role: 'user', content: 'look' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'assistant', content: 'done' },
+    ]);
+
+    const msgs = useStore.getState().sessionMessages.s1;
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0].images).toBe(images);
+    expect(msgs[0].localImagePreviews).toBe(previews);
+    // ONLY the image fields are rescued.
+    expect(msgs[1]).toEqual({ role: 'assistant', content: 'ok' });
+    // A row that never carried images gains none.
+    expect(msgs[2]).toEqual({ role: 'assistant', content: 'done' });
+    expect(msgs[2].images).toBeUndefined();
+  });
+
+  it('replace does not overwrite image attachments the incoming row already has', () => {
+    const older = [{ id: 'img-1', media_type: 'image/png' }];
+    const newer = [{ id: 'img-9', media_type: 'image/jpeg' }];
+    useStore.getState().receiveConversationChanged('s1', [
+      { role: 'user', content: 'look', images: older, localImagePreviews: ['data:image/png;base64,AAAA'] },
+    ]);
+    useStore.getState().receiveConversationChanged('s1', [
+      { role: 'user', content: 'look', images: newer, localImagePreviews: ['data:image/jpeg;base64,BBBB'] },
+    ]);
+
+    const msgs = useStore.getState().sessionMessages.s1;
+    expect(msgs[0].images).toBe(newer);
+    expect(msgs[0].localImagePreviews).toEqual(['data:image/jpeg;base64,BBBB']);
+  });
 });
 
 // ==========================================================================

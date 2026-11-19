@@ -32,7 +32,7 @@ import { useStickToBottom } from '../hooks/useStickToBottom'
 const AT_BOTTOM_THRESHOLD = 50
 
 /* ── Main panel ── */
-function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
+function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0, sessionId }) {
   const chatRef = useRef(null)
   const prevCountRef = useRef(0)
   // Streaming deltas grow the LAST message in place (count unchanged), so the
@@ -182,7 +182,7 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
           </div>
         )}
         {messages && messages.map((msg, i) => (
-          <MessageBubble key={i} msg={msg} index={i} />
+          <MessageBubble key={i} msg={msg} index={i} sessionId={sessionId} />
         ))}
         {/* "New messages below" offer.  A real <button>, so it is keyboard
             reachable in DOM order; it reuses the floating-pill styling the
