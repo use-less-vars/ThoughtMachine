@@ -1,10 +1,22 @@
 """Tests for composing the session addendum into the LLM system prompt.
 
-Composition point: ``LLMClient.ensure_system_prompt`` in
-``agent/core/llm_client.py`` - the single place where the system prompt is
-resolved and inserted at position 0 of the conversation. Every provider
-adapter is handed that same conversation, so the addendum is rendered there,
-once, in stored order.
+Composition point: ``compose_addendum_into_messages`` in
+``agent/core/llm_client.py``, called from the turn loop
+(``Agent.process_query``) on EVERY request. It appends the session's current
+entries to the outgoing system message, once, in stored order, and leaves the
+stored conversation untouched.
+
+``LLMClient.ensure_system_prompt`` is deliberately NOT a composition point any
+more: it resolves the BASE prompt once per agent construction (and on
+pause/resume / config apply), so a block baked in there was frozen - later
+edits and removals were invisible and deleted text kept being sent. The cases
+below therefore resolve the base prompt the way a turn does and then compose
+onto it, which is exactly the order the turn loop uses.
+
+Every provider adapter is handed the same composed conversation, so the
+per-adapter cases at the bottom assert the block survives each serialization
+path (system message for openai_compatible, top-level ``system`` param for
+anthropic).
 
 The slice-1 session model is deliberately NOT imported: a session object
 carrying only the contract shape (plus one plain dict) is stubbed here, so this
@@ -24,7 +36,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.core.llm_client import ADDENDUM_HEADING, LLMClient
+from agent.core.llm_client import (
+    ADDENDUM_HEADING,
+    LLMClient,
+    compose_addendum_into_messages,
+)
 from llm_providers.base import ProviderConfig
 from llm_providers.exceptions import ProviderError
 from llm_providers.factory import ProviderFactory
@@ -106,11 +122,17 @@ def _make_client(monkeypatch, session):
     return LLMClient(_make_config(), session=session), provider
 
 
-def _compose(monkeypatch, session):
-    """Run the real composition point for *session*; return the conversation."""
+def _compose(monkeypatch, session, conversation=None):
+    """Run the real composition path for *session*; return the conversation.
+
+    Two real steps, in the order the turn loop uses: ``ensure_system_prompt``
+    builds the BASE prompt (what an agent stores at construction), then the
+    composer appends the CURRENT entry set to the outgoing payload. Nothing in
+    between touches the stored conversation.
+    """
     client, _provider = _make_client(monkeypatch, session)
-    conversation = [{'role': 'user', 'content': 'hello'}]
-    return client.ensure_system_prompt(conversation)
+    messages = list(conversation) if conversation else [{'role': 'user', 'content': 'hello'}]
+    return compose_addendum_into_messages(client.ensure_system_prompt(messages), session)
 
 
 def _system_text(conversation):
@@ -195,11 +217,13 @@ def test_entry_metadata_is_never_rendered(monkeypatch):
 
 
 def test_addendum_renders_exactly_once_across_repeated_turns(monkeypatch):
-    """ensure_system_prompt rebuilds the prompt each turn: no accumulation."""
-    client, _provider = _make_client(monkeypatch, _StubSession(_addendum(TWO_ENTRIES)))
+    """Composing the same base twice yields one block: no accumulation."""
+    session = _StubSession(_addendum(TWO_ENTRIES))
+    client, _provider = _make_client(monkeypatch, session)
     conversation = [{'role': 'user', 'content': 'hello'}]
-    first = client.ensure_system_prompt(conversation)
-    second = client.ensure_system_prompt(conversation)
+    base = client.ensure_system_prompt(conversation)
+    first = compose_addendum_into_messages(base, session)
+    second = compose_addendum_into_messages(base, session)
 
     assert first == second
     assert _system_text(second).count(TEXT_ONE) == 1
@@ -207,10 +231,56 @@ def test_addendum_renders_exactly_once_across_repeated_turns(monkeypatch):
     assert _system_text(second).count(ADDENDUM_HEADING) == 1
 
 
+def test_composing_onto_an_already_composed_payload_keeps_one_block(monkeypatch):
+    """Re-composing a payload that already carries the block: still one copy.
+
+    The composer strips whatever block the base message carried before
+    appending the current one, so it is idempotent - a double composition site
+    or a retried payload cannot duplicate the entries.
+    """
+    session = _StubSession(_addendum(TWO_ENTRIES))
+    client, _provider = _make_client(monkeypatch, session)
+    once = compose_addendum_into_messages(
+        client.ensure_system_prompt([{'role': 'user', 'content': 'hello'}]), session
+    )
+    twice = compose_addendum_into_messages(once, session)
+
+    assert _system_text(twice) == _system_text(once)
+    assert _system_text(twice).count(ADDENDUM_HEADING) == 1
+
+
+def test_stale_block_baked_into_the_base_prompt_is_dropped(monkeypatch):
+    """A legacy session carrying an old block sends ONLY the current entries.
+
+    This is the removal case: the deleted entry is still baked into the stored
+    system message of an older session, and it must not survive into the next
+    request. The base prompt (everything before the block) stays byte-identical.
+    """
+    # Stored set no longer contains TEXT_ONE; the legacy prompt still carries it.
+    session = _StubSession(_addendum([_entry('e-002', TEXT_TWO, pinned=True)]))
+    client, _provider = _make_client(monkeypatch, session)
+    baked_base = f'{BASE_PROMPT}\n\n{ADDENDUM_HEADING}\n{TEXT_ONE}'
+    legacy = [
+        {'role': 'system', 'content': baked_base},
+        {'role': 'user', 'content': 'hello'},
+    ]
+
+    system_text = _system_text(compose_addendum_into_messages(legacy, session))
+
+    assert TEXT_TWO in system_text
+    assert TEXT_ONE not in system_text
+    assert system_text.count(ADDENDUM_HEADING) == 1
+    assert system_text.startswith(BASE_PROMPT + '\n\n' + ADDENDUM_HEADING)
+    # The caller's payload is not mutated by composing onto it.
+    assert legacy[0]['content'] == baked_base
+
+
 def test_composition_reaches_the_provider_boundary(monkeypatch):
     """The composed conversation is what the client hands to the provider."""
-    client, provider = _make_client(monkeypatch, _StubSession(_addendum(TWO_ENTRIES)))
-    conversation = client.ensure_system_prompt([{'role': 'user', 'content': 'hello'}])
+    session = _StubSession(_addendum(TWO_ENTRIES))
+    client, provider = _make_client(monkeypatch, session)
+    base = client.ensure_system_prompt([{'role': 'user', 'content': 'hello'}])
+    conversation = compose_addendum_into_messages(base, session)
     client.chat_completion(messages=conversation)
 
     assert provider.calls, 'provider was never called'

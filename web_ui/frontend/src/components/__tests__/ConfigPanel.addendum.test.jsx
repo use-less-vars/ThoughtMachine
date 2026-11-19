@@ -403,8 +403,13 @@ describe('ConfigPanel addendum', () => {
     await waitFor(() => expect(screen.getByTestId('addendum-effective-block')).toBeInTheDocument());
     expect(screen.getByTestId('addendum-effective-block').textContent).toBe(BLOCK_BEFORE);
     const meta = screen.getByTestId('addendum-effective-meta').textContent;
-    expect(meta).toContain('applied next_query');
+    // The route's `applied: 'next_query'` is reported in operator terms: the block
+    // lands in the system prompt of the very next message, not after a restart.
+    expect(meta).toContain('applies to your next message');
     expect(meta).toContain('resolved via live');
+    // ...and the panel says out loud that nothing here is waiting for Apply (the
+    // panel-wide Apply button is correctly grey on this tab: no draft state).
+    expect(screen.getByTestId('addendum-persist-note').textContent).toContain('no Apply needed');
     expect(meta).toContain('2 / 64 entries');
     expect(screen.getByTestId('addendum-effective-diagnostics').textContent).toContain(
       'same session object: yes'

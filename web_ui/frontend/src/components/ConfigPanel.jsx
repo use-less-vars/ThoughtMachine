@@ -37,6 +37,17 @@ const permissionOptionLabel = (value) => value === 'write_on_feature_branch'
   ? 'Write on feature branches'
   : String(value).charAt(0).toUpperCase() + String(value).slice(1)
 
+//: What "applied" means for the addendum. There is no deferred-apply path here:
+//: a write is saved immediately and composed into the request built for the next
+//: message, so the config form's "applied after Apply" vocabulary (and the greyed
+//: Apply button beside it) would describe a mechanism that does not exist.
+const ADDENDUM_APPLIED_LABELS = {
+  next_query: 'applies to your next message',
+}
+
+const addendumAppliedLabel = (applied) =>
+  ADDENDUM_APPLIED_LABELS[applied] ?? `applied ${applied ?? 'next_query'}`
+
 // Flat-map deep equality for the permissions raw maps (string/bool values).
 const isEqualRaw = (a, b) => {
   if (a === b) return true;
@@ -1057,6 +1068,17 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           {/* ── Addendum (W1.5) ── */}
           <div style={{ marginTop: '1rem', borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
             <label style={labelStyle}><strong>Addendum</strong></label>
+            {/* Every control below writes through to the session store on its own:
+                there is no draft state here and therefore nothing for the panel's
+                Apply button to apply. Saying so explicitly keeps the (correctly)
+                grey Apply button from reading as a pending save. */}
+            <div
+              data-testid="addendum-persist-note"
+              style={{ margin: '0.15rem 0 0.35rem 0', fontSize: '0.72rem', color: '#6c7086', fontStyle: 'italic' }}
+            >
+              Saved immediately — no Apply needed. Each add, edit or removal is
+              included in the system prompt of your next message.
+            </div>
             <div
               data-testid="addendum-totals"
               style={{ margin: '0.25rem 0 0.5rem 0', fontSize: '0.75rem', color: '#a6adc8' }}
@@ -1220,6 +1242,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                 exact block (or the absence of one) the model will get. */}
             <div style={{ marginTop: '0.75rem', borderTop: '1px solid #45475a', paddingTop: '0.5rem' }}>
               <label style={labelStyle}><strong>Effective block (next query)</strong></label>
+              {/* "next query" is the resolver's term; the meta line below spells
+                  out in operator terms when this block is actually sent. */}
               {addendumEffectiveError && (
                 <div data-testid="addendum-effective-error" style={{ color: '#f38ba8', fontSize: '0.75rem', margin: '0.25rem 0' }}>
                   {addendumEffectiveError}
@@ -1228,7 +1252,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               {addendumEffective && (
                 <>
                   <div data-testid="addendum-effective-meta" style={{ margin: '0.25rem 0', fontSize: '0.7rem', color: '#6c7086' }}>
-                    {`${addendumEffective.block_chars ?? 0} chars · applied ${addendumEffective.applied ?? 'next_query'} · resolved via ${addendumEffective.resolved_via ?? 'store'} · ${(addendumEffective.entries || []).length} / ${addendumEffective.max_entries ?? '—'} entries`}
+                    {`${addendumEffective.block_chars ?? 0} chars · ${addendumAppliedLabel(addendumEffective.applied)} · resolved via ${addendumEffective.resolved_via ?? 'store'} · ${(addendumEffective.entries || []).length} / ${addendumEffective.max_entries ?? '—'} entries`}
                   </div>
                   {addendumEffective.diagnostics && (
                     <div data-testid="addendum-effective-diagnostics" style={{ margin: '0 0 0.25rem 0', fontSize: '0.7rem', color: '#6c7086' }}>
