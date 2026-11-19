@@ -180,7 +180,8 @@ class _FakeRegistry:
     def __init__(self) -> None:
         self.calls: list = []
 
-    def terminalize(self, job_id, status="paused", envelope=None):
+    def terminalize(self, job_id, status="paused", envelope=None, *,
+                    worker_name=None, session_id=None, instance_id=None):
         self.calls.append((job_id, status, dict(envelope or {})))
         return {"job_id": job_id, "status": status}
 

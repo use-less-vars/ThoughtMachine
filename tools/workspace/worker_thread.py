@@ -1918,7 +1918,13 @@ def enqueue_query_to_worker(
     worker._input_queue.put((job_id, query, None))  # pragma: no cover - doubles
 
 
-def _job_registry_reporter(job_id: Any) -> Callable[[str, Any, Any], None]:
+def _job_registry_reporter(
+    job_id: Any,
+    *,
+    worker_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+    instance_id: Optional[int] = None,
+) -> Callable[[str, Any, Any], None]:
     """Build the ``on_result`` callback that closes *job_id* in the job registry.
 
     A process-mode child publishes its WORKER_* events on ITS event bus; they
@@ -1933,6 +1939,11 @@ def _job_registry_reporter(job_id: Any) -> Callable[[str, Any, Any], None]:
     demand and refuses to overwrite a terminal one, a missing registry is a
     no-op, and no failure here may propagate -- this runs on the runtime's
     daemon waiter thread, where an exception would only be logged.
+
+    ``worker_name``/``session_id``/``instance_id`` are RECORDED on the record
+    this reporter closes (these terminal writes are all a cross-process job
+    gets) and are captured lexically by the closure below, so ``_report`` keeps
+    its ``on_result`` signature. Omitted -> the record stays unattributed.
     """
 
     def _report(query_id: str, reply: Any, error: Any) -> None:
@@ -1944,14 +1955,27 @@ def _job_registry_reporter(job_id: Any) -> Callable[[str, Any, Any], None]:
             if not isinstance(envelope, dict):
                 envelope = {}
             if error is None and bool(getattr(reply, "ok", False)):
-                registry.complete(job_id, envelope)
+                registry.complete(
+                    job_id,
+                    envelope,
+                    worker_name=worker_name,
+                    session_id=session_id or "",
+                    instance_id=instance_id,
+                )
                 return
             if error is None:
                 # A real reply frame that says the runtime refused or failed
                 # the query. Carry ITS status through; do not invent one.
                 status = envelope.get("status")
                 if status == "timeout":
-                    registry.terminalize(job_id, status="timeout", envelope=envelope)
+                    registry.terminalize(
+                        job_id,
+                        status="timeout",
+                        envelope=envelope,
+                        worker_name=worker_name,
+                        session_id=session_id or "",
+                        instance_id=instance_id,
+                    )
                 else:
                     registry.terminalize(
                         job_id,
@@ -1961,6 +1985,9 @@ def _job_registry_reporter(job_id: Any) -> Callable[[str, Any, Any], None]:
                             "status": "error",
                             "query_id": job_id,
                         },
+                        worker_name=worker_name,
+                        session_id=session_id or "",
+                        instance_id=instance_id,
                     )
                 return
             if isinstance(error, TimeoutError):
@@ -1974,6 +2001,9 @@ def _job_registry_reporter(job_id: Any) -> Callable[[str, Any, Any], None]:
                         if isinstance(terminal_envelope, dict) and terminal_envelope
                         else {"error": str(error), "status": "timeout"}
                     ),
+                    worker_name=worker_name,
+                    session_id=session_id or "",
+                    instance_id=instance_id,
                 )
                 return
             registry.terminalize(
@@ -1984,6 +2014,9 @@ def _job_registry_reporter(job_id: Any) -> Callable[[str, Any, Any], None]:
                     "status": "error",
                     "query_id": job_id,
                 },
+                worker_name=worker_name,
+                session_id=session_id or "",
+                instance_id=instance_id,
             )
         except Exception as exc:  # noqa: BLE001 - reporting must never raise
             logger.warning(
@@ -3155,6 +3188,9 @@ class WorkerThread(threading.Thread):
                             "status": "error",
                             "query_id": job_id,
                         },
+                        worker_name=self.worker_name,
+                        session_id=self.session_id or "",
+                        instance_id=self.instance_id,
                     )
                 except Exception:
                     pass
@@ -3547,6 +3583,9 @@ class WorkerThread(threading.Thread):
                     "status": status,
                     "reason": reason,
                 },
+                worker_name=self.worker_name,
+                session_id=self.session_id or "",
+                instance_id=self.instance_id,
             )
         except Exception as exc:
             log("WARNING", "tools.worker",
@@ -3919,6 +3958,9 @@ class WorkerThread(threading.Thread):
         # worktree_root unset, i.e. exactly the pre-existing behaviour.  The
         # directory is created HERE because ``worktree_root`` is validated
         # fail-closed downstream — the validator is never relaxed.
+        # It is checked out on ``wt/<session>`` so the worker can commit; a
+        # detached worktree makes every git_write verb refuse with
+        # ``_DETACHED_HEAD_ERROR``.  Do not detach here.
         if not worker_cfg.get("worktree_root"):
             from tools.workspace.worktree_defaults import (
                 resolve_worker_worktree_root,
@@ -5154,6 +5196,9 @@ class WorkerThread(threading.Thread):
                                     self._current_query_id,
                                     status="paused",
                                     envelope={"content": reply, "status": "paused"},
+                                    worker_name=self.worker_name,
+                                    session_id=self.session_id or "",
+                                    instance_id=self.instance_id,
                                 )
                         except Exception:
                             pass
@@ -5370,7 +5415,13 @@ class WorkerThread(threading.Thread):
                     try:
                         _registry = _get_worker_job_registry()
                         if _registry is not None:
-                            _registry.complete(self._current_query_id, envelope)
+                            _registry.complete(
+                                self._current_query_id,
+                                envelope,
+                                worker_name=self.worker_name,
+                                session_id=self.session_id or "",
+                                instance_id=self.instance_id,
+                            )
                     except Exception:
                         pass
 
@@ -8476,7 +8527,12 @@ class Worker(ToolBase):
                     job_id,
                     delivered_query,
                     timeout=wait,
-                    on_result=_job_registry_reporter(job_id),
+                    on_result=_job_registry_reporter(
+                        job_id,
+                        worker_name=self.worker_name,
+                        session_id=self.session_id or "",
+                        instance_id=self.instance_id,
+                    ),
                 )
             except WorkerQueryTransportMissing as exc:
                 # Nothing was queued, so no body will ever run this job. Say
@@ -8783,7 +8839,12 @@ class Worker(ToolBase):
                 job_id,
                 delivered_query,
                 timeout=wait,
-                on_result=_job_registry_reporter(job_id),
+                on_result=_job_registry_reporter(
+                    job_id,
+                    worker_name=self.worker_name,
+                    session_id=self.session_id or "",
+                    instance_id=self.instance_id,
+                ),
             )
         except WorkerQueryTransportMissing as exc:
             return {
@@ -8846,7 +8907,7 @@ class Worker(ToolBase):
             return {"error": "Worker job registry unavailable", "worker_name": self.worker_name}
         job_id = (self.worker_query or "").strip() or None
         if job_id:
-            rec = registry.job(job_id)
+            rec = registry.job(job_id, session_id=self.session_id)
             if rec is None:
                 return {"worker_name": self.worker_name, "job_id": job_id, "error": "Job not found"}
             return {
@@ -8872,6 +8933,7 @@ class Worker(ToolBase):
             for r in registry.jobs(
                 worker_name=self.worker_name or None,
                 instance_id=self.instance_id,
+                session_id=self.session_id,
             )
         ]
         return {"worker_name": self.worker_name, "jobs": jobs, "count": len(jobs)}
@@ -8911,7 +8973,7 @@ class Worker(ToolBase):
         registry = _get_worker_job_registry()
         if registry is None:
             return {"error": "Worker job registry unavailable", "worker_name": self.worker_name}
-        rec = registry.job(job_id)
+        rec = registry.job(job_id, session_id=self.session_id)
         if rec is None:
             return {
                 "error": "Job not found",
@@ -8935,7 +8997,7 @@ class Worker(ToolBase):
         deadline = time.monotonic() + total
         last_status = rec.get("status")
         while True:
-            rec = registry.job(job_id)
+            rec = registry.job(job_id, session_id=self.session_id)
             status = rec.get("status") if rec is not None else None
             if status is not None:
                 last_status = status
@@ -9072,7 +9134,11 @@ class Worker(ToolBase):
     def _join_completed_jobs(self, registry) -> list:
         """Jobs of this worker/instance already terminal when a join is interrupted."""
         try:
-            jobs = registry.jobs(worker_name=self.worker_name or None, instance_id=self.instance_id)
+            jobs = registry.jobs(
+                worker_name=self.worker_name or None,
+                instance_id=self.instance_id,
+                session_id=self.session_id,
+            )
         except Exception:  # pragma: no cover - defensive
             return []
         return [
