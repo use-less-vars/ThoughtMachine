@@ -12,6 +12,9 @@ would each still "look" fine in a diff. Each test pins one of those.
      block collapsed on both sides before the comparison;
  1b. those pinned facts are also asserted directly, and the 'last five commits'
      block must start at the same commit the `dev` line names;
+ 1c. the `dev` line's commit is still REACHABLE from `dev` -- the clone is
+     deepened as needed first, because a shallow checkout can only report
+     "not fetched", which is not the same answer as "not an ancestor";
   2. section 2 really carries the three members added for C47;
   3. every recorded ``- sha256:`` matches the file it names, on disk -- and the
      live work queue records none at all (it is ADVISORY: branch-local bytes);
@@ -286,13 +289,139 @@ def test_router_recent_block_starts_at_the_recorded_dev_head():
     assert lines[0].split(" ", 1)[0] == _recorded_dev()[0]
 
 
+# ── Dev ancestry: ESTABLISH it, do not assume it ─────────────────────────────
+# merge-base can only answer from the objects in the LOCAL clone. A shallow
+# checkout (actions/checkout defaults to fetch-depth: 1) usually does not contain
+# the pinned commit at all, and then "not an ancestor" is precisely the WRONG
+# report: the commit was never fetched, it did not leave dev. The helper below
+# makes the question answerable first -- it deepens the clone until the pin is
+# present -- and only then asks it. It takes the runner as a parameter, so the
+# whole decision flow is testable with no git binary and no network.
+_DEEPEN_STEPS = 200
+_GIT_TIMEOUT = 120
+# Fetch the branch BY NAME. `dev` is not abbreviated, and it is the very ref the
+# ancestry question is about, so making it exist is part of establishing the
+# fact. `git fetch origin <sha>` cannot do this job: the pinned sha is stored
+# abbreviated (7 characters) and a server will not serve a want for an
+# abbreviated oid.
+_DEV_REFSPEC = "dev:refs/remotes/origin/dev"
+
+
+def pin_dev_ancestry(sha, *, run=subprocess.run, repo_root=REPO_ROOT, diagnostics=None):
+    """Ask git whether ``sha`` is reachable from ``dev``.
+
+    Three answers, deliberately not a bool, because "git could not answer" must
+    never be reported as staleness:
+
+      'ancestor'     -- in the local object database and reachable from dev.
+      'not_ancestor' -- dev does not contain it; the pin is stale.
+      'unresolvable' -- the history needed to answer could not be obtained (no
+                        git binary, no network, a server that refuses to
+                        deepen). The caller must FAIL on this, not skip it: an
+                        unanswerable question is not a passing one.
+
+    Steps, in the order they run:
+      1. `rev-parse --is-shallow-repository` -- shallow, or a full clone?
+      2. `rev-parse --verify --quiet <sha>^{commit}` -- is the pin even here?
+      3. only when the clone is shallow AND the pin is absent, deepen until it
+         arrives: `fetch --unshallow origin`, then
+         `fetch origin dev:refs/remotes/origin/dev` (the unshallow failed, or it
+         left the branch unborn -- see step 4), then
+         `fetch --deepen <_DEEPEN_STEPS> origin` (a server that refuses to
+         unshallow). Re-probe after each. Still absent -> 'unresolvable'.
+      4. `rev-parse --verify --quiet origin/dev`. `--unshallow` inherits the
+         remote's CONFIGURED refspec, and actions/checkout gives a pull_request
+         checkout a narrow one (+<sha>:refs/remotes/pull/N/merge), so history can
+         arrive while `origin/dev` stays unborn. Hence the one-shot safety net:
+         fetch `dev` by name once and re-probe. Ref = `origin/dev` if it exists
+         now, else `dev` (a plain local clone with no remote-tracking ref).
+         Asking merge-base about an unborn local `dev` would answer 128 -- a hard
+         'unresolvable' on a branch that is perfectly healthy.
+      5. `merge-base --is-ancestor <sha> <ref>` -- rc 0 -> 'ancestor', rc 1 ->
+         'not_ancestor', any other rc (bad cwd, dubious ownership) ->
+         'unresolvable'.
+
+    ``diagnostics``, when a list is passed, receives one ``"<cmd> -> rc=N"`` line
+    per git invocation, so a failure can name the command that left the question
+    unanswerable and not just the conclusion.
+    """
+
+    def git(*args):
+        command = " ".join(("git", *args))
+        try:
+            result = run(
+                ["git", *args],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+        except OSError as exc:  # no git binary, or it could not be spawned
+            if diagnostics is not None:
+                diagnostics.append(f"{command} -> {type(exc).__name__}: {exc}")
+            return None
+        if diagnostics is not None:
+            diagnostics.append(f"{command} -> rc={result.returncode}")
+        return result
+
+    def present(commit):
+        """Is ``commit`` in the local object database?"""
+        probe = git("rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}")
+        return probe is not None and probe.returncode == 0
+
+    shallow_probe = git("rev-parse", "--is-shallow-repository")
+    shallow = (
+        shallow_probe is not None
+        and shallow_probe.returncode == 0
+        and (shallow_probe.stdout or "").strip() == "true"
+    )
+
+    have_pin = present(sha)
+    if shallow and not have_pin:
+        for fetch in (
+            ("fetch", "--unshallow", "origin"),
+            ("fetch", "origin", _DEV_REFSPEC),
+            ("fetch", "--deepen", str(_DEEPEN_STEPS), "origin"),
+        ):
+            git(*fetch)
+            have_pin = present(sha)
+            if have_pin:
+                break
+
+    if not have_pin:
+        return "unresolvable"
+
+    def has_origin_dev():
+        probe = git("rev-parse", "--verify", "--quiet", "origin/dev")
+        return probe is not None and probe.returncode == 0
+
+    have_origin_dev = has_origin_dev()
+    if not have_origin_dev:
+        git("fetch", "origin", _DEV_REFSPEC)
+        have_origin_dev = has_origin_dev()
+    ref = "origin/dev" if have_origin_dev else "dev"
+
+    result = git("merge-base", "--is-ancestor", sha, ref)
+    if result is None:
+        return "unresolvable"
+    if result.returncode == 0:
+        return "ancestor"
+    if result.returncode == 1:
+        return "not_ancestor"
+    return "unresolvable"
+
+
 @pytest.mark.skipif(
     shutil.which("git") is None,
     reason=(
         "no git binary: SKIPPED, NOT PASSED -- this is the only assertion in the "
         "repo that can notice the router pinning a commit dev no longer contains, "
-        "so a skipped run leaves the router's staleness UNCHECKED. CI, which has "
-        "git, is the only place this guarantee holds."
+        "so a skipped run leaves the router's staleness UNCHECKED. The checkout "
+        "no longer has to be deep (pin_dev_ancestry deepens a shallow one), but "
+        "RUNNING it still needs a git binary and a `dev` to ask about; the "
+        "handler itself is covered without either by the "
+        "test_pin_dev_ancestry_* tests below."
     ),
 )
 def test_pinned_dev_sha_is_an_ancestor_of_dev():
@@ -307,30 +436,195 @@ def test_pinned_dev_sha_is_an_ancestor_of_dev():
     been rebased away. That is exactly the drift C95 records.
 
     So this test asks git the one question the literals cannot answer: is
-    PINNED_DEV_SHA still reachable from `dev`? A non-zero, non-one exit means
-    git itself failed (bad cwd, dubious ownership) and is reported as an error
-    rather than as staleness. Dev legitimately moving AHEAD of the pin is not a
-    failure: the coupling documented above is that dev moves into the router
-    deliberately, in a change that also updates these constants.
+    PINNED_DEV_SHA still reachable from `dev`? pin_dev_ancestry does the asking
+    because a shallow checkout cannot answer it as-is. Only 'not_ancestor' is
+    staleness; 'unresolvable' (no git, no network, history unobtainable) FAILS
+    here rather than passing or skipping, because an ancestry question that was
+    never answered must not be mistaken for a green one. Dev legitimately moving
+    AHEAD of the pin is not a failure: the coupling documented above is that dev
+    moves into the router deliberately, in a change that also updates these
+    constants.
     """
-    result = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", PINNED_DEV_SHA, "dev"],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
+    diagnostics = []
+    state = pin_dev_ancestry(
+        PINNED_DEV_SHA, repo_root=REPO_ROOT, diagnostics=diagnostics
     )
+    trail = "\n  ".join(diagnostics)
 
-    assert result.returncode in (0, 1), (
-        f"git merge-base --is-ancestor failed: rc={result.returncode} "
-        f"stderr={result.stderr.strip()!r}"
+    assert state != "unresolvable", (
+        f"could not establish whether PINNED_DEV_SHA {PINNED_DEV_SHA} is an "
+        "ancestor of `dev`: the history needed to answer was not obtainable, so "
+        "this is NEITHER a pass NOR a staleness report. Commands tried:\n  "
+        f"{trail}"
     )
-    assert result.returncode == 0, (
+    assert state == "ancestor", (
         f"PINNED_DEV_SHA {PINNED_DEV_SHA} is not an ancestor of `dev`: the router "
         "pins a commit that dev no longer contains. Regenerate HANDOFF.md and "
         "update PINNED_DEV_SHA/PINNED_DEV_SUBJECT/PINNED_RECENT in the same change."
+        f"\nCommands tried:\n  {trail}"
     )
+
+
+class _FakeRun:
+    """A ``subprocess.run`` stand-in: records argv and answers from a table.
+
+    Keys are the git arguments AFTER the executable; values are a list of
+    ``(returncode, stdout)`` pairs consumed in order (the last pair repeats), so
+    a command expected to answer differently before and after a fetch can be
+    scripted. An unscripted command answers ``(1, "")`` -- and every command the
+    helper should not have reached still shows up in ``git_calls()``, which is
+    what the assertions compare.
+    """
+
+    def __init__(self, answers):
+        self._answers = {key: list(value) for key, value in answers.items()}
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        script = self._answers.get(tuple(argv[1:])) or [(1, "")]
+        returncode, stdout = script[0] if len(script) == 1 else script.pop(0)
+        return subprocess.CompletedProcess(argv, returncode, stdout, "")
+
+    def git_calls(self):
+        return [call[1:] for call in self.calls]
+
+
+def test_pin_dev_ancestry_deepens_a_shallow_clone_before_asking():
+    """Shallow checkout: the pin is fetched FIRST, then the question is asked.
+
+    The order is the assertion. Asking merge-base before deepening is what makes
+    a shallow clone report "the commit was never fetched" as "the pin is stale".
+    """
+    pin = f"{PINNED_DEV_SHA}^{{commit}}"
+    fake = _FakeRun(
+        {
+            ("rev-parse", "--is-shallow-repository"): [(0, "true\n")],
+            ("rev-parse", "--verify", "--quiet", pin): [
+                (1, ""),
+                (0, PINNED_DEV_SHA + "\n"),
+            ],
+            ("fetch", "--unshallow", "origin"): [(0, "")],
+            ("rev-parse", "--verify", "--quiet", "origin/dev"): [(0, "aaaaaaa\n")],
+            ("merge-base", "--is-ancestor", PINNED_DEV_SHA, "origin/dev"): [(0, "")],
+        }
+    )
+
+    assert pin_dev_ancestry(PINNED_DEV_SHA, run=fake) == "ancestor"
+    assert fake.git_calls() == [
+        ["rev-parse", "--is-shallow-repository"],
+        ["rev-parse", "--verify", "--quiet", pin],
+        ["fetch", "--unshallow", "origin"],
+        ["rev-parse", "--verify", "--quiet", pin],
+        ["rev-parse", "--verify", "--quiet", "origin/dev"],
+        ["merge-base", "--is-ancestor", PINNED_DEV_SHA, "origin/dev"],
+    ]
+
+
+def test_pin_dev_ancestry_is_unresolvable_when_the_pin_cannot_be_fetched():
+    """History unobtainable -> 'unresolvable', and merge-base is NEVER asked.
+
+    This is the shallow-checkout failure that must not be read as a stale pin:
+    all three deepening strategies ran and the commit is still absent, so the
+    only honest answer is "could not establish" -- and no ancestry claim is made.
+    """
+    pin = f"{PINNED_DEV_SHA}^{{commit}}"
+    fake = _FakeRun({("rev-parse", "--is-shallow-repository"): [(0, "true\n")]})
+    diagnostics = []
+
+    state = pin_dev_ancestry(PINNED_DEV_SHA, run=fake, diagnostics=diagnostics)
+
+    assert state == "unresolvable"
+    assert fake.git_calls() == [
+        ["rev-parse", "--is-shallow-repository"],
+        ["rev-parse", "--verify", "--quiet", pin],
+        ["fetch", "--unshallow", "origin"],
+        ["rev-parse", "--verify", "--quiet", pin],
+        ["fetch", "origin", _DEV_REFSPEC],
+        ["rev-parse", "--verify", "--quiet", pin],
+        ["fetch", "--deepen", str(_DEEPEN_STEPS), "origin"],
+        ["rev-parse", "--verify", "--quiet", pin],
+    ]
+    assert "merge-base" not in [call[0] for call in fake.git_calls()]
+    assert any("fetch --deepen" in line for line in diagnostics)
+
+
+def test_pin_dev_ancestry_reports_a_stale_pin_as_not_ancestor():
+    """rc 1 from merge-base is the real failure: dev no longer contains the pin."""
+    pin = f"{PINNED_DEV_SHA}^{{commit}}"
+    fake = _FakeRun(
+        {
+            ("rev-parse", "--is-shallow-repository"): [(0, "false\n")],
+            ("rev-parse", "--verify", "--quiet", pin): [(0, PINNED_DEV_SHA + "\n")],
+            ("rev-parse", "--verify", "--quiet", "origin/dev"): [(0, "bbbbbbb\n")],
+            ("merge-base", "--is-ancestor", PINNED_DEV_SHA, "origin/dev"): [(1, "")],
+        }
+    )
+
+    assert pin_dev_ancestry(PINNED_DEV_SHA, run=fake) == "not_ancestor"
+    # A full clone that already has the pin must not pay for a fetch.
+    assert "fetch" not in [call[0] for call in fake.git_calls()]
+
+
+def test_pin_dev_ancestry_falls_back_to_the_local_dev_ref():
+    """`origin/dev` still unborn after the safety-net fetch -> ask about `dev`.
+
+    A plain local clone has no remote-tracking ref and a server may refuse the
+    refspec; the question is then put to the local `dev` instead of abandoned.
+    """
+    pin = f"{PINNED_DEV_SHA}^{{commit}}"
+    fake = _FakeRun(
+        {
+            ("rev-parse", "--is-shallow-repository"): [(0, "false\n")],
+            ("rev-parse", "--verify", "--quiet", pin): [(0, PINNED_DEV_SHA + "\n")],
+            ("rev-parse", "--verify", "--quiet", "origin/dev"): [(1, "")],
+            ("merge-base", "--is-ancestor", PINNED_DEV_SHA, "dev"): [(0, "")],
+        }
+    )
+
+    assert pin_dev_ancestry(PINNED_DEV_SHA, run=fake) == "ancestor"
+    assert fake.git_calls() == [
+        ["rev-parse", "--is-shallow-repository"],
+        ["rev-parse", "--verify", "--quiet", pin],
+        ["rev-parse", "--verify", "--quiet", "origin/dev"],
+        ["fetch", "origin", _DEV_REFSPEC],
+        ["rev-parse", "--verify", "--quiet", "origin/dev"],
+        ["merge-base", "--is-ancestor", PINNED_DEV_SHA, "dev"],
+    ]
+
+
+def test_pin_dev_ancestry_fetches_dev_when_the_pr_checkout_lacks_it():
+    """PR checkout: history arrived but `origin/dev` did not -> fetch the ref ONCE.
+
+    actions/checkout gives a pull_request checkout a narrow refspec, so
+    `--unshallow` can bring the pinned commit while leaving `origin/dev` unborn.
+    Asking merge-base about a local `dev` that a PR checkout does not have would
+    answer 128 and turn a healthy branch red, so the ref is fetched by name first
+    -- exactly one fetch -- and the question is then asked of the ref that exists.
+    """
+    pin = f"{PINNED_DEV_SHA}^{{commit}}"
+    fake = _FakeRun(
+        {
+            ("rev-parse", "--is-shallow-repository"): [(0, "false\n")],
+            ("rev-parse", "--verify", "--quiet", pin): [(0, PINNED_DEV_SHA + "\n")],
+            ("rev-parse", "--verify", "--quiet", "origin/dev"): [
+                (1, ""),
+                (0, "ccccccc\n"),
+            ],
+            ("fetch", "origin", _DEV_REFSPEC): [(0, "")],
+            ("merge-base", "--is-ancestor", PINNED_DEV_SHA, "origin/dev"): [(0, "")],
+        }
+    )
+
+    assert pin_dev_ancestry(PINNED_DEV_SHA, run=fake) == "ancestor"
+    assert fake.git_calls() == [
+        ["rev-parse", "--is-shallow-repository"],
+        ["rev-parse", "--verify", "--quiet", pin],
+        ["rev-parse", "--verify", "--quiet", "origin/dev"],
+        ["fetch", "origin", _DEV_REFSPEC],
+        ["rev-parse", "--verify", "--quiet", "origin/dev"],
+        ["merge-base", "--is-ancestor", PINNED_DEV_SHA, "origin/dev"],
+    ]
 
 
 def test_priorities_carries_no_recorded_digest():
