@@ -140,3 +140,17 @@ Resolve every path before writing anything, and echo the resolved absolute-ish p
 - The worker container is hard-capped at 512 MB regardless of a larger `mem_limit` in config.
 - The worker container has no `git`, so a worker's claim to have run git commands is false by construction.
 - Positive note: asking for a 900 s worker timeout is refused and clamped to 600 s, with a clear explanation. That is exemplary behaviour and worth keeping.
+
+## 2026-11-19 — three rules from a documentation ledger (Gen 70)
+
+### 1. The branch is a shared reference; the worktree is the isolation
+
+Every checkout of this repo points `dev` at the same `refs/heads/dev`. Two agents on two branches, one shared checkout, and whichever one runs `git checkout` last decides what the other one is looking at. `724dcc89` fixed the acute form by making the default `worktree add --detach`; C100 records the hole that remains — when the resolver cannot create a worktree it falls back to the shared checkout instead of refusing (`tools/workspace/worktree_defaults.py:170-191`). A fallback that succeeds quietly is worse than a failure that stops you, because the failure is the only signal you were about to share state.
+
+### 2. The key names an owner and the lookup ignores it
+
+A key can exist, be documented, be present in the file — and still be read by nothing on the path that acts on it. Anything that answers "who owns this?" by reading the key is answering a different question than the code answers, and the two answers stay compatible for months because neither is checked against the other. Before trusting an ownership or permission field, find the line that reads it. If you cannot, the field is a comment.
+
+### 3. A measurement whose root is unstated is a rumour
+
+"~40 hardcoded dev/master literals" became **5 occurrences on 4 lines** the moment somebody named the directories being counted (agent 0, scripts 3, tools 2, web_ui/backend 0). "10 required checks", "11 unique contexts", "18 in-tree" are not three estimates of one number — they are three tallies of three different objects, and a sentence that mixes them is wrong whichever digit it picks. A count without its root is not a low-confidence count; it is not a count.
