@@ -521,6 +521,60 @@ Debt found while repairing the generator's own blind spot, filed rather than fix
 
 - **C98: The knowledge base advertises domains it cannot serve.** **Open.** The KB tool's domain list names surfaces that do not resolve for an agent session; `MAIN_ONBOARDING` and `project/MAIN_ONBOARDING` were both rejected. Workaround that works: `git_read show_file(source='committed'|'working', path=...)`, which reports which source it used. Not repaired here — the domain list and the readable set must be reconciled, and that is a tool-surface change, not a doc edit.
 
+## Filed Gen 71 — LEDGER audit (branch `docs/ledger-c95-and-audit-tickets`)
+
+**Numbering correction (measured).** The audit brief said "start at C95; C94 is the
+high-water mark; C88/C89/C90/C91 are taken". Measured in this file at `c89cb56b`:
+**C95, C96, C97 and C98 are all already allocated** under `## Filed Gen 70 (verification
+debt)` (`:516`, `:518`, `:520`, `:522`), so C95 is not free; **C93 and C94 have no row at
+all** (zero hits for either id); **C91 has no row either** — only a cross-reference at
+`:471`. The highest allocated id is **C98**. These tickets are therefore filed as
+**C99–C104**. No existing id was renumbered and no gap was back-filled. Every citation
+below was read at `c89cb56b`; anything not read there is marked **UNVERIFIED**.
+
+- **C99**: The auth e2e job is a job *id*, not a required-context *string* — promote it to a required status check on `dev` and stop the docs conflating the two. **Open.**
+  - `.github/workflows/platform-matrix.yml:175` `  linux-e2e-auth:` (the job id) and `:176` `    name: Linux - auth e2e (browser)` (the required-context string) — both verified byte-exact.
+  - `scripts/apply_branch_protection.sh:79` registers the *name*: `  "Linux - auth e2e (browser)"                  # job linux-e2e-auth (platform-matrix.yml)`. So the in-tree protection script already lists it.
+  - `docs/CONTRACTS.md:245` and `:264` refer to `linux-e2e-auth`, i.e. a job id, in a position where a required-context string is what GitHub matches. Same conflation class the doc corrections (see the doc-fix commit on this branch) address.
+  - The claim that the *live* gate currently excludes this context is asserted only by an in-repo ticket (`.thoughtmachine/working_docs/ticket-hygiene-merge-gate-is-rulesets-not-classic-protection.md`) and was **not** verified against GitHub — **UNVERIFIED**.
+  - Done means: a push to `dev` missing only the auth e2e check is rejected, and `docs/CONTRACTS.md` names the context string, not the job id.
+
+- **C100**: The worker worktree resolver fails *open*; it must fail *closed* — a worker that cannot get its own worktree must be refused, not silently handed the main agent's tree. **Open.**
+  - `tools/workspace/worktree_defaults.py:9` states the design intent: `Everything here is deliberately FAIL-OPEN and side-effect-scoped:`, and `:15-16` spells out the consequence: "which leaves the caller on the workspace root -- exactly the pre-existing behaviour."
+  - `:113` `def resolve_worker_worktree_root(`; `:170` `status = runner(["worktree", "add", "--detach", worktree], root)`; `:171` `except Exception as exc:  # a runner must never break the spawn boundary`; `:177` `if status != 0:`; the failure returns are `:130, :138, :145, :158, :164, :175, :182, :189` (all `return None`); the only non-`None` return is `:191` `return worktree`. **There is no refusal path anywhere in the function.**
+  - Caller: `tools/workspace/worker_thread.py:3922` `if not worker_cfg.get("worktree_root"):` — on failure `worktree_root` is simply left unset (`:3927-3933`), so the worker runs on the workspace root and two workers can collide. The caller's own comments admit it: `:3917-3919` `# Fail-open: no workspace root, no git` / ``# binary, no repository, or a failing `git worktree add` all leave`` / `# worktree_root unset`; `:3914` `# An explicitly configured root (the parent session's) always wins.`
+  - Coordinate with commit `724dcc89` ("fix(worktree): create the worker worktree on a branch, not detached"), which rewrites the `--detach` at `:170`. Line numbers in `worktree_defaults.py` are ref-sensitive: re-read before citing.
+  - Done means: a worker whose worktree cannot be created fails the spawn with a named error, and no code path returns a worker with an inherited root by accident.
+
+- **C101**: The `mode` layer silently overrides `enabled_tools`, and the UI offers no way to tell that a save was discarded — needs a design pass, not a patch. **Open (design pass only).**
+  - Coercion at model-construction time: `agent/config/session_config.py:226` `@model_validator(mode='after')`, `:227` `def enforce_mode_presets(self)`, `:242` `preset_tools = get_tools_for_mode(self.mode)`, `:243` `if preset_tools:`, `:244` `object.__setattr__(self, 'enabled_tools', list(preset_tools))`; the custom-mode variant is at `:237`.
+  - **Correction to the circulating claim.** The brief said `update_tools` ends in a "bare return". It does not. `:266` `def update_tools(self, new_tools)`, `:272` `if self.mode and self.mode != 'custom':`, `:273` `return  # mode-locked — cannot override`, `:274` `self.enabled_tools = list(new_tools)`. It is a **mode-conditional silent discard**, not an unconditional one: in `custom` mode the assignment does happen. Any ticket text that says "bare return" is wrong and should be corrected wherever it repeats.
+  - UI: `web_ui/frontend/src/components/ConfigPanel.jsx:1735` `disabled={!wsConnected || isApplying}` — the Apply button has **no mode term**, so in a locked mode it is enabled, accepts the click, and the write is thrown away. Contrast the per-tool checkbox at `:1449` `disabled={isModeLocked}`, which does model the lock. Apply handlers at `:1733` and `:1752`.
+  - Done means: a design note that decides whether the lock belongs in the model (reject), the API (400), or the UI (disable) — and the UI stops offering a control whose effect is conditional.
+
+- **C102**: Branch names are hardcoded as literals in tooling and in a test fixture; the audit's "~40 occurrences" count is not reproducible and must not be quoted. **Open — deferred.**
+  - Measured at `c89cb56b` over `agent/`, `scripts/`, `tools/`, `web_ui/backend/` (regex `(['\"])(dev|master|origin/dev|origin/master)\1`, extensions .py/.js/.jsx/.ts/.tsx/.sh/.yml/.yaml/.json/.md/.html, excluding `tests/`, `node_modules`, `dist`): **5 occurrences on 4 lines** — `agent/` 0, `scripts/` 3, `tools/` 2, `web_ui/backend/` 0. The "~40" figure in the audit input is **UNVERIFIED** in that scope; a whole-repo count including `docs/`, `tests/` and `resources/` has not been done.
+  - Hits: `scripts/gen_handoff.py:315` `dev_sha = sh("git", "rev-parse", "--short", "dev")`, `:319`, `:323` `recent = sh("git", "log", "-5", "--oneline", "dev")`; `:174` renders ``- `dev` at `{dev_sha}` -- *{dev_subj}*`` into the handoff, `:342` writes it; `tools/git_write_tool.py:163` `_PROTECTED_BRANCHES: ClassVar[tuple] = ("dev", "master", "main")`.
+  - Test fixture pins a moving target: `tests/test_onboarding_bundle_contract.py:96` `PINNED_DEV_SHA = "7bf3f1ab"`, asserted at `:278`, guarded by `:427` `def test_pinned_dev_sha_is_an_ancestor_of_dev():` (`:449-450`, `:460-461`).
+  - The contract gate that would police this is `contract-gate` — `.github/workflows/contract-gate.yml:38` `  contract-gate:`, `:39` `    name: Contract gate (docs/CONTRACTS.md)` (lowercase `g` in the display name; the two strings differ, so copy both verbatim).
+  - Done means: a single source for the integration branch name, and a real count to justify the work.
+
+- **C103**: There is no principal in the tool surface for merging; a merge cannot be performed by the agent at all, only simulated by a human. **BLOCKED.**
+  - No code citation can be produced, because the capability does not exist: `tools/git_write_tool.py:196-199` is the operation `Literal` and contains no `merge`, `pr` or pull-request verb; `:181-182` is the refusal comment that enumerates what the tool will not do.
+  - Blocked on credentials: the blocking factor is the vault-held principal used for authenticated writes, and the vault is not readable from the workspace container. Do not close this ticket on the basis of repository evidence alone.
+
+- **C104**: Ten smaller audit findings, each with the evidence and the verification status it actually reached. **Open (batch).**
+  - **B1 — a merge cannot be committed.** `tools/git_write_tool.py:1097` `args = ["commit", "-m", self.message, "--"] + rels` — a pathspec is always appended, and `:1094` `add_output = self._git_add(repo_root)` stages everything first; `file_path` is required (`:1046-1049`). git itself refuses a partial commit while `MERGE_HEAD` exists, so a conflicted merge cannot be concluded through this surface. Observed in-session; the git half is upstream behaviour, not a bug here.
+  - **B2 — the refusal list is incomplete.** `tools/git_write_tool.py:181-182` names fetch, reset, clean, cherry-pick and rebase as deliberately absent, but **never mentions `merge`** — so the one absent verb that a reader is most likely to look for is the one the docstring omits. The authoritative surface is the `Literal` at `:196-199`.
+  - **B3 — the tool's own docstring under-reports the surface.** `:104-105` lists 8 operations; the `Literal` at `:196-199` lists 13. Undocumented in prose: `worktree_add`, `worktree_remove`, `stash_push`, `stash_pop`, `stash_drop`.
+  - **B4 — test scratch directories leak into the repo root.** `tmpgc4ksvne/` was present as `??` (untracked) in `git status` during this audit. Untracked means no existing check sees it. Verified by direct observation, single instance, cause not investigated.
+  - **B5 — `delete_branch_on_merge` is nowhere in the tree.** grep over `scripts/`, `docs/`, `.github/` returns 0 matches for it. The GitHub-side setting is **UNVERIFIED**, and the local branch count is **UNVERIFIED** (needs `git branch | wc -l` on a live clone) — do not claim a number.
+  - **B6 — a py3.11 flake in `test_worker_tray_truth_fields`.** Reported in the audit input; **UNVERIFIED** — not reproduced in this session, no log captured. Needs a reproduction before it is worth work.
+  - **B7 — an out-of-range committed read succeeds silently with an empty body.** `tools/git_info_tool.py:2497-2505` (`_slice_line_window`, whose comment says "an out-of-range `end` simply clamps to the end of the file", ending `return "\n".join(lines[start - 1:end])`); `:2563-2567` always prepends a header and never checks that the body is empty; `:2590` states the contract as a feature: ``* both given: honoured exactly (`end` clamps to EOF);``. Confirmed for `show_file`. **The `show` operation is a different code path** — it shells out to `git -L` at `:2066-2069` and was **not** verified to behave the same: **UNVERIFIED**.
+  - **B8 — "`ls_tree` re-roots its output" is REFUTED.** `tools/git_info_tool.py:2234-2245` builds `["ls-tree", ("-r"), treeish, "--", *rels]`, i.e. `path` is a pathspec *filter*; the output is not re-rooted under the path. (The separate `prefix=` parameter was not measured.) Record the refutation so the claim stops circulating.
+  - **B9 — the worker timeout advisory overshoots, and the overshoot is normal.** Measured in this session: requested 200s, actual elapsed **213.8s**, with `timeout_triggered: true`. Overshoot confirmed. The circulating variant ("150 → 224s with `timeout_triggered` **false**") is **UNVERIFIED** — in this run the flag reported `true`.
+  - **B10 — the `Worker` tool's `inspect` action is described but not exercised.** Its description promises runtime mode and child pid, and null without a runtime handle; not reached during this audit: **UNVERIFIED**.
+
 ## Archived (pre-Gen 42 brain dump — do not read as current work)
 
 - **W11 (Resource Composition):** Bins (granular permissions), Dynamic Imports,
