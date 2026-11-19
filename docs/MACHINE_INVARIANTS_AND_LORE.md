@@ -411,15 +411,18 @@ fact in a standup.
    (`worker_thread.py:7054-7062`). Unconfirmed as *the* fix. **Section 4.**
 4. **RESOLVED — measured, and the stored count is not the in-tree count.** The operator read the live
    `dev` ruleset with admin credentials this session: it stores **twelve** required-check entries, of
-   which **eleven** are unique check contexts, and **Contract Gate is among the required set**. The
-   eighteen contexts the tree enumerates (`scripts/apply_branch_protection.sh:75-96`,
-   `docs/BRANCH_PROTECTION.md:29`) are what the script *declares*, not what the server stores — the
+   which **eleven** are unique check contexts (`Unit tests - Python 3.12` is stored twice, which is
+   why the stored count is twelve), and **Contract Gate is among the required set**. The
+   eighteen contexts the tree enumerates (`scripts/apply_branch_protection.sh:78-96`,
+   `docs/BRANCH_PROTECTION.md` — the declared-contexts table) are what the script *declares*,
+   not what the server stores — the
    same declared-versus-measured gap as §3.1, which is why the older evidence below is kept rather
    than deleted. Historical: the push rejections at `a869255d` and `544bd407` reported
    `remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are
-   expected.`, which was the best evidence available from inside the checkout. Still open: whether the
-   ruleset blocks the *merge button* (a bypassable direct push is a different rule), and the context
-   names, which need the same admin call. **Section 10.**
+   expected.`, which was the best evidence available from inside the checkout. The context names
+   are measured and recorded, with the instrument that produced them, in `docs/BRANCH_PROTECTION.md`
+   — which is what makes this a measurement rather than an attribution. Still open: whether the
+   ruleset blocks the *merge button* (a bypassable direct push is a different rule). **Section 10.**
 5. **"The only chokepoint."** Contradicted for MCP stdio, and ~11 other `import subprocess` sites
    remain unadjudicated one by one (git tools, `worker_execution.py`, `sandboxed_execution.py`,
    `doctor.py`, `workspace_lifecycle_manager.py`, `containers/executor.py:1259`). Needs a per-site

@@ -270,20 +270,29 @@ What the trigger blocks and job names add to that table:
   `web-ui-backend-suite` job was the fourth until C91 made it BLOCKING (no `continue-on-error`, and
   its name no longer carries the "(advisory)" suffix).
 
-**RESOLVED — measured, and the stored count is not the in-tree count.** The operator read the live
-`dev` ruleset with admin credentials this session: it stores **twelve** required-check entries, of
-which **eleven** are unique check contexts, and **Contract Gate is among the required set**. That
+**RESOLVED — measured, and the stored count is not the in-tree count.** The operator read the live `dev` ruleset with admin credentials on 2026-11-19: it stores **twelve** required-check entries, of which **eleven** are unique check contexts — `Unit tests - Python 3.12` is stored twice — and **Contract Gate is among the required set**. This is no longer an attribution: it is re-derivable by anyone with `gh`, which is what makes it a measurement. That
 supersedes the count this section previously carried. The eighteen contexts enumerated from the tree
-(`scripts/apply_branch_protection.sh:75-96`, `docs/BRANCH_PROTECTION.md:29`) are what the script
-*declares*, not what the server stores. Historical, and kept rather than deleted because it is not
+(`scripts/apply_branch_protection.sh:78-96`, `docs/BRANCH_PROTECTION.md` — the declared-contexts
+table) are what the script *declares*, not what the server stores. Historical, and kept rather than
+deleted because it is not
 reconstructible from the checkout: the push rejections at `a869255d` and `544bd407` reported
 `remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are expected.`
-Still open: whether the ruleset blocks the *merge button* (a bypassable direct push is a different rule),
-and the check *names* by context, which need the same admin call.
+The eleven context names, and the seven names `REQUIRED_CHECKS` asks for that the ruleset does not enforce, are recorded in `docs/BRANCH_PROTECTION.md` alongside the command that produced them. Still open: whether the ruleset blocks the *merge button* — a bypassable direct push is a different rule.
+
+**Instrument.** The enforced list is a `gh` call, not a reading of the tree:
+
+```
+gh api repos/:owner/:repo/rulesets/24214086 --jq '.rules[] |
+  select(.type=="required_status_checks") |
+  .parameters.required_status_checks[].context'
+```
+
+`docs/BRANCH_PROTECTION.md` owns the list; this file cites it rather than keeping a
+second copy that can drift.
 
 ### OPEN ITEM (revised) — required checks: what the push rejection settles, and what it does not
 
-This section previously concluded that required checks "cannot be determined from this repository". That conclusion is retired above. The evidence it rested on is preserved here, because none of it is reconstructible from the checkout, and one of the two notes rests on an inference the push rejection contradicts.
+This section previously concluded that required checks "cannot be determined from this repository". That conclusion is retired above. The evidence it rested on is preserved here, because none of it is reconstructible from the checkout (the *enforced* list is no longer in that category — see the instrument above), and one of the two notes rests on an inference the push rejection contradicts.
 
 Two knowledge-base notes, quoted below as whole lines so a later reader can verify them with `sed -n '<line>p'` rather than trusting this document:
 
