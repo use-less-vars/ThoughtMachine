@@ -86,18 +86,50 @@ def sh(*args: str) -> str:
     return subprocess.check_output(args, text=True, encoding="utf-8").strip()
 
 
-def _parse_open_items(active: str) -> list:
-    """Return ``[(cid, title), ...]`` for every open C-item in ``active``.
+#: The CLOSED vocabulary, as a BOLD STATUS TOKEN and nothing else.
+#
+#: Bold-only is load-bearing twice over. An open item whose prose merely quotes
+#: the word ("the show_file half never reproduced") is still open, and the early
+#: bare-word version of this test dropped exactly such an item: C33 collided
+#: with its own description and the parse fell from 13 items to 12. Matching the
+#: token immediately after ``**`` also keeps ``**Fix landed:**`` -- which sits
+#: inside C33's body -- from reading as a status.
+CLOSED_MARKER_RE = re.compile(r"\*\*(?:Landed|Done|FIXED|Disproved|CLOSED)\b")
+
+#: The two TITLE SHAPES the queue actually uses. Both must parse:
+#:
+#:   ``- **C11: Title, possibly wrapped over two lines.**``   (colon form)
+#:   ``- **C78** -- Title.``                                  (dash form)
+#:
+#: The dash form is how C78-C92 are written. A colon-only title regex cannot see
+#: them at all, so those items were invisible to every generated handoff.
+COLON_TITLE_RE = re.compile(r"^- \*\*(C\d+):\s+(.*?)\*\*")
+DASH_TITLE_RE = re.compile(r"^- \*\*(C\d+)\*\*\s*[—-]\s*(.*)$")
+
+
+def _parse_open_items(text: str) -> list:
+    """Return ``[(cid, title), ...]`` for every open C-item in ``text``.
 
     The unit of parsing is a BLOCK, not a physical line: a block starts at any
     line beginning ``- `` and absorbs every following line up to the next such
     line. A block whose bold title wraps across two lines is therefore parsed
-    intact instead of vanishing. The done-marker test runs over the whole
-    joined block, and the title is the same capture as before.
+    intact instead of vanishing (C11 stayed invisible for a generation that
+    way). The status-token test runs over the whole joined block.
+
+    ``text`` is the WHOLE queue file. Callers used to cut it at the
+    ``## Archived`` heading, which made every live item filed below that
+    heading unreachable -- C12, C14 and the C74-C92 residue were never named by
+    a generated handoff for that reason. Where an item is filed is a historical
+    accident; what makes it open is its status token.
+
+    An id names ONE item, so the FIRST occurrence wins and later duplicates are
+    dropped. The queue preserves duplicate historical bullets on purpose (the
+    archived C35/C36 forms, the long/short C74-C77 pairs), and emitting them
+    twice would put the same work on the router twice.
     """
     blocks = []
     current = None
-    for line in active.splitlines():
+    for line in text.splitlines():
         if line.startswith("- "):
             if current is not None:
                 blocks.append(current)
@@ -107,14 +139,22 @@ def _parse_open_items(active: str) -> list:
     if current is not None:
         blocks.append(current)
     open_items = []
+    seen = set()
     for block_lines in blocks:
         block = " ".join(" ".join(block_lines).split())
-        m = re.match(r"^- \*\*(C\d+):\s+(.*?)\*\*", block)
-        if not m:
+        m = COLON_TITLE_RE.match(block)
+        if m:
+            cid, body = m.group(1), m.group(2)
+        else:
+            m = DASH_TITLE_RE.match(block)
+            if not m:
+                continue
+            cid, body = m.group(1), m.group(2)
+        if CLOSED_MARKER_RE.search(block):
             continue
-        cid, body = m.group(1), m.group(2)
-        if re.search(r"\*\*Landed\*\*", block):
+        if cid in seen:
             continue
+        seen.add(cid)
         open_items.append((cid, " ".join(body.split()).strip()))
     return open_items
 
@@ -282,8 +322,9 @@ def main(argv=None) -> int:
     else:
         recent = sh("git", "log", "-5", "--oneline", "dev")
 
-    active = priorities.read_text(encoding="utf-8").split("## Archived")[0]
-    open_items = _parse_open_items(active)
+    # The WHOLE file, never ``.split("## Archived")[0]``: cutting at the heading
+    # made every live item filed below it invisible to the router.
+    open_items = _parse_open_items(priorities.read_text(encoding="utf-8"))
     if not open_items:
         print("ERROR: no open C-items parsed; refusing.", file=sys.stderr)
         return 1
