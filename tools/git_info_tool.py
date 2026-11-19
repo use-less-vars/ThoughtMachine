@@ -42,6 +42,22 @@ _SHOW_FILE_MAX_SPAN_FALLBACK = 2000
 #: the header says so, instead of slurping an arbitrarily large file into memory.
 _SHOW_FILE_MAX_READ_BYTES = 4 * 1024 * 1024
 
+#: Fail-closed refusal returned by ``GitReadTool._exec_host_raw`` for a ``commit``
+#: when the repository has hooks configured while host execution mode neutralizes
+#: them (``core.hooksPath=/dev/null`` + ``--no-verify``).  A module constant so
+#: the documented wording has exactly one home and tests can pin it byte-exactly.
+_HOST_COMMIT_HOOKS_REFUSAL = (
+    "Error: refusing commit: repository hooks are configured "
+    "(.githooks/pre-commit) but host execution mode neutralizes "
+    "them (core.hooksPath=/dev/null, --no-verify); hooks cannot "
+    "be enforced on the host. Use container mode, or remove the "
+    "configured hooks to accept the bypass."
+)
+
+#: Bounded depth for the ancestor walk that looks for a configured
+#: ``.githooks/pre-commit`` between the repository root and the workspace root.
+_MAX_HOOK_ANCESTOR_STEPS = 8
+
 
 class GitUnavailableError(FileNotFoundError):
     """The git executable could not be run (missing binary / unspawnable).
@@ -1042,6 +1058,87 @@ class GitReadTool(ToolBase):
                 identity_args.extend(["-c", pair])
         return identity_args
 
+    def _host_commit_hook_dirs(self, repo_root: Path) -> List[Path]:
+        """Directories whose ``.githooks/pre-commit`` the host guard must honour.
+
+        Host execution neutralizes hooks, so the guard has to find EVERY
+        configured hook that could apply to this commit.  It used to consult
+        ``self._resolved_workspace_path`` alone -- which ``execute()`` resets on
+        entry and only re-populates from a session-registry lookup, leaving it
+        ``None`` for callers that bind the deprecated ``workspace_path``.  On
+        those paths the guard was consulted but DISARMED.  Resolve the
+        workspace here, late, with one fixed precedence: the already-resolved
+        attribute, then an explicitly bound ``workspace_path`` (the caller's
+        declaration of which workspace this commit belongs to -- it must beat
+        the narrower ``worktree_root``/registry answer that
+        ``_resolve_workspace_root`` prefers, so the guard can never re-target
+        itself at a different repository than the one named), then that shared
+        resolver.  Honour ``repo_root`` itself plus every directory between it
+        and the workspace root -- a hook configured at any of them is a hook
+        the host path would silently bypass.
+        """
+        candidates: List[Path] = []
+        seen = set()
+
+        def _add(directory) -> None:
+            if not directory:
+                return
+            try:
+                resolved = Path(directory).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                resolved = Path(directory)
+            key = str(resolved)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(resolved)
+
+        # PRECEDENCE: an explicitly bound ``workspace_path`` is the caller's
+        # declaration of WHICH workspace this commit belongs to, so it outranks
+        # every narrower or ambient root (``worktree_root``, registry lookup)
+        # that ``_resolve_workspace_root`` would otherwise prefer.  Two reasons:
+        # security code must never silently re-target itself at a different
+        # repository than the one it was named, and honouring the DECLARED
+        # (wider) root is strictly more fail-closed -- the ancestor walk below
+        # then still reaches a ``.githooks`` sitting inside a narrower worktree.
+        workspace_root = getattr(self, "_resolved_workspace_path", None)
+        if not workspace_root:
+            workspace_root = getattr(self, "workspace_path", None)
+        if not workspace_root:
+            try:
+                workspace_root = self._resolve_workspace_root()
+            except (OSError, ValueError):
+                # An unresolvable/invalid worktree must not DISARM the guard;
+                # there is simply no workspace root left to honour.
+                workspace_root = None
+        if workspace_root:
+            self._resolved_workspace_path = workspace_root
+
+        workspace_real = None
+        if workspace_root:
+            try:
+                workspace_real = Path(workspace_root).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                workspace_real = Path(workspace_root)
+        _add(workspace_real)
+        _add(repo_root)
+
+        if workspace_real is not None:
+            try:
+                current = Path(repo_root).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                current = Path(repo_root)
+            steps = 0
+            while steps < _MAX_HOOK_ANCESTOR_STEPS and current != current.parent:
+                parent = current.parent
+                if parent != workspace_real and workspace_real not in parent.parents:
+                    # The ancestor left the workspace: nothing above it belongs
+                    # to this workspace, so stop here.
+                    break
+                _add(parent)
+                current = parent
+                steps += 1
+        return candidates
+
     def _exec_host_raw(
         self, repo_root: Path, args: List[str], timeout: int = 30
     ) -> tuple:
@@ -1052,16 +1149,17 @@ class GitReadTool(ToolBase):
         # configured (design §E3: fail closed only when hooks are
         # configured-but-unenforceable).
         if args and args[0] == "commit":
-            _ws = getattr(self, "_resolved_workspace_path", None)
-            _hook = Path(_ws) / ".githooks" / "pre-commit" if _ws else None
-            if _hook is not None and _hook.is_file():
-                return (1, "", (
-                    "Error: refusing commit: repository hooks are configured "
-                    "(.githooks/pre-commit) but host execution mode neutralizes "
-                    "them (core.hooksPath=/dev/null, --no-verify); hooks cannot "
-                    "be enforced on the host. Use container mode, or remove the "
-                    "configured hooks to accept the bypass."
-                ))
+            try:
+                hooks_configured = any(
+                    (directory / ".githooks" / "pre-commit").is_file()
+                    for directory in self._host_commit_hook_dirs(repo_root)
+                )
+            except OSError:
+                # Fail closed: a hook that cannot be probed cannot be proven
+                # absent, and host execution bypasses whatever it cannot see.
+                hooks_configured = True
+            if hooks_configured:
+                return (1, "", _HOST_COMMIT_HOOKS_REFUSAL)
         # Hardened args, applied to EVERY git invocation: hooks are
         # neutralized (core.hooksPath=/dev/null), external diff drivers /
         # textconv filters, fsmonitor helpers and credential helpers are

@@ -34,6 +34,10 @@ Contract (a cache, not the source of truth)
   process, resolve to ``None`` here; the adapter substitutes
   ``IMAGE_UNAVAILABLE_PLACEHOLDER`` so the model is told the screenshot can no
   longer be seen instead of the whole request failing.
+* Neither is a model that cannot receive images.  The adapter substitutes
+  ``IMAGE_UNSUPPORTED_PLACEHOLDER`` and leaves the bytes here, so the entry is
+  still resolvable if the session is switched to a vision-capable model - the
+  image is withheld from a turn, never destroyed.
 
 All methods are thread-safe (a single ``RLock`` guards the entry table); the
 store is used from the event loop and from tool worker threads.
@@ -46,6 +50,7 @@ __all__ = [
     "MAX_ENTRIES",
     "MAX_BYTES",
     "IMAGE_UNAVAILABLE_PLACEHOLDER",
+    "IMAGE_UNSUPPORTED_PLACEHOLDER",
     "ImageStore",
     "get_image_store",
     "put",
@@ -64,6 +69,14 @@ MAX_BYTES = 96 * 1024 * 1024
 
 #: Text substituted for an image whose bytes are no longer available.
 IMAGE_UNAVAILABLE_PLACEHOLDER = "[screenshot — no longer available]"
+
+#: Text substituted for an image the target model cannot receive.
+#:
+#: Deliberately does not name the model: the placeholder is written into a
+#: message that outlives the turn, and naming a model the session may later be
+#: switched away from would make the transcript lie.  The model name and the
+#: remedy go to the log line instead.
+IMAGE_UNSUPPORTED_PLACEHOLDER = "[screenshot — this model cannot view images]"
 
 
 class ImageStore:
