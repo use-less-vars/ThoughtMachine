@@ -210,7 +210,7 @@ def test_a_text_only_model_gets_a_placeholder_instead_of_a_refusal(image_id):
     and the session could never be used for anything else.
     """
     wire = build_wire_messages(
-        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-v4-flash'
+        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-v4-pro'
     )
 
     assert wire == [
@@ -226,7 +226,7 @@ def test_a_text_only_model_gets_a_placeholder_instead_of_a_refusal(image_id):
 
 def test_a_withheld_image_leaves_no_image_block_for_the_model_to_reject(image_id):
     wire = build_wire_messages(
-        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-v4-flash'
+        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-v4-pro'
     )
 
     assert 'images' not in wire[0]
@@ -237,7 +237,7 @@ def test_an_image_only_turn_still_has_content_to_send(image_id):
     # An empty content list is rejected by the API, so the placeholder has to
     # stand on its own when there is no prompt to carry it.
     wire = build_wire_messages(
-        [{'role': 'user', 'content': '', 'images': [image_id]}], model='deepseek-v4-flash'
+        [{'role': 'user', 'content': '', 'images': [image_id]}], model='deepseek-v4-pro'
     )
 
     assert wire[0]['content'] == [{'type': 'text', 'text': IMAGE_UNSUPPORTED_PLACEHOLDER}]
@@ -249,7 +249,7 @@ def test_every_image_is_represented_by_its_own_placeholder():
 
     wire = build_wire_messages(
         [{'role': 'user', 'content': 'compare', 'images': [first, second]}],
-        model='deepseek-v4-flash',
+        model='deepseek-v4-pro',
     )
 
     assert wire[0]['content'] == [
@@ -262,7 +262,7 @@ def test_every_image_is_represented_by_its_own_placeholder():
 def test_withholding_an_image_does_not_consume_it(image_id):
     """The bytes survive, so a later vision-capable turn can still send them."""
     build_wire_messages(
-        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-v4-flash'
+        [{'role': 'user', 'content': 'look', 'images': [image_id]}], model='deepseek-v4-pro'
     )
 
     assert image_store.get(image_id) == (_PNG_BYTES, 'image/png')
@@ -277,7 +277,7 @@ def test_withholding_an_image_does_not_consume_it(image_id):
 def test_the_callers_transcript_is_not_mutated_when_the_image_is_withheld(image_id):
     messages = [{'role': 'user', 'content': 'look', 'images': [image_id]}]
 
-    build_wire_messages(messages, model='deepseek-v4-flash')
+    build_wire_messages(messages, model='deepseek-v4-pro')
 
     assert messages == [{'role': 'user', 'content': 'look', 'images': [image_id]}]
 
@@ -293,11 +293,11 @@ def test_the_degradation_is_logged_once_per_image_not_once_per_turn(image_id, mo
     messages = [{'role': 'user', 'content': 'look', 'images': [image_id]}]
 
     for _ in range(3):
-        build_wire_messages(messages, model='deepseek-v4-flash')
+        build_wire_messages(messages, model='deepseek-v4-pro')
 
     assert len(warnings) == 1
     assert image_id in warnings[0]
-    assert 'deepseek-v4-flash' in warnings[0]
+    assert 'deepseek-v4-pro' in warnings[0]
 
 
 def test_the_gate_is_only_applied_when_images_are_present():
@@ -334,6 +334,35 @@ def test_model_capability_hints():
     assert model_supports_images('gpt-4o', explicit=False) is False
 
 
+def test_deepseek_vision_is_per_model_not_per_family():
+    """DeepSeek's Flash model takes images; its Pro model explicitly does not.
+
+    Verified against api-docs.deepseek.com (Vision guide + Models & Pricing):
+    the Flash model accepts ``image_url`` content parts, the Pro model lists
+    Vision as unsupported.  A family-wide ``deepseek`` hint would wrongly send
+    image blocks to the Pro model, so the hints stay per-model.
+    """
+    # Flash: the current name and the two retired-but-still-accepted names.
+    assert model_supports_images('deepseek-flash') is True
+    assert model_supports_images('deepseek-v4-flash') is True
+    assert model_supports_images('deepseek-v4-flash-vision-exp') is True
+
+    # Pro: no vision, and it must not be caught by the Flash hints.
+    assert model_supports_images('deepseek-v4-pro') is False
+
+
+def test_a_deepseek_flash_image_still_reaches_the_wire(image_id):
+    """The hints are the whole gate: a listed model must really send the image."""
+    wire = build_wire_messages(
+        [{'role': 'user', 'content': 'what is wrong with this screenshot?',
+          'images': [image_id]}],
+        model='deepseek-v4-flash',
+    )
+
+    assert [block['type'] for block in wire[0]['content']] == ['text', 'image_url']
+    assert wire[0]['content'][1]['image_url']['url'].startswith('data:image/png;base64,')
+
+
 # ---------------------------------------------------------------------------
 # The provider itself
 # ---------------------------------------------------------------------------
@@ -363,7 +392,7 @@ def test_a_transcript_carrying_an_unsendable_image_does_not_block_later_turns(
         )
 
     monkeypatch.setattr(provider.client.chat.completions, 'create', _fake_create)
-    provider.config = ProviderConfig(api_key='test-key', model='deepseek-v4-flash')
+    provider.config = ProviderConfig(api_key='test-key', model='deepseek-v4-pro')
 
     transcript = [
         {'role': 'user', 'content': 'what is this?', 'images': [image_id]},
