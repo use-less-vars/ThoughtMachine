@@ -1,15 +1,25 @@
 # contract-gate.yml - the fast gate over the invariants named in docs/CONTRACTS.md.
 #
 # It runs the test files cited by the ledger, enumerated by hand (no glob, no `-m`
-# marker expression, never the whole suite), plus three gate-only additions the
+# marker expression, never the whole suite), plus four gate-only additions the
 # ledger does not cite: tests/security/test_git_hardening.py and
-# web_ui/backend/tests/test_auth_boundary.py (both added by C91), and
+# web_ui/backend/tests/test_auth_boundary.py (both added by C91),
 # tests/test_verify_doc_citations.py, the mutation guard for the citation checker
-# wired in below. The parity test enforces cited <= run, so an uncited extra file
-# cannot turn this workflow red.
+# wired in below, and tests/test_onboarding_bundle_contract.py, whose git
+# ancestry check is the only assertion in the repo that can notice the router
+# pinning a commit dev no longer contains. The parity test enforces cited <= run,
+# so an uncited extra file cannot turn this workflow red.
+#
+# The checkout is fetch-depth: 0 (full history). That is not a luxury: the
+# ancestry check has to be able to SEE the pinned commit, and a depth-1 clone
+# cannot -- it would either report "not fetched" as staleness or spend the gate's
+# budget deepening the clone one fetch at a time. With full history that check is
+# a plain local merge-base: no network, nothing to deepen.
 # Docker, secrets and the image cache of python-version-matrix.yml are
-# deliberately absent: every file here is hermetic, so this job should finish in
-# well under the 2-minute budget.
+# deliberately absent: every file here is hermetic -- on the full-history
+# checkout above, test_onboarding_bundle_contract.py reads the real tree and runs
+# git/bash locally but fetches nothing -- so this job should finish in well under
+# the 2-minute budget.
 name: Contract Gate
 
 on:
@@ -31,8 +41,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: Checkout -- full history, so the router's pinned commit is visible
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -67,6 +79,7 @@ jobs:
             tests/test_workspace_permission_vocab_unification.py \
             tests/test_visual_grain_closure.py \
             tests/security/test_git_hardening.py \
+            tests/test_onboarding_bundle_contract.py \
             web_ui/backend/tests/test_auth_boundary.py
           status=$?
           end=$(date +%s)
