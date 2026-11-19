@@ -86,6 +86,121 @@ def _kb_atomic_write(path: Path, text: str) -> None:
     os.replace(tmp_path, path)
 
 
+# ---------------------------------------------------------------------------
+# Checkout discovery for the workspace KB root (pure filesystem, no git binary)
+# ---------------------------------------------------------------------------
+# The workspace KB lives at ``<checkout>/.thoughtmachine/knowledge``. When a
+# session works in a *linked worktree* of the registered workspace (or in the
+# registered workspace itself) the KB must be anchored to the checkout the
+# caller is actually in -- otherwise a write performed from worktree A lands in
+# checkout B, where no ``read`` from A will ever find it.
+#
+# The checkout is discovered without the ``git`` binary, using the two
+# filesystem shapes git produces:
+#   * main checkout: ``<tree>/.git`` is a DIRECTORY
+#   * linked worktree: ``<tree>/.git`` is a FILE holding ``gitdir: <path>``,
+#     where ``<path>`` is normally ``<main>/.git/worktrees/<name>``
+#
+# Switching roots is only ever allowed between two checkouts of the SAME
+# repository (identical main checkout), so an unrelated repository can never
+# capture the KB.
+
+
+def _kb_git_dir(tree: Path) -> Optional[Path]:
+    """Return the git dir of *tree* (a directory holding ``.git``), or None."""
+    dot_git = tree / ".git"
+    try:
+        if dot_git.is_dir():
+            return dot_git
+        if dot_git.is_file():
+            text = dot_git.read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines():
+                if line.startswith("gitdir:"):
+                    raw = line[len("gitdir:"):].strip()
+                    if not raw:
+                        return None
+                    git_dir = Path(raw)
+                    # Relative pointers are relative to the tree itself.
+                    if not git_dir.is_absolute():
+                        git_dir = tree / git_dir
+                    return git_dir
+    except OSError:
+        return None
+    return None
+
+
+def _kb_git_tree(path) -> Optional[Path]:
+    """Walk up from *path* to the nearest directory containing ``.git``.
+
+    Returns the (symlink-resolved) tree root, or None when *path* is not inside
+    any checkout.
+    """
+    try:
+        current = Path(path).resolve()
+    except OSError:
+        return None
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _kb_main_checkout(tree: Optional[Path]) -> Optional[Path]:
+    """Return the main checkout *tree* belongs to, or None when undeterminable.
+
+    ``<main>/.git`` (directory) -> ``<main>``;
+    ``<main>/.git/worktrees/<name>`` (gitdir pointer) -> ``<main>``.
+    """
+    if tree is None:
+        return None
+    git_dir = _kb_git_dir(tree)
+    if git_dir is None:
+        return None
+    if git_dir.name == ".git":
+        return git_dir.parent
+    if git_dir.parent.name == "worktrees" and git_dir.parent.parent.name == ".git":
+        return git_dir.parent.parent.parent
+    return None
+
+
+def _kb_same_checkout(left: Optional[Path], right: Optional[Path]) -> bool:
+    """True when both trees are (worktrees of) the same repository."""
+    if left is None or right is None:
+        return False
+    left_main = _kb_main_checkout(left)
+    right_main = _kb_main_checkout(right)
+    if left_main is None or right_main is None:
+        return False
+    try:
+        return os.path.realpath(left_main) == os.path.realpath(right_main)
+    except OSError:
+        return False
+
+
+def _kb_workspace_kb_root(registered_root: Optional[str]) -> Path:
+    """Resolve the workspace KB root for the current caller.
+
+    * *registered_root* (the session's workspace root) is the default anchor.
+    * When the caller's current directory is inside a checkout of the SAME
+      repository as *registered_root* -- the registered workspace itself or a
+      linked worktree of it -- the caller's own checkout wins, so reads and
+      writes made from a worktree stay in that worktree.
+    * A caller in an unrelated repository, or outside any checkout, can never
+      re-target the KB: the registered root is kept.
+    """
+    caller_tree = _kb_git_tree(Path.cwd())
+
+    if registered_root:
+        base = Path(registered_root)
+        registered_tree = _kb_git_tree(base)
+        if _kb_same_checkout(caller_tree, registered_tree):
+            base = caller_tree
+        return base / ".thoughtmachine" / "knowledge"
+
+    # No registered workspace: historical behaviour, the caller's cwd.
+    return Path.cwd() / ".thoughtmachine" / "knowledge"
+
+
 # Hardcoded domain registry mapping domain names to relative file paths
 DOMAINS: Dict[str, str] = {
     "system_architecture": "project/system_architecture.md",
@@ -331,10 +446,21 @@ class KnowledgeBaseTool(ToolBase):
                     self._log_debug(
                         "KnowledgeBaseTool falling back to deprecated AgentConfig.workspace_path")
 
-            if ws_path:
-                kb_root = Path(ws_path) / ".thoughtmachine" / "knowledge"
+            # An explicitly bound `worktree_root` (injected by ToolExecutor when
+            # the session is bound to a narrower checkout) is the tree the
+            # caller is actually in, so it outranks the ambient root. It is
+            # validated fail-closed by ToolBase._worktree_root(): an invalid
+            # value refuses the operation rather than silently redirecting the
+            # KB into the main checkout.
+            try:
+                worktree_root = self._worktree_root()
+            except ValueError as exc:
+                return json.dumps({"error": f"Error: {exc}"})
+
+            if worktree_root:
+                kb_root = Path(worktree_root) / ".thoughtmachine" / "knowledge"
             else:
-                kb_root = Path.cwd() / ".thoughtmachine" / "knowledge"
+                kb_root = _kb_workspace_kb_root(ws_path)
             # The skeleton is materialised only AFTER the permission gate below.
             init_result = None
 
@@ -1157,6 +1283,10 @@ class KnowledgeBaseTool(ToolBase):
     def _mode_append(self, kb_root: Path) -> str:
         """Append a timestamped entry to the specified domain file.
 
+        The entry is written under a ``## {date} — {summary}`` heading, unless
+        the entry already starts with its own ``## `` heading (then it is
+        written as-is, so it is never double-headed).
+
         If ``append_section`` is set, the entry is inserted under that ## heading
         (creating it if missing). Otherwise the entry is appended at the end.
 
@@ -1176,7 +1306,19 @@ class KnowledgeBaseTool(ToolBase):
         # Generate the entry block
         today = datetime.now().strftime("%Y-%m-%d")
         entry_summary = self.summary if self.summary else (self.entry[:60] + "..." if len(self.entry) > 60 else self.entry)
-        entry_block = f"\n## {today} — {entry_summary}\n\n{self.entry}\n"
+        # An entry that already starts with its own `## ` heading is written
+        # as-is: synthesising the `## {today} — {summary}` heading on top of it
+        # produced two headings per entry (a duplicated, unparseable block for
+        # `archive`).
+        stripped_entry = self.entry.lstrip()
+        if _re.match(r"##[ \t]", stripped_entry):
+            entry_block = f"\n{stripped_entry.rstrip()}\n"
+            if not self.summary:
+                own_heading = stripped_entry.splitlines()[0][2:].strip()
+                if own_heading:
+                    entry_summary = own_heading
+        else:
+            entry_block = f"\n## {today} — {entry_summary}\n\n{self.entry}\n"
 
         lock = _get_file_lock(str(file_path))
         with lock:
