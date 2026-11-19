@@ -420,9 +420,9 @@ fact in a standup.
    than deleted. Historical: the push rejections at `a869255d` and `544bd407` reported
    `remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are
    expected.`, which was the best evidence available from inside the checkout. The context names
-   are measured and recorded, with the instrument that produced them, in `docs/BRANCH_PROTECTION.md`
-   — which is what makes this a measurement rather than an attribution. Still open: whether the
-   ruleset blocks the *merge button* (a bypassable direct push is a different rule). **Section 10.**
+   are measured, recorded, and now quoted verbatim in `docs/BRANCH_PROTECTION.md` — which is what
+   makes this a measurement rather than an attribution. Still open: whether the ruleset blocks the
+   *merge button* (a bypassable direct push is a different rule). **Section 10.**
 5. **"The only chokepoint."** Contradicted for MCP stdio, and ~11 other `import subprocess` sites
    remain unadjudicated one by one (git tools, `worker_execution.py`, `sandboxed_execution.py`,
    `doctor.py`, `workspace_lifecycle_manager.py`, `containers/executor.py:1259`). Needs a per-site

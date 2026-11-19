@@ -23,12 +23,34 @@ gh api repos/:owner/:repo/rulesets/24214086 --jq '.rules[] |
 ```
 
 That returns **twelve** entries for **eleven** unique contexts. The duplicate is
-`Unit tests - Python 3.12`, stored twice inside the same ruleset — which is the
-entire reason the stored count and the enforced count disagree. Nothing is broken
-by it, but without that sentence the twelve-versus-eleven gap reads as a
-measurement error and gets "corrected" in the wrong direction.
+`Unit tests - Python 3.12`, stored adjacent to itself at positions 7 and 8 of the
+stored order — which is the entire reason the stored count and the enforced count
+disagree. Nothing is broken by it, but without that sentence the twelve-versus-eleven
+gap reads as a measurement error and gets "corrected" in the wrong direction. The
+order below is the order the call returns, not an order anyone chose: it is neither
+alphabetical nor grouped by workflow.
 
-The eleven, spelled the way `scripts/apply_branch_protection.sh` spells them:
+**Verbatim, as the operator pasted it on 2026-11-19** — twelve entries, stored order,
+duplicate intact. This is a transcript, not a reconstruction: every name below is
+copied, and nothing in the block was inferred from a count.
+
+```
+Ubuntu - full test suite
+Linux - install/startup smoke (blocking)
+Linux install + check-only + backend smoke
+macOS launcher preflight (gating)
+Install + check-only
+Unit tests - Python 3.11
+Unit tests - Python 3.12
+Unit tests - Python 3.12
+Unit tests - Python 3.13
+Installer version-contract assertions
+Contract gate (docs/CONTRACTS.md)
+Unit tests - Python 3.14
+```
+
+De-duplicated and sorted, those are the eleven unique contexts — the same eleven,
+spelled the way `scripts/apply_branch_protection.sh` spells them:
 
 ```
 Contract gate (docs/CONTRACTS.md)
@@ -50,19 +72,23 @@ Seven names that `REQUIRED_CHECKS` asks for are **not** enforced:
 `Windows - thin pytest slice`, `Windows venv + smoke script`. Every one of those
 is a check that runs, can go red, and stops no merge.
 
-**Provenance, because it matters more than the list does — and it is not uniform.**
-The eighteen names above are byte-exact from `REQUIRED_CHECKS`
-(`scripts/apply_branch_protection.sh:78-96`). The *membership* of the eleven is
-constrained rather than read off in one go: the counts say eleven unique contexts
-out of eighteen candidates, three exclusions were re-confirmed by name in the same
-read (`Linux - auth e2e (browser)`, `web-ui-backend-suite`,
-`Windows Python 3.14 gate proof`), and the remaining four follow from a separate
-prior capture of the ruleset's ten non-`Contract gate` names, which omits exactly
-those four. That determines the seven uniquely — but it is arithmetic over a
-measurement, not a transcript of one. Paste the instrument's raw output into this
-file when you have it and the paragraph collapses to a quotation. Either way: if
-the command and this file disagree, the command wins and this file is what gets
-edited.
+None of the seven appears in the transcript above. That is a stronger statement than
+the one this sentence made an hour ago: the list was then derived by subtraction from
+a total, and it is now read off by name.
+
+**Provenance, and the one paragraph of this file that evidence rewrote.** The eighteen
+declared names are byte-exact from `REQUIRED_CHECKS`
+(`scripts/apply_branch_protection.sh:78-96`). The enforced twelve are byte-exact from
+the operator's unedited paste of the instrument's output, reproduced above in the
+order it returns. An earlier version of this paragraph reconstructed the membership
+instead — eleven out of eighteen by subtraction, three exclusions re-confirmed by
+name, four carried over from a separate capture. That reconstruction landed on
+exactly these eleven names, and it is recorded here rather than tidied away, because
+the next reader should be able to tell a transcript from a good guess and should not
+conclude from this file that counting is as good as quoting. It is not: the seven
+absences above are now read off the transcript, where before they were inferred from
+a total. If the command and this file disagree, the command wins and this file is what
+gets edited.
 
 ## What a required context is
 
