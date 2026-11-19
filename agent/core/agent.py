@@ -37,7 +37,7 @@ from agent.core.state import AgentState, ExecutionState, SessionState, TimeState
 from agent import events as ev
 from agent.events import global_event_bus
 from .token_counter import TokenCounter
-from .llm_client import LLMClient, LLMError
+from .llm_client import LLMClient, LLMError, compose_addendum_into_messages
 from .stream_events import Done, Interrupted, ReasoningDelta, TextDelta, ToolCallComplete, UsageUpdate
 from .conversation_manager import ConversationManager
 from .tool_executor import ToolExecutor, is_interrupted_tool_entry
@@ -1789,6 +1789,15 @@ class Agent:
                 messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
                 if original_len != len(messages):
                     log('DEBUG', 'core.agent', f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
+                # The session addendum joins the request HERE, on every turn, and
+                # only in the OUTGOING payload: ``build()`` hands back references
+                # into ``session.user_history``, so composing in place would write
+                # the block back into the durable record (and into compaction
+                # summaries) and freeze the entry set again.  This is the ONE
+                # composition site; ``ensure_system_prompt`` no longer touches the
+                # addendum, so whatever the operator wrote, edited or removed is
+                # what the very next query carries.
+                messages = compose_addendum_into_messages(messages, self.session)
                 if self.logger and hasattr(self.logger, 'py_logger'):
                     import tiktoken
                     try:

@@ -46,6 +46,7 @@ from session.models import Session
 from session.store import FileSystemSessionStore
 from web_ui.backend.addendum_routes import (
     AddendumWriteBody,
+    _bridge_agent_session,
     _live_bridges,
     _resolve_addendum_session,
     get_session_addendum_effective,
@@ -305,3 +306,47 @@ def test_effective_diagnostics_report_warm_registry(
     diagnostics = body["diagnostics"]
     assert diagnostics["warm_registry_bridges"] >= 1
     assert diagnostics["registry_source"] == "warm"
+
+
+def test_controller_delegated_agent_counts_as_agent_bearing(
+    store, routes_store, warm_registry
+):
+    """The DELEGATION shape: ``_agent`` is None while ``_controller.agent`` runs.
+
+    ``WebAgentBridge.start()`` hands the turn loop to a controller when one is
+    attached and leaves ``_agent`` unset for the whole turn.  A resolution that
+    read only ``_agent`` therefore reported ``agent-bearing: 0`` and ``same
+    session object: no`` while an agent was in fact running -- the diagnostic was
+    wrong about the one thing it exists to answer.  ``_bridge_agent_session`` is
+    the single place that knows both shapes; this pins that it asks the
+    controller first and that the counters follow it.
+    """
+    _seed(store)
+    live = store.load_session(SID)
+    assert live is not None
+    bridge = _warm_bridge(store, live)
+    # The delegation shape in full: no owned agent, the controller carries one.
+    bridge._agent = None
+    bridge._controller = SimpleNamespace(agent=SimpleNamespace(session=live))
+    warm_registry[SID] = bridge
+
+    # (1) the resolver finds the agent through the controller ...
+    assert _bridge_agent_session(bridge) is live
+    assert _bridge_agent_session(bridge) is bridge._controller.agent.session
+
+    # (2) ... so a write still lands on the object that agent is running on ...
+    status, body = _post_text(TEXT)
+    assert status == 200, body
+    assert body["status"] == "accepted"
+    assert _texts(live) == [TEXT]
+
+    # (3) ... and the diagnostic stops under-reporting: one live bridge, one
+    # agent-bearing bridge, and the agent holds THIS session object.
+    status, body = _get_effective()
+    assert status == 200, body
+    assert body["resolved_via"] == "live"
+    diagnostics = body["diagnostics"]
+    assert diagnostics["agent_bearing_bridges"] == 1
+    assert diagnostics["same_object"] is True
+    assert diagnostics["agent_session_object_id"] == diagnostics["session_object_id"]
+
