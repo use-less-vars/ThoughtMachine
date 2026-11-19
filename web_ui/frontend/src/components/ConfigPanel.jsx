@@ -37,6 +37,17 @@ const permissionOptionLabel = (value) => value === 'write_on_feature_branch'
   ? 'Write on feature branches'
   : String(value).charAt(0).toUpperCase() + String(value).slice(1)
 
+//: What "applied" means for the addendum. There is no deferred-apply path here:
+//: a write is saved immediately and composed into the request built for the next
+//: message, so the config form's "applied after Apply" vocabulary (and the greyed
+//: Apply button beside it) would describe a mechanism that does not exist.
+const ADDENDUM_APPLIED_LABELS = {
+  next_query: 'applies to your next message',
+}
+
+const addendumAppliedLabel = (applied) =>
+  ADDENDUM_APPLIED_LABELS[applied] ?? `applied ${applied ?? 'next_query'}`
+
 // Flat-map deep equality for the permissions raw maps (string/bool values).
 const isEqualRaw = (a, b) => {
   if (a === b) return true;
