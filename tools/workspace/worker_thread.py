@@ -3919,6 +3919,9 @@ class WorkerThread(threading.Thread):
         # worktree_root unset, i.e. exactly the pre-existing behaviour.  The
         # directory is created HERE because ``worktree_root`` is validated
         # fail-closed downstream — the validator is never relaxed.
+        # It is checked out on ``wt/<session>`` so the worker can commit; a
+        # detached worktree makes every git_write verb refuse with
+        # ``_DETACHED_HEAD_ERROR``.  Do not detach here.
         if not worker_cfg.get("worktree_root"):
             from tools.workspace.worktree_defaults import (
                 resolve_worker_worktree_root,
