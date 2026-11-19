@@ -131,11 +131,115 @@ def render_addendum_block(session) -> str:
     Returns ``''`` when the session has no addendum, a ``None`` addendum or an
     addendum with no entries - the caller then leaves the system prompt
     completely untouched (byte-identical to the un-composed prompt).
+
+    ``pinned`` is stored and rendered-adjacent but inert BY DESIGN: the block is
+    rendered in stored order, nothing sorts or filters by ``pinned``, and no
+    writer sets it True.  It exists so the field can gain a meaning later without
+    a migration; until then it must not appear to do anything.
     """
     texts = _addendum_entry_texts(_session_addendum(session))
     if not texts:
         return ''
     return ADDENDUM_HEADING + '\n' + '\n\n'.join(texts)
+
+
+def _addendum_entry_ids(addendum) -> List[str]:
+    """Return the stored ids of *addendum* in stored order (diagnostics only)."""
+    if isinstance(addendum, dict):
+        entries = addendum.get('entries')
+    else:
+        entries = getattr(addendum, 'entries', None)
+    if not isinstance(entries, (list, tuple)):
+        return []
+    ids = []
+    for entry in entries:
+        entry_id = entry.get('id') if isinstance(entry, dict) else getattr(entry, 'id', None)
+        ids.append(entry_id if isinstance(entry_id, str) else '?')
+    return ids
+
+
+def strip_addendum_block(text) -> str:
+    """Remove an addendum block previously baked into *text*, if any.
+
+    Older builds composed the addendum INTO the stored system prompt
+    (``ensure_system_prompt``) and persisted the result, so a resumed session
+    can still carry a stale block at the end of its system message.  Composing
+    onto such a message would send the stale entries *and* the fresh ones, which
+    is exactly the "I deleted it but the model still sees it" failure.  Cutting
+    the block off the base before appending the current one makes the outgoing
+    prompt a function of the CURRENT entry set only, whatever history holds.
+
+    The cut is at the LAST occurrence: a rebuild always replaced the whole
+    system message, so at most one block can be present, and taking the last one
+    keeps a legitimate mention of the heading earlier in a prompt text intact.
+
+    A *text* that carries no block is returned unchanged (identity), so the
+    byte-stable-prefix property (design doc P4) is unaffected for clean sessions.
+    """
+    if not isinstance(text, str):
+        return text
+    marker = f'\n\n{ADDENDUM_HEADING}\n'
+    index = text.rfind(marker)
+    if index == -1:
+        return text
+    return text[:index]
+
+
+def compose_addendum_into_messages(messages, session):
+    """Return *messages* with *session*'s addendum appended to its system message.
+
+    THIS is where the addendum enters a request (design doc §6.2, ruling D-2):
+    the block is composed onto the OUTGOING message list on every single turn,
+    so a write, an edit or a removal is carried by the very next query — no
+    rebuild, no restart, no resume.
+
+    Why the outgoing list and not the stored conversation:
+
+    * ``context_builder.build()`` returns REFERENCES into ``session.user_history``,
+      so composing in place would write the block back into the durable record
+      (and into compaction summaries) and freeze it again.  This returns a NEW
+      list whose system message is a COPY; the caller's history is untouched.
+    * The base prompt stays byte-identical: the block is appended after it, never
+      interleaved, which is what makes the prompt prefix cache-stable (P4).
+    * Exactly one system message is produced (P2): the append targets the single
+      system message the builder emits, and a stale block already baked into it
+      is stripped first so no second copy can appear.
+
+    Returns *messages* UNCHANGED (same object) when there is nothing to compose:
+    no addendum, an empty one, or an empty message list.  The un-composed payload
+    is therefore byte-identical to what a session without an addendum sends.
+    """
+    if not messages:
+        return messages
+    block = render_addendum_block(session)
+    if not block:
+        return messages
+
+    addendum = _session_addendum(session)
+    entry_ids = _addendum_entry_ids(addendum)
+    try:
+        import hashlib
+        digest = hashlib.sha256(block.encode('utf-8')).hexdigest()[:12]
+    except Exception:
+        digest = 'unhashed'
+    log('DEBUG', 'core.addendum',
+        f'[addendum] composing {len(entry_ids)} entries into the outgoing system '
+        f'prompt: ids={entry_ids} sha256={digest} chars={len(block)}')
+
+    composed = list(messages)
+    for index, message in enumerate(composed):
+        if message.get('role') != 'system':
+            continue
+        fresh = dict(message)
+        base = strip_addendum_block(fresh.get('content', ''))
+        fresh['content'] = f'{base}\n\n{block}' if base else block
+        composed[index] = fresh
+        return composed
+
+    # No system message in the payload at all (a conversation built without one):
+    # the block is still carried, as the single system message P2 allows.
+    composed.insert(0, {'role': 'system', 'content': block})
+    return composed
 
 
 class LLMError(ProviderError):
@@ -219,12 +323,13 @@ class LLMClient:
         else:
             system_prompt = self.load_system_prompt()
 
-        # Compose the session addendum (if any) onto the end of the system
-        # prompt. An absent / None / zero-entry addendum renders nothing, which
-        # leaves ``system_prompt`` byte-identical to the text resolved above.
-        addendum_block = render_addendum_block(getattr(self, 'session', None))
-        if addendum_block:
-            system_prompt = f'{system_prompt}\n\n{addendum_block}'
+        # The session addendum is deliberately NOT composed here.  This method
+        # runs once per agent construction (and on pause/resume / config apply),
+        # so baking the block in made the model read whatever the entry set was
+        # at that moment - edits and removals after it were invisible and
+        # deleted text kept being sent.  The block now enters each request in
+        # ``compose_addendum_into_messages`` (called from the turn loop), which
+        # is the ONE composer and leaves the stored history addendum-free.
 
         # Remove old system prompts but preserve summary messages
         # (Summaries also use role='system' and are needed by SummaryBuilder.
