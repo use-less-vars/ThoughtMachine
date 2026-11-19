@@ -85,15 +85,26 @@ def _run_git_clean(cwd: Path, *args) -> subprocess.CompletedProcess:
     )
 
 
-@pytest.fixture(scope="module", autouse=True)
-def git_available():
-    """Skip the whole module when git is not installed (e.g. minimal containers).
+# These tests exercise the hardening contract with REAL git, so on a host
+# without a git binary they cannot prove anything.  That used to be handled by
+# a module-scoped autouse ``git_available`` fixture which called pytest.skip()
+# for the whole file: pytest then reported the entire suite as a single "s",
+# which is indistinguishable from "the hardening tests do not exist / are not
+# collected" -- the same green wall whether the contract was checked or not.
+#
+# The skip is therefore now PER TEST, with an unambiguous reason, so a sandbox
+# without git shows 13 explicit "s" lines plus one genuinely EXECUTED test
+# (the container-path argv pin, which needs no git binary at all).
+GIT_AVAILABLE = shutil.which("git") is not None
 
-    The hardening contract is exercised with real git on hosts that have it;
-    in sandboxes without a git binary the suite skips instead of erroring.
-    """
-    if shutil.which("git") is None:
-        pytest.skip("git binary not available in this environment")
+requires_git = pytest.mark.skipif(
+    not GIT_AVAILABLE,
+    reason=(
+        "git binary not available in this environment: this test builds a real "
+        "repository, so its assertion is SKIPPED (UNPROVEN on this machine, "
+        "proven only on a runner that has git) -- not passed"
+    ),
+)
 
 
 @pytest.fixture
@@ -128,6 +139,7 @@ def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
     )
 
 
+@requires_git
 def test_host_path_pre_commit_hook_does_not_run(hardened_repo):
     """HOST path: a pre-commit hook in the repo must never execute.
 
@@ -187,6 +199,7 @@ def test_container_path_commit_runs_githooks_only(tmp_path):
     assert command2 == ["git", "-c", "core.autocrlf=input", "-c", "core.eol=lf", "status"]
 
 
+@requires_git
 def test_commit_still_succeeds(hardened_repo):
     """Hardening must not break normal commits."""
     workspace, repo, marker = hardened_repo
@@ -200,6 +213,7 @@ def test_commit_still_succeeds(hardened_repo):
     assert "test commit" in log.stdout
 
 
+@requires_git
 def test_repo_root_outside_workspace_rejected(tmp_path):
     """A repo whose root sits ABOVE the workspace must be rejected.
 
@@ -224,6 +238,7 @@ def test_repo_root_outside_workspace_rejected(tmp_path):
     assert "Git command failed" not in result
 
 
+@requires_git
 def test_status_still_works(hardened_repo):
     """A normal status operation inside the workspace is unaffected."""
     workspace, repo, _ = hardened_repo
@@ -240,6 +255,7 @@ def test_status_still_works(hardened_repo):
     assert "Git command failed" not in result
 
 
+@requires_git
 def test_ambient_global_config_is_ignored(hardened_repo, monkeypatch, tmp_path):
     """A hostile ~/.gitconfig must never influence commits made by the tool.
 
@@ -297,6 +313,7 @@ def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit", file
     )
 
 
+@requires_git
 def test_repo_hooks_never_execute(hardened_repo):
     """A post-commit hook in the repo must never run during a commit."""
     workspace, repo, _ = hardened_repo
@@ -312,6 +329,7 @@ def test_repo_hooks_never_execute(hardened_repo):
     assert not post_marker.exists()
 
 
+@requires_git
 def test_fsmonitor_config_not_executed(hardened_repo):
     """A repo-local core.fsmonitor helper must never be executed."""
     workspace, repo, _ = hardened_repo
@@ -335,6 +353,7 @@ def test_fsmonitor_config_not_executed(hardened_repo):
     assert not fsmon_marker.exists()
 
 
+@requires_git
 def test_vault_pre_commit_hook_never_runs(tmp_path, monkeypatch):
     """A vault-managed pre-commit hook must NEVER execute anymore.
 
@@ -383,6 +402,7 @@ def test_vault_pre_commit_hook_never_runs(tmp_path, monkeypatch):
     assert "vault hook commit" in log.stdout
 
 
+@requires_git
 def test_failing_vault_pre_commit_hook_does_not_abort(tmp_path, monkeypatch):
     """A failing vault pre-commit hook must NOT abort the commit anymore.
 
@@ -426,6 +446,7 @@ def test_failing_vault_pre_commit_hook_does_not_abort(tmp_path, monkeypatch):
     assert log.returncode == 0  # the commit was created
 
 
+@requires_git
 def test_commit_denied_without_git_write_permission(hardened_repo):
     """Committing without a write-capable session git permission fails closed.
 
@@ -450,6 +471,7 @@ def test_commit_denied_without_git_write_permission(hardened_repo):
     assert log.returncode != 0  # nothing was committed
 
 
+@requires_git
 def test_normal_git_operations(hardened_repo):
     """Read-only operations keep working through the hardened runner."""
     workspace, repo, _ = hardened_repo
@@ -476,6 +498,8 @@ def test_normal_git_operations(hardened_repo):
         assert "Git command failed" not in result
         assert "Error running git command" not in result
 
+
+@requires_git
 def test_textconv_driver_never_executes_via_show(tmp_path):
     """A repo-local textconv diff driver must never run during git show.
 
@@ -520,6 +544,7 @@ def test_textconv_driver_never_executes_via_show(tmp_path):
     )
 
 
+@requires_git
 def test_textconv_disabled_but_builtin_diff_works(tmp_path):
     """With --no-textconv, normal diff output stays correct."""
     workspace = tmp_path / "workspace"
