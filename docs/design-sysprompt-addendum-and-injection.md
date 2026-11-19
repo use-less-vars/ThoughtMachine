@@ -258,7 +258,7 @@ agent/core/agent.py:1914
 
 ### 6.2 How it reaches the model
 
-The assembly site is already a single function, already called per turn:
+The base prompt comes from a single function, `ensure_system_prompt`. This section originally described it as "already called per turn"; **that was wrong** (§11.7 records the defect). What follows is the shape of the **system-message rebuild**, not a per-turn hook: turns do not call it, and nothing below should be read as a per-turn site.
 
 ```
 agent/core/llm_client.py:144-179
@@ -311,7 +311,20 @@ agent/core/agent.py:1285-1288
       messages = self.conversation
 ```
 
-`ensure_system_prompt` is already invoked per turn (`agent/core/agent.py:1169`), so a mid-stream write becomes visible on the next request with no extra plumbing — which is exactly what P3 promises.
+`ensure_system_prompt` is **not** invoked per turn: it runs at `Agent.__init__`, on `_apply_pending_config` and on pause/resume. The stub at `agent/core/agent.py:1169` was read as a per-turn call site; it is not one.
+
+The per-turn site is `Agent.process_query`, immediately after the context build and `ContextBuilder._cleanup_orphaned_tool_messages`:
+
+```
+agent/core/agent.py:1800
+  messages = compose_addendum_into_messages(messages, self.session)
+```
+
+`compose_addendum_into_messages` (`agent/core/llm_client.py:183`) returns a NEW list, copies the outgoing system message, strips any addendum block already at its end (`strip_addendum_block`, `llm_client.py:156`) and appends the block rendered from the session as it is *at that instant*. Three properties follow, and each is pinned by a test:
+
+* a mid-stream add, edit or removal is carried by the very next request — P3, made structural;
+* the block is never written back into `user_history`, so no frozen snapshot can shadow a later edit (the defect in §11.7);
+* composing onto an already-composed payload keeps exactly one block, and a block baked in by an older build is dropped rather than doubled.
 
 ### 6.3 Why it survives both pruners — and why "exempt" would be the wrong word
 
@@ -517,6 +530,12 @@ These are consequences of reading, not of the proposal. Each is worth its own ru
 **11.5 Unknown-event behaviour on the main frontend switch is unverified** (§5.5). One `grep` settles it; it should happen before implementation, not during.
 
 **11.6 `docs/design-streaming-canonical-ir.md:18` states a premise the code refutes** (§3). The line should be corrected rather than silently contradicted by this brief, because as written it will cause the next reader to re-reject the addendum for a bad reason.
+
+**11.7 This document's own §6.2 was false, and the implementation built on it was wrong in a way the tests did not catch.** §6.2 claimed `ensure_system_prompt` was "already invoked per turn (`agent/core/agent.py:1169`)". It is not: it runs at construction, on a config re-apply and on resume. Composition was nevertheless attached to it, and it wrote the rendered block INTO `session.user_history[0]['content']` — so every later turn replayed that frozen string through `SummaryBuilder.build`. An entry added after the agent was constructed never reached the model; an entry removed there stayed forever.
+
+Observed live, not inferred: the prompt sent at 17:59:54 carried an entry written at 17:59 and did **not** carry an entry written at 18:09, in the same session, with the operator having watched the write succeed.
+
+The fix is structural and is described in §6.2: composition happens on the outgoing message list in `process_query`, the stored system message is never touched, and `strip_addendum_block` removes a block baked in by an older build. Unlike §11.1–§11.6 this one is fixed in the same change; it is recorded because the failure mode — a line number asserted as a call site and never checked against the call graph, with tests inheriting the same assumption — is the one worth remembering.
 
 ---
 
