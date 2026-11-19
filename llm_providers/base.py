@@ -48,8 +48,11 @@ def _redact_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
 #:
 #: Only used when the provider config does not state ``supports_images``
 #: explicitly: an unknown model is assumed to be text-only, so a pasted
-#: screenshot is refused with a clear message instead of being sent to a
-#: model that would reject - or silently ignore - the image blocks.
+#: screenshot is replaced by a placeholder instead of being sent to a model
+#: that would reject - or silently ignore - the image blocks.  Being a name
+#: heuristic it goes stale, so vendor docs are the source of truth: an
+#: unknown-but-capable model shows the placeholder until it is listed here or
+#: opted in with ``supports_images: true``.
 VISION_MODEL_HINTS = (
     'gpt-4o',
     'gpt-4.1',
@@ -69,6 +72,15 @@ VISION_MODEL_HINTS = (
     'qwen2-vl',
     'qwen2.5-vl',
     'deepseek-vl',
+    # DeepSeek's API is multimodal on the Flash model only: `deepseek-flash`
+    # accepts image content parts, and the retired names `deepseek-v4-flash` /
+    # `deepseek-v4-flash-vision-exp` are still accepted and served by that same
+    # model.  `deepseek-v4-pro` explicitly does NOT accept images, so nothing
+    # generic such as 'deepseek-v4' may be added here - it would wrongly enable
+    # the pro model.  Substring matching means 'deepseek-v4-flash' also covers
+    # the '-vision-exp' alias.
+    'deepseek-flash',
+    'deepseek-v4-flash',
     'glm-4v',
     'vision',
 )
