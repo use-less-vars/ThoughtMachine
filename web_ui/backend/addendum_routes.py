@@ -37,7 +37,9 @@ A session can be *live* or *cold*, and this module resolves which one it is in
 exactly one place (``_resolve_addendum_session``):
 
 * **live** — a bridge in THIS process currently holds a ``Session`` object for
-  that id (a running agent's session, the bridge's ``_session``, or its
+  that id (a running agent's session -- resolved through
+  ``bridge._controller.agent`` when the bridge delegates and through
+  ``bridge._agent`` when it owns it -- the bridge's ``_session``, or its
   ``_loaded_session``).  That object is the runtime authority: it is the one the
   turn loop and the model actually read, so a write that landed only on disk
   would be invisible until the next resume.  The route therefore mutates the
@@ -127,21 +129,47 @@ def _get_store():
     return session_routes._get_store()
 
 
+def _bridge_agent_session(bridge) -> Any:
+    """The ``Session`` the bridge's agent is running on, or ``None``.
+
+    A bridge can be driving an agent in two shapes, and this is the ONE place
+    that knows both: a directly-owned agent (``bridge._agent``, the plain
+    ``start()`` path) and a controller-delegated one
+    (``bridge._controller.agent``).  In the delegation path
+    (``web_ui/backend/bridge.py``: the ``if self._controller is not None`` branch
+    of ``start()``) ``_agent`` stays ``None`` for the whole turn while
+    ``_controller.agent`` is the live agent, so looking only at ``_agent``
+    reported ``agent-bearing: 0``, ``same session object: no`` while an agent was
+    in fact reading this very session.  That diagnostic was truthful and
+    misleading at once: it described the attribute, not the fact.
+
+    The controller is asked first because it is the agent whose turn loop is
+    actually running; ``_agent`` is the fallback for the direct path.
+    """
+    controller_agent = getattr(getattr(bridge, "_controller", None), "agent", None)
+    for agent in (controller_agent, getattr(bridge, "_agent", None)):
+        session = getattr(agent, "session", None)
+        if session is not None:
+            return session
+    return None
+
+
 def _held_sessions(bridge, session_id: str) -> List[Any]:
     """Every ``Session`` object *bridge* currently holds for *session_id*.
 
     Ordered by authority, most authoritative first: the running agent's own
-    session (the object its ``LLMClient`` re-reads), then the bridge's
-    ``_session``, then ``_loaded_session``.  In practice the first two are the
-    same object; the order makes that explicit instead of assumed, and
-    ``_loaded_session`` is included because it is the object the next
+    session (the object the turn loop reads -- resolved through the controller
+    when the bridge delegates, through ``_agent`` when it owns the agent), then
+    the bridge's ``_session``, then ``_loaded_session``.  In practice the first
+    two are the same object; the order makes that explicit instead of assumed,
+    and ``_loaded_session`` is included because it is the object the next
     ``start()`` will run, so a write that skipped it could be undone.
 
     De-duplicated by identity, so a bridge that aliases the same Session three
     ways contributes it once.
     """
     candidates = [
-        getattr(getattr(bridge, "_agent", None), "session", None),
+        _bridge_agent_session(bridge),
         getattr(bridge, "_session", None),
         getattr(bridge, "_loaded_session", None),
     ]
@@ -200,7 +228,9 @@ def _live_bridges(session_id: str) -> List[Tuple[Any, List[Any]]]:
     unregistering mid-request cannot change the set under the loop, and
     de-duplicated by bridge identity so a bridge present in both contributes
     once.  Bridges with a running agent sort first: that is the copy the model
-    is reading.
+    is reading.  "Has a running agent" is asked through
+    ``_bridge_agent_session``, so the controller-delegation shape (where
+    ``bridge._agent`` is ``None``) sorts correctly instead of looking agentless.
     """
     candidates: List[Any] = []
     for bridge in list(_active_tab_bridges) + _warm_registry_bridges(session_id):
@@ -212,7 +242,7 @@ def _live_bridges(session_id: str) -> List[Tuple[Any, List[Any]]]:
         held = _held_sessions(bridge, session_id)
         if held:
             live.append((bridge, held))
-    live.sort(key=lambda pair: getattr(pair[0], "_agent", None) is None)
+    live.sort(key=lambda pair: _bridge_agent_session(pair[0]) is None)
     return live
 
 
@@ -533,18 +563,29 @@ async def get_session_addendum_effective(
     """Return the addendum block the session's NEXT query will carry, verbatim.
 
     ``rendered_block`` is ``agent.core.llm_client.render_addendum_block`` output
-    for the resolved session -- the very function the turn's
-    ``ensure_system_prompt`` composes the system prompt with -- so the operator
-    reads the text the model will read instead of a second rendering of it that
-    could drift.  ``block_chars`` is that string's character count and
-    ``applied`` is always ``'next_query'``: this route renders, it never reaches
-    into a running turn.
+    for the resolved session, and that is exactly the function
+    ``compose_addendum_into_messages`` calls when it composes the block onto an
+    outgoing request -- so the operator reads the text the model will read
+    instead of a second rendering of it that could drift.
+
+    ``applied`` is ``'next_query'`` and, unlike before the per-request fix, that
+    is now literally true: composition happens in the turn loop
+    (``agent/core/agent.py``, ``process_query``) on every request, so the entry
+    set stored at this instant is the entry set the next query carries.  It used
+    to be a promise the runtime did not keep -- the block was composed once per
+    agent construction into a stored system message that later turns replayed
+    verbatim, so an edit or a removal could stay invisible indefinitely.  This
+    route renders; it never reaches into a running turn.
 
     ``resolved_via`` names the copy that was read: ``'live'`` when a bridge in
     this process holds the session, ``'store'`` when it was loaded from disk.
     ``diagnostics.same_object`` is True only when the resolved session IS the
     running agent's own session object; on the cold path no agent holds it, so
     it is necessarily False and ``agent_session_object_id`` is ``None``.
+    ``diagnostics.agent_bearing_bridges`` counts bridges whose agent was found --
+    through the controller when the bridge delegates, through ``_agent`` when it
+    owns the agent -- because the delegation shape used to report 0 agents while
+    one was in fact running.
     """
     try:
         _store, bridges, session = _resolve_addendum_session(session_id)
@@ -570,8 +611,7 @@ async def get_session_addendum_effective(
 
         rendered_block = render_addendum_block(session)
         agent_sessions = [
-            getattr(getattr(bridge, "_agent", None), "session", None)
-            for bridge, _held in bridges
+            _bridge_agent_session(bridge) for bridge, _held in bridges
         ]
         agent_session = next(
             (candidate for candidate in agent_sessions if candidate is not None),
@@ -591,7 +631,7 @@ async def get_session_addendum_effective(
                 "registry_source": registry_source,
                 "agent_bearing_bridges": _count([
                     bridge for bridge, _held in bridges
-                    if getattr(bridge, "_agent", None) is not None
+                    if _bridge_agent_session(bridge) is not None
                 ]),
                 "session_object_id": id(session),
                 "agent_session_object_id": (
