@@ -219,8 +219,16 @@ class TestWitnessReadersNeverInventAPid(unittest.TestCase):
         self.assertIn(prove.NOT_MEASURED, why)
 
     def test_proc_evidence_speaks_for_a_live_and_an_absent_pid(self):
-        self.assertIn(f"/proc/{os.getpid()} exists", prove.proc_evidence(os.getpid()))
-        self.assertIn("NOT live", prove.proc_evidence(_IMPOSSIBLE_PID))
+        if Path("/proc").is_dir():
+            self.assertIn(
+                f"/proc/{os.getpid()} exists", prove.proc_evidence(os.getpid())
+            )
+            self.assertIn("NOT live", prove.proc_evidence(_IMPOSSIBLE_PID))
+        else:
+            # No procfs on this platform (darwin): the only honest verdict is
+            # "not measured", which is *not* the same as "disproved".
+            self.assertIn(prove.NOT_MEASURED, prove.proc_evidence(os.getpid()))
+            self.assertIn(prove.NOT_MEASURED, prove.proc_evidence(_IMPOSSIBLE_PID))
         self.assertIn(prove.NOT_MEASURED, prove.proc_evidence(None))
 
 
@@ -282,7 +290,12 @@ class TestTheProofIsDrivenAndCannotPassVacuously(unittest.TestCase):
         hello = re.search(r"witness hello\.pid\s+= (\S+)", text)
         self.assertIsNotNone(hello, text)
         self.assertEqual(hello.group(1), str(child_pid))
-        self.assertIn("exists, comm=", text)
+        if Path("/proc").is_dir():
+            self.assertIn("exists, comm=", text)
+        else:
+            # Without procfs the witness line can only report "not measured";
+            # that is an honest gap in the evidence, not a disproof.
+            self.assertIn(prove.NOT_MEASURED, text)
 
     def test_main_reports_the_thread_layer_as_no_fork(self):
         """The top-level aggregation cannot turn "no child" into a proof."""
