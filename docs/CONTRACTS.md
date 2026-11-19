@@ -270,7 +270,16 @@ What the trigger blocks and job names add to that table:
   `web-ui-backend-suite` job was the fourth until C91 made it BLOCKING (no `continue-on-error`, and
   its name no longer carries the "(advisory)" suffix).
 
-**RESOLVED (partial):** 10 required status checks exist server-side on `dev`, evidenced by GitHub's own rejection message on direct push at `a869255d` and `544bd407`: `remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are expected.` The check *names* still require `gh api repos/{owner}/{repo}/branches/dev/protection` (operator-admin). Whether branch protection blocks the *merge button*, as opposed to being bypassable by direct push, is still unknown and needs the same `gh api` call.
+**RESOLVED — measured, and the stored count is not the in-tree count.** The operator read the live
+`dev` ruleset with admin credentials this session: it stores **twelve** required-check entries, of
+which **eleven** are unique check contexts, and **Contract Gate is among the required set**. That
+supersedes the count this section previously carried. The eighteen contexts enumerated from the tree
+(`scripts/apply_branch_protection.sh:75-96`, `docs/BRANCH_PROTECTION.md:29`) are what the script
+*declares*, not what the server stores. Historical, and kept rather than deleted because it is not
+reconstructible from the checkout: the push rejections at `a869255d` and `544bd407` reported
+`remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are expected.`
+Still open: whether the ruleset blocks the *merge button* (a bypassable direct push is a different rule),
+and the check *names* by context, which need the same admin call.
 
 ### OPEN ITEM (revised) — required checks: what the push rejection settles, and what it does not
 
@@ -286,7 +295,7 @@ Two knowledge-base notes, quoted below as whole lines so a later reader can veri
 Required checks only, not the unfiltered set. Attempted form `gh pr checks <PR> --required --watch` returns "no required checks reported" in this repo — branch protection has no required checks configured, so every check is advisory and --required gates on the empty set. Operative form: filter the check list by name. The repo suffixes advisory checks with "(advisory)".
 ```
 
-The push rejection at `544bd407` settles the underlying fact that EDGE 8 disputed — required status checks do exist on `dev`, 10 of them — so the first note's premise holds. It does **not** refute the second note, whose subject is narrower: both notes distinguish the configuration of required checks from what the CLI reports about merge eligibility, and `operator_observations.md:314` warns about that conflation in its own words. What is falsified is only the second note's *inference* (`branch protection has no required checks configured`); what it actually measured is that `gh pr checks --required` reports no required checks **by name** in this repo. That is a reporting gap, not an absence of protection. `.thoughtmachine/knowledge/project/working_agreements.md:127` should still be corrected in a follow-up, so it stops asserting the inference.
+The push rejection at `544bd407` settles the underlying fact that EDGE 8 disputed — required status checks do exist on `dev`, 10 of them (eleven unique contexts measured since — see above) — so the first note's premise holds. It does **not** refute the second note, whose subject is narrower: both notes distinguish the configuration of required checks from what the CLI reports about merge eligibility, and `operator_observations.md:314` warns about that conflation in its own words. What is falsified is only the second note's *inference* (`branch protection has no required checks configured`); what it actually measured is that `gh pr checks --required` reports no required checks **by name** in this repo. That is a reporting gap, not an absence of protection. `.thoughtmachine/knowledge/project/working_agreements.md:127` should still be corrected in a follow-up, so it stops asserting the inference.
 
 Counts still do not have to reconcile: run rows are per-job, per-matrix-leg and per-workflow (§ above enumerates eighteen jobs), so "13 rows", "10 required checks" and the eighteen enumerated jobs are three different tallies of three different things.
 
