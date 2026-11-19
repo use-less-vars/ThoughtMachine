@@ -26,6 +26,7 @@ from tools.workspace.worktree_defaults import (
     _host_git_runner,
     resolve_worker_worktree_root,
     session_worktree_name,
+    worktree_branch_name,
 )
 
 
@@ -139,6 +140,24 @@ class _Git:
         return self.status
 
 
+class _ScriptedGit:
+    """Returns a SCRIPTED status per call; creates the worktree on success."""
+
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+        self.calls = []
+
+    def __call__(self, argv, cwd):
+        self.calls.append((list(argv), cwd))
+        status = self.statuses.pop(0)
+        if status == 0 and argv[:2] == ["worktree", "add"]:
+            target = next(arg for arg in reversed(argv) if os.path.isabs(arg))
+            os.makedirs(target, exist_ok=True)
+            with open(os.path.join(target, ".git"), "w") as handle:
+                handle.write("gitdir: /nowhere\n")
+        return status
+
+
 def _repo(tmp_path):
     root = tmp_path / "workspace"
     (root / ".git").mkdir(parents=True)
@@ -155,8 +174,112 @@ class TestResolveWorkerWorktreeRoot:
         assert path == os.path.join(os.path.realpath(root), ".worktrees", "sess-1")
         assert os.path.isdir(path)
         assert git.calls == [
-            (["worktree", "add", "--detach", path], os.path.realpath(root))
+            (
+                ["worktree", "add", "-b", "wt/sess-1", path],
+                os.path.realpath(root),
+            )
         ]
+
+    def test_the_worktree_is_created_on_a_branch_not_detached(self, tmp_path):
+        """``--detach`` would leave every worker commit dangling."""
+        root = _repo(tmp_path)
+        git = _Git()
+
+        resolve_worker_worktree_root(str(root), "sess-1", git_runner=git)
+
+        argv = git.calls[0][0]
+        assert "--detach" not in argv, (
+            f"the worktree must be on a branch, not detached; got {argv}"
+        )
+        assert argv == [
+            "worktree",
+            "add",
+            "-b",
+            "wt/sess-1",
+            os.path.join(os.path.realpath(root), ".worktrees", "sess-1"),
+        ]
+
+    @pytest.mark.parametrize(
+        "session_id,expected",
+        [
+            ("a b", "wt/a-b"),
+            ("a..b", None),
+            ("-x-", "wt/x"),
+            ("x.lock", None),
+            ("dev", "wt/dev"),
+            ("sess-1", "wt/sess-1"),
+        ],
+    )
+    def test_branch_name_is_folded_and_prefixed(self, session_id, expected):
+        assert worktree_branch_name(session_id) == expected
+
+    def test_an_unusable_branch_name_falls_back(self, tmp_path, caplog):
+        """No usable branch -> no worktree at all (never a detached one)."""
+        root = _repo(tmp_path)
+        git = _Git()
+
+        assert worktree_branch_name("a..b") is None
+        with caplog.at_level(logging.WARNING):
+            path = resolve_worker_worktree_root(str(root), "a..b", git_runner=git)
+
+        assert path is None
+        assert git.calls == []
+        assert "unusable branch name" in caplog.text
+
+    def test_a_branch_that_already_exists_is_reattached(self, tmp_path):
+        """``-b`` fails on an existing ref: re-attach instead of giving up.
+
+        A removed worktree leaves its branch behind, so ``worktree add -b``
+        refuses; the ``rev-parse`` probe proves the ref is there and the second
+        ``worktree add <path> <branch>`` puts the worktree on it.
+        """
+        root = _repo(tmp_path)
+        worktree = os.path.join(os.path.realpath(root), ".worktrees", "sess-1")
+        git = _ScriptedGit([1, 0, 0])
+
+        path = resolve_worker_worktree_root(str(root), "sess-1", git_runner=git)
+
+        assert path == worktree
+        assert git.calls == [
+            (
+                ["worktree", "add", "-b", "wt/sess-1", worktree],
+                os.path.realpath(root),
+            ),
+            (["rev-parse", "--verify", "refs/heads/wt/sess-1"], os.path.realpath(root)),
+            (["worktree", "add", worktree, "wt/sess-1"], os.path.realpath(root)),
+        ]
+
+    def test_a_failed_branch_creation_falls_back(self, tmp_path):
+        root = _repo(tmp_path)
+        worktree = os.path.join(os.path.realpath(root), ".worktrees", "sess-1")
+        git = _ScriptedGit([128, 1])
+
+        assert resolve_worker_worktree_root(
+            str(root), "sess-1", git_runner=git
+        ) is None
+        # The probe ran (that is how the re-attach is decided) and, the ref
+        # being absent, no re-attach was attempted.
+        assert git.calls == [
+            (
+                ["worktree", "add", "-b", "wt/sess-1", worktree],
+                os.path.realpath(root),
+            ),
+            (["rev-parse", "--verify", "refs/heads/wt/sess-1"], os.path.realpath(root)),
+        ]
+
+    def test_the_warning_names_the_branch(self, tmp_path, caplog):
+        root = _repo(tmp_path)
+        git = _Git(status=128, create=False)
+
+        with caplog.at_level(logging.WARNING):
+            assert resolve_worker_worktree_root(
+                str(root), "sess-1", git_runner=git
+            ) is None
+
+        assert "wt/sess-1" in caplog.text, (
+            "the fallback warning must name the branch it failed to create; "
+            f"captured: {[r.getMessage() for r in caplog.records]}"
+        )
 
     def test_an_existing_worktree_is_reused_without_calling_git(self, tmp_path):
         root = _repo(tmp_path)
@@ -178,7 +301,12 @@ class TestResolveWorkerWorktreeRoot:
         assert resolve_worker_worktree_root(
             str(root), "sess-1", git_runner=git
         ) is None
-        assert len(git.calls) == 1
+        # The failed ``-b`` add is followed by the re-attach probe; what must
+        # NOT happen is a second ``worktree add`` adopting the leftover.
+        assert [argv[:2] for argv, _ in git.calls] == [
+            ["worktree", "add"],
+            ["rev-parse", "--verify"],
+        ]
 
     @pytest.mark.parametrize("session_id", [None, "", "   ", "...", "..", "/"])
     def test_an_unusable_session_id_falls_back_without_calling_git(
