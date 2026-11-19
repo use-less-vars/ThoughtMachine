@@ -8907,7 +8907,7 @@ class Worker(ToolBase):
             return {"error": "Worker job registry unavailable", "worker_name": self.worker_name}
         job_id = (self.worker_query or "").strip() or None
         if job_id:
-            rec = registry.job(job_id)
+            rec = registry.job(job_id, session_id=self.session_id)
             if rec is None:
                 return {"worker_name": self.worker_name, "job_id": job_id, "error": "Job not found"}
             return {
@@ -8933,6 +8933,7 @@ class Worker(ToolBase):
             for r in registry.jobs(
                 worker_name=self.worker_name or None,
                 instance_id=self.instance_id,
+                session_id=self.session_id,
             )
         ]
         return {"worker_name": self.worker_name, "jobs": jobs, "count": len(jobs)}
@@ -8972,7 +8973,7 @@ class Worker(ToolBase):
         registry = _get_worker_job_registry()
         if registry is None:
             return {"error": "Worker job registry unavailable", "worker_name": self.worker_name}
-        rec = registry.job(job_id)
+        rec = registry.job(job_id, session_id=self.session_id)
         if rec is None:
             return {
                 "error": "Job not found",
@@ -8996,7 +8997,7 @@ class Worker(ToolBase):
         deadline = time.monotonic() + total
         last_status = rec.get("status")
         while True:
-            rec = registry.job(job_id)
+            rec = registry.job(job_id, session_id=self.session_id)
             status = rec.get("status") if rec is not None else None
             if status is not None:
                 last_status = status
@@ -9133,7 +9134,11 @@ class Worker(ToolBase):
     def _join_completed_jobs(self, registry) -> list:
         """Jobs of this worker/instance already terminal when a join is interrupted."""
         try:
-            jobs = registry.jobs(worker_name=self.worker_name or None, instance_id=self.instance_id)
+            jobs = registry.jobs(
+                worker_name=self.worker_name or None,
+                instance_id=self.instance_id,
+                session_id=self.session_id,
+            )
         except Exception:  # pragma: no cover - defensive
             return []
         return [

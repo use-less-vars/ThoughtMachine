@@ -16,6 +16,7 @@ event bus is unavailable; nothing here ever raises for the caller.
 from __future__ import annotations
 
 import copy
+import logging
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -34,6 +35,10 @@ from agent.config.defaults import (
     PARTIAL_PREVIEW_CAP,
     TERMINAL_STATUSES,
 )
+
+# Module logger: a cross-session job read is recorded here (WARNING) so that
+# probing another session's job ids stays visible to operators.
+logger = logging.getLogger(__name__)
 
 # Worker event type names the registry mirrors into job status transitions.
 _JOB_EVENT_TYPES = (
@@ -284,14 +289,43 @@ class WorkerJobRegistry:
 
     # -- reads ---------------------------------------------------------
 
-    def job(self, job_id: str) -> Optional[dict]:
-        """Deep copy of one job record, or None."""
+    def job(self, job_id: str, *, session_id=None) -> Optional[dict]:
+        """Deep copy of one job record, or None.
+
+        ``session_id`` scopes the read to the caller's session. A record that
+        carries a DIFFERENT non-empty session is denied -- identically to an
+        unknown job id -- and the attempt is logged as a session mismatch. A
+        record with no session attribution stays readable (fail-safe: never
+        deny what cannot be attributed).
+        """
         with self._lock:
             job = self._jobs.get(job_id)
-            return copy.deepcopy(job) if job is not None else None
+            rec_session = (job.get("session_id") or "") if job is not None else ""
+            mismatched = bool(
+                job is not None
+                and session_id is not None
+                and rec_session
+                and rec_session != session_id
+            )
+            if job is not None and not mismatched:
+                return copy.deepcopy(job)
+        if mismatched:
+            logger.warning(
+                "job read denied: session mismatch for job %s "
+                "(caller session=%s, record session=%s)",
+                job_id, session_id, rec_session,
+            )
+        return None
 
-    def jobs(self, worker_name=None, status=None, instance_id=None) -> list:
-        """Deep copies of all job records, optionally filtered."""
+    def jobs(self, worker_name=None, status=None, instance_id=None, *,
+             session_id=None) -> list:
+        """Deep copies of all job records, optionally filtered.
+
+        ``session_id`` is applied ONLY when supplied: the caller's own records
+        plus records with no session attribution are kept, another session's
+        records are dropped. With no ``session_id`` there is no session
+        filter at all.
+        """
         with self._lock:
             out = []
             for job in self._jobs.values():
@@ -301,6 +335,10 @@ class WorkerJobRegistry:
                     continue
                 if instance_id is not None and job.get("instance_id") != instance_id:
                     continue
+                if session_id is not None:
+                    rec_session = job.get("session_id") or ""
+                    if rec_session and rec_session != session_id:
+                        continue
                 out.append(copy.deepcopy(job))
             return out
 
