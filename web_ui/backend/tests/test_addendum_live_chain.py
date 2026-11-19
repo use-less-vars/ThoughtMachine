@@ -26,13 +26,15 @@ REAL, i.e. NOT stubbed (production object or coroutine in every case):
 * ``session.addendum.write_addendum_entry`` (``session/addendum.py:156``) -- the
   ONE budget boundary, including its own refusal sentence and its own numbers;
 * ``agent.core.agent.Agent`` + ``Agent.process_query`` -- the real turn loop:
-  the real per-turn ``ensure_system_prompt`` (agent/core/agent.py:1217), the real
-  composition (``LLMClient.ensure_system_prompt`` agent/core/llm_client.py:201,
-  the addendum appended at llm_client.py:225-227 through
-  ``render_addendum_block`` llm_client.py:128), the real context build
-  (agent/core/agent.py:1334 + ``ContextBuilder._cleanup_orphaned_tool_messages``
-  agent/core/agent.py:1344) and the real request object handed to the transport
-  at agent/core/agent.py:1398;
+  the real context build (agent/core/agent.py:1334 +
+  ``ContextBuilder._cleanup_orphaned_tool_messages`` agent/core/agent.py:1344),
+  the real PER-REQUEST composition (``compose_addendum_into_messages``, called at
+  agent/core/agent.py:1800 and defined at agent/core/llm_client.py:183, rendering
+  through ``render_addendum_block`` llm_client.py:128) and the real request
+  object handed to the transport at agent/core/agent.py:1398.  Note what is NOT
+  here: ``ensure_system_prompt`` is *not* invoked per turn and no longer touches
+  the addendum -- the block is composed onto the outgoing list every turn
+  instead of being baked into the stored system message;
 * ``WebAgentBridge.save_session`` (bridge.py:2229) -- the real end-of-turn save.
 
 FAKE -- exactly ONE seam, the transport:
@@ -265,8 +267,8 @@ def test_live_chain_post_turn_and_end_of_turn_save(store, routes_store):
     """POST -> real turn (addendum in the system string) -> real save -> reload.
 
     The agent is built BEFORE the write, so the entry can only reach the system
-    prompt through the per-turn composition (agent/core/agent.py:1217 ->
-    agent/core/llm_client.py:225-227) and not through some earlier snapshot.
+    prompt through the per-request composition (agent/core/agent.py:1800 ->
+    agent/core/llm_client.py:183) and not through some earlier snapshot.
     """
     _seed(store)
     live = store.load_session(SID)
@@ -311,10 +313,14 @@ def test_live_chain_post_turn_and_end_of_turn_save(store, routes_store):
     reloaded = store.load_session(SID)
     assert reloaded is not None
     assert TEXT in _texts(reloaded), _texts(reloaded)
-    # The composed prompt itself is what the live session now holds, so the
-    # entry is durable both as data and as the string the next turn will send.
+    # The composition is PER REQUEST (agent/core/agent.py:1800): the entry reaches
+    # the model through the outgoing message list, never through the stored
+    # system message.  The durable record therefore stays addendum-free by design
+    # -- that is exactly what stops a frozen snapshot from shadowing a later edit
+    # or removal.
     assert reloaded.user_history[0]["role"] == "system"
-    assert TEXT in reloaded.user_history[0]["content"]
+    assert TEXT not in reloaded.user_history[0]["content"]
+    assert ADDENDUM_HEADING not in reloaded.user_history[0]["content"]
 
 
 def test_live_chain_recovery_409_then_clear_then_next_turn(store, routes_store):
