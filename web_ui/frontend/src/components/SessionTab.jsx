@@ -1461,7 +1461,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
               onDismiss={() => setSecurityPrompt(null)}
             />
           )}
-          <ChatPanel messages={viewMessages} loadMore={loadMore} hasMore={hasMore} scrollToBottomKey={scrollToBottomKey} />
+          <ChatPanel
+            messages={viewMessages}
+            loadMore={loadMore}
+            hasMore={hasMore}
+            scrollToBottomKey={scrollToBottomKey}
+            sessionId={currentSessionId}
+          />
           <QueryBar
             sendCommand={sendCommand}
             status={status}

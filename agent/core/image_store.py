@@ -1,28 +1,37 @@
 """
-Ephemeral, in-process store for pasted images.
+In-process CACHE of pasted-image bytes (the durable copy lives on disk).
 
 A pasted screenshot reaches the backend as bytes, but the canonical message
 dict only ever carries a *reference* to it::
 
     {"role": "user", "content": "why does this fail?", "images": ["3f2a...c1"]}
 
-The bytes live here, keyed by a content-addressed id, and are resolved by the
+The bytes are held here, keyed by an opaque image id, and are resolved by the
 provider adapter when the request is built.  Keeping them out of the message
 dict means the transcript, the context builder and every token estimator stay
 JSON-serialisable and cheap - a message prints (and is estimated) as its text
 plus a short id, never as megabytes of base64.
 
-Contract (deliberately ephemeral)
----------------------------------
-* Process-local, in-memory only.  Nothing is persisted - not to disk, not to
-  the vault, not to the database - so images do not survive a restart and are
-  not shared between worker processes.
-* Content-addressed: the id is ``sha256(data).hexdigest()[:16]``.  Pasting the
-  same screenshot twice produces the same id and one stored copy.
+Contract (a cache, not the source of truth)
+------------------------------------------
+* **The durable layer is** :mod:`agent.core.image_files`: every ingested image
+  is written to ``<vault>/workspaces/<workspace_id>/images/<image_id>.<ext>``
+  before it is put here, so a session switch, a reload or a process restart can
+  re-read it.  This module is the *cache* in front of that: decoded bytes in
+  memory, no disk I/O on the turn path.
+* Nothing here is persisted, and nothing here may be treated as storage.  An
+  entry leaving this table (eviction, :meth:`ImageStore.release`,
+  :meth:`ImageStore.reconcile`) NEVER deletes a file -- the file is the durable
+  copy and outlives the cache.
+* Ids are supplied by the caller (``put(..., image_id=...)``), minted by
+  :func:`agent.core.image_files.mint_image_id` -- random, not content-derived,
+  so identical bytes in two workspaces are two unrelated ids.  ``put`` without
+  an id still falls back to a content hash for callers that have no workspace
+  (tests, legacy paths); no ingest path uses that fallback.
 * Capacity is capped (``MAX_ENTRIES`` / ``MAX_BYTES``).  Insertion evicts the
   least recently used entries, preferring entries nothing references anymore.
 * A miss is never fatal.  Evicted bytes, or a transcript replayed in a fresh
-  process, resolve to ``None``; the adapter substitutes
+  process, resolve to ``None`` here; the adapter substitutes
   ``IMAGE_UNAVAILABLE_PLACEHOLDER`` so the model is told the screenshot can no
   longer be seen instead of the whole request failing.
 
@@ -58,7 +67,7 @@ IMAGE_UNAVAILABLE_PLACEHOLDER = "[screenshot — no longer available]"
 
 
 class ImageStore:
-    """Bounded, content-addressed, in-memory image store.
+    """Bounded, id-keyed, in-memory image cache.
 
     Each entry is held as ``[data, media_type, refcount, last_used_seq]`` so
     that reconciliation can tell which images are still referenced by the live
@@ -99,6 +108,11 @@ class ImageStore:
         Unreferenced entries (``refcount == 0``) are preferred; within a class
         the least recently used one goes first.  Bounded by the entry count and
         the byte budget, whichever binds first.
+
+        Eviction drops the in-memory copy ONLY.  The durable file written by
+        ``agent.core.image_files.save_image`` is untouched: that file is the
+        copy that survives the cache, so unlinking it here would delete the
+        user's image exactly when the cache is under pressure.
         """
         while self._entries and (
             len(self._entries) + 1 > self._max_entries
@@ -113,12 +127,16 @@ class ImageStore:
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
-    def put(self, data: bytes, media_type: str) -> str:
-        """Store image bytes and return their content-addressed id.
+    def put(self, data: bytes, media_type: str, image_id: Optional[str] = None) -> str:
+        """Store image bytes and return the id they are held under.
 
         Args:
             data: Raw image bytes.
             media_type: MIME type, e.g. ``image/png``.
+            image_id: The id to key the entry by.  Supplied by the caller that
+                minted it (and already wrote the durable copy with it); when
+                omitted, a content hash is used so callers without a workspace
+                still work.
 
         Returns:
             The image id, to be placed in a message's ``images`` list.
@@ -126,7 +144,10 @@ class ImageStore:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("image data must be bytes")
         payload = bytes(data)
-        image_id = hashlib.sha256(payload).hexdigest()[:16]
+        if image_id is None:
+            image_id = hashlib.sha256(payload).hexdigest()[:16]
+        elif not isinstance(image_id, str) or not image_id:
+            raise ValueError("image_id must be a non-empty string")
         with self._lock:
             entry = self._entries.get(image_id)
             if entry is not None:
@@ -221,9 +242,9 @@ def get_image_store() -> ImageStore:
     return _singleton
 
 
-def put(data: bytes, media_type: str) -> str:
+def put(data: bytes, media_type: str, image_id: Optional[str] = None) -> str:
     """Module-level shortcut for :meth:`ImageStore.put` on the shared store."""
-    return get_image_store().put(data, media_type)
+    return get_image_store().put(data, media_type, image_id=image_id)
 
 
 def get(image_id: str) -> Optional[Tuple[bytes, str]]:

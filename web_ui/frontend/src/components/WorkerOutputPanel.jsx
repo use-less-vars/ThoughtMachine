@@ -862,7 +862,7 @@ function WorkerOutputPanel({
                 <span className="worker-event-timestamp">
                   {relativeTime(evt.timestamp)}
                 </span>
-                <MessageBubble msg={msg} index={idx} />
+                <MessageBubble msg={msg} index={idx} sessionId={sessionId} />
               </div>
             );
           })}

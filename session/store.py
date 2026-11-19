@@ -1091,9 +1091,48 @@ class FileSystemSessionStore(SessionStore):
         — this prevents session resurrection on server restart when duplicate
         copies exist across directories.
 
+        The durable image bytes the deleted session alone referenced are
+        reclaimed as a side effect (see :meth:`_prune_session_images`): the
+        session is loaded FIRST to collect the ids its history names, the file
+        is removed, and only then is the workspace re-scanned — so the ids the
+        scan still reports belong to other, still-persisted sessions and are
+        kept.  Image cleanup never changes the return value and never raises
+        into the caller.
+
         Returns True if at least one file was deleted.
         """
         self._ensure_dirs()
+
+        # Image candidates must be captured BEFORE anything is removed: once
+        # the file is gone its history is unreadable and the ids it named are
+        # unrecoverable.  A session that cannot be loaded, or whose history is
+        # empty, simply has no candidates -- that is not an error.  The import
+        # is lazy because ``agent.core`` pulls the whole agent engine, which
+        # imports this module: a top-level import would be circular.
+        from agent.core import image_files
+
+        try:
+            deleted_session = self.load_session(session_id, workspace_id=workspace_id)
+        except Exception as exc:  # defensive: load_session already swallows
+            logger.warning(
+                f"[SessionStore] Could not load session {session_id} to collect "
+                f"its image ids: {exc}")
+            deleted_session = None
+
+        candidate_image_ids: set = set()
+        # The owning workspace is the session's own stamp, falling back to the
+        # workspace the caller named (a legacy record carries no stamp at all).
+        image_workspace_id = workspace_id
+        if deleted_session is not None:
+            image_workspace_id = deleted_session.workspace_id or workspace_id
+            try:
+                candidate_image_ids = image_files.referenced_ids_from_history(
+                    list(deleted_session.user_history or []))
+            except Exception as exc:  # defensive: the walk never raises
+                logger.warning(
+                    f"[SessionStore] Could not collect the image ids of session "
+                    f"{session_id}: {exc}")
+                candidate_image_ids = set()
 
         # Invalidate caches
         self._invalidate_path_cache(session_id)
@@ -1146,7 +1185,107 @@ class FileSystemSessionStore(SessionStore):
         else:
             logger.debug(f"[SessionStore] Session {session_id} not found for deletion")
 
+        # Only NOW, with this session's own file gone, can the workspace scan
+        # answer "which ids do SURVIVING sessions still reference?" -- so the
+        # ids to reclaim are exactly the candidates minus what the scan still
+        # sees.
+        try:
+            self._prune_session_images(session_id, image_workspace_id,
+                                       candidate_image_ids)
+        except Exception as exc:  # defensive: the helper never raises
+            logger.warning(
+                f"[SessionStore] Image cleanup for deleted session {session_id} "
+                f"failed: {exc}")
+
         return found
+
+    def _prune_session_images(self, session_id: str, workspace_id: Optional[str],
+                              candidate_image_ids: set) -> None:
+        """Reclaim the image bytes only the deleted session owned.
+
+        Called AFTER the session file is removed, so
+        :func:`agent.core.image_files.scan_workspace_references` no longer sees
+        this session's ids: whatever it still reports is referenced by a
+        surviving transcript and is kept.  A scan that could not read every
+        persisted file reports ``complete=False``, meaning its set may
+        UNDER-count — pruning is then skipped entirely (fail-safe) instead of
+        acting on a partial view.  An unknown workspace deletes nothing either:
+        another workspace's directory is never a fallback.
+
+        Exactly one INFO line is logged per call — including every "removed
+        nothing" case — because a silent cleanup and a broken cleanup look
+        identical in a log.
+
+        Never raises.
+        """
+        # Lazy for the same reason as in delete_session: agent.core imports
+        # this module, so a top-level import would be circular.
+        from agent.core import image_files
+
+        considered = len(candidate_image_ids)
+
+        if not workspace_id:
+            logger.info(
+                f"[SessionStore] Image cleanup for session {session_id}: scanned "
+                f"{considered} candidate id(s), removed 0, freed 0 B — workspace "
+                f"unknown, image bytes retained")
+            return
+
+        try:
+            referenced, complete = image_files.scan_workspace_references(workspace_id)
+        except Exception as exc:  # defensive: the scan never raises
+            logger.warning(
+                f"[SessionStore] Image pruning skipped for session {session_id} in "
+                f"workspace {workspace_id}: reference scan failed ({exc}); "
+                f"{considered} candidate id(s) withheld, their bytes retained")
+            logger.info(
+                f"[SessionStore] Image cleanup for session {session_id} in workspace "
+                f"{workspace_id}: scanned {considered} candidate id(s), removed 0, "
+                f"freed 0 B")
+            return
+
+        if not complete:
+            logger.warning(
+                f"[SessionStore] Image pruning skipped for session {session_id} in "
+                f"workspace {workspace_id}: at least one persisted transcript could "
+                f"not be read, so the reference set may under-count; "
+                f"{considered} candidate id(s) withheld, their bytes retained")
+            logger.info(
+                f"[SessionStore] Image cleanup for session {session_id} in workspace "
+                f"{workspace_id}: scanned {considered} candidate id(s), removed 0, "
+                f"freed 0 B")
+            return
+
+        removed = 0
+        freed_bytes = 0
+        for image_id in sorted(candidate_image_ids - referenced):
+            path = image_files.image_path(workspace_id, image_id)
+            if path is None:
+                # Nothing stored under this id (already gone, another
+                # workspace's file, or not a durable id at all): a miss.
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            try:
+                if image_files.delete_image(workspace_id, image_id):
+                    removed += 1
+                    freed_bytes += size
+                    continue
+            except Exception as exc:  # defensive: delete_image never raises
+                logger.warning(
+                    f"[SessionStore] Could not remove image {image_id} of workspace "
+                    f"{workspace_id}: {exc}")
+                continue
+            logger.warning(
+                f"[SessionStore] Could not remove image {image_id} of workspace "
+                f"{workspace_id}: unlink failed")
+
+        logger.info(
+            f"[SessionStore] Image cleanup for session {session_id} in workspace "
+            f"{workspace_id}: scanned {considered} candidate id(s), removed "
+            f"{removed} file(s), freed {freed_bytes} B")
 
     def get_session_path(self, session_id: str,
                          workspace_id: Optional[str] = None) -> Path:

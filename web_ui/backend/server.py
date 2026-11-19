@@ -251,8 +251,9 @@ config_manager = ConfigManager()
 # ── Pasted images: the transport boundary ────────────────────────────────
 # The envelope's TOP-LEVEL ``images`` list is validated and base64-decoded
 # exactly once, here, by ``ingest_incoming_images``; the bytes go into the
-# process-wide ephemeral image store and only ``image_id`` metadata travels
-# below this module (bridge → controller → agent → provider adapter).
+# workspace's durable image store (plus the process-wide cache) and only
+# ``image_id`` metadata travels below this module
+# (bridge → controller → agent → provider adapter).
 # ``IMAGE_ONLY_QUERY_PLACEHOLDER`` is the text substituted for an empty query
 # on an image-only turn.
 from web_ui.backend.image_ingest import (
@@ -806,8 +807,103 @@ def _startup_registry_has_workspaces() -> bool:
         return False
 
 
+def _run_image_sweep() -> dict:
+    """Reclaim orphaned pasted-image files once. Best-effort; NEVER raises.
+
+    Fourth step of the periodic sweep tick (see
+    :func:`_run_container_sweeps`): it frees the image files that no persisted
+    session history references any more, once they are older than
+    :data:`agent.core.image_files.ORPHAN_TTL_SECONDS`.
+
+    The completeness flag from ``scan_workspace_references`` is LOAD-BEARING,
+    not decoration.  That scan reports ``complete=False`` when any of the
+    workspace's session files could not be read, so the ids it returns may be
+    an UNDER-count -- and a partial reference set handed to a function that
+    deletes unreferenced files destroys bytes live sessions still reference.
+    Such a workspace is therefore SKIPPED WHOLE for this tick (nothing deleted
+    for it, one WARNING naming it) and re-scanned on the next tick.  Only
+    ``complete=True`` workspaces reach ``sweep_workspace``, and they are handed
+    their own id set with the shared TTL.
+
+    Workspaces come from the workspace REGISTRY, the same source every other
+    sweep in this module enumerates (never a filesystem walk of our own).  A
+    registered workspace that never stored an image is harmless:
+    ``sweep_workspace`` never creates a directory and reports zero files.
+
+    Blocking policy is inherited, not introduced: ``_run_container_sweeps`` is
+    already dispatched to a worker thread by the sweep loop
+    (``asyncio.to_thread``), so the per-workspace filesystem I/O stays inside
+    that existing boundary -- no new thread, no per-workspace await.
+
+    Returns:
+        ``{'workspaces_scanned', 'workspaces_skipped_incomplete',
+        'files_removed', 'bytes_freed', 'skipped_incomplete'}``.  Zeros (and an
+        empty ``skipped_incomplete``) on a failure that prevented the tick from
+        scanning anything, such as an unreadable registry.
+    """
+    summary = {
+        'workspaces_scanned': 0,
+        'workspaces_skipped_incomplete': 0,
+        'files_removed': 0,
+        'bytes_freed': 0,
+        'skipped_incomplete': [],
+    }
+    try:
+        from agent.core.image_files import (
+            ORPHAN_TTL_SECONDS,
+            scan_workspace_references,
+            sweep_workspace,
+        )
+
+        registry = WorkspaceRegistry.get_default()
+        workspace_ids = [entry.id for entry in registry.list_workspaces()]
+    except Exception as exc:
+        log('WARNING', 'server', f'Periodic image sweep skipped: {exc}')
+        return summary
+
+    for workspace_id in workspace_ids:
+        try:
+            referenced, complete = scan_workspace_references(workspace_id)
+            if not complete:
+                # FAIL-SAFE: a partial view may simply not have SEEN an id, so
+                # "not referenced" is not evidence the file is dead.  Delete
+                # nothing here; the next tick re-scans this workspace.
+                summary['workspaces_skipped_incomplete'] += 1
+                summary['skipped_incomplete'].append(workspace_id)
+                log('WARNING', 'server',
+                    f'Periodic image sweep: skipping workspace {workspace_id} '
+                    f'-- its session references could not be read completely, '
+                    f'so nothing is deleted for it')
+                continue
+            result = sweep_workspace(
+                workspace_id,
+                referenced,
+                ttl_seconds=ORPHAN_TTL_SECONDS,
+            )
+        except Exception as exc:
+            log('WARNING', 'server',
+                f'Periodic image sweep failed for workspace {workspace_id}: '
+                f'{exc}')
+            continue
+        summary['workspaces_scanned'] += 1
+        summary['files_removed'] += int(result.get('removed', 0) or 0)
+        summary['bytes_freed'] += int(result.get('freed_bytes', 0) or 0)
+
+    # Exactly ONE INFO line per tick, zero-removed runs included: a silent
+    # sweep and a broken sweep must not look alike in an operator's log.
+    log('INFO', 'server',
+        f"Periodic image sweep: scanned {summary['workspaces_scanned']} "
+        f"workspace(s), removed {summary['files_removed']} file(s), freed "
+        f"{summary['bytes_freed']} byte(s), skipped "
+        f"{summary['workspaces_skipped_incomplete']} workspace(s) with "
+        f"incomplete references")
+    return summary
+
+
 def _run_container_sweeps():
-    """Run both container sweeps once. Best-effort; NEVER raises.
+    """Run the three container sweeps plus the image sweep once.
+
+    Best-effort; NEVER raises.
 
     Each entry is ``(label, guard, fn)``.  When ``guard`` is set and returns
     falsy the step is skipped for this tick with a WARNING (the guard already
@@ -837,6 +933,15 @@ def _run_container_sweeps():
         else:
             log('INFO', 'server',
                 f'Periodic container sweep ({_label}) completed')
+
+    # Fourth step: the durable pasted-image orphan sweep.  Same tick, same
+    # worker thread, same cancellation as the sweeps above -- deliberately NOT
+    # a loop of its own.  Guarded separately so a fault in it can neither
+    # propagate into the loop nor affect the sweeps that already ran.
+    try:
+        _run_image_sweep()
+    except Exception as exc:
+        log('WARNING', 'server', f'Periodic image sweep failed: {exc}')
 
 
 async def _periodic_container_sweep_loop(
@@ -1573,9 +1678,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     config_dict = msg.get("config", {})
                     # Pasted images ride the envelope TOP LEVEL (a sibling of
                     # command/query/config), never inside ``config``.  Ingest
-                    # decodes them once and hands back ids only; a rejected
-                    # image aborts the turn before any session is started.
-                    images, image_error = ingest_incoming_images(msg.get("images"))
+                    # decodes them once, writes them into this connection's
+                    # workspace image store and hands back ids only; a rejected
+                    # image aborts the turn before any session is started.  The
+                    # workspace is pinned at handshake (D2), so the bytes land
+                    # in the same workspace the bridge will bootstrap from.
+                    images, image_error = ingest_incoming_images(
+                        msg.get("images"), workspace_id=_handshake_ws_id,
+                    )
                     if image_error:
                         await ws.send_json({"type": "status_message", "text": f"⚠ {image_error}"})
                         continue
@@ -1627,7 +1737,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "continue_session":
                     query = msg.get("query", "")
-                    images, image_error = ingest_incoming_images(msg.get("images"))
+                    # Same handshake-pinned workspace as start_session above.
+                    images, image_error = ingest_incoming_images(
+                        msg.get("images"), workspace_id=_handshake_ws_id,
+                    )
                     if image_error:
                         await ws.send_json({"type": "status_message", "text": f"⚠ {image_error}"})
                         continue
@@ -2027,6 +2140,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                     # Move semantics: the record now lives in the new workspace; drop the
                                     # stale copy (and its _meta_ file) left in the previous one so reads
                                     # cannot resolve the old location.
+                                    # INVARIANT: safe only because this branch is the "no conversation"
+                                    # one -- an empty session references no image ids, so delete_session
+                                    # reclaims nothing.  If a session WITH a conversation is ever moved,
+                                    # its image bytes must be migrated to the new workspace FIRST, or the
+                                    # deletion below strips them.
                                     if not session_store.delete_session(existing_session.session_id, workspace_id=old_workspace_id):
                                         # The previous copy lived in the workspace-agnostic legacy dir.
                                         session_store.delete_session(existing_session.session_id)

@@ -3284,9 +3284,11 @@ class WebAgentBridge:
             # Persisting above already collected the images this session's
             # post-prune history no longer references; the ids it still
             # references stay in the store (they must resolve if this session is
-            # reopened in this process), so only the tracking record is dropped.
+            # reopened in this process).  Dropping the tracking record then
+            # reclaims the durable files of this session's ids that no persisted
+            # transcript of the workspace still mentions.
             from agent.core import image_gc
-            image_gc.drop_session(sid)
+            image_gc.drop_session(sid, workspace_id=self._workspace_id)
             self._session_manager.close_session(sid)
             # Containers are now workspace-scoped (thoughtmachine.workspace_id
             # label) and survive session close; workspace cleanup is handled
@@ -3436,13 +3438,14 @@ class WebAgentBridge:
         # The conversation is being discarded, so this session must stop
         # claiming the images it tracked: a stale claim would make every later
         # collection skip those ids as "shared", keeping them resident for the
-        # life of the process.  The bytes themselves are left to the store's
-        # LRU cap -- the persisted transcript may still reference them.
+        # life of the process.  The persisted transcript is still on disk, so
+        # the reference scan sees its ids and the durable files survive.
         from agent.core import image_gc
         image_gc.drop_session(
             self._session_id or (
                 self._loaded_session.session_id if self._loaded_session else None
-            )
+            ),
+            workspace_id=self._workspace_id,
         )
         self._session = None
         self._loaded_session = None
