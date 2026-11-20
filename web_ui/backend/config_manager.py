@@ -69,6 +69,7 @@ FALLBACK_FRONTEND_CONFIG: Dict[str, Any] = {
     "timeout_seconds": None,
     "stop_check": None,
     "system_prompt": None,
+    "system_prompt_addendum": "",
     "api_key_configured": False,
     "token_monitor_warning_threshold": 65000,
     "token_monitor_critical_threshold": 80000,
@@ -1132,6 +1133,7 @@ class ConfigManager:
             "max_turns",
             "timeout_seconds",
             "system_prompt",
+            "system_prompt_addendum",
             "api_key_configured",
         )
         return {k: frontend_config.get(k) for k in keys if k in frontend_config}
@@ -1205,6 +1207,15 @@ class ConfigManager:
         if "system_prompt" in config_dict:
             session_config.update_prompt(
                 normalize_system_prompt(config_dict["system_prompt"])
+            )
+
+        # Additive prompt channel — NOT mode-locked.  The addendum only ever
+        # APPENDS to the assembled prompt (LLMClient.ensure_system_prompt), so
+        # it cannot replace the mode preset the lock protects; it is therefore
+        # the one free-text prompt field that works in agent/engineer mode.
+        if "system_prompt_addendum" in config_dict:
+            session_config.update_prompt_addendum(
+                normalize_system_prompt(config_dict["system_prompt_addendum"])
             )
 
         # Mutable fields (always allowed regardless of mode)

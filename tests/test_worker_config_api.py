@@ -169,6 +169,7 @@ class TestConfigFieldTiers:
         "api_key",
         "base_url",
         "system_prompt",
+        "system_prompt_addendum",
         "workspace_path",
         "worktree_root",
         "provider_config",

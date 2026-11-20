@@ -11,8 +11,11 @@ The ``to_agent_config()`` method injects it back when constructing the full
 """
 
 from __future__ import annotations
+import logging
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field, model_validator, ConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 def _load_file_or_fallback(path: str, fallback: str = '') -> str:
@@ -143,6 +146,15 @@ class SessionConfig(BaseModel):
     system_prompt: Optional[str] = Field(
         default=None,
         description='Custom system prompt for this session.  When None, the factory default is used.',
+    )
+    system_prompt_addendum: Optional[str] = Field(
+        default=None,
+        description=(
+            'Extra instructions APPENDED to the assembled system prompt, in every '
+            'mode.  Distinct from ``system_prompt``: that one replaces the base '
+            'prompt and is mode-locked to "custom", this one only ever adds and '
+            'is therefore accepted in agent/engineer mode too.'
+        ),
     )
     mode: Optional[str] = Field(
         default=None,
@@ -288,8 +300,34 @@ class SessionConfig(BaseModel):
         downstream).
         """
         if self.mode and self.mode != 'custom':
-            return  # mode-locked — cannot override
+            # Mode-locked: the factory prompt for this mode is authoritative.
+            # This used to be a BARE ``return`` - a pushed system_prompt then
+            # vanished with no log line, no error and a UI that still reported
+            # "Config applied", so a refusal was indistinguishable from a save.
+            # Only a genuine attempted CHANGE is logged: the panel echoes the
+            # locked preview back on every Apply, which is not an attempt.
+            normalized = normalize_system_prompt(new_prompt)
+            if normalized.strip() and normalized != (self.system_prompt or ''):
+                logger.warning(
+                    "update_prompt: system_prompt IGNORED in mode=%r - the base "
+                    "prompt is mode-locked (only 'custom' may replace it). Use "
+                    "system_prompt_addendum instead: it is additive and applies "
+                    "in every mode.",
+                    self.mode,
+                )
+            return
         self.system_prompt = normalize_system_prompt(new_prompt)
+
+    def update_prompt_addendum(self, new_addendum: Any) -> None:
+        """Update the system-prompt ADDENDUM (never mode-locked).
+
+        Unlike :meth:`update_prompt`, this accepts a value in EVERY mode:
+        the addendum only ever appends to the assembled prompt, so it cannot
+        fight the mode preset the lock exists to protect.  ``new_addendum`` is
+        normalized through :func:`normalize_system_prompt` (same file-object
+        dict defence), so the field is always ``str`` after this returns.
+        """
+        self.system_prompt_addendum = normalize_system_prompt(new_addendum)
 
     # ── Conversions ─────────────────────────────────────────────────────
 
@@ -313,6 +351,7 @@ class SessionConfig(BaseModel):
             'enabled_tools': list(self.enabled_tools),
             'max_turns': self.max_turns or 100,
             'system_prompt': self.system_prompt or '',
+            'system_prompt_addendum': self.system_prompt_addendum or '',
             'provider_id': self.provider_id or '',
             'api_key': self.api_key or '',
             'base_url': self.base_url or '',
