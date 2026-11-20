@@ -90,6 +90,20 @@ absences above are now read off the transcript, where before they were inferred 
 a total. If the command and this file disagree, the command wins and this file is what
 gets edited.
 
+**A second reading of the same ruleset — and the two views disagree.** The transcript
+above is the earlier reading of ruleset 24214086: twelve stored entries, eleven
+unique. A later reading of the same ruleset (operator, `gh api`) returns **thirteen**
+stored entries and **twelve** unique contexts — `web-ui-frontend-suite` has been
+added — while the ruleset page itself renders only **twelve** rows, because the UI
+**de-duplicates** the repeated `Unit tests - Python 3.12`. That divergence is why, on
+the operator's account, a duplicate could survive months of people reading that page:
+the two views differ by exactly one row, only the API tells the truth, and a reader
+looking at the page had no reason to suspect it. The transcript above is kept as what
+it is — a transcript of one reading, not the current set. **Open:** the seven names
+`REQUIRED_CHECKS` asks for and the ruleset did not enforce were read off that
+transcript; if `web-ui-frontend-suite` was among them, six remain. That diff has
+**not** been re-measured against the new reading.
+
 ## What a required context is
 
 GitHub matches a required status check by its **check-run name**: the bare job
