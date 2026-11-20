@@ -589,6 +589,25 @@ below was read at `c89cb56b`; anything not read there is marked **UNVERIFIED**.
   - Same family as `(advisory)` being a *name* rather than a policy: a qualifier in a job's display name is prose, and only the ruleset is enforcement. Reading `blocking` or `gate proof` in a workflow and inferring gating is the error this ticket records.
   - Done means: every name meant to gate a merge is in the ruleset, **or** the docs stop calling it blocking — plus a name-level check that fails when a `blocking`, `gate proof` or `(advisory)` qualifier in a job name disagrees with the ruleset's membership set.
   - `docs/BRANCH_PROTECTION.md` and `docs/CONTRACTS.md` already cite C105; this entry is what makes those cross-references resolve rather than dangle.
+  - **Measured after this ticket was filed** (operator, `gh api`, the same ruleset 24214086): it now stores **13 entries / 12 unique contexts** — `web-ui-frontend-suite` has been added — while the ruleset page renders only **12 rows**, because the UI **de-duplicates** the repeated `Unit tests - Python 3.12`. Two views of one ruleset disagree by exactly the entry this ticket is about, and only the API reading is truthful.
+  - **The predicted consequence has now happened, with a broken default branch attached.** `327d931f` (#424) merged with a RED `web-ui-frontend-suite` run because that context was not required, so nothing stopped it; `dev` carried the failure until a human repaired it (#426, squashed as `b8587e5`, CI green at that commit). Break and repair were both done by hand — the gate never entered into it.
+
+- **C106**: A leaked session bridge contaminates every later test in the same process — and may never release at all, which would make it a production leak with a test symptom. **Open.**
+  - Failure: `tests/test_worker_tray_truth_fields.py:154` (`test_paused_manually_true_only_for_manual_only_pause`) failed on `Unit tests - Python 3.14` with a dozen-plus `server.bridge` instances bound to **foreign** sessions still subscribed and logging `DROPPING WORKER_SPAWNED 'w1'`. It passed on re-run (12m27s), which is what makes this a flake rather than a break — and the flake is the smaller half of the finding.
+  - Cause: no teardown. The bridges outlive the test. **Open question, and the reason this is filed as more than a test chore: does a session bridge EVER unsubscribe?** If not, a long-lived backend accumulates one subscriber per session and every event is walked past all of them — a cost that grows with uptime and is invisible in any single test run.
+  - Verification: the py3.14 failure was observed by the operator; the unsubscribe question is **UNVERIFIED** (the teardown path has not been read). Line number operator-supplied, not re-read on this branch.
+
+- **C107**: `terminalize` failures are downgraded to a warning, so journaling can silently do nothing and leave a record asserting the job is still running, forever. **Open.**
+  - Mechanism: `tools/workspace/worker_thread.py:3590` wraps `registry.terminalize(...)` (`:3578-3589`) in `except Exception as exc:` and logs a warning.
+  - Observed: when `3a` added `worker_name`/`session_id`/`instance_id`, two test doubles still carried the old signature and raised `TypeError` — which degraded into "journaling silently does nothing" and surfaced as unrelated assertion failures somewhere else entirely.
+  - Why it outlives the tests: a `terminalize` that never ran leaves a journal record asserting the job is still running, permanently, and nothing notices. The warning is emitted into a stream nobody reads after the fact.
+  - Proposed: narrow the handler so contract drift propagates — `TypeError` and `AttributeError` should not be caught at all — and count failed terminalizations into the response envelope the agent reads, not only into `job_status`, where nothing looks.
+  - Verification: source read by the operator; line numbers operator-supplied, not re-read on this branch.
+
+- **C108**: `ContainerStartTool` records an image it ignores, so the record can misstate what is actually running. **Open.**
+  - Observed: a container named `git-runner-alpine`, requested with `alpine/git:latest`, came up as **Debian trixie with no `git` in it**, while the record kept the requested name. A record that misstates its own image is worse than a refusal: a refusal is visible at the call, while a misstatement is read back as fact later.
+  - Same class, adjacent: container drift is **detected but not remediable**. The remedy text is "recreate the container to restore the desired isolation", and for `persistent` containers recreation is itself out of the agent's hands, because removal is an operator-grain permission. Detection whose only available action is unavailable is a report nobody can act on.
+  - Verification: observed live by the operator; not reproduced here.
 
 ## Archived (pre-Gen 42 brain dump — do not read as current work)
 
