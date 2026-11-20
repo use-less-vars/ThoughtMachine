@@ -260,6 +260,25 @@ def normalize_addendum(raw: Any) -> Dict[str, Any]:
             f'using {DEFAULT_ADDENDUM_MAX_ENTRIES}')
         addendum['max_entries'] = DEFAULT_ADDENDUM_MAX_ENTRIES
 
+    # `rev` -- the addendum's mutation counter -- is CARRIED, never invented: it
+    # is part of the shape only when the record carries it.  A fresh addendum
+    # (`_default_addendum`, and every test that compares an addendum dict to the
+    # default) therefore keeps its exact shape, and "no counter" reads as
+    # generation 0 (`session/addendum.py:addendum_rev`).  A writer's copy would
+    # otherwise look one generation older than the record it came from, and the
+    # rev-aware save in `SessionManager` would ADOPT the stored addendum over a
+    # memory copy that is in fact identical.
+    if 'rev' in raw:
+        raw_rev = raw['rev']
+        if isinstance(raw_rev, int) and not isinstance(raw_rev, bool) and raw_rev >= 0:
+            addendum['rev'] = raw_rev
+        else:
+            # Self-heal to generation 0 rather than dropping the key: a garbage
+            # counter must not make this record's generation unreadable.
+            log('WARNING', 'core.session',
+                f'[addendum] rev={raw_rev!r} is not a non-negative int; using 0')
+            addendum['rev'] = 0
+
     return addendum
 
 

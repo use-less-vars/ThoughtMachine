@@ -558,6 +558,37 @@ class FileSystemSessionStore(SessionStore):
                 session, workspace_id=workspace_id or session.workspace_id)
         return session, result
 
+    def read_stored_addendum(self, session_id: str,
+                             workspace_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """The STORED record's raw ``addendum`` dict, or ``None`` when unknown.
+
+        A write-side companion to :meth:`save_session`: a rev-aware save needs
+        the stored addendum and nothing else, so this reads the JSON payload
+        WITHOUT deserialising the conversation.  ``load_session`` runs
+        ``Session.from_persistable_dict``, which builds a ``Message`` object per
+        stored message -- the expensive half of a load, and pure waste when the
+        only question is "which generation is on disk".
+
+        Returns ``None`` when the session does not exist, the file cannot be
+        read, or the stored record carries no ``addendum`` dict: all three mean
+        "there is nothing on disk to lose", so the caller keeps what it has.
+        The read happens under the same per-file ``FileLock`` every other store
+        operation takes, so it can never observe a torn write.
+        """
+        path = self._find_session_path(session_id, workspace_id=workspace_id)
+        if path is None or not path.exists():
+            return None
+        try:
+            with FileLock(str(path)):
+                data = self._read_session_file(path)
+        except Exception as exc:
+            logger.warning(
+                f"[SessionStore] Could not read the stored addendum of session "
+                f"{session_id}: {exc}")
+            return None
+        addendum = data.get('addendum') if isinstance(data, dict) else None
+        return addendum if isinstance(addendum, dict) else None
+
     def load_session(self, session_id: str, workspace_id: Optional[str] = None) -> Optional[Session]:
         """Load a session from a JSON file.
 

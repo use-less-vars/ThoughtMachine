@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import threading
 
+from session.addendum import write_addendum_entry
 from session.models import Session
 from session.store import FileSystemSessionStore
 from web_ui.backend.bridge import WebAgentBridge
@@ -116,19 +117,28 @@ def _seed_session_with_first_entry(tmp_path):
 
 
 def _append_late_entry_directly_to_store(tmp_path) -> dict:
-    """A writer the in-memory Session knows nothing about (the cold path)."""
-    accepted = _entry("e2", LATE_TEXT)
+    """A writer the in-memory Session knows nothing about (the cold path).
 
+    The append goes through the REAL write boundary
+    (``session.addendum.write_addendum_entry``) inside the store's atomic
+    read-modify-write -- exactly what the REST route does when nobody holds the
+    session -- so the entry's id, its ``ts`` and the addendum's generation are
+    the production ones, not fixtures that happen to look right.
+    """
     def _mutate(stored: Session):
-        stored.addendum["entries"].append(dict(accepted))
-        return None, True
+        result = write_addendum_entry(stored, LATE_TEXT, source="operator", notify=False)
+        return result, result.get("status") == "ok"
 
     writer = _store(tmp_path)  # separate store instance, as another process would have
-    mutated, _ = writer.mutate_session(SESSION_ID, _mutate)
+    mutated, result = writer.mutate_session(SESSION_ID, _mutate)
     assert mutated is not None, "test setup: the session file must exist to be mutated"
+    assert result is not None and result.get("status") == "ok", (
+        f"test setup: the boundary must accept the late write; result={result!r}"
+    )
+    accepted = dict(result["entry"])
 
     on_disk = _store(tmp_path).load_session(SESSION_ID)
-    assert LATE_TEXT in [e["text"] for e in on_disk.addendum["entries"]], (
+    assert accepted["id"] in [e["id"] for e in on_disk.addendum["entries"]], (
         "test setup: the late entry must be on disk before the save under test"
     )
     return accepted
@@ -198,7 +208,12 @@ def test_in_memory_entry_is_not_the_price_of_keeping_the_accepted_one(tmp_path):
     """
     stale_in_memory, stale_for_bridge = _seed_session_with_first_entry(tmp_path)
     accepted = _append_late_entry_directly_to_store(tmp_path)
-    stale_in_memory.addendum["entries"].append(_entry("e3", NEW_TEXT))
+    # Same boundary, this time on the object that knows nothing about the late
+    # write: a legitimate in-memory append the save must not trade away.
+    in_memory = write_addendum_entry(stale_in_memory, NEW_TEXT, source="operator",
+                                     notify=False)
+    assert in_memory.get("status") == "ok", f"test setup: {in_memory!r}"
+    in_memory_entry = dict(in_memory["entry"])
 
     bridge = _BridgeHarness(_store(tmp_path),
                             session=stale_in_memory,
@@ -206,5 +221,4 @@ def test_in_memory_entry_is_not_the_price_of_keeping_the_accepted_one(tmp_path):
     assert bridge.save_session() is not None
 
     _assert_survived(tmp_path, accepted, "active session path with an in-memory append")
-    in_memory_entry = _entry("e3", NEW_TEXT)
     _assert_survived(tmp_path, in_memory_entry, "in-memory append")

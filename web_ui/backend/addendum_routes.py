@@ -69,6 +69,7 @@ from pydantic import BaseModel
 
 from session.addendum import (
     addendum_total_chars,
+    bump_addendum_rev,
     remove_addendum_entry,
     update_addendum_entry,
     write_addendum_entry,
@@ -533,6 +534,15 @@ async def delete_session_addendum(
             persisted["entries"] = []
             persisted["budget_chars"] = normalized["budget_chars"]
             persisted["max_entries"] = normalized["max_entries"]
+            # Clearing is a mutation like any other, so it advances the
+            # generation.  This mutator is the ONE place that builds the
+            # persisted addendum without going through a boundary mutation
+            # (there is no entry to append, update or remove), so it is also the
+            # one place that must advance the counter by hand -- otherwise a
+            # stale snapshot's rev would still match the record's, its entries
+            # would be unioned back in by the next save, and the operator would
+            # watch a cleared list resurrect itself.
+            bump_addendum_rev(persisted)
             session.addendum = persisted
             return persisted, True
 
