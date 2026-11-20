@@ -102,6 +102,16 @@ def config_requires_respawn(old_config, new_config) -> bool:
         return True
     if new_config.system_prompt != old_config.system_prompt:
         return True
+    # The configured addendum is baked into the system prompt by
+    # LLMClient.ensure_system_prompt, which only runs on a (re)build: a
+    # hot-swap would leave the old text in the live prompt until the next
+    # restart, so a change here is respawn-required for the same reason a
+    # ``system_prompt`` change is.
+    if (
+        getattr(new_config, 'system_prompt_addendum', '')
+        != getattr(old_config, 'system_prompt_addendum', '')
+    ):
+        return True
     # Workspace path changes require a full restart
     if new_config.workspace_path != old_config.workspace_path:
         return True

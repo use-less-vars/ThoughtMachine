@@ -97,6 +97,7 @@ class AgentConfig(BaseModel):
         'provider_config': RESTART_REQUIRED,
         'max_turns': HOT_SWAPPABLE,
         'system_prompt': RESTART_REQUIRED,
+        'system_prompt_addendum': RESTART_REQUIRED,
         'token_monitor_warning_threshold': HOT_SWAPPABLE,
         'token_monitor_critical_threshold': HOT_SWAPPABLE,
         'turn_monitor_enabled': HOT_SWAPPABLE,
@@ -243,6 +244,20 @@ class AgentConfig(BaseModel):
         default=False,
         description='Enable the Workspace Lifecycle Manager for worker queries (feature flag).',
     )
+    #: Operator instructions appended to the assembled system prompt in EVERY
+    #: mode.  Additive by design: it can neither replace the mode factory prompt
+    #: (``agent`` / ``engineer``) nor be replaced by it, and the
+    #: ``~/.thoughtmachine/custom_system_prompt.txt`` precedence cannot reach it
+    #: (that precedence only rewrites ``system_prompt``).  Rendered by
+    #: ``LLMClient.ensure_system_prompt``, so it lands on the next turn after a
+    #: config apply.
+    system_prompt_addendum: str = Field(
+        default='',
+        description=(
+            'Extra instructions appended to the assembled system prompt in every mode.'
+        ),
+    )
+
     @field_validator('system_prompt')
     def load_default_system_prompt(cls, v):
         """Load the system prompt with the following precedence:

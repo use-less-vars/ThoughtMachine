@@ -168,6 +168,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     provider_id: cfg?.provider_id,
     model: cfg?.model,
     system_prompt: cfg?.system_prompt ?? '',
+    // Additive prompt channel: editable in EVERY mode, appended after the base
+    // prompt by LLMClient.ensure_system_prompt.
+    system_prompt_addendum: cfg?.system_prompt_addendum ?? '',
     tools: cfg?.tools ?? [],
     // NOTE: session_permissions deliberately NOT included — permissions now live
     // in the disk-pure session endpoint (/api/session/{id}/permissions) and the
@@ -1661,6 +1664,33 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       {/* ── System Prompt Tab (merged with library) ───────────────────────────────── */}
       {activeTab === 'system_prompt' && (
         <div>
+          {/* ── System Prompt Addendum — editable in EVERY mode ── */}
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}>
+              <strong>System Prompt Addendum</strong>{' '}
+              <span style={{ color: '#6c7086', fontSize: '0.7rem' }}>
+                (appended — available in every mode)
+              </span>
+              <ConfigTierBadge field="system_prompt_addendum" tiers={configTiers} />
+            </label>
+            <div
+              data-testid="system-prompt-addendum-note"
+              style={{ margin: '0.15rem 0 0.35rem 0', fontSize: '0.72rem', color: '#6c7086', fontStyle: 'italic' }}
+            >
+              Appended to the end of the system prompt, after the base prompt.
+              It never replaces the factory prompt, and unlike the base prompt it
+              is not locked to Custom mode. Takes effect on Apply.
+            </div>
+            <textarea
+              rows={5}
+              data-testid="system-prompt-addendum"
+              style={{ ...inputStyle, fontFamily: 'monospace', resize: 'vertical' }}
+              value={draft.system_prompt_addendum || ''}
+              onChange={(e) => updateDraft({ ...draft, system_prompt_addendum: e.target.value })}
+              placeholder="Extra instructions appended to the system prompt for this session..."
+            />
+          </div>
+
           {isModeLocked ? (
             /* ── Locked modes: factory prompt preview (read-only) ── */
             <>

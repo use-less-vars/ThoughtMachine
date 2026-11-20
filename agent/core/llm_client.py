@@ -86,6 +86,14 @@ def _to_canonical_tool_call(tool_call):
 #: source / pinned) is never rendered, so the model sees prose only.
 ADDENDUM_HEADING = 'Additional session context:'
 
+#: Framing line for the operator's *configured* system-prompt addendum
+#: (``AgentConfig.system_prompt_addendum``).  Deliberately distinct from
+#: ``ADDENDUM_HEADING``: that block is cut and re-appended on EVERY request
+#: (``strip_addendum_block``), while this one is baked into the assembled
+#: prompt and must never be mistaken for - and stripped with - the session
+#: block.
+CONFIG_ADDENDUM_HEADING = 'Operator instructions:'
+
 
 def _session_addendum(session):
     """Return ``session``'s addendum, or ``None`` when it has none.
@@ -322,6 +330,26 @@ class LLMClient:
             system_prompt = self.config.system_prompt
         else:
             system_prompt = self.load_system_prompt()
+
+        # The CONFIGURED addendum (``AgentConfig.system_prompt_addendum``) IS
+        # composed here, at assembly time.  It is configuration, not session
+        # content, so it belongs with the base prompt - and this method re-runs
+        # on every agent (re)build, config apply and resume, which is what makes
+        # an edit visible without a restart-vs-hot-swap guess (a change to the
+        # field is classified as respawn-required, so this method always sees
+        # the new value).
+        #
+        # It is APPENDED, never substituted: the mode factory prompt (agent /
+        # engineer) stays authoritative and keeps its byte-stable prefix, which
+        # is also why this cannot be clobbered by
+        # ``~/.thoughtmachine/custom_system_prompt.txt`` precedence - that
+        # precedence only ever rewrites ``system_prompt``.
+        config_addendum = getattr(self.config, 'system_prompt_addendum', '') or ''
+        if config_addendum.strip():
+            system_prompt = (
+                f'{system_prompt}\n\n{CONFIG_ADDENDUM_HEADING}\n'
+                f'{config_addendum.strip()}'
+            )
 
         # The session addendum is deliberately NOT composed here.  This method
         # runs once per agent construction (and on pause/resume / config apply),
