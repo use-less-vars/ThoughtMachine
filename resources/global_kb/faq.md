@@ -95,8 +95,15 @@ A: Use `FileSearchTool pattern="your_text" file_pattern="*.py"` for text search,
 or `SearchCodebaseTool "what you're looking for"` for semantic search.
 
 **Q: Can the agent make git commits?**
-A: No. GitInfoTool is read-only — status, diff, log, blame, branch. No commits,
-pushes, or merges.
+A: Yes — on a feature branch, and only when the write gate allows it.
+`GitWriteTool` exposes thirteen write operations, `commit` among them
+(`tools/git_write_tool.py:196-199`), gated on the `git:write` permission
+(`:173-177`). Commits are always selective: the tool stages and commits an
+explicit path list and never `-A`. `push` is exposed but narrowed to
+`git push origin <branch>` — fixed remote, no refspec, no force, never a
+protected branch (`:189-195`). There is no merge op in that operation list,
+and no rebase, reset, clean, cherry-pick or branch deletion (`:181-182`).
+`GitInfoTool` is the read-only half of the pair.
 
 **Q: How do I preview changes before applying them?**
 A: Use `ApplyEdits` with `preview=True` to see the diff without writing. Also

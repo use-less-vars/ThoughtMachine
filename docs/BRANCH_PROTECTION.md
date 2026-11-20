@@ -4,6 +4,92 @@ Measured 2026-11-18 (C93) off the check-runs API on PR #401, not derived from
 the workflow files. Enforced by `scripts/apply_branch_protection.sh` (dry run by
 default).
 
+Read that last sentence as *intended*, not *effective*. The script targets the
+**classic** branch-protection endpoint, which answers 404 on this repo; the gate
+that actually blocks merges is a repository ruleset. So `REQUIRED_CHECKS`, and the
+eighteen-row table further down, are what the script asks for, while what is
+enforced is the eleven contexts measured in the next section.
+
+## Enforced on `dev` today: 11 unique contexts (measured 2026-11-19)
+
+Classic protection 404s on this repo, so the only surface that answers this
+question is the repository ruleset. The instrument — run it rather than trusting
+the list below, which will drift before this file is edited again:
+
+```
+gh api repos/:owner/:repo/rulesets/24214086 --jq '.rules[] |
+  select(.type=="required_status_checks") |
+  .parameters.required_status_checks[].context'
+```
+
+That returns **twelve** entries for **eleven** unique contexts. The duplicate is
+`Unit tests - Python 3.12`, stored adjacent to itself at positions 7 and 8 of the
+stored order — which is the entire reason the stored count and the enforced count
+disagree. Nothing is broken by it, but without that sentence the twelve-versus-eleven
+gap reads as a measurement error and gets "corrected" in the wrong direction. The
+order below is the order the call returns, not an order anyone chose: it is neither
+alphabetical nor grouped by workflow.
+
+**Verbatim, as the operator pasted it on 2026-11-19** — twelve entries, stored order,
+duplicate intact. This is a transcript, not a reconstruction: every name below is
+copied, and nothing in the block was inferred from a count.
+
+```
+Ubuntu - full test suite
+Linux - install/startup smoke (blocking)
+Linux install + check-only + backend smoke
+macOS launcher preflight (gating)
+Install + check-only
+Unit tests - Python 3.11
+Unit tests - Python 3.12
+Unit tests - Python 3.12
+Unit tests - Python 3.13
+Installer version-contract assertions
+Contract gate (docs/CONTRACTS.md)
+Unit tests - Python 3.14
+```
+
+De-duplicated and sorted, those are the eleven unique contexts — the same eleven,
+spelled the way `scripts/apply_branch_protection.sh` spells them:
+
+```
+Contract gate (docs/CONTRACTS.md)
+Install + check-only
+Installer version-contract assertions
+Linux install + check-only + backend smoke
+Linux - install/startup smoke (blocking)
+macOS launcher preflight (gating)
+Ubuntu - full test suite
+Unit tests - Python 3.11
+Unit tests - Python 3.12
+Unit tests - Python 3.13
+Unit tests - Python 3.14
+```
+
+Seven names that `REQUIRED_CHECKS` asks for are **not** enforced:
+`Linux - auth e2e (browser)`, `web-ui-backend-suite`, `web-ui-frontend-suite`,
+`Windows - import smoke`, `Windows Python 3.14 gate proof`,
+`Windows - thin pytest slice`, `Windows venv + smoke script`. Every one of those
+is a check that runs, can go red, and stops no merge.
+
+None of the seven appears in the transcript above. That is a stronger statement than
+the one this sentence made an hour ago: the list was then derived by subtraction from
+a total, and it is now read off by name.
+
+**Provenance, and the one paragraph of this file that evidence rewrote.** The eighteen
+declared names are byte-exact from `REQUIRED_CHECKS`
+(`scripts/apply_branch_protection.sh:78-96`). The enforced twelve are byte-exact from
+the operator's unedited paste of the instrument's output, reproduced above in the
+order it returns. An earlier version of this paragraph reconstructed the membership
+instead — eleven out of eighteen by subtraction, three exclusions re-confirmed by
+name, four carried over from a separate capture. That reconstruction landed on
+exactly these eleven names, and it is recorded here rather than tidied away, because
+the next reader should be able to tell a transcript from a good guess and should not
+conclude from this file that counting is as good as quoting. It is not: the seven
+absences above are now read off the transcript, where before they were inferred from
+a total. If the command and this file disagree, the command wins and this file is what
+gets edited.
+
 ## What a required context is
 
 GitHub matches a required status check by its **check-run name**: the bare job
@@ -26,7 +112,7 @@ That prints one bare name per reported check run; 21 distinct names came back.
 checks no job ever reports. Every name below is a literal string observed in
 that API response.
 
-## Required contexts (18 gating, 21 measured)
+## Declared contexts: the 18 `REQUIRED_CHECKS` asks for (21 measured on PR #401)
 
 | check-run name | workflow | job id | gating |
 | --- | --- | --- | --- |
@@ -52,17 +138,25 @@ that API response.
 | macOS - install/startup smoke (advisory) | platform-matrix-macos.yml | macos-install-smoke | advisory — not required |
 | macOS - Docker availability probe (advisory) | platform-matrix-macos.yml | macos-docker-probe | advisory — not required |
 
+Only eleven of those eighteen are enforced today — see *Enforced on `dev` today*
+above. The `gating` column records the script's intent, not the ruleset's state.
+
 The four `Unit tests - Python 3.x` names are ONE job in
 `python-version-matrix.yml` whose `name:` interpolates `matrix.python-version`;
 adding or dropping a version there means editing `REQUIRED_CHECKS` too.
 
-`Linux - auth e2e (browser)` is required even though its steps skip when no
-auth-relevant file changed: the job itself has no `if:`, so it still reports,
-and a skip reports success.
+`Linux - auth e2e (browser)` is in `REQUIRED_CHECKS` but is **not** one of the
+eleven enforced contexts. It is worth knowing what it would mean if it were added:
+its steps skip when no auth-relevant file changed, the job itself has no `if:`, so
+it still reports, and a skip reports success. A required check that usually
+executes nothing is acceptable — it blocks exactly the PRs that touch auth files,
+and it fails when those break — but it must never be counted as coverage.
 
-Every required name belongs to a job that is merge-blocking in its own workflow
+Every name in `REQUIRED_CHECKS` belongs to a job that is merge-blocking in its own workflow
 (no `continue-on-error`) **and** triggered by `pull_request`, so the check runs
-on every PR head commit. `contract-gate.yml` triggers on `pull_request:
+on every PR head commit. That is a property of the workflow, not of the ruleset: a
+job can be merge-blocking there and still be absent from the required set, which
+is C105. `contract-gate.yml` triggers on `pull_request:
 branches: [dev]` plus `workflow_dispatch` — it has **no `push:` trigger**, so a
 direct push to `dev` does not run it. Branch protection needs only the
 `pull_request` trigger, which is what it has.
@@ -126,6 +220,10 @@ PUT answers **422 Invalid request** rather than ignoring them; drop those two
 lines from `build_payload` and retry — the rest of the rule is unaffected.
 
 ## Applying and verifying
+
+Both commands below address classic branch protection. On this repo that endpoint
+answers 404, so read them as the intended path for a host where it does not; the
+list enforced today comes from the ruleset instrumented at the top of this file.
 
 ```
 scripts/apply_branch_protection.sh            # print payload + command, change nothing

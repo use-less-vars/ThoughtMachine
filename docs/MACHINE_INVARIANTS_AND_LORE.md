@@ -107,6 +107,34 @@ bridge, and nothing raises.
 | I11 | Host execution goes through `host_run`, which re-checks identity → kill switch → grant → env → cwd → argv, in that order | Structural, not convention | `thoughtmachine/host_port.py:1-12` |
 | I12 | `stop` detaches; `kill` is the only termination path | "Stop" must be recoverable | `worker_thread.py:2631-2637`, `:2688` |
 | I13 | Timeout does not stop the worker | A timeout is about the caller, not the worker | `docs/CONTROL_PLANE.md:311` |
+| I14 | A declared state never overrides a measured one | A stale declaration cannot fail, so it outlives the fact it names | §3.1 below; `tools/git_write_tool.py:163` |
+
+### 3.1 The four copies of `master`
+
+`master` is gone from the remote and still present four times in the tree. All four, measured:
+
+1. **The ref.** `git show-ref` lists `refs/heads/master` at
+   `1866dd399c60389c6f1a3e7b8128507445114d3e`. Nothing checks it out; `git` resolves it anyway.
+2. **The literal.** `tools/git_write_tool.py:163` — 
+   `_PROTECTED_BRANCHES: ClassVar[tuple] = ("dev", "master", "main")`. The write gate refuses to
+   commit to a name that no longer exists, and cannot tell that the entry is dead.
+3. **The trigger.** `.github/workflows/platform-matrix.yml:47` — `branches: [dev, master]`. CI is
+   configured to run on a push to a branch that cannot be pushed to.
+4. **The prose.** `docs/CONTRACTS.md:252-253` — "Those five run on `push` to `dev` and `master` and
+   on `pull_request`." A description of a repository that no longer exists, in the present tense.
+
+The measured state has already been repaired around them: `refs/remotes/origin/master` no longer
+resolves at all, and `refs/remotes/origin/HEAD` points at `origin/dev`. The fact was fixed; four
+declarations of it were not, and each is still readable as truth by whatever reads it next.
+
+**The rule.** The declaration is the defect, and it is the dangerous kind. A measured state that is
+wrong fails on the next read. A declared state that is wrong fails on nothing — it is never
+re-derived, so no test goes red and no log line appears, and it survives every run of the suite that
+would have caught the fact. Two consequences. First, one owner per fact applies to *copies* too: a
+copy is a second owner, and nothing reconciles owners (C102 counts the same disease in code, with
+`dev`/`master` literals instead of prose). Second, a claim whose measurement is not reproducible from
+the checkout is not yet a fact; it must be labelled with its measurer and stay labelled, as the
+required-check counts in `docs/CONTRACTS.md` now are.
 
 ## 4. The deadlock we survived
 
@@ -381,7 +409,20 @@ fact in a standup.
 3. **"Timeouts" as the fix.** Which timeouts? The only lock-adjacent candidates are the bounded
    bus-resolve retry (`bridge.py:869-874`) and `join(timeout=…)` in force-spawn
    (`worker_thread.py:7054-7062`). Unconfirmed as *the* fix. **Section 4.**
-4. **RESOLVED (partial):** 10 required status checks exist server-side on `dev`, evidenced by GitHub's own rejection message on direct push at `a869255d` and `544bd407`: `remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are expected.` The check *names* still require `gh api repos/{owner}/{repo}/branches/dev/protection` (operator-admin). Whether branch protection blocks the *merge button*, as opposed to being bypassable by direct push, is still unknown and needs the same `gh api` call.
+4. **RESOLVED — measured, and the stored count is not the in-tree count.** The operator read the live
+   `dev` ruleset with admin credentials this session: it stores **twelve** required-check entries, of
+   which **eleven** are unique check contexts (`Unit tests - Python 3.12` is stored twice, which is
+   why the stored count is twelve), and **Contract Gate is among the required set**. The
+   eighteen contexts the tree enumerates (`scripts/apply_branch_protection.sh:78-96`,
+   `docs/BRANCH_PROTECTION.md` — the declared-contexts table) are what the script *declares*,
+   not what the server stores — the
+   same declared-versus-measured gap as §3.1, which is why the older evidence below is kept rather
+   than deleted. Historical: the push rejections at `a869255d` and `544bd407` reported
+   `remote: Bypassed rule violations for refs/heads/dev: - 10 of 10 required status checks are
+   expected.`, which was the best evidence available from inside the checkout. The context names
+   are measured, recorded, and now quoted verbatim in `docs/BRANCH_PROTECTION.md` — which is what
+   makes this a measurement rather than an attribution. Still open: whether the ruleset blocks the
+   *merge button* (a bypassable direct push is a different rule). **Section 10.**
 5. **"The only chokepoint."** Contradicted for MCP stdio, and ~11 other `import subprocess` sites
    remain unadjudicated one by one (git tools, `worker_execution.py`, `sandboxed_execution.py`,
    `doctor.py`, `workspace_lifecycle_manager.py`, `containers/executor.py:1259`). Needs a per-site

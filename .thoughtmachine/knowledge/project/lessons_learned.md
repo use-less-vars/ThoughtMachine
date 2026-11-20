@@ -135,8 +135,32 @@ Resolve every path before writing anything, and echo the resolved absolute-ish p
 - `git_read diff` on a CLEAN file returns 'no diff output ... check the path spelling'. It reads like an error but means success; there is no way to distinguish 'no change' from 'no such path'.
 - `git_read show_file` requires the parameter named `path`; passing `file_path` errors 'path is required'.
 - `git_read show` maps `format` to `--format=`, so `--stat` is rejected (exit 128).
-- `git_read ls_tree` ignores the `prefix`/`path` arguments, so a subtree listing returns the whole tree (and ~5k tokens).
+- `git_read ls_tree` does **not** ignore `path=` — it forwards it to git as a pathspec after `--` (`tools/git_info_tool.py:2243-2245`), so the listing is filtered and full paths are kept. `prefix=` is not an `ls_tree` argument at all (it belongs to `for_each_ref`, `:578-582`), so the older version of this bullet was misattributing a parameter rather than observing a dropped filter. The genuine trap is `path="<dir>"` **without** `recursive=true`: that returns the single tree entry for the directory — one line — which reads exactly like an ignored filter. Re-rooting is done by `treeish="<rev>:<path>"`, not by `path=`.
 - `Worker` results intermittently come back with `status: null` / `confidence: null`. That is NOT a completion signal; verify the artefact on disk.
 - The worker container is hard-capped at 512 MB regardless of a larger `mem_limit` in config.
 - The worker container has no `git`, so a worker's claim to have run git commands is false by construction.
 - Positive note: asking for a 900 s worker timeout is refused and clamped to 600 s, with a clear explanation. That is exemplary behaviour and worth keeping.
+
+## 2026-11-19 — three rules from a documentation ledger (Gen 70)
+
+### 1. The branch is a shared reference; the worktree is the isolation
+
+Every checkout of this repo points `dev` at the same `refs/heads/dev`. Two agents on two branches, one shared checkout, and whichever one runs `git checkout` last decides what the other one is looking at. `724dcc89` fixed the acute form by making the default `worktree add --detach`; C100 records the hole that remains — when the resolver cannot create a worktree it falls back to the shared checkout instead of refusing (`tools/workspace/worktree_defaults.py:170-191`). A fallback that succeeds quietly is worse than a failure that stops you, because the failure is the only signal you were about to share state.
+
+### 2. The key names an owner and the lookup ignores it
+
+A key can exist, be documented, be present in the file — and still be read by nothing on the path that acts on it. Anything that answers "who owns this?" by reading the key is answering a different question than the code answers, and the two answers stay compatible for months because neither is checked against the other. Before trusting an ownership or permission field, find the line that reads it. If you cannot, the field is a comment.
+
+### 3. A measurement whose root is unstated is a rumour
+
+"~40 hardcoded dev/master literals" became **5 occurrences on 4 lines** the moment somebody named the directories being counted (agent 0, scripts 3, tools 2, web_ui/backend 0). "10 required checks", "11 unique contexts", "18 in-tree" are not three estimates of one number — they are three tallies of three different objects, and a sentence that mixes them is wrong whichever digit it picks. A count without its root is not a low-confidence count; it is not a count.
+
+### 4. An instrument is what makes a number a measurement
+
+Two figures moved through this ledger in the same week and only one of them survived contact with a command. "~40 hardcoded branch literals" collapsed to 5 the moment somebody named the directories being counted; "18 required checks" collapsed to 11 unique contexts the moment the ruleset was queried directly, and the seven-name gap turned out to be jobs that are *declared* in workflows and *not* enforced by the ruleset. Nobody was lying in either case — a figure only its author can reproduce is an attribution wearing a measurement's clothes, and the remedy is not a confidence interval, it is the command.
+
+Four habits follow, and all four are cheap:
+- Write the command, not just its output. `gh api repos/:owner/:repo/rulesets/<id> --jq '.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context'` survives review; "the operator measured 11" does not, because the next reader cannot tell which question produced it.
+- "Unverified" is a status, not a verdict, and it is not the same as "verified wrong". The `ls_tree` re-root claim and the auth-e2e exclusion were both parked as UNVERIFIED in the same audit; one turned out false and the other true. Parking both was correct, and the failure mode to avoid is closing either on the strength of the word alone.
+- When the instrument yields an approximate number, say so in the same sentence that quotes it. The branch count here is "150+" from an operator count with no command recorded — usable as an order of magnitude, unusable as a fact, and the entry has to carry that distinction or the next reader will launder it into a precise number.
+- A paste retires the paragraph that reconstructed it — record the retirement. When an instrument's output arrives verbatim, the paragraph that inferred the same thing loses its reason to exist; removing it is itself a finding. Here the reconstruction landed on the same eleven names, which is a fact about that week, not a property of the method. Say so where the paragraph was, rather than tidying it away.
