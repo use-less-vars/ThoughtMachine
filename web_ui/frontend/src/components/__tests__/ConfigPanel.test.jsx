@@ -225,7 +225,7 @@ describe('Save as Default', () => {
   });
 
   // GUARD (characterization): the payload already strips session_permissions and
-  // carries all 12 safe-draft keys — expected GREEN pre-change.
+  // carries every safe-draft key (13 as of the system-prompt addendum).
   it('sends set_default_config with the full defaults payload (session_permissions stripped)', () => {
     const { sendCommand } = renderPanel();
     fireEvent.click(screen.getByRole('button', { name: 'Save as Default' }));
@@ -239,6 +239,7 @@ describe('Save as Default', () => {
       'provider',
       'provider_id',
       'system_prompt',
+      'system_prompt_addendum',
       'temperature',
       'token_monitor_critical_threshold',
       'token_monitor_warning_threshold',
@@ -602,6 +603,61 @@ describe('live workspace binding', () => {
       permissions: null,
     });
     expect(useStore.getState().sessionConfigs['ws-keep-sess'].workspace_path).toBe('/ws/b');
+  });
+});
+
+// ==========================================================================
+// System Prompt Addendum (the one prompt field editable in EVERY mode)
+// ==========================================================================
+//
+// Regression guard for the operator-facing defect "the system prompt does not
+// work at all": in `agent` / `engineer` mode the base System Prompt is a
+// read-only factory preview, so text typed there is discarded by the backend.
+// The ADDENDUM is the additive channel that stays editable in every mode, is
+// appended AFTER the base prompt by LLMClient.ensure_system_prompt, and must
+// therefore reach Apply in the payload.
+describe('System Prompt Addendum', () => {
+  const lockedAgentConfig = {
+    ...baseConfig,
+    mode: 'agent',
+    system_prompt_addendum: 'Always answer in British English.',
+  };
+
+  it('is editable in a mode-locked session (agent), unlike the base prompt', () => {
+    renderPanel({ config: lockedAgentConfig });
+    fireEvent.click(screen.getByRole('button', { name: 'Prompt' }));
+
+    const addendum = screen.getByTestId('system-prompt-addendum');
+    expect(addendum).toBeInTheDocument();
+    expect(addendum).not.toBeDisabled();
+    expect(addendum.value).toBe('Always answer in British English.');
+
+    // The base prompt is a read-only preview in this mode: no textarea carries it.
+    const textareas = Array.from(document.querySelectorAll('textarea'));
+    expect(textareas.some((t) => t.value === baseConfig.system_prompt)).toBe(false);
+  });
+
+  it('sends the edited addendum to apply_config in a locked mode', () => {
+    const { sendCommand } = renderPanel({ config: lockedAgentConfig });
+    fireEvent.click(screen.getByRole('button', { name: 'Prompt' }));
+
+    fireEvent.change(screen.getByTestId('system-prompt-addendum'), {
+      target: { value: 'Prefer tables over prose.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    const [, payload] = sendCommand.mock.calls.find(([cmd]) => cmd === 'apply_config');
+    expect(payload.config.system_prompt_addendum).toBe('Prefer tables over prose.');
+  });
+
+  it('renders next to the editable base prompt in custom mode', () => {
+    renderPanel({ config: { ...baseConfig, system_prompt_addendum: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Prompt' }));
+
+    const addendum = screen.getByTestId('system-prompt-addendum');
+    expect(addendum.value).toBe('');
+    const textareas = Array.from(document.querySelectorAll('textarea'));
+    expect(textareas.some((t) => t.value === baseConfig.system_prompt)).toBe(true);
   });
 });
 

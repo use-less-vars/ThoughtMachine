@@ -71,6 +71,7 @@ const DEFAULT_KEY_LABELS = {
   token_monitor_warning_threshold: 'Token warning threshold',
   token_monitor_critical_threshold: 'Token critical threshold',
   tool_output_token_limit: 'Tool output limit',
+  system_prompt_addendum: 'System Prompt Addendum',
 };
 
 function humanizeDefaultKey(key) {
