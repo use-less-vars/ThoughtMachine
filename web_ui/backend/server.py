@@ -4044,17 +4044,30 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     if not workspace_id:
                         await ws.send_json({"type": "status_message", "text": "⚠ workspace_id is required."})
                         continue
+                    # The profile reported here is the one the runtime gate
+                    # actually enforces.  ``security.security_gate.
+                    # get_workspace_capabilities`` is fail-closed: a workspace
+                    # with no (or an unreadable) ``capabilities.json`` resolves
+                    # to the deny-everything profile.  Re-deriving the value
+                    # locally with a ``WorkspaceCapabilities.default()``
+                    # fallback used to answer "unrestricted" for exactly the
+                    # workspaces the gate denies -- the display out-claimed the
+                    # gate.
                     try:
-                        from thoughtmachine.workspace_capabilities import (
-                            load_workspace_capabilities,
-                        )
-                        caps = load_workspace_capabilities(workspace_id)
-                        if caps is None:
-                            # Return unrestricted defaults when no capabilities file exists
-                            from thoughtmachine.workspace_capabilities import (
-                                WorkspaceCapabilities,
-                            )
-                            caps = WorkspaceCapabilities.default()
+                        from security.security_gate import get_workspace_capabilities
+                    except ImportError as exc:
+                        # A missing gate is an error, never a permissive
+                        # stand-in for the capabilities it would have resolved.
+                        log("ERROR", "server.ws",
+                            f"security gate unavailable for get_workspace_capabilities: {exc}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ Failed to load capabilities: security gate "
+                                    "unavailable (security.security_gate failed to import)",
+                        })
+                        continue
+                    try:
+                        caps = get_workspace_capabilities(workspace_id)
                         await ws.send_json({
                             "type": "workspace_capabilities",
                             "workspace_id": workspace_id,

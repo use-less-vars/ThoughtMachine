@@ -122,6 +122,29 @@ def get_workspace_capabilities(workspace_id: str) -> WorkspaceCapabilities:
 # ══════════════════════════════════════════════════════════════════════════
 
 
+#: Level emitted when a permission is HARD DENIED on a level-string axis.
+#:
+#: ``SessionPermissions`` types each axis: ``container`` is the one boolean
+#: axis, every other axis carries a level token.  A boolean ``False`` is
+#: therefore not a legal value on a level axis (the model rejects it), and the
+#: pre-merge value tells us which spelling the deny must use.  ``banned`` is
+#: the deny-all level (``GRANT_LEVEL_RANKS['banned'] == 0``), ranks exactly like
+#: ``False`` on the shared level scale (``_level(False) == 0.0``) and is
+#: recognised as a refusal everywhere a refusal is checked
+#: (``_value_satisfies``, ``_is_refusal_grant``), so the two spellings are
+#: equivalent to every consumer -- only the spelling is axis-typed.
+_DENIED_LEVEL = "banned"
+
+
+def _denied_value(sample: Any) -> Any:
+    """Return "denied", spelled in the vocabulary of *sample*'s axis.
+
+    *sample* is the pre-merge value of the same axis: boolean ``False`` for the
+    boolean axis (``container``), the denied level token otherwise.
+    """
+    return False if isinstance(sample, bool) else _DENIED_LEVEL
+
+
 def _min_permission(
     effective_val: Any,
     override_val: Any,
@@ -134,7 +157,10 @@ def _min_permission(
     1. **Session × workspace** (existing callers):
        *override_val* is ``Optional[bool]``.
        * ``None`` → *effective_val* unchanged.
-       * ``False`` → hard deny (``False``).
+       * ``False`` → hard deny, spelled in *effective_val*'s own
+         vocabulary: ``False`` on the boolean ``container`` axis,
+         ``"banned"`` on a level-string axis (a bare ``False`` there is
+         not a legal ``SessionPermissions`` value).
        * ``True`` → *effective_val* unchanged.
 
     2. **Effective × worker** (worker_permissions):
@@ -146,7 +172,10 @@ def _min_permission(
         return effective_val
     if isinstance(override_val, bool):
         if not override_val:
-            return False  # hard deny
+            # Hard deny, in the effective value's own vocabulary: the denied
+            # capability caps a LEVEL axis (allow_network / git_available are
+            # booleans while network / git are level tokens).
+            return _denied_value(effective_val)
         return effective_val  # True → passthrough
 
     # override_val is a string — compare permission levels on the shared

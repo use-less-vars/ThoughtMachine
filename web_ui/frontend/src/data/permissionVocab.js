@@ -60,3 +60,22 @@ export function getPill(key) {
   const normalizedKey = String(key);
   return PILL_COLORS[normalizedKey] || { bg: '#6c7086', fg: '#cdd6f4', label: normalizedKey };
 }
+
+// ── One word per state (the effective column) ───────────────────────────────
+// PILL_COLORS keys above are TOKENS, not states: 'banned' is a level a ceiling
+// or a grant may name, and its pill legitimately reads 'Banned'. An *effective*
+// value is an OUTCOME instead -- the question "what does the agent actually
+// have?" -- and it has exactly two answers plus "unknown".
+//
+// The gate spells that denial two ways for the same state: 'banned' on a LEVEL
+// axis (git, network, filesystem, mcp, host_bash, credential, visual) and a
+// literal boolean `false` on the boolean axis (container). Same state, so same
+// word -- otherwise the same denial prints 'Banned' or 'Disabled' depending on
+// which axis it happened to land on.
+export function effectivePermissionLabel(value) {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'boolean') return value ? 'Enabled' : 'Disabled';
+  const token = String(value);
+  // A level-axis denial is the same state as a boolean-axis denial.
+  return token.toLowerCase() === 'banned' ? 'Disabled' : token;
+}

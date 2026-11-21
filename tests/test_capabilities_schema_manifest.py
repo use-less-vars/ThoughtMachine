@@ -133,9 +133,46 @@ def test_filesystem_and_network_capabilities_are_enforced():
     effective = _merge_with_capabilities(session, workspace)
 
     assert effective["filesystem"] == "read"
-    assert effective["network"] is False
+    # Each axis is capped in ITS OWN vocabulary: ``container`` is the one
+    # boolean axis, so it caps to ``False``; ``network`` and ``git`` are
+    # level-string axes, so they cap to the denied level ``"banned"``.
+    # (A bare ``False`` on a level axis is the container vocabulary leaking
+    # across axes and is not a legal ``SessionPermissions`` value.)
+    assert effective["network"] == "banned"
     assert effective["container"] is False
-    assert effective["git"] is False
+    assert effective["git"] == "banned"
+
+
+def test_denied_capability_merge_stays_in_the_axis_vocabulary():
+    """A denied capability must be spelled in the axis' own vocabulary.
+
+    Contract guard: the merge result is handed back to callers as a session
+    profile (and ``SessionPermissions(**effective)`` is how several layers
+    re-validate it), so a denial may never be emitted as a boolean on a
+    level-string axis.  ``container`` stays boolean; every level axis must
+    carry a level token.
+    """
+    from security.security_gate import _merge_with_capabilities
+
+    session = SessionPermissions(
+        filesystem="write", network="outbound", container=True, git="write",
+    )
+    denied = WorkspaceCapabilities(
+        filesystem_write=False,
+        allow_network=False,
+        allow_docker=False,
+        git_available=False,
+    )
+    effective = _merge_with_capabilities(session, denied)
+
+    for axis, value in effective.items():
+        if axis == "container":
+            assert isinstance(value, bool), (axis, value)
+        else:
+            assert not isinstance(value, bool), (axis, value)
+
+    # The model is the arbiter of the vocabulary: it must accept the merge.
+    SessionPermissions(**effective)
 
 
 def test_permissive_capabilities_preserve_session_grants():

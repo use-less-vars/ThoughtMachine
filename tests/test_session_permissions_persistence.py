@@ -98,6 +98,26 @@ def _write_workspace_config(vault, ws_id, permissions):
     }))
 
 
+def _write_permissive_capabilities(vault, ws_id):
+    """Seed a fully-permissive ``capabilities.json`` for the workspace.
+
+    The capabilities merged into the effective profile are resolved by
+    ``security.security_gate.get_workspace_capabilities``, which is fail-closed:
+    with no capabilities file the workspace resolves to the deny-everything
+    profile, so the boolean denials (``network: False``, ``git: False``) would
+    replace the ``banned`` levels asserted here.  This test pins the *session /
+    ceiling* axis, so the capability axis is kept neutral.
+    """
+    ws_dir = vault / "workspaces" / ws_id
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    (ws_dir / "capabilities.json").write_text(json.dumps({
+        "allow_network": True,
+        "allow_docker": True,
+        "filesystem_write": True,
+        "git_available": True,
+    }))
+
+
 # ── Store round-trip (the runtime persistence path) ──────────────────────────
 
 
@@ -206,6 +226,7 @@ def test_effective_permissions_restores_grants_after_restart(
     _write_workspace_config(
         vault, "ws-1", {"filesystem": "write", "git": "write"}
     )
+    _write_permissive_capabilities(vault, "ws-1")
     store, manager = _make_manager(tmp_path)
     session_id, _ = manager.create_session(mode="agent")
     write_session_permissions(vault, "ws-1", session_id, GRANTS)
@@ -213,8 +234,12 @@ def test_effective_permissions_restores_grants_after_restart(
     # ── simulated restart: fresh store factory + hermetic workspace dirs ──
     _patch_store_factory(monkeypatch, tmp_path)
     monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
-    monkeypatch.setattr(workspace_routes, "load_workspace_capabilities",
-                        lambda ws_id: None)
+    # No capabilities monkeypatch: the route resolves them through
+    # ``security.security_gate.get_workspace_capabilities`` (fail-closed), so
+    # the permissive ``capabilities.json`` written above is what the merge
+    # sees.  Patching ``workspace_routes.load_workspace_capabilities`` here
+    # would be inert and would silently re-introduce the deny-all capability
+    # profile if it ever became live.
 
     result = asyncio.run(
         workspace_routes.get_effective_permissions("ws-1", session_id=session_id)
