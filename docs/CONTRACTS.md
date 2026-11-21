@@ -287,6 +287,16 @@ open: whether the ruleset blocks the *merge button* — a bypassable direct push
 The operator's raw paste is quoted verbatim, in stored order with its duplicate intact,
 in `docs/BRANCH_PROTECTION.md` — the membership there is a transcript, not a subtraction.
 
+**Superseding reading (same ruleset, later).** The counts above are the measurement of record for
+their date and are kept rather than edited. A later reading of ruleset 24214086 (operator, `gh api`)
+returns **thirteen** stored entries and **twelve** unique contexts — `web-ui-frontend-suite` has
+been added — while the ruleset page renders **twelve rows**, because the UI de-duplicates the
+repeated `Unit tests - Python 3.12`. Two views of one ruleset disagree by exactly one row; only the
+API reading is authoritative. **"Require branches to be up to date before merging" is checked** on
+this ruleset, and that is worth writing down twice over: every merge into `dev` invalidates every
+open pull request until it takes `dev` back in, and the same setting is what would have exposed
+#425's red as **inherited** rather than as a regression in the branch under review.
+
 **Instrument.** The enforced list is a `gh` call, not a reading of the tree:
 
 ```
