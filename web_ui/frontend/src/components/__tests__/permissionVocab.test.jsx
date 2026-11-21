@@ -10,6 +10,7 @@ import {
   PERMISSION_RANK_ORDER,
   PILL_COLORS,
   getPill,
+  effectivePermissionLabel,
 } from '../../data/permissionVocab';
 
 // ── Backend stub (same conventions as ConfigPanelDraft.test.jsx) ─────────────
@@ -167,6 +168,36 @@ describe('PILL_COLORS / getPill', () => {
     expect(getPill('unknown')).toEqual({ bg: '#6c7086', fg: '#cdd6f4', label: 'unknown' });
     // values with no dedicated pill entry fall back with their stringified key
     expect(getPill('outbound')).toEqual({ bg: '#6c7086', fg: '#cdd6f4', label: 'outbound' });
+  });
+});
+
+describe('effectivePermissionLabel (one word per state)', () => {
+  it('renders a level-axis denial and a boolean-axis denial as the same word', () => {
+    // The gate spells a capability deny as 'banned' on a LEVEL axis and as a
+    // literal `false` on the boolean axis (container); one state, one word.
+    expect(effectivePermissionLabel('banned')).toBe('Disabled');
+    expect(effectivePermissionLabel(false)).toBe('Disabled');
+    expect(effectivePermissionLabel('banned')).toBe(effectivePermissionLabel(false));
+  });
+
+  it('renders an allow as Enabled and passes a level token through verbatim', () => {
+    expect(effectivePermissionLabel(true)).toBe('Enabled');
+    expect(effectivePermissionLabel('read')).toBe('read');
+    expect(effectivePermissionLabel('ask')).toBe('ask');
+    // 'write_on_feature_branch' must survive untouched (no lower-casing pass-through).
+    expect(effectivePermissionLabel('write_on_feature_branch')).toBe('write_on_feature_branch');
+  });
+
+  it('renders an absent value as the em-dash placeholder, never as a state word', () => {
+    expect(effectivePermissionLabel(undefined)).toBe('\u2014');
+    expect(effectivePermissionLabel(null)).toBe('\u2014');
+  });
+
+  it('leaves the token pills alone: PILL_COLORS keys are tokens, not states', () => {
+    // A 'banned' CEILING/GRANT pill legitimately reads 'Banned'; only the
+    // effective-outcome label collapses to 'Disabled'.
+    expect(getPill('banned').label).toBe('Banned');
+    expect(getPill(false).label).toBe('Disabled');
   });
 });
 

@@ -313,8 +313,12 @@ describe('SessionSidebar — permissions (read-only)', () => {
     // as the display label 'Enabled' (once for ceiling, once for effective).
     expect(screen.getAllByText('Enabled')).toHaveLength(2)
     expect(screen.queryByText('enabled')).not.toBeInTheDocument()
-    // network, mcp and host_bash are banned in both columns.
-    expect(screen.getAllByText('banned')).toHaveLength(6)
+    // network, mcp and host_bash are banned by the CEILING cap, which keeps the
+    // level token ('banned') — a cap names a choice, not an outcome.
+    expect(screen.getAllByText('banned')).toHaveLength(3)
+    // In the EFFECTIVE column those same three denials read 'Disabled': one word
+    // per state, so the outcome never echoes the cap's token.
+    expect(screen.getAllByText('Disabled')).toHaveLength(3)
   })
 
   it('shows a "no active session" notice when the workspace has no active session', async () => {
@@ -380,6 +384,50 @@ describe('SessionSidebar — permissions (read-only)', () => {
     expect(gitRow.querySelectorAll('td')[3].textContent).toBe('write') // effective preserved
   })
 
+  it('renders one word per state: an effective "banned" and a boolean false both read Disabled — never Enabled, never blank', async () => {
+    // One state, one word. A workspace ceiling that bans a resource denies it,
+    // and the gate spells that denial two ways for the same state: 'banned' on a
+    // LEVEL axis (git, network, filesystem, mcp, ...) and a literal JSON boolean
+    // `false` on the boolean axis (container). The effective column asks "what
+    // does the agent actually have?", so both spellings must read the same word.
+    // Both classic slips are pinned here: a truthiness test would print 'Enabled'
+    // for `false`, and a bare `?? '—'` would fall to the em-dash placeholder —
+    // either one reports the denied capability as available/unknown instead of
+    // denied.
+    stubBackend({
+      '/api/workspace/ws-1/effective_permissions': jsonOk({
+        // Both spellings in one envelope: the level-axis deny arrives as the
+        // string 'banned', the boolean-axis deny as a literal `false`.
+        effective_permissions: { network: 'banned', git: false, filesystem: 'read' },
+        workspace_ceiling: { network: 'banned', git: 'banned' },
+        contradictions: [],
+      }),
+    })
+    renderSidebar({ tools: [] })
+    await act(async () => {})
+    const section = screen.getByRole('heading', { name: 'Permissions' }).closest('section')
+    const rows = Array.from(section.querySelectorAll('tbody tr'))
+    const rowFor = (name) => rows.find((r) => r.querySelectorAll('td')[0].textContent === name)
+    // Cell layout is name | ceiling [1] | session grant [2] | effective [3].
+    const effective = (name) => rowFor(name).querySelectorAll('td')[3].textContent
+    expect(effective('network')).toBe('Disabled') // the 'banned' spelling
+    expect(effective('git')).toBe('Disabled') // the boolean `false` spelling
+    // Same state, same word: neither spelling may stand out on its own.
+    expect(effective('network')).toBe(effective('git'))
+    // The CEILING column keeps the level token — it names the cap the operator
+    // was given, not an outcome, and 'banned' is that cap's own word.
+    expect(rowFor('network').querySelectorAll('td')[1].textContent).toBe('banned')
+    // A string level still passes through verbatim (lower-case, as sent).
+    expect(effective('filesystem')).toBe('read')
+    // No deny may leak out as an enablement claim, and none may render blank
+    // or as the unknown-value em-dash.
+    expect(screen.queryByText('Enabled')).not.toBeInTheDocument()
+    for (const name of ['network', 'git', 'filesystem']) {
+      expect(effective(name)).not.toBe('')
+      expect(effective(name)).not.toBe('\u2014')
+    }
+  })
+
   it('renders exactly the three layer headers: ceiling cap, session grant, effective', async () => {
     stubBackend()
     renderSidebar({ tools: [] })
@@ -420,10 +468,12 @@ describe('SessionSidebar — permissions (read-only)', () => {
     const row = Array.from(section.querySelectorAll('tbody tr')).find(
       (r) => r.querySelectorAll('td')[0].textContent === 'host_bash'
     )
-    // ceiling 'allow' (a cap only) | session grant 'banned' | effective 'banned'
+    // ceiling 'allow' (a cap only) | session grant 'banned' | effective 'Disabled'
+    // The grant echoes the level token it stores; the outcome reads the state
+    // word ('banned' and boolean false are one state, so one word).
     expect(row.querySelectorAll('td')[1].textContent).toContain('allow')
     expect(row.querySelectorAll('td')[2].textContent).toBe('banned')
-    expect(row.querySelectorAll('td')[3].textContent).toBe('banned')
+    expect(row.querySelectorAll('td')[3].textContent).toBe('Disabled')
   })
 
   it('does not mark a ceiling the session grant already meets (let alone exceeds)', async () => {

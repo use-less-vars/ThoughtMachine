@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import useWorkspaceStore from '../store/workspaceStore'
+import { effectivePermissionLabel } from '../data/permissionVocab'
 import './SessionSidebar.css'
 
 const WORKER_STATUS_COLORS = {
@@ -15,6 +16,10 @@ const isRunningStatus = (status) => /^(running|active|up|started)$/i.test(status
 
 // container is the one boolean session resource; render its raw boolean as a
 // display label. Component-local on purpose — the store keeps booleans.
+// This renders the two INPUT columns (the ceiling cap and the session grant),
+// which echo the token the operator chose or was capped to — so a 'banned' cap
+// keeps its own word. The EFFECTIVE column is an outcome, not a token, and goes
+// through permissionVocab.effectivePermissionLabel (one word per state).
 const renderPermissionValue = (value) =>
   typeof value === 'boolean' ? (value ? 'Enabled' : 'Disabled') : (value ?? '—')
 
@@ -263,7 +268,7 @@ export default function SessionSidebar({ workspaceId, config, tools, sendCommand
                         )}
                       </td>
                       <td>{renderPermissionValue(grant)}</td>
-                      <td>{renderPermissionValue(p.effective)}</td>
+                      <td>{effectivePermissionLabel(p.effective)}</td>
                     </tr>
                   )
                 })}

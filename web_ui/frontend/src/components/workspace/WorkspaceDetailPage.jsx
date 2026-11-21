@@ -157,6 +157,11 @@ function PermissionsResourcesTab({
   function renderResourceCard({ name, label, context, description, options, tools, current }) {
     const booleanCeiling = options === CONTAINER_CEILING
     const noCeilingControl = options === undefined
+    // `current` is a CEILING level ('banned' | …), never an effective value. The
+    // gate spells an effective level-axis deny as 'banned' too, so that one is
+    // unambiguous — but a boolean `false` (the container axis, or any raw
+    // boolean) is not 'banned' and would read ENABLED here, so never pass it the
+    // /effective_permissions dict.
     const enabled = booleanCeiling ? containerCeilingEnabled(current) : current !== 'banned'
     return (
       <div className="wdp-resource-card" key={name}>
