@@ -1321,3 +1321,19 @@ Continuity written under token pressure is written badly or not at all. Append a
 - Worker spawn `timeout_seconds` is advisory and `timeout_triggered` is unreliable in both directions.
 - `Worker action=query` ignores `context['query']`; only `worker_query` is read.
 - `git worktree list` marks worktrees "prunable" when they are registered with the container path `/workspace/...` rather than the host path. Cosmetic, but it makes them look dead.
+
+## 2026-11-21 — **2026-11-21 (J2) — the guarantee system's own coverage, MEA...
+
+**2026-11-21 (J2) — the guarantee system's own coverage, MEASURED.**
+
+(1) The repo has exactly ONE sha256 tripwire: 9 inline tokens in `.thoughtmachine/knowledge/project/HANDOFF.md` §2 pinning the BYTES of 9 onboarding docs. Enforced twice: `tests/test_onboarding_bundle_contract.py:693-718` and `scripts/check_kb_staleness.sh` (hard exit 1; `python-version-matrix.yml:171-172`). Coverage of `agent/ session/ infra/ tools/ web_ui/backend/` SOURCE: **0 of 199 files** content-pinned; 4 files line-bounds-checked only. `session/`, `infra/`, `web_ui/backend/` have zero coverage of any kind. It is a documentation-staleness pin, NOT a security mechanism.
+
+(2) `docs/CONTRACTS.md` held 3 contracts; `architecture_invariants.md` held 2 numbered invariants (§1 container envelope, §2 host chokepoint). **No contract named either invariant, and none of the six detecting test files was in the gate.** Both headline invariants were enforced AND tested but NOT merge-blocking — e.g. widening `thoughtmachine/host_port.py::AUTHORIZED_VALUES` would not have blocked a merge. Repaired in #434 by `tests/test_invariants_ledger_parity.py`, which makes ABSENCE fail (red-first: 3 rule-(a) failures before any marker was added).
+
+(3) `scripts/verify_doc_citations.py` checks that a cited LINE EXISTS AND IS IN BOUNDS — not that it is the RIGHT line. Measured rot it passes today: `architecture_invariants.md` cites `security_gate.py:1360-1361` (pair actually at `:1580`) and `infra/container_manager.py:2249-2252` (actual `:2260`). A citation pin cannot detect semantic drift.
+
+(4) Prose that asserts a guarantee is an unverified claim, and this repo does it repeatedly one layer above where it breaks: `CONTRACTS.md`'s header and `contract-gate.yml`'s step title both claimed the gate "runs only the tests named here" (measured 18 run / 10 cited) — same defect class as `ConfigPanel.jsx:560-561`'s "the panel cannot drift" and `mutate_session`'s docstring vs the negative path cache. Corrected in #434.
+
+(5) `MANDATORY_STOP.md:9` records §9.3's two named exceptions: **git and container-git are OUTSIDE `host_port`'s coverage.** Do not claim the host chokepoint covers git — that surface is unaudited (the operator's "git hooks surface" class of attack).
+
+(6) `contract-gate.yml` runs a HAND-ENUMERATED 18-file list, no `paths` filter, on every PR to `dev`, but NOT on push to dev. The ledger→gate coupling is one-way (`cited ⊆ run`): it catches a deleted check, never an absent one. A new contract citing no test passes.
