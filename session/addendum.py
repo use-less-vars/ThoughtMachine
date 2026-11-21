@@ -170,6 +170,40 @@ def _find_entry_index(entries, entry_id):
     return None
 
 
+def addendum_rev(addendum) -> int:
+    """The GENERATION of a (normalised or raw) addendum: its mutation counter.
+
+    ``rev`` counts the mutations committed to this addendum, so comparing two
+    copies answers "which one is newer" without diffing entry sets.  A copy
+    written before the counter existed -- and a freshly created addendum, which
+    deliberately does not carry the key (``session/models.py:normalize_addendum``)
+    -- is generation 0.  Anything that is not a non-negative int is 0 too: the
+    counter is advisory, and an unreadable one must degrade to "no idea", never
+    to an exception on a save path.
+    """
+    if not isinstance(addendum, dict):
+        return 0
+    rev = addendum.get('rev', 0)
+    if isinstance(rev, int) and not isinstance(rev, bool) and rev >= 0:
+        return rev
+    return 0
+
+
+def bump_addendum_rev(addendum: dict) -> int:
+    """Set and return ``addendum['rev']`` = the next generation (prev + 1).
+
+    The ONE place the counter is advanced, called from the shared commit tail
+    (:func:`_commit_mutation`) and from the one mutator that builds the
+    persisted addendum by hand (the DELETE-all route, whose semantics are
+    "replace the entry set" rather than "mutate one entry", so it does not go
+    through the entry boundary).  Duplicating the increment in a second place is
+    how two writers come to disagree about which generation is newer -- the very
+    disagreement this counter exists to settle.
+    """
+    addendum['rev'] = addendum_rev(addendum) + 1
+    return addendum['rev']
+
+
 def _commit_mutation(session, normalized: dict, entries: list, entry: dict,
                      notify: bool, log_detail: str, boundary: dict, **extra) -> dict:
     """Persist ``entries`` on ``session``, notify the queue, return the result.
@@ -192,6 +226,11 @@ def _commit_mutation(session, normalized: dict, entries: list, entry: dict,
     persisted['entries'] = entries
     persisted['budget_chars'] = normalized['budget_chars']
     persisted['max_entries'] = normalized['max_entries']
+    # The generation advance is part of "persisted", not a separate step: every
+    # committed mutation is one generation, for every mutation kind, in one
+    # place.  A reader of the stored record can then tell this addendum from a
+    # snapshot taken before the mutation (see ``SessionManager.save_session``).
+    persisted['rev'] = bump_addendum_rev(persisted)
     session.addendum = persisted
 
     if notify:
