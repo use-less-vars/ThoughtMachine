@@ -319,10 +319,20 @@ def test_b2_get_reads_the_live_object_not_the_cold_copy(routes_store):
     """A read resolves live-first, so a client never sees a set the turn won't."""
     _seed(routes_store, entries=[_entry("on-disk", "e-disk")])
     live = routes_store.load_session(SID)
+    # The live copy is a NEWER GENERATION than the record, which is what "drift
+    # after a mutation that went through this object" actually looks like: an
+    # addendum carries a mutation counter (`rev`), and the read seam reconciles
+    # the live copy against the record with the same rule the snapshot save uses
+    # (session/addendum.py:reconcile_addendum_with_stored).  A live generation
+    # AHEAD of the record is kept -- the record cannot know about mutations it
+    # was never told.  The other direction (record ahead) is the read seam test's
+    # subject, and a SAME-generation disagreement is the concurrent-writer case,
+    # which unions by entry id instead of picking a winner.
     live.addendum = {
         "entries": [_entry("live-only", "e-live")],
         "budget_chars": 8000,
         "max_entries": 64,
+        "rev": 1,
     }
     _active_tab_bridges.add(_bridge(agent=SimpleNamespace(session=live), session=live))
 
