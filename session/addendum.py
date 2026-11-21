@@ -204,6 +204,93 @@ def bump_addendum_rev(addendum: dict) -> int:
     return addendum['rev']
 
 
+def reconcile_addendum_with_stored(session, stored_raw) -> str:
+    """Bring ``session.addendum`` up to at least the stored generation.
+
+    THE WRITEBACK LOSS, stated once: the addendum write path
+    (``web_ui/backend/addendum_routes.py:_write_through``) mutates the live
+    ``Session`` and persists it, but every OTHER in-memory copy of the same
+    session keeps the entry set it had before the write.  The next snapshot save
+    on such a copy writes that whole stale set over the record, so an entry the
+    server had already minted an id for and echoed to the client disappears from
+    the store.  The same mechanism reverts a PATCH-ed text and resurrects a
+    cleared set.
+
+    The fix is a GENERATION on the addendum, not a diff: every committed
+    mutation advances ``addendum['rev']`` (:func:`bump_addendum_rev`), so two
+    copies can be ordered without knowing what changed between them.  The three
+    cases, and why each one is the only safe answer:
+
+    * ``stored > memory`` -- the record is a NEWER generation than this
+      snapshot: adopt it wholesale (deep copy, so the saved session never
+      aliases the read one).  This is the case that was losing writes; a union
+      here would resurrect entries the newer generation deleted and revert its
+      edits.
+    * ``memory > stored`` -- this copy carries mutations the record has not been
+      told about yet (the in-process writer whose save is this very call): keep
+      it.  A union here would resurrect what THIS generation removed, for the
+      same reason as above.
+    * equal -- same generation, so neither copy is newer: union by entry id.  An
+      id is immutable and never reused, so a union can duplicate nothing and
+      lose nothing; it only matters when two writers each advanced the counter
+      once from the same ancestor (concurrent appends), and in that case both
+      entries are legitimately accepted and must survive.
+
+    A session with no stored record (a new session, or an unreadable one) is
+    left exactly as it is: there is nothing on disk to lose.
+
+    Returns which of the four outcomes happened -- ``'none'`` (no stored record
+    to reconcile against), ``'keep'`` (memory is not older, nothing changed),
+    ``'adopt'`` (the stored generation replaced the in-memory one) or
+    ``'union'`` (a same-generation union recovered at least one entry).  The
+    DECISION lives here rather than at the call sites, because a READ path and a
+    SAVE path must not be able to disagree about which generation wins: the read
+    seam (``web_ui/backend/addendum_routes.py:_resolve_addendum_session``) and
+    the snapshot save (``web_ui/backend/session_manager.py:_reconcile_addendum``)
+    both call this one function.
+    """
+    if not isinstance(stored_raw, dict):
+        return 'none'
+
+    current = getattr(session, 'addendum', None)
+    memory = normalize_addendum(current)
+    stored = normalize_addendum(stored_raw)
+    memory_rev = addendum_rev(memory)
+    stored_rev = addendum_rev(stored)
+    if memory_rev > stored_rev:
+        return 'keep'
+
+    if stored_rev > memory_rev:
+        adopted = dict(stored_raw)
+        adopted['entries'] = [dict(item) for item in stored['entries']]
+        adopted['budget_chars'] = stored['budget_chars']
+        adopted['max_entries'] = stored['max_entries']
+        adopted['rev'] = stored_rev
+        session.addendum = adopted
+        return 'adopt'
+
+    merged_entries = [dict(item) for item in memory['entries']]
+    seen = {item['id'] for item in merged_entries}
+    appended = 0
+    for item in stored['entries']:
+        if item['id'] in seen:
+            continue
+        merged_entries.append(dict(item))
+        seen.add(item['id'])
+        appended += 1
+    if not appended:
+        # Same generation and the same entry ids: nothing on disk to recover, so
+        # the in-memory dict is left untouched (no key is added, no order is
+        # rewritten).
+        return 'keep'
+
+    merged = dict(current) if isinstance(current, dict) else {}
+    merged['entries'] = merged_entries
+    merged['rev'] = memory_rev + 1  # the unioned set is a new generation
+    session.addendum = merged
+    return 'union'
+
+
 def _commit_mutation(session, normalized: dict, entries: list, entry: dict,
                      notify: bool, log_detail: str, boundary: dict, **extra) -> dict:
     """Persist ``entries`` on ``session``, notify the queue, return the result.
