@@ -4,27 +4,37 @@
  *
  * jsdom + @testing-library/react, per-file environment (ConfigPanel has no
  * `test` config in vite.config.js).  Covers the operator-visible half of the
- * addendum REST surface (GET/POST/DELETE /api/session/{id}/addendum):
- *   - the list and the totals line render what the SERVER returned
- *   - a write adopts the server's resulting entry set (never a local append)
- *   - the 409 refusal channel renders the boundary's own sentence verbatim,
- *     leaves the stored list untouched, and keeps the typed text for editing
- *   - the refusal banner does not survive a later accepted write
+ * addendum REST surface — ONE read plus the writes:
+ *   GET    /api/session/{id}/addendum/effective
+ *   POST   /api/session/{id}/addendum
+ *   DELETE /api/session/{id}/addendum
+ *   PATCH  /api/session/{id}/addendum/entries/{entry_id}
+ *   DELETE /api/session/{id}/addendum/entries/{entry_id}
+ *
+ * The contract these tests pin:
+ *   - ONE read paints the whole section.  GET .../addendum/effective answers
+ *     with the entry set AND the block the next turn will carry, resolved once
+ *     by the one resolver, so the rows you see and the preview you see are two
+ *     views of a single payload and cannot disagree.  There is no second list
+ *     request, and the seam test below asserts the panel makes exactly one.
+ *   - A write only echoes the server's resulting set into the session store and
+ *     bumps an epoch; what ends up on screen always comes from the re-read, never
+ *     from a local append and never from panel-side arithmetic.  The mocked
+ *     server here is therefore STATEFUL: the GET answers with whatever the last
+ *     write left behind, exactly like the real read whose whole job is to be the
+ *     authority.
+ *   - The 409 refusal channel renders the boundary's own sentence verbatim,
+ *     leaves the stored list untouched, and keeps the typed text for editing.
+ *   - The refusal banner does not survive a later accepted write.
  *   - "clear all" is two-step: the first click only arms, the second fires
- *     DELETE
- *   - the store echo (receiveAddendumUpdated) merges by entry id — it neither
- *     duplicates nor wipes the rendered rows
- *   - the effective-block preview (GET /addendum/effective) renders the text the
- *     backend RESOLVED for the next turn, and is refetched after a write rather
- *     than reconstructed from the list
- *   - one entry can be edited in place (PATCH) and removed (DELETE) on its own
- *     URL, each adopting the server's resulting set
- *   - the WS/event echo still merges by entry id, while the REST echoes use
- *     mode:'replace' -- the only shape that can represent a clear or a removal
+ *     DELETE, and the post-clear re-read is what removes the rows.
+ *   - The store echo (receiveAddendumUpdated) merges by entry id for WS/event
+ *     traffic, while the REST echoes use mode:'replace' — the only shape that can
+ *     represent a clear or a removal.
  *
  * The panel is a mirror, not an owner: it must never invent a char count, a
- * budget, or an entry.  These tests therefore assert against the payloads the
- * mocked server hands back, not against panel-side arithmetic.
+ * budget, an entry, or a rendered block.  These tests therefore assert against
+ * the payloads the mocked server hands back, not against panel-side arithmetic.
  */
 
 import React from 'react';
@@ -75,10 +85,23 @@ const E1 = makeEntry('a-000000000001', 'always answer in metric units');
 const E2 = makeEntry('a-000000000002', 'never truncate tool output');
 const E3 = makeEntry('a-000000000003', 'prefer boring solutions');
 
-// GET /api/session/{id}/addendum payload shape (backend addendum_routes).
-const addendumBody = (entries, total_chars) => ({
+// The backend measures the text as stored; the panel only echoes the number, so
+// every expectation below is derived from the payload rather than hard-coded.
+const textLen = (entries) => entries.reduce((n, e) => n + (e.text || '').length, 0);
+const totalsText = (entries) =>
+  `${textLen(entries)} / ${BUDGET} chars · ${entries.length} / ${MAX_ENTRIES} entries`;
+
+// The block the resolver would render for a set: the framing line plus one line
+// per entry, and NO block at all when there is nothing to render.
+const renderBlock = (entries) =>
+  entries.length === 0 ? '' : `[addendum]\n${entries.map((e) => e.text).join('\n')}`;
+
+// WRITE-response shape only.  POST/PATCH/DELETE answer with the resulting entry
+// set (plus `status`/`entry`), which the panel echoes into the store; the panel
+// never renders from these, so they carry no `rendered_block`.
+const addendumBody = (entries) => ({
   entries,
-  total_chars,
+  total_chars: textLen(entries),
   budget_chars: BUDGET,
   max_entries: MAX_ENTRIES,
   session_id: SESSION,
@@ -93,13 +116,14 @@ const clearedBody = () => ({
   session_id: SESSION,
 });
 
-// GET /api/session/{id}/addendum/effective payload shape: the RESOLVED block
-// plus the diagnostics the panel renders as a one-line note.
+// THE read: GET /api/session/{id}/addendum/effective.  One payload carries the
+// entry set AND the block the next turn receives, so the list and the preview
+// are two views of one resolution.
 const effectiveBody = (entries, renderedBlock) => ({
   status: 'ok',
   session_id: SESSION,
   entries,
-  total_chars: entries.reduce((n, e) => n + (e.text || '').length, 0),
+  total_chars: textLen(entries),
   budget_chars: BUDGET,
   max_entries: MAX_ENTRIES,
   rendered_block: renderedBlock,
@@ -123,13 +147,41 @@ const response = (status, body) => ({
 });
 
 /*
- * URL-routing fetch stub.  ConfigPanel issues three fetches on mount
- * (/api/tools, /api/session/{id}/permissions and /api/session/{id}/addendum),
- * so a blanket mock would let the addendum GET answer the tool-list call.  The
- * router keys on the URL and on init.method and records per-verb call counts.
+ * A stateful stand-in for the real read: the GET always answers with the set the
+ * last successful write left behind.  That is what makes "the list is re-read
+ * from the authority" testable — a panel that patched itself from a write
+ * response would still pass, but a panel that kept its own stale copy would not.
+ */
+function statefulServer(initialEntries, renderedBlock) {
+  let entries = initialEntries;
+  let block = renderedBlock === undefined ? renderBlock(initialEntries) : renderedBlock;
+  return {
+    get: () => response(200, effectiveBody(entries, block)),
+    set(nextEntries, nextBlock) {
+      entries = nextEntries;
+      block = nextBlock === undefined ? renderBlock(nextEntries) : nextBlock;
+    },
+  };
+}
+
+/*
+ * URL-routing fetch stub.  ConfigPanel issues two fetches on mount
+ * (/api/session/{id}/permissions and /api/session/{id}/addendum/effective, plus
+ * /api/tools), so a blanket mock would let the addendum GET answer the tool-list
+ * call.  The router keys on the URL and on init.method, records per-verb call
+ * counts, and records every addendum GET URL so a test can prove WHICH read the
+ * panel made (there must be exactly one, and it must be the /effective one).
  */
 function installFetch(handlers) {
-  const calls = { get: 0, post: 0, patch: 0, delete: 0, postBodies: [], patchBodies: [] };
+  const calls = {
+    get: 0,
+    post: 0,
+    patch: 0,
+    delete: 0,
+    getUrls: [],
+    postBodies: [],
+    patchBodies: [],
+  };
   const fetchMock = vi.fn(async (url, init = {}) => {
     const target = String(url);
     const method = String(init.method || 'GET').toUpperCase();
@@ -149,8 +201,7 @@ function installFetch(handlers) {
         return handlers.delete ? handlers.delete(calls.delete, target) : response(200, clearedBody());
       }
       calls.get += 1;
-      // The list GET and the effective-block GET share the /addendum prefix, so
-      // the URL is handed to the handler (existing handlers ignore it).
+      calls.getUrls.push(target);
       return handlers.get(calls.get, target);
     }
     if (target.includes('/permissions')) return response(200, { raw: {} });
@@ -199,24 +250,33 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-// ==========================================================================
-// Render + write chain
-// ==========================================================================
-describe('ConfigPanel addendum', () => {
+describe('ConfigPanel addendum surface', () => {
+  // ========================================================================
+  // The loaded set, a write, and the store echo
+  // ========================================================================
   it('renders the loaded list, adopts the server set after a write, and never duplicates on the store echo', async () => {
+    const server = statefulServer([E1, E2]);
     const { calls } = installFetch({
-      get: () => response(200, addendumBody([E1, E2], 53)),
-      post: () =>
-        response(200, { status: 'accepted', entry: E3, ...addendumBody([E1, E2, E3], 82) }),
+      get: server.get,
+      post: () => {
+        // The write itself only reports the resulting set; the RENDER comes from
+        // the re-read below.
+        server.set([E1, E2, E3]);
+        return response(200, { status: 'accepted', entry: E3, ...addendumBody([E1, E2, E3]) });
+      },
     });
     renderPanel();
 
-    // The rendered list IS the server's answer.
+    // The rendered list IS the server's answer...
     await waitFor(() =>
       expect(screen.getByTestId(`addendum-entry-${E1.id}`)).toBeInTheDocument()
     );
+    // ...and it came from exactly one request on mount, the /effective one.
+    expect(calls.get).toBe(1);
+    expect(calls.getUrls).toHaveLength(1);
+    expect(calls.getUrls[0]).toContain('/addendum/effective');
     expect(screen.getByTestId(`addendum-entry-${E2.id}`)).toBeInTheDocument();
-    expect(totals().textContent).toBe('53 / 100 chars · 2 / 64 entries');
+    expect(totals().textContent).toBe(totalsText([E1, E2]));
     expect(rows()).toHaveLength(2);
     // Per-entry char count is computed from the text (the payload carries none).
     expect(screen.getByTestId(`addendum-entry-${E1.id}`).textContent).toContain(
@@ -230,7 +290,9 @@ describe('ConfigPanel addendum', () => {
     expect(calls.post).toBe(1);
     // The text goes out verbatim — trimming here would misreport the budget.
     expect(calls.postBodies[0]).toEqual({ text: E3.text });
-    expect(totals().textContent).toBe('82 / 100 chars · 3 / 64 entries');
+    // The write bumped the epoch, so the section was re-read from the authority.
+    expect(calls.get).toBe(2);
+    expect(totals().textContent).toBe(totalsText([E1, E2, E3]));
     expect(rows()).toHaveLength(3);
     // Accepted write clears the composer.
     expect(textarea().value).toBe('');
@@ -248,39 +310,80 @@ describe('ConfigPanel addendum', () => {
   });
 
   // ========================================================================
+  // The seam: one read, one resolution
+  // ========================================================================
+  it('paints the list AND the preview from a single read, so the two cannot disagree', async () => {
+    const BLOCK = '[addendum]\nalways answer in metric units\nnever truncate tool output';
+    const server = statefulServer([E1, E2], BLOCK);
+    const { calls } = installFetch({ get: server.get });
+    renderPanel();
+
+    await waitFor(() =>
+      expect(screen.getByTestId('addendum-effective-block')).toBeInTheDocument()
+    );
+
+    // THE point of this test: one request on mount, and it is the /effective one.
+    // A second list GET would be a second resolution of the same session state and
+    // the two answers could eventually differ — which is the bug this seam removed.
+    expect(calls.get).toBe(1);
+    expect(calls.getUrls).toHaveLength(1);
+    expect(calls.getUrls[0]).toContain(`/api/session/${SESSION}/addendum/effective`);
+
+    // The rows ARE that payload's entries, in the payload's order...
+    expect(rows()).toHaveLength(2);
+    expect(Array.from(rows()).map((li) => li.getAttribute('data-testid'))).toEqual([
+      `addendum-entry-${E1.id}`,
+      `addendum-entry-${E2.id}`,
+    ]);
+    expect(totals().textContent).toBe(totalsText([E1, E2]));
+    // ...and the preview IS that same payload's rendered_block, verbatim: the
+    // panel never re-derives framing, so what it shows is what the turn receives.
+    expect(screen.getByTestId('addendum-effective-block').textContent).toBe(BLOCK);
+    // Even the preview's own counts come from the payload, not from the rows.
+    expect(screen.getByTestId('addendum-effective-meta').textContent).toContain(
+      '2 / 64 entries'
+    );
+  });
+
+  // ========================================================================
   // Refusal channel + recovery
   // ========================================================================
   it('shows the boundary refusal verbatim, leaves the list untouched, then recovers after a clear', async () => {
-    installFetch({
-      get: () => response(200, addendumBody([E1], 90)),
+    const server = statefulServer([E1]);
+    const { calls } = installFetch({
+      get: server.get,
       post: (n) => {
         if (n === 1) {
           return response(409, {
             status: 'refused',
             reason: 'budget_exceeded',
             message: 'addendum budget exceeded: 120 > 100 chars',
-            entries: [E1],
-            total_chars: 90,
-            budget_chars: BUDGET,
-            max_entries: MAX_ENTRIES,
+            ...addendumBody([E1]),
           });
         }
-        return response(200, { status: 'accepted', entry: E3, ...addendumBody([E3], E3.text.length) });
+        server.set([E3]);
+        return response(200, { status: 'accepted', entry: E3, ...addendumBody([E3]) });
+      },
+      delete: () => {
+        server.set([], '');
+        return response(200, clearedBody());
       },
     });
     renderPanel();
 
     await waitFor(() => expect(screen.getByTestId(`addendum-entry-${E1.id}`)).toBeInTheDocument());
-    expect(totals().textContent).toBe('90 / 100 chars · 1 / 64 entries');
+    expect(totals().textContent).toBe(totalsText([E1]));
 
     submitText('x'.repeat(30));
     await waitFor(() => expect(screen.getByTestId('addendum-refusal')).toBeInTheDocument());
     const banner = screen.getByTestId('addendum-refusal');
     expect(banner).toHaveTextContent('addendum budget exceeded: 120 > 100 chars');
     expect(banner).toHaveTextContent('budget_exceeded');
-    // Refused, never truncated: the stored set is exactly what it was.
+    // Refused, never truncated: the stored set is exactly what it was — confirmed
+    // against a re-read, since a refusal also bumps the epoch.
+    await waitFor(() => expect(calls.get).toBe(2));
     expect(rows()).toHaveLength(1);
-    expect(totals().textContent).toBe('90 / 100 chars · 1 / 64 entries');
+    expect(totals().textContent).toBe(totalsText([E1]));
     expect(screen.queryByTestId('addendum-error')).not.toBeInTheDocument();
 
     // Recovery: the clear action is reachable from the panel itself.
@@ -288,7 +391,7 @@ describe('ConfigPanel addendum', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Confirm clear' }));
     await waitFor(() => expect(screen.queryByTestId('addendum-list')).not.toBeInTheDocument());
     expect(screen.getByText('No addendum entries.')).toBeInTheDocument();
-    expect(totals().textContent).toBe('0 / 100 chars · 0 / 64 entries');
+    expect(totals().textContent).toBe(totalsText([]));
     expect(screen.queryByTestId('addendum-refusal')).not.toBeInTheDocument();
 
     // The same write now fits.
@@ -298,26 +401,25 @@ describe('ConfigPanel addendum', () => {
   });
 
   it('drops a stale refusal banner once a later write is accepted', async () => {
+    const server = statefulServer([]);
     installFetch({
-      get: () => response(200, addendumBody([], 0)),
+      get: server.get,
       post: (n) => {
         if (n === 1) {
           return response(409, {
             status: 'refused',
             reason: 'budget_exceeded',
             message: 'addendum budget exceeded: 120 > 100 chars',
-            entries: [],
-            total_chars: 0,
-            budget_chars: BUDGET,
-            max_entries: MAX_ENTRIES,
+            ...addendumBody([]),
           });
         }
-        return response(200, { status: 'accepted', entry: E3, ...addendumBody([E3], E3.text.length) });
+        server.set([E3]);
+        return response(200, { status: 'accepted', entry: E3, ...addendumBody([E3]) });
       },
     });
     renderPanel();
 
-    await waitFor(() => expect(totals().textContent).toBe('0 / 100 chars · 0 / 64 entries'));
+    await waitFor(() => expect(totals().textContent).toBe(totalsText([])));
     expect(screen.getByText('No addendum entries.')).toBeInTheDocument();
 
     submitText('x'.repeat(30));
@@ -330,17 +432,15 @@ describe('ConfigPanel addendum', () => {
 
   it('keeps the typed text when the write is refused', async () => {
     const typed = 'a much longer sentence that will not fit the remaining budget';
+    const server = statefulServer([E1]);
     installFetch({
-      get: () => response(200, addendumBody([E1], 90)),
+      get: server.get,
       post: () =>
         response(409, {
           status: 'refused',
           reason: 'budget_exceeded',
-          message: `addendum budget exceeded: ${90 + typed.length} > 100 chars`,
-          entries: [E1],
-          total_chars: 90,
-          budget_chars: BUDGET,
-          max_entries: MAX_ENTRIES,
+          message: `addendum budget exceeded: ${textLen([E1]) + typed.length} > 100 chars`,
+          ...addendumBody([E1]),
         }),
     });
     renderPanel();
@@ -357,8 +457,13 @@ describe('ConfigPanel addendum', () => {
   // Two-step clear
   // ========================================================================
   it('arms on the first click and fires DELETE only on the confirm click', async () => {
+    const server = statefulServer([E1]);
     const { calls } = installFetch({
-      get: () => response(200, addendumBody([E1], E1.text.length)),
+      get: server.get,
+      delete: () => {
+        server.set([], '');
+        return response(200, clearedBody());
+      },
     });
     renderPanel();
 
@@ -373,8 +478,11 @@ describe('ConfigPanel addendum', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Confirm clear' }));
     await waitFor(() => expect(calls.delete).toBe(1));
+    // The rows disappear because the post-clear re-read says the set is empty.
+    await waitFor(() => expect(calls.get).toBe(2));
     await waitFor(() => expect(screen.queryByTestId('addendum-list')).not.toBeInTheDocument());
     expect(screen.getByText('No addendum entries.')).toBeInTheDocument();
+    expect(totals().textContent).toBe(totalsText([]));
   });
 
   // ========================================================================
@@ -383,19 +491,13 @@ describe('ConfigPanel addendum', () => {
   it('renders the block the backend RESOLVED for the next turn, and refetches it after a write', async () => {
     const BLOCK_BEFORE = '[addendum]\nalways answer in metric units\nnever truncate tool output';
     const BLOCK_AFTER = `${BLOCK_BEFORE}\nprefer boring solutions`;
-    let effectiveCalls = 0;
-    installFetch({
-      get: (n, url) => {
-        if (String(url).includes('/addendum/effective')) {
-          effectiveCalls += 1;
-          return effectiveCalls === 1
-            ? response(200, effectiveBody([E1, E2], BLOCK_BEFORE))
-            : response(200, effectiveBody([E1, E2, E3], BLOCK_AFTER));
-        }
-        return response(200, addendumBody([E1, E2], 53));
+    const server = statefulServer([E1, E2], BLOCK_BEFORE);
+    const { calls } = installFetch({
+      get: server.get,
+      post: () => {
+        server.set([E1, E2, E3], BLOCK_AFTER);
+        return response(200, { status: 'accepted', entry: E3, ...addendumBody([E1, E2, E3]) });
       },
-      post: () =>
-        response(200, { status: 'accepted', entry: E3, ...addendumBody([E1, E2, E3], 82) }),
     });
     renderPanel();
 
@@ -414,13 +516,14 @@ describe('ConfigPanel addendum', () => {
     expect(screen.getByTestId('addendum-effective-diagnostics').textContent).toContain(
       'same session object: yes'
     );
-    expect(effectiveCalls).toBe(1);
+    // One read painted the section, preview included.
+    expect(calls.get).toBe(1);
 
     submitText(E3.text);
     await waitFor(() => expect(screen.getByTestId(`addendum-entry-${E3.id}`)).toBeInTheDocument());
     // A REST write lands in the session STORE, not in a running agent, so the
     // preview is re-fetched (never patched from the list).
-    await waitFor(() => expect(effectiveCalls).toBe(2));
+    await waitFor(() => expect(calls.get).toBe(2));
     await waitFor(() =>
       expect(screen.getByTestId('addendum-effective-block').textContent).toBe(BLOCK_AFTER)
     );
@@ -431,14 +534,16 @@ describe('ConfigPanel addendum', () => {
   // ========================================================================
   it('edits one entry in place with PATCH and adopts the server set', async () => {
     const edited = { ...E1, text: 'always answer in SI units' };
+    const server = statefulServer([E1, E2]);
     const { calls } = installFetch({
-      get: () => response(200, addendumBody([E1, E2], 53)),
+      get: server.get,
       patch: (n, url) => {
         expect(String(url)).toContain(`/addendum/entries/${E1.id}`);
+        server.set([edited, E2]);
         return response(200, {
           status: 'updated',
           entry: edited,
-          ...addendumBody([edited, E2], 44),
+          ...addendumBody([edited, E2]),
         });
       },
     });
@@ -457,10 +562,16 @@ describe('ConfigPanel addendum', () => {
     await waitFor(() => expect(calls.patch).toBe(1));
     // Text goes out verbatim, exactly like an append.
     expect(calls.patchBodies[0]).toEqual({ text: edited.text });
+    // The edited text on screen is the re-read set's, and the preview was re-read
+    // from the same resolution.
+    await waitFor(() => expect(calls.get).toBe(2));
     await waitFor(() =>
       expect(screen.getByTestId(`addendum-entry-${E1.id}`).textContent).toContain(edited.text)
     );
-    expect(totals().textContent).toBe(`44 / 100 chars \u00b7 2 / 64 entries`);
+    expect(totals().textContent).toBe(totalsText([edited, E2]));
+    expect(screen.getByTestId('addendum-effective-block').textContent).toBe(
+      renderBlock([edited, E2])
+    );
     // The editor collapses once the server accepted the new text.
     expect(screen.queryByLabelText(`Edit addendum entry ${E1.id}`)).not.toBeInTheDocument();
     expect(screen.getByTestId(`addendum-entry-${E2.id}`)).toBeInTheDocument();
@@ -468,15 +579,17 @@ describe('ConfigPanel addendum', () => {
 
   it('removes one entry on its own URL and drops the row (replace echo)', async () => {
     let removed = 0;
+    const server = statefulServer([E1, E2]);
     installFetch({
-      get: () => response(200, addendumBody([E1, E2], 53)),
+      get: server.get,
       delete: (n, url) => {
         removed += 1;
         expect(String(url)).toContain(`/addendum/entries/${E1.id}`);
+        server.set([E2]);
         return response(200, {
           status: 'removed',
           removed_id: E1.id,
-          ...addendumBody([E2], E2.text.length),
+          ...addendumBody([E2]),
         });
       },
     });
@@ -488,15 +601,25 @@ describe('ConfigPanel addendum', () => {
     );
 
     await waitFor(() => expect(removed).toBe(1));
-    expect(screen.queryByTestId(`addendum-entry-${E1.id}`)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId(`addendum-entry-${E1.id}`)).not.toBeInTheDocument());
     expect(rows()).toHaveLength(1);
-    expect(totals().textContent).toBe(`${E2.text.length} / 100 chars \u00b7 1 / 64 entries`);
+    expect(totals().textContent).toBe(totalsText([E2]));
+    // The preview follows the same re-read, so it cannot still advertise the
+    // removed line.
+    expect(screen.getByTestId('addendum-effective-block').textContent).toBe(renderBlock([E2]));
     // A removal is not representable by a merge: the echo replaces the slice.
     expect(Object.keys(useStore.getState().addendumEntries[SESSION])).toEqual([E2.id]);
   });
 
   it('makes a clear representable in the store slice (replace, not merge)', async () => {
-    installFetch({ get: () => response(200, addendumBody([E1], E1.text.length)) });
+    const server = statefulServer([E1]);
+    installFetch({
+      get: server.get,
+      delete: () => {
+        server.set([], '');
+        return response(200, clearedBody());
+      },
+    });
     renderPanel();
 
     await waitFor(() => expect(screen.getByTestId(`addendum-entry-${E1.id}`)).toBeInTheDocument());

@@ -22,7 +22,7 @@ from agent.config.provider_profile import ProviderManager
 from agent.config.audit import log_config_audit
 from agent.core.message import is_system_notice_text
 from agent.logging import log
-from session.addendum import addendum_rev
+from session.addendum import addendum_rev, reconcile_addendum_with_stored
 from session.models import Session, normalize_addendum
 from session.store import FileSystemSessionStore
 from session.session_registry import SessionRegistry
@@ -381,97 +381,41 @@ class SessionManager:
         return session
 
     def _reconcile_addendum(self, session: Session) -> None:
-        """Bring ``session.addendum`` up to at least the stored generation.
+        """Reconcile this snapshot's addendum with the stored record before saving.
 
-        THE WRITEBACK LOSS, stated once: the addendum write path
-        (``web_ui/backend/addendum_routes.py:_write_through``) mutates the live
-        ``Session`` and persists it, but every OTHER in-memory copy of the same
-        session keeps the entry set it had before the write.  The next
-        ``save_session`` on such a copy writes that whole stale snapshot over the
-        record, so an entry the server had already minted an id for and echoed to
-        the client disappears from the store.  The same mechanism reverts a
-        PATCH-ed text and resurrects a cleared set.
-
-        The fix is a GENERATION on the addendum, not a diff: every committed
-        mutation advances ``addendum['rev']`` (``session/addendum.py``), so two
-        copies can be ordered without knowing what changed between them.  The
-        three cases, and why each one is the only safe answer:
-
-        * ``stored > memory`` -- the record is a NEWER generation than this
-          snapshot: adopt it wholesale (deep copy, so the saved session never
-          aliases the read one).  This is the case that was losing writes; a
-          union here would resurrect entries the newer generation deleted and
-          revert its edits.
-        * ``memory > stored`` -- this copy carries mutations the record has not
-          been told about yet (the in-process writer whose save is this very
-          call): keep it.  A union here would resurrect what THIS generation
-          removed, for the same reason as above.
-        * equal -- same generation, so neither copy is newer: union by entry id.
-          An id is immutable and never reused, so a union can duplicate nothing
-          and lose nothing; it only matters when two writers each advanced the
-          counter once from the same ancestor (concurrent appends), and in that
-          case both entries are legitimately accepted and must survive.
-
-        A session with no stored record (a new session, or an unreadable one)
-        is left exactly as it is: there is nothing on disk to lose.
+        A save is a WHOLESALE snapshot write, so a copy that predates an addendum
+        mutation would write its stale entry set over the newer one.  The three
+        cases (adopt / keep / union) and why each is the only safe answer are
+        documented once, in ``session/addendum.py:reconcile_addendum_with_stored``
+        -- this method only reads the record, applies that decision, and reports
+        which one it took.  Keeping the DECISION in one function is what lets the
+        read seam use the very same rule instead of a second opinion.
         """
         reader = getattr(self._session_store, "read_stored_addendum", None)
         if not callable(reader):  # a store double without the read side
             return
-        stored_raw = reader(session.session_id, workspace_id=session.workspace_id)
-        if not isinstance(stored_raw, dict):
-            return
-
-        current = getattr(session, "addendum", None)
-        memory = normalize_addendum(current)
-        stored = normalize_addendum(stored_raw)
-        memory_rev = addendum_rev(memory)
-        stored_rev = addendum_rev(stored)
-        if memory_rev > stored_rev:
-            return
-
-        if stored_rev > memory_rev:
-            adopted = dict(stored_raw)
-            adopted["entries"] = [dict(item) for item in stored["entries"]]
-            adopted["budget_chars"] = stored["budget_chars"]
-            adopted["max_entries"] = stored["max_entries"]
-            adopted["rev"] = stored_rev
-            session.addendum = adopted
+        memory_rev = addendum_rev(normalize_addendum(getattr(session, "addendum", None)))
+        outcome = reconcile_addendum_with_stored(
+            session, reader(session.session_id, workspace_id=session.workspace_id)
+        )
+        if outcome == "adopt":
             log(
                 "INFO",
                 "session_manager",
-                f"[addendum] save adopted the stored generation rev={stored_rev} "
-                f"over the in-memory rev={memory_rev} for session "
-                f"{session.session_id} (entries={len(adopted['entries'])})",
+                f"[addendum] save adopted the stored generation "
+                f"rev={addendum_rev(session.addendum)} over the in-memory "
+                f"rev={memory_rev} for session {session.session_id} "
+                f"(entries={len(session.addendum['entries'])})",
             )
-            return
-
-        merged_entries = [dict(item) for item in memory["entries"]]
-        seen = {item["id"] for item in merged_entries}
-        appended = 0
-        for item in stored["entries"]:
-            if item["id"] in seen:
-                continue
-            merged_entries.append(dict(item))
-            seen.add(item["id"])
-            appended += 1
-        if not appended:
-            # Same generation and the same entry ids: nothing on disk to recover,
-            # so the in-memory dict is written unchanged (no key is added, no
-            # order is rewritten).
-            return
-
-        merged = dict(current) if isinstance(current, dict) else {}
-        merged["entries"] = merged_entries
-        merged["rev"] = memory_rev + 1  # the unioned set is a new generation
-        session.addendum = merged
-        log(
-            "INFO",
-            "session_manager",
-            f"[addendum] save unioned {appended} stored entr{'y' if appended == 1 else 'ies'} "
-            f"into the in-memory generation for session {session.session_id} "
-            f"(rev={merged['rev']}, entries={len(merged_entries)})",
-        )
+        elif outcome == "union":
+            log(
+                "INFO",
+                "session_manager",
+                f"[addendum] save unioned stored entries into the in-memory "
+                f"generation for session {session.session_id} "
+                f"(rev={addendum_rev(session.addendum)}, "
+                f"entries={len(session.addendum['entries'])})",
+            )
 
     # ── Delete ────────────────────────────────────────────────────────────────
 

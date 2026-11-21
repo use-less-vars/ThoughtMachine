@@ -557,19 +557,22 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   // surface (GET/POST/DELETE /api/session/{id}/addendum), never through the
   // config draft or apply_config: the write boundary owns the budget verdict
   // (refuse, never truncate), so the panel only mirrors what the server
-  // returns. The rendered list IS the server's answer — every mutation adopts
-  // the `entries` it came back with, so the panel cannot drift.
+  // returns. ONE read paints this section: GET .../addendum/effective returns
+  // the entry set AND the block the next query carries, resolved once by the
+  // one resolver, so the list and the preview below cannot disagree. A second
+  // list request would be a second resolution of the same state, and the two
+  // would eventually answer differently.
   const [addendumState, setAddendumState] = useState({ entries: [], total_chars: 0, budget_chars: null, max_entries: null })
   const [addendumText, setAddendumText] = useState('')
   const [addendumBusy, setAddendumBusy] = useState(false)
   const [addendumRefusal, setAddendumRefusal] = useState(null)  // { reason, message } | null — the 409 channel
   const [addendumError, setAddendumError] = useState(null)      // every other non-2xx
   const [confirmClearAddendum, setConfirmClearAddendum] = useState(false)
-  // Effective-block preview (GET /addendum/effective): the block the NEXT turn
-  // actually receives, rendered by the same resolver a turn uses. Kept apart
-  // from addendumState because it is a derived view, never an authority.
+  // The ONE read of this section (GET /addendum/effective): the block the NEXT
+  // turn actually receives -- rendered by the same resolver a turn uses -- and
+  // the entry set it was rendered from. `addendumState` below is populated from
+  // THIS payload, never from a list request of its own.
   const [addendumEffective, setAddendumEffective] = useState(null)
-  const [addendumEffectiveError, setAddendumEffectiveError] = useState(null)
   // Bumped after every accepted mutation to re-fetch the preview: the REST write
   // lands in the session STORE (not in a running agent's in-memory Session), so
   // the preview is the only place the resolved block is visible.
@@ -580,9 +583,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const [addendumEditText, setAddendumEditText] = useState('')
   const [addendumEntryBusy, setAddendumEntryBusy] = useState(false)
 
-  // Adopt a server payload without inventing numbers: fields the response does
-  // not carry keep their previous value (DELETE and POST both return them, but
-  // a future reader should not silently zero the budget).
+  // Adopt the read payload into the rendered state without inventing numbers: a
+  // field the payload does not carry keeps its previous value (a partial answer
+  // must not silently zero the budget or blank the list).
   const adoptAddendum = (data) => {
     setAddendumState((prev) => ({
       entries: Array.isArray(data?.entries) ? data.entries : prev.entries,
@@ -596,43 +599,33 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const addendumEntryUrl = (entryId) =>
     apiUrl(`/api/session/${encodeURIComponent(sessionId)}/addendum/entries/${encodeURIComponent(entryId)}`)
 
-  // Load the entry list on mount and whenever the session changes.
+  // A new session starts from nothing: never show the previous session's
+  // entries (or its refusal banner) while the read below is in flight. The read
+  // itself lives in ONE place, the effective-block effect, so the list and the
+  // preview can never come from two different resolutions.
   useEffect(() => {
-    let cancelled = false
     setAddendumError(null)
     setAddendumRefusal(null)
     setConfirmClearAddendum(false)
     setEditingAddendumId(null)
     setAddendumEditText('')
-    if (!sessionId) {
-      setAddendumState({ entries: [], total_chars: 0, budget_chars: null, max_entries: null })
-      return () => { cancelled = true }
-    }
-    fetch(addendumUrl())
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const data = await res.json()
-        if (cancelled) return
-        adoptAddendum(data)
-      })
-      .catch((err) => {
-        if (cancelled) return
-        setAddendumError(`Failed to load addendum: ${err?.message || err}`)
-      })
-    return () => { cancelled = true }
+    setAddendumState({ entries: [], total_chars: 0, budget_chars: null, max_entries: null })
   }, [sessionId])
 
-  // Preview what the NEXT turn receives. The backend renders the block with the
-  // same resolver a turn uses, so the panel shows the RESOLVED text instead of
-  // re-deriving the framing, and refetches after every accepted mutation
-  // (`addendumEpoch`) — but only while the addendum is actually on screen.
+  // THE read of the addendum section, and the only one. The backend resolves the
+  // session ONCE and answers with both the entry set and the block the NEXT turn
+  // receives, rendered by the same resolver a turn uses -- so the list and the
+  // preview are two views of one payload instead of two answers that can drift.
+  // Refetched after every write (`addendumEpoch`), because a REST write lands in
+  // the session store and this read is the authority on the resulting state, but
+  // only while the addendum is actually on screen.
   useEffect(() => {
     let cancelled = false
-    setAddendumEffectiveError(null)
     if (!sessionId || activeTab !== 'live_view') {
       setAddendumEffective(null)
       return () => { cancelled = true }
     }
+    setAddendumError(null)
     fetch(apiUrl(`/api/session/${encodeURIComponent(sessionId)}/addendum/effective`))
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -641,11 +634,14 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         // Only a payload that actually carries a rendered block becomes the
         // preview: a partial answer must neither fabricate nor clear one.
         setAddendumEffective(typeof data?.rendered_block === 'string' ? data : null)
+        // ...and the list is adopted from that same payload, which is what makes
+        // "the rows you see" and "the block you see" the same resolution.
+        adoptAddendum(data)
       })
       .catch((err) => {
         if (cancelled) return
         setAddendumEffective(null)
-        setAddendumEffectiveError(`Failed to load effective addendum: ${err?.message || err}`)
+        setAddendumError(`Failed to load addendum: ${err?.message || err}`)
       })
     return () => { cancelled = true }
   }, [sessionId, activeTab, addendumEpoch])
@@ -674,14 +670,16 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           reason: data?.reason ?? 'refused',
           message: data?.message ?? 'addendum write refused',
         })
-        if (Array.isArray(data?.entries)) adoptAddendum(data)
+        // Nothing was persisted, so the set is unchanged -- but the list is
+        // re-read from the authority rather than patched from a response body:
+        // one renderer, one resolution.
+        setAddendumEpoch((n) => n + 1)
         return
       }
       if (!res.ok || data?.status !== 'accepted') {
         setAddendumError(`Failed to add entry: HTTP ${res.status}`)
         return
       }
-      adoptAddendum(data)
       // Persisted, not pushed: the REST write lands in the session STORE
       // (FileSystemSessionStore.load_session() returns a fresh deserialised
       // Session), so a running Agent's in-memory Session keeps its old addendum
@@ -715,7 +713,6 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         setAddendumError(`Failed to clear addendum: HTTP ${res.status}`)
         return
       }
-      adoptAddendum(data)
       // Same echo as the write, but this one MUST be replace: the point of a
       // clear is that the set becomes empty, which a merge-by-id echo cannot
       // represent.
@@ -749,7 +746,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           reason: data?.reason ?? 'refused',
           message: data?.message ?? 'addendum write refused',
         })
-        if (Array.isArray(data?.entries)) adoptAddendum(data)
+        // Nothing was persisted, so the set is unchanged -- but the list is
+        // re-read from the authority rather than patched from a response body:
+        // one renderer, one resolution.
+        setAddendumEpoch((n) => n + 1)
         return
       }
       if (res.status === 404 || data?.status === 'not_found') {
@@ -763,7 +763,6 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         setAddendumError(`Failed to update entry: HTTP ${res.status}`)
         return
       }
-      adoptAddendum(data)
       // Same authoritative-set echo as the append: the PATCH response carries
       // the full resulting set.
       useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries }, { mode: 'replace' })
@@ -793,7 +792,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           reason: data?.reason ?? 'refused',
           message: data?.message ?? 'addendum write refused',
         })
-        if (Array.isArray(data?.entries)) adoptAddendum(data)
+        // Nothing was persisted, so the set is unchanged -- but the list is
+        // re-read from the authority rather than patched from a response body:
+        // one renderer, one resolution.
+        setAddendumEpoch((n) => n + 1)
         return
       }
       if (res.status === 404 || data?.status === 'not_found') {
@@ -805,7 +807,6 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         setAddendumError(`Failed to remove entry: HTTP ${res.status}`)
         return
       }
-      adoptAddendum(data)
       // A removal is exactly the case a merge-by-id echo cannot represent.
       useStore.getState().receiveAddendumUpdated(sessionId, { entries: data.entries ?? [] }, { mode: 'replace' })
       setAddendumEpoch((n) => n + 1)
@@ -1248,11 +1249,6 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               <label style={labelStyle}><strong>Effective block (next query)</strong></label>
               {/* "next query" is the resolver's term; the meta line below spells
                   out in operator terms when this block is actually sent. */}
-              {addendumEffectiveError && (
-                <div data-testid="addendum-effective-error" style={{ color: '#f38ba8', fontSize: '0.75rem', margin: '0.25rem 0' }}>
-                  {addendumEffectiveError}
-                </div>
-              )}
               {addendumEffective && (
                 <>
                   <div data-testid="addendum-effective-meta" style={{ margin: '0.25rem 0', fontSize: '0.7rem', color: '#6c7086' }}>
