@@ -1200,3 +1200,124 @@ A worker concluded from its own SIGTERMs that "long pytest runs are impossible i
 **The is_alive() Lie:** In MODE_PROCESS, the supervisor's thread is intentionally never started. `thread.is_alive()` is always False. Six different places in the codebase used `is_alive()` to decide if a worker was dead, causing orphan spawns and lying status panels. The fix is `worker_is_live()` which checks the runtime handle, not the thread.
 
 **The Timeout Race:** If a child process replies with `status='timeout'` at the exact moment the parent's `future.result()` times out, the parent raises `WorkerRuntimeLost` instead of `WorkerQueryTimeout`. The `dispatch_query` must inspect `reply.envelope['status']` and map it to the correct exception.
+
+## 2026-11-19 — ## Live problems encountered (agent-side), 2026-11-19 — "pro...
+
+## Live problems encountered (agent-side), 2026-11-19 — "problems I had live"
+
+Written because the session addendum asks for it directly; I had accumulated this list across several hours without filing it, which is itself a compliance gap.
+
+**1. `Worker(action="spawn")` transport corrupts long payloads (2 occurrences this session).**
+- Call A lost the `action` field entirely → `Invalid arguments: 1 validation error for Worker / action: Field required`.
+- Call B turned `timeout_seconds` into `string="false">150` → `Input should be a valid integer, unable to parse string as an integer`.
+- Cost: one full retry each time (payload re-sent, tokens re-spent). Not agent sloppiness: the same payload shape succeeded immediately on resend. Long XML-ish bodies appear to get mangled at serialisation. Fix idea: validate the nested payload before dispatch and echo back the received argument tree on failure, so the caller can see *what arrived* versus what it sent.
+
+**2. One verb, two result shapes.** Same `spawn` call returns either `spawned:true, status:"final"` with full telemetry, or `spawned:false, status:"ready"`, `elapsed_seconds:null`, with the report nested inside a JSON *string*. Seen three times. A caller cannot tell success from in-progress by top-level fields. Fix: one schema, always with `telemetry`.
+
+**3. `timeout_seconds` is advisory on the spawn path.** Requested 150s → worker ran 224.0s with `timeout_triggered:false, timeout_clamped:false`. A parameter documented as a timeout that terminates nothing is a lie that looks like an API (same class as `worktree_add` ignoring `branch=`). Consequence: "it finished, therefore it finished within budget" is not a valid inference.
+
+**4. `git_read show_file` returns EMPTY SUCCESS out of range.** `show_file path=… ref=<sha> source=committed line_start=205 line_end=230` on a 191-line file → header line, zero content lines, `failure_reason: none`. Silent-empty reads as "absence measured" when it is really "I did not look". Fix: `file_lines: N, lines_returned: M` trailer, or refuse.
+
+**5. `git_read ls_tree` with `path=` is a SUBTREE RE-ROOT, not a file filter.** A blob path yields an empty body with `failure_reason: none`. Correct form: `treeish="<rev>:<path>"`. Fix: `entries: N` trailer, or reject blob paths explicitly.
+
+**CORRECTION (2026-11-19, code-level) — the re-root diagnosis above is RETRACTED.** `path=` is a pathspec filter, not a re-root: it goes through `_validated_rel_paths` and is appended after `--` (`tools/git_info_tool.py:2240-2243`), so `git ls-tree -r <tree> -- <path>` filters and still prints full paths from the tree root. `ls_tree` reads no `prefix` and no `pattern` field at all; `treeish="<rev>:<path>"` is the only form that re-roots, and the entry above already names it. The empty body was most likely `recursive` unset (`-r` is emitted only when `recursive=true`, `:2238-2239`), so a pathspec naming a nested file matched nothing — which is the real trap, and it is silent: empty body, `failure_reason: none`. The `entries: N` trailer proposal above stands.
+
+**6. The agent has no file-write or grep tool.** Every code edit requires a worker spawn; every search must be delegated. Workers reach worktrees only via RELATIVE `.worktrees/…` paths (absolute `/workspace/...` rejected). This makes cheap operations (grep a symbol, read 20 lines) into expensive round-trips.
+
+**7. pytest cannot be run in the container.** `python -m pytest tests/test_worker_jobs.py` → `Killed` on stderr, empty stdout, ~2.9s, no summary line (SIGTERM reaper). Consequence: a fail-first test (red before fix, green after) CANNOT be demonstrated locally. Workaround proposed: split into commit b1 = test only (pushes red, CI is the instrument) and b2 = the fix (pushes green). Without egress I cannot see CI, so the operator must relay the red/green.
+
+**8. Worker token cap enforcement is late and unclassified.** A worker was declared 80k, consumed 86,649 tokens, and then had tools restricted — enforcement exists but fires after the declared cap. Not yet a fail-open; unclassified.
+
+**9. Self-inflicted, worth recording because it recurred in the tools too:** my briefing said "Repo: /workspace" while the main tree was checked out on a *different* branch; the worker therefore grepped non-baseline content and I reported a false claim. Rule adopted: every path citation must name its substrate and root — `DISK:<root>` / `REF:<hash>` / `UNKNOWN` — and a bare relative path with no root is a rumour. A measurement whose root is unstated is a rumour.
+
+
+## 2026-11-19 — ## CORRECTION to a defect I myself filed: "pytest unusable i...
+
+## CORRECTION to a defect I myself filed: "pytest unusable in container" is FALSE (measured 2026-xx)
+
+I previously filed "pytest unusable in container; every commit is unverified by construction" after a `Killed` with empty stdout. That conclusion was wrong, and it cost a whole strand its verification loop: I built a standing protocol ("every dispatch ends with a host command, my commits are unverified") on top of a false premise.
+
+MEASURED, in-container, twice:
+  cd /workspace/.worktrees/async-worker && /usr/local/bin/python3.12 -m pytest tests/test_worker_jobs.py tests/test_worker_operation_semantics.py tests/test_worker_detached_queue.py -q
+  -> "84 passed, 25 warnings in 50.20s", real summary line, no `Killed`, 58.5s wall. NOT reaped.
+  .../ -m pytest tests/test_job_session_scoping.py -q  -> "4 failed, 2 passed ... in 1.42s", EXIT=1 (measured under bash + pipefail).
+
+The original `Killed` was almost certainly the *broken interpreter path*, not the reaper: `.venv/bin/python` is broken in this image, and `/usr/local/bin/python3.12` works. Distinguishing "command died" from "environment cannot run this" requires varying the invocation before generalising the failure. I generalised from one dead invocation to a platform capability limit.
+
+WORKING RECIPE (use this, stop re-deriving):
+  - interpreter: `/usr/local/bin/python3.12` (NOT `.venv/bin/python`)
+  - `-m pytest` for evidence: per-test `FAILED <node id>` lines in one place; `-m unittest` reports the same SetUpError/TypeError split as `errors=` vs `failures=`, which makes tallies incomparable across runners and mislabelled runners easy.
+  - `PYTHONPATH=/workspace/.venv/lib/python3.12/site-packages` only if imports fail.
+
+TOOL DEFECT (new): the code-execution backend's default shell is **dash (/bin/sh)**, so `${PIPESTATUS[0]}` yields "Bad substitution" and the tool reports **exit_code 2 = the shell's error, NOT the tested command's status**. A run can therefore look "failed" while its own output says "84 passed". Fix/avoid: pass `interpreter: "bash"` or use `set -o pipefail; cmd | tail -3; echo EXIT=$?`. Suggested product fix: capture and report the real exit code of the pipeline's first command by default, or refuse `${PIPESTATUS}`/bashisms in dash mode with a clear message instead of a silent shell error.
+
+ARCHITECTURAL GAP (worth raising, with a first idea): the agent's git surface has **no rebase and no cherry-pick and no fetch** — only commit/checkout/branch_create/worktree_add/stash/push. With no egress and no git binary in the container, a branch cannot be replayed onto a moved `dev` at all; every base-drift requires an operator round trip. First idea: add `rebase` and `cherry_pick` to `git_write` with the same gating as `commit` (they are history-rewriting, so they deserve the write grain), and give `checkout` an optional `start_point` so a branch can be rebuilt on a new base without a host shell.
+
+## 2026-11-19 — ## Host paths and host interpreters are NOT the container's ...
+
+## Host paths and host interpreters are NOT the container's (measured, cost 2 round trips)
+
+The container's `/workspace` is the mount point; the SAME tree on the operator's host is `~/PycharmProjects/ThoughtMachine-dev`. `git -C /workspace ...` on the host fails with "cannot change to '/workspace'". The bind means files and `.git` ARE shared (confirmed: a host-side `git rebase` produced SHAs the container then read), but the path strings are not interchangeable.
+
+Also: the container's working interpreter `/usr/local/bin/python3.12` DOES NOT EXIST on the host (`bash: No such file or directory`, EXIT=127). The host has an activated venv at the repo root — `python -m pytest` is the host invocation.
+
+Consequences for how I compose host commands (every one of these was a real failure):
+- never emit `/workspace/...` in a command for the operator; use `~/PycharmProjects/ThoughtMachine-dev/...`
+- container interpreter paths do not transfer; ask for `python -m pytest` and let the venv resolve
+- `git fetch` moves `origin/dev`, NOT local `dev` — `git rebase dev` is the wrong target unless someone fast-forwards `dev`; use `git rebase origin/dev`
+- rebasing a worktree whose branch is checked out IN THAT WORKTREE is fine and leaves it clean/attached; SHAs are rewritten, so every hash I quoted before the rebase is dead and must be re-anchored.
+
+ARCHITECTURAL GAP (with first idea): nothing in `CheckSystem` reports the workspace's HOST-side root or whether `.worktrees/` is shared. My entire commit discipline (and the operator round trip) depends on the bind being shared, and I inferred it rather than measured it for several sessions. Fix: `CheckSystem` should report the mount source path plus a shared-filesystem assertion, and the host-command templates in worker briefings should be rendered from that measured path, not from a path the agent guessed.
+
+## 2026-11-19 — ## Vitest IN the container: set TMPDIR/HOME, and re-read the branc...
+
+## Vitest IN the container: set TMPDIR/HOME, and re-read the branch before re-applying a fix
+
+Two measured corrections from one round trip.
+
+1. Vitest is runnable in-container (node v20.19.2, `web_ui/frontend/node_modules` pre-installed, 230 entries), but the bare invocation dies BEFORE collecting tests with
+   `Unhandled Error: ENOENT: no such file or directory, mkdir '/var/tmp/<rand>/web'` and reports `Tests no tests` — a harness failure that reads like "no suite". The temp root is unusable in this image; overriding it is the whole fix:
+   `cd /workspace/web_ui/frontend && TMPDIR=/tmp HOME=/tmp ./node_modules/.bin/vitest run <file|empty>`
+   Use `./node_modules/.bin/vitest`, not `npx` (no egress). Full suite: 70 files / 833 tests, 378 s wall — long but under the 900 s tool ceiling; `mem_limit: 2g` was enough.
+
+2. I spent the start of this session planning to re-apply a 4-line frontend fix, because my last edit had vanished when the tree was left on a DETACHED HEAD. The workspace had moved under me: my branch had been **merged into `origin/dev` as a squash commit (#424)**, and the very fix I was about to write already existed as `b44765ba` on `fix/addendum-applied-label` (an operator commit with the same label map and the same `applied ${applied ?? 'next_query'}` fallback). Re-applying would have produced a duplicate commit against merged history.
+   Rule: after any "my edit is gone" observation, `git_read log/branch_list` FIRST and look for (a) a detached HEAD, (b) a squash-merge of the branch into `origin/dev`, (c) an operator follow-up branch carrying the fix. A lost working-tree edit is a symptom of someone else's concurrent commit, not necessarily of work still owed. Reverting my speculative edit (`ApplyEdits` back out) and checking out the operator's branch cost two calls; the alternative cost a duplicated patch.
+
+
+## Declaration discipline — hard-won rules (2026-11-20 session)
+
+### Rule 1 — a canary must arrive through the channel under test, and only through it
+Three separate failures in one night:
+- The orchestrator was shown the canary **in a screenshot** and nearly recited it as proof the addendum pipeline worked. It proved nothing: the answer came through the image, not the prompt.
+- A host agent reported "clean negative on every surface — not in the store, not in any backups, not in the prompt" for a canary **it had never been given**. Zero hits on an unknown needle is an empty query, not a negative.
+- A worker's own test fixture string (`CANARY-AGENT-SYSTEM-PROMPT-ADDENDUM-7f3a`) was later found in the vault and mistaken for the operator's probe, because the orchestrator's grep pattern (`CANARY[A-Za-z0-9_-]*`) matched anything canary-shaped.
+**Rule:** probes carry a timestamp + random suffix a fixture generator cannot produce; the prober states the literal token; the answer is recited, never screenshotted.
+
+### Rule 2 — a claim, once logged, is lexically indistinguishable from state
+An id (`a-64858916e343`) appeared **61 times across 10 files** — session log, rotated event logs, the session JSON itself — and was never once a JSON value. Every `grep -rl` "confirmed" it, and log rotation *multiplied* the confirmation. A whole lost-write theory was built on it and had to be retracted.
+**Rule:** a real identifier is a JSON value at a known path. An identifier that appears only in prose is a rumour. Counting sightings is not evidence of persistence — the count grows whether the state exists or not.
+
+### Rule 3 — inherited facts enter as ASSUMED
+Six orchestrator declarations had to be retracted in one night, every one of them a claim inherited or asserted before measurement:
+1. `ls_tree` "subtree re-root" (refuted — `path=` IS a pathspec filter; the real trap is `path=` WITHOUT `recursive`).
+2. A "phantom UI row" the client invented (refuted — ids are server-minted).
+3. Accepting "2 rows / 4823 chars" for hours without a root (4823 = 105 real + 4718 *quoted in prose*; no 2-entry state ever existed on disk).
+4. "There is a process boundary" (refuted — one process; the split is object identity).
+5. "Two resolvers" (refuted — one store read, one renderer, both callers already use them).
+6. "`#425` merged as `f0402b2`" (false — that object does not exist in the repo; and "ledger-wt is a separate clone" — false, it is a worktree sharing `.git`).
+**Rule:** a fact inherited from a previous instance or another agent enters as ASSUMED until re-measured in the current context. Three agents corrected the orchestrator six times in one night; the ledger should record it that way, because a ledger that only records the agents' errors is not a ledger.
+
+### Rule 4 — declare the boundary of a negative result
+"Not found" is only meaningful with the search set stated. Agent 1's inventory closed with exactly that: `infra/`, `session/`, `presets/`, `resources/`, `scripts/` were not searched — "a cache there is unenumerated, not absent". Copy that habit. The alternative is that the next reader treats an incomplete sweep as a complete one.
+
+### Rule 5 — write at decision points, not at the wall
+Continuity written under token pressure is written badly or not at all. Append after a dispatch, a ruling, a merge, a measurement that changed beliefs, or a self-caught error.
+
+### Tool traps confirmed this session
+- `git_read log` **ignores `commit=`** and silently returns HEAD — history searches are shallower than they look.
+- `git_read ls_tree` with `path=` and no `recursive` returns the single tree entry, not its contents.
+- `git_read show_file source=committed` returns EMPTY SUCCESS for an out-of-range window.
+- `git_write branch_create` does NOT switch; `checkout` is a separate call.
+- Worker spawn `timeout_seconds` is advisory and `timeout_triggered` is unreliable in both directions.
+- `Worker action=query` ignores `context['query']`; only `worker_query` is read.
+- `git worktree list` marks worktrees "prunable" when they are registered with the container path `/workspace/...` rather than the host path. Cosmetic, but it makes them look dead.
