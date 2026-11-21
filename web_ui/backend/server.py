@@ -1156,10 +1156,7 @@ async def lifespan(app: FastAPI):
             record_permissions,
         )
         from thoughtmachine.container_record.state import creating_drift_finding
-        from thoughtmachine.workspace_capabilities import (
-            WorkspaceCapabilities,
-            load_workspace_capabilities,
-        )
+        from security.security_gate import get_workspace_capabilities
 
         client = docker.from_env()
         # ONE server-side-narrowed list call: only containers owned by the
@@ -1197,10 +1194,12 @@ async def lifespan(app: FastAPI):
         caps_cache: dict = {}
         for ws, record in pending[:_BOOT_DRIFT_SCAN_LIMIT]:
             if ws not in caps_cache:
-                caps_cache[ws] = (
-                    load_workspace_capabilities(ws)
-                    or WorkspaceCapabilities.default()
-                )
+                # The GATE's resolution (fail-closed: a workspace with no or an
+                # unparsable ``capabilities.json`` resolves to the deny-all
+                # profile).  Re-deriving it here with a permissive
+                # ``WorkspaceCapabilities.default()`` fallback compared records
+                # against a policy the gate does not enforce.
+                caps_cache[ws] = get_workspace_capabilities(ws)
             caps = caps_cache[ws]
             # The record's OWN recorded grant (v5 ``permissions`` field) feeds
             # the policy resolution.  Passing ``{}`` pinned every record to the

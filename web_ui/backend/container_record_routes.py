@@ -26,6 +26,16 @@ from typing import Any, Optional
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
+# What the computed ``drift`` field compares.  The findings answer "does the
+# live container match the policy resolved from the record's OWN recorded
+# intent (its v5 ``permissions`` snapshot) under the workspace capabilities the
+# gate enforces?" -- they never compare a container against the CALLING
+# session's live grants (this router carries no session id and no auth layer,
+# and a record's live container may belong to any session or to none).  The
+# value is emitted on every record as ``drift_subject`` so the wire says what
+# the finding is about instead of letting the panel imply a grant comparison.
+DRIFT_SUBJECT = "record_intent"
+
 router = APIRouter(prefix="/api/container-records", tags=["container-records"])
 
 
@@ -62,6 +72,16 @@ def _compute_drift(record: Any, workspace_id: str) -> Optional[list[dict[str, An
         * ``None`` when the live state could **not** be resolved -- the Docker
           package/client is unavailable or any error occurred.
 
+    Policy axis: the policy a record is compared against is resolved from the
+    record's OWN recorded intent (its v5 ``permissions`` snapshot) under the
+    workspace capabilities the **gate** enforces --
+    :func:`security.security_gate.get_workspace_capabilities`, which fails
+    CLOSED to the deny-all profile when ``capabilities.json`` is missing or
+    unparsable. Re-deriving the profile here with a permissive
+    ``WorkspaceCapabilities.default()`` fallback evaluated drift against a
+    policy the gate does not enforce. What is being compared is stated on the
+    wire as ``drift_subject`` (:data:`DRIFT_SUBJECT`).
+
     Strictly read-only: only the non-emitting detector is used, so no drift
     event is appended and no record is mutated. ``docker`` is imported lazily
     so importing this module has no side effects. Never raises.
@@ -74,10 +94,7 @@ def _compute_drift(record: Any, workspace_id: str) -> Optional[list[dict[str, An
             detect_record_drift,
             record_permissions,
         )
-        from thoughtmachine.workspace_capabilities import (
-            WorkspaceCapabilities,
-            load_workspace_capabilities,
-        )
+        from security.security_gate import get_workspace_capabilities
 
         client = docker.from_env()
         resolved = client.containers.list(
@@ -91,7 +108,11 @@ def _compute_drift(record: Any, workspace_id: str) -> Optional[list[dict[str, An
             def list(self, all: bool = True) -> list[Any]:  # noqa: A002 - docker API
                 return list(resolved)
 
-        caps = load_workspace_capabilities(workspace_id) or WorkspaceCapabilities.default()
+        # The GATE's resolution -- fail-closed: a workspace with no (or an
+        # unreadable) ``capabilities.json`` resolves to the deny-all profile.
+        # A local permissive ``WorkspaceCapabilities.default()`` fallback would
+        # evaluate drift against a profile the gate does not enforce.
+        caps = get_workspace_capabilities(workspace_id)
         # The record's OWN recorded grant (v5 ``permissions`` field) feeds the
         # policy resolution.  Passing ``{}`` made every record resolve to the
         # framework-default profile, so a record whose recorded intent was
@@ -117,13 +138,19 @@ def _serialise(record: Any, workspace_id: str) -> dict[str, Any]:
 
     It also attaches a computed, **read-only** ``drift`` field: the record's
     live drift findings (see :func:`_compute_drift`), or ``None`` when the live
-    state could not be inspected. The field is computed on the fly and is never
-    persisted -- the stored record's shape is unchanged.
+    state could not be inspected. It also attaches ``drift_subject``
+    (:data:`DRIFT_SUBJECT`), which states what that comparison was about so the
+    panel cannot imply a comparison the route never made. Both fields are
+    computed on the fly and are never persisted -- the stored record's shape is
+    unchanged.
     """
     data = record.to_dict()
     data["workspace_id"] = workspace_id
     data["container_id"] = record.id
     data["drift"] = _compute_drift(record, workspace_id)
+    # What ``drift`` compared: the record's own recorded intent under the gate's
+    # capabilities -- never the calling session's live grants. Always emitted.
+    data["drift_subject"] = DRIFT_SUBJECT
     return data
 
 
