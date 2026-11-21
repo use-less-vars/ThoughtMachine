@@ -211,12 +211,21 @@ class _FakeManager:
 
 
 class TestContainersEndpointStatsFields:
-    def _get(self, monkeypatch, containers, cap=4):
-        monkeypatch.setattr(
-            server_module, "_make_container_manager",
-            lambda ws_id, workspace_path="": _FakeManager(containers, cap),
-        )
-        return client.get("/api/workspace/ws-test/containers")
+    def _get(self, monkeypatch, containers, cap=4, session_id=None, seen=None):
+        # The real factory is
+        # ``_make_container_manager(workspace_id, workspace_path="", session_id=None)``:
+        # the containers-list route ALWAYS passes ``session_id=`` (a row's
+        # ``envelope_status`` is compared against that session's grant), so this
+        # double must accept it too -- a narrower signature turns every call into
+        # a TypeError that the route's ``except Exception`` reports as a 503.
+        def _factory(ws_id, workspace_path="", session_id=None):
+            if seen is not None:
+                seen.append(session_id)
+            return _FakeManager(containers, cap)
+
+        monkeypatch.setattr(server_module, "_make_container_manager", _factory)
+        headers = {"X-Session-Id": session_id} if session_id is not None else {}
+        return client.get("/api/workspace/ws-test/containers", headers=headers)
 
     @pytest.mark.trust_harness
     def test_in_use_and_available(self, monkeypatch, container_vault):
@@ -224,12 +233,19 @@ class TestContainersEndpointStatsFields:
             "ws-test", "ephemeral", "workspace-owned",
             id="rec-e", name="c1", vault_root=container_vault,
         )
-        resp = self._get(monkeypatch, [{"name": "c1", "container_id": "id1"}], cap=4)
+        seen = []
+        resp = self._get(
+            monkeypatch, [{"name": "c1", "container_id": "id1"}], cap=4,
+            session_id="sess-stats-1", seen=seen,
+        )
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data["containers_in_use"] == 1
         assert data["containers_available"] == 3
         assert len(data["containers"]) == 1
+        # The caller's session must reach the manager factory: the list route is
+        # the one route that threads it through (per-row envelope_status).
+        assert seen == ["sess-stats-1"]
 
     @pytest.mark.trust_harness
     def test_full_cap_yields_zero_available(self, monkeypatch, container_vault):
@@ -259,7 +275,7 @@ class TestContainersEndpointStatsFields:
     def test_missing_manager_404_preserved(self, monkeypatch):
         monkeypatch.setattr(
             server_module, "_make_container_manager",
-            lambda ws_id, workspace_path="": None,
+            lambda ws_id, workspace_path="", session_id=None: None,
         )
         resp = client.get("/api/workspace/ws-test/containers")
         assert resp.status_code == 404
@@ -273,7 +289,7 @@ class TestContainersEndpointStatsFields:
 
         monkeypatch.setattr(
             server_module, "_make_container_manager",
-            lambda ws_id, workspace_path="": _Boom(),
+            lambda ws_id, workspace_path="", session_id=None: _Boom(),
         )
         resp = client.get("/api/workspace/ws-test/containers")
         assert resp.status_code == 503

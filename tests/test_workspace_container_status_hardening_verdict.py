@@ -87,7 +87,7 @@ def _install(monkeypatch, container):
     manager = _FakeManager(container)
     monkeypatch.setattr(
         server_module, "_make_container_manager",
-        lambda workspace_id, workspace_path="": manager)
+        lambda workspace_id, workspace_path="", session_id=None: manager)
     return manager
 
 
@@ -166,7 +166,7 @@ def test_unobtainable_container_reports_unverified(monkeypatch):
 
     monkeypatch.setattr(
         server_module, "_make_container_manager",
-        lambda workspace_id, workspace_path="": _Manager())
+        lambda workspace_id, workspace_path="", session_id=None: _Manager())
     resp = client.get(STATUS.format(ws="ws1", name="c-a"))
     assert resp.status_code == 200
     body = resp.json()
