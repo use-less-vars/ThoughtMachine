@@ -41,7 +41,11 @@ from thoughtmachine.security import (
 )
 from thoughtmachine.vault import vault_root
 from thoughtmachine.workspace_registry import WorkspaceRegistry
-from thoughtmachine.workspace_capabilities import (
+# ``WorkspaceCapabilities`` / ``load_workspace_capabilities`` are no longer
+# consulted for DISPLAY values (capabilities now come from the fail-closed
+# security gate), but they stay importable from this module: they are the
+# historical monkeypatch seam used by the permission tests.
+from thoughtmachine.workspace_capabilities import (  # noqa: F401
     WorkspaceCapabilities,
     ensure_workspace_dirs,
     load_workspace_capabilities,
@@ -399,11 +403,16 @@ def _compute_effective_session_permissions(
     rather than falling back to permissive defaults.  The gate import is lazy
     (import precedent: workspace_routes.py effective_permissions handler).
     """
-    from security.security_gate import get_effective_permissions as _gate_effective
+    from security.security_gate import (
+        get_effective_permissions as _gate_effective,
+        get_workspace_capabilities,
+    )
 
-    caps = load_workspace_capabilities(workspace_id)
-    if caps is None:
-        caps = WorkspaceCapabilities.default()
+    # The workspace capability profile is resolved by the gate too: it is
+    # fail-closed (a workspace with no/unreadable capabilities.json yields the
+    # deny-everything profile), so this display can never advertise more than
+    # the runtime gate grants.
+    caps = get_workspace_capabilities(workspace_id)
 
     # Disk mode engages when session_id and workspace_id are supplied and the
     # in-memory ceiling is None (the default); the passed session profile is

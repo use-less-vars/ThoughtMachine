@@ -25,7 +25,11 @@ from pydantic import BaseModel
 
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 
-from thoughtmachine.workspace_capabilities import (
+# ``WorkspaceCapabilities`` / ``load_workspace_capabilities`` are no longer
+# consulted for DISPLAY values (capabilities now come from the fail-closed
+# security gate), but they stay importable from this module: they are the
+# historical monkeypatch seam used by the permission tests.
+from thoughtmachine.workspace_capabilities import (  # noqa: F401
     WorkspaceCapabilities,
     _workspace_dir,
     ensure_workspace_dirs,
@@ -1166,9 +1170,26 @@ async def get_effective_permissions(
     ensure_workspace_dirs(ws_id)
 
     # ── Load workspace capabilities ──────────────────────────────────────
-    caps = load_workspace_capabilities(ws_id)
-    if caps is None:
-        caps = WorkspaceCapabilities.default()
+    # The capabilities reported here are the ones the gate actually enforces.
+    # ``security.security_gate.get_workspace_capabilities`` is fail-closed: a
+    # workspace with no (or an unreadable) capabilities.json resolves to the
+    # deny-everything profile.  Re-deriving the value locally with a
+    # ``WorkspaceCapabilities.default()`` fallback used to advertise
+    # network/git/docker/write that the gate then refused, so the display
+    # out-claimed the gate.  A missing gate is an error, never a permissive
+    # stand-in.
+    try:
+        from security.security_gate import get_workspace_capabilities
+    except ImportError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "security gate unavailable: cannot resolve workspace "
+                "capabilities (security.security_gate failed to import)"
+            ),
+        )
+
+    caps = get_workspace_capabilities(ws_id)
 
     # ── Build SessionPermissions ─────────────────────────────────────────
     # Fail-closed: the shared helper returns the readable session grants or,
@@ -1222,21 +1243,16 @@ async def get_effective_permissions(
             session_perms, caps, ceiling, session_id=session_id, workspace_id=ws_id
         )
     except ImportError:
-        # Fallback when security gate dependencies are not available
-        # (e.g., in minimal test environments)
-        effective = {
-            "filesystem": session_perms.filesystem,
-            "network": session_perms.network,
-            "container": session_perms.container,
-            "git": session_perms.git,
-            "mcp": session_perms.mcp,
-            "host_bash": session_perms.host_bash,
-            "workspace_restrictions": {
-                "allow_docker": caps.allow_docker,
-                "allow_network": caps.allow_network,
-                "filesystem_write": caps.filesystem_write,
-            },
-        }
+        # No un-narrowed fallback: an approximate merge computed here would
+        # report grants the gate never issued (it is the sole authority for
+        # ``effective_permissions``).  An unavailable gate is an error.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "security gate unavailable: cannot compute effective "
+                "permissions (security.security_gate failed to import)"
+            ),
+        )
     # ── Ceiling provenance (additive; existing keys unchanged) ───────────
     # The gate records, on the returned dict, the workspace-ceiling levels it
     # actually enforced and flags any resource whose SESSION grant sits above
@@ -2576,14 +2592,22 @@ async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
     if not isinstance(permissions, dict):
         permissions = {}
 
-    # Capability flags (default = fully permissive when nothing saved).
+    # Capability flags: the gate's fail-closed resolution (a workspace with
+    # no/unreadable capabilities.json reports the deny-everything profile), so
+    # the summary can never advertise more than the gate would grant.  No
+    # permissive default, no broad ``except Exception`` fallback.
     try:
-        capabilities = WorkspaceCapabilities.default()
-        caps = load_workspace_capabilities(ws_id)
-        if caps is not None:
-            capabilities = caps
-    except Exception:
-        capabilities = WorkspaceCapabilities.default()
+        from security.security_gate import get_workspace_capabilities
+    except ImportError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "security gate unavailable: cannot resolve workspace "
+                "capabilities (security.security_gate failed to import)"
+            ),
+        )
+
+    capabilities = get_workspace_capabilities(ws_id)
 
     # Workspace Dockerfile (content is safe - it is user-authored build config).
     dockerfile_path = _workspace_dir(ws_id) / "Dockerfile"

@@ -91,6 +91,36 @@ def _write_grants_sidecar(vault, grants) -> Path:
     return sidecar
 
 
+def _write_permissive_capabilities(vault) -> Path:
+    """Seed a fully-permissive ``capabilities.json`` for the workspace.
+
+    These tests pin the *session / workspace-ceiling* axis.  The capabilities
+    the gate merges in are resolved by
+    ``security.security_gate.get_workspace_capabilities``, which is fail-closed:
+    with no capabilities file the workspace resolves to the deny-everything
+    profile, whose boolean denials (``network: False``, ``git: False``,
+    ``filesystem: False``) short-circuit the string ``banned`` levels this suite
+    asserts -- the capability axis would then be deciding the outcome under
+    test.  Seeding the permissive profile keeps that axis neutral so what is
+    observed is the deny decided by the session-grants x workspace-ceiling
+    merge.
+    """
+    caps = Path(vault) / "workspaces" / WS_ID / "capabilities.json"
+    caps.parent.mkdir(parents=True, exist_ok=True)
+    caps.write_text(
+        json.dumps(
+            {
+                "allow_network": True,
+                "allow_docker": True,
+                "filesystem_write": True,
+                "git_available": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return caps
+
+
 # ---------------------------------------------------------------------------
 # Agreement with disk mode when the store is readable
 # ---------------------------------------------------------------------------
@@ -100,6 +130,7 @@ def test_readable_ceiling_caps_session_grants(tmp_path, monkeypatch):
     """A readable ceiling caps grants that sit above it (filesystem/git write ->
     read), and the effect matches the gate's own disk-mode resolution."""
     vault = _vault(tmp_path, monkeypatch)
+    _write_permissive_capabilities(vault)
     _write_config(vault, permissions={"filesystem": "read", "git": "read"})
     _write_grants_sidecar(vault, {"filesystem": "write", "git": "write"})
 
@@ -142,6 +173,7 @@ def test_config_without_permissions_key_fails_closed(tmp_path, monkeypatch):
     missing key as a legitimate empty ceiling -- a FAIL-OPEN grant).
     """
     vault = _vault(tmp_path, monkeypatch)
+    _write_permissive_capabilities(vault)
     _write_config(vault)  # no "permissions" key
     _write_grants_sidecar(vault, {"filesystem": "write", "git": "write"})
 
@@ -154,6 +186,7 @@ def test_legacy_record_without_sidecar_fails_closed(tmp_path, monkeypatch):
     helper fails CLOSED to the all-banned profile -- even though a readable
     ceiling is present."""
     vault = _vault(tmp_path, monkeypatch)
+    _write_permissive_capabilities(vault)
     _write_config(vault, permissions={"filesystem": "read", "git": "read"})
     sessions = Path(vault) / "workspaces" / WS_ID / "sessions"
     sessions.mkdir(parents=True, exist_ok=True)
@@ -191,6 +224,7 @@ def test_corrupt_workspace_config_fails_closed(tmp_path, monkeypatch):
     post-migration the disk-mode store read fails CLOSED.
     """
     vault = _vault(tmp_path, monkeypatch)
+    _write_permissive_capabilities(vault)
     _write_config(vault, corrupt=True)
     _write_grants_sidecar(vault, {"filesystem": "write", "git": "write"})
 
@@ -204,6 +238,7 @@ def test_missing_workspace_config_fails_closed(tmp_path, monkeypatch):
     CLOSED rather than passing the stored grants through."""
     vault = _vault(tmp_path, monkeypatch)
     # No config.json written at all -- only the readable grants sidecar.
+    _write_permissive_capabilities(vault)
     _write_grants_sidecar(vault, {"filesystem": "write", "git": "write"})
 
     assert dict(_effective(WS_ID, SESSION_ID)) == FAIL_CLOSED
