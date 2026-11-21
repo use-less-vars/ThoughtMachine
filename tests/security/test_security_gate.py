@@ -156,11 +156,11 @@ class TestEffectivePermissionsMerge:
         }
 
     def test_network_workspace_denied(self):
-        """Workspace allow_network=False → effective network=False."""
+        """Workspace allow_network=False → effective network=banned."""
         session = SessionPermissions(network="write")
         workspace = WorkspaceCapabilities(allow_network=False)
         eff = get_effective_permissions(session, workspace)
-        assert eff["network"] is False
+        assert eff["network"] == "banned"
 
     def test_filesystem_write_downgraded(self):
         """Workspace filesystem_write=False downgrades session write to read."""
@@ -198,11 +198,11 @@ class TestEffectivePermissionsMerge:
         assert eff["git"] == "ask"
 
     def test_git_workspace_denied(self):
-        """Workspace git_available=False → effective False."""
+        """Workspace git_available=False → effective banned."""
         session = SessionPermissions(git="write")
         workspace = WorkspaceCapabilities(git_available=False)
         eff = get_effective_permissions(session, workspace)
-        assert eff["git"] is False
+        assert eff["git"] == "banned"
 
     def test_container_workspace_denied(self):
         """Workspace allow_docker=False + session container=True → False."""

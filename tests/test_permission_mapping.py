@@ -75,7 +75,7 @@ class TestEffectivePermissionsGitSplit:
             SessionPermissions(git="read"),
             WorkspaceCapabilities(git_available=False),
         )
-        assert eff["git"] is False
+        assert eff["git"] == "banned"
 
     def test_workspace_defaults_are_permissive(self):
         caps = WorkspaceCapabilities()

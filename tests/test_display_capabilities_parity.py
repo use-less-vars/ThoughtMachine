@@ -218,14 +218,17 @@ def test_summary_reports_saved_capabilities_file(tmp_path, monkeypatch):
 
 # ── GET /api/workspace/{ws_id}/effective_permissions ────────────────────────
 
-# ``git_available=False`` pins git to False and ``allow_network=False`` pins
-# network to False (with the permissive default both would read "read" /
-# "banned" -- i.e. a WIDER profile than the gate enforces).
+# ``git_available=False`` bans git and ``allow_network=False`` bans network.
+# A capability deny on a LEVEL axis is spelled in that axis's own vocabulary
+# ("banned"), never as a boolean False; ``container`` is a genuine boolean
+# axis, so its deny stays False.  (With the permissive default both axes
+# would read "read" / "banned" -- i.e. a WIDER profile than the gate
+# enforces.)
 EFFECTIVE_FAIL_CLOSED = {
     "filesystem": "read",
-    "network": False,
+    "network": "banned",
     "container": False,
-    "git": False,
+    "git": "banned",
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
@@ -246,8 +249,8 @@ def test_effective_permissions_missing_capabilities_file_is_fail_closed(
     )
 
     assert result["effective_permissions"] == EFFECTIVE_FAIL_CLOSED
-    assert result["effective_permissions"]["git"] is False
-    assert result["effective_permissions"]["network"] is False
+    assert result["effective_permissions"]["git"] == "banned"
+    assert result["effective_permissions"]["network"] == "banned"
 
 
 def test_effective_permissions_reports_saved_capabilities_file(
@@ -270,13 +273,13 @@ def test_effective_permissions_reports_saved_capabilities_file(
 
 # Disk mode with a readable grants sidecar (filesystem/git = write) and a
 # permissive ceiling: with the permissive capability default the helper
-# reported "write"/"write"; the gate enforces read/False because the workspace
+# reported "write"/"write"; the gate enforces read/banned because the workspace
 # has no capabilities file.
 SESSION_FAIL_CLOSED = {
     "filesystem": "read",
-    "network": False,
+    "network": "banned",
     "container": False,
-    "git": False,
+    "git": "banned",
     "mcp": "banned",
     "host_bash": "banned",
     "ci": "banned",
@@ -304,7 +307,7 @@ def test_session_permissions_missing_capabilities_file_is_fail_closed(
     assert effective == SESSION_FAIL_CLOSED
     # The pre-fix over-claim, stated explicitly:
     assert effective["filesystem"] == "read"
-    assert effective["git"] is False
+    assert effective["git"] == "banned"
 
 
 def test_session_permissions_reports_saved_capabilities_file(tmp_path, monkeypatch):

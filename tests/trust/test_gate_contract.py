@@ -257,7 +257,7 @@ class TestResolveContainerConfigSlice:
             LIFECYCLE_PERSISTENT,
         )
         assert result.network_mode == "none"
-        assert result.effective["network"] is False
+        assert result.effective["network"] == "banned"
 
     def test_workspace_denies_container(self):
         """Workspace container deny overrides session container."""

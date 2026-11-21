@@ -32,11 +32,12 @@ class TestGitReadWritePermissionGrains:
         eff = get_effective_permissions(session, WorkspaceCapabilities())
         assert eff['git'] == 'write'
 
-    def test_workspace_git_unavailable_caps_git_to_false(self):
+    def test_workspace_git_unavailable_caps_git_to_banned(self):
         caps = WorkspaceCapabilities(git_available=False)
         session = SessionPermissions(git='write')
         eff = get_effective_permissions(session, caps)
-        assert eff['git'] is False
+        # The deny is spelled in the axis's own vocabulary, not boolean False.
+        assert eff['git'] == 'banned'
 
     def test_safe_defaults_deny_write(self):
         # Canonical defaults: git='read' -- write is denied unless granted.
@@ -84,7 +85,7 @@ def test_git_read_write_permission_grains():
     tc = TestGitReadWritePermissionGrains()
     tc.test_git_read_passthrough()
     tc.test_git_write_passthrough()
-    tc.test_workspace_git_unavailable_caps_git_to_false()
+    tc.test_workspace_git_unavailable_caps_git_to_banned()
     tc.test_safe_defaults_deny_write()
 
 

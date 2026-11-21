@@ -61,6 +61,26 @@ def _write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+def _write_capabilities(vault: Path, ws: str, **overrides) -> None:
+    """Write the workspace capability flags (``capabilities.json``).
+
+    A workspace with no ``capabilities.json`` fails CLOSED: the gate's
+    capability merge then denies docker, network and git outright, so every
+    test that expects a session grant to survive the merge has to declare the
+    permissive capabilities it assumes.  The ceiling is independent of this
+    file (it can only lower grants) -- the flags only stop the *capability*
+    layer from denying them.
+    """
+    caps = {
+        "allow_docker": True,
+        "allow_network": True,
+        "filesystem_write": True,
+        "git_available": True,
+    }
+    caps.update(overrides)
+    _write_json(vault / "workspaces" / ws / "capabilities.json", caps)
+
+
 def _write_ceiling(
     vault: Path,
     ws: str,
@@ -75,6 +95,7 @@ def _write_ceiling(
     Ceilings that need a non-banned ``host_bash`` must pass
     ``allow_host_resources=True``.
     """
+    _write_capabilities(vault, ws)
     config = {"permissions": permissions}
     if allow_host_resources is not None:
         config["allow_host_resources"] = allow_host_resources
@@ -376,6 +397,7 @@ class TestSessionPermissionsRoutes:
     @pytest.mark.trust_harness
     def test_ceiling_caps_session_grants(self, vault, stub_store):
         self._register(stub_store)
+        _write_capabilities(vault, self.WS)
         _write_json(
             vault / "workspaces" / self.WS / "config.json",
             {"permissions": {"filesystem": "read", "network": "banned",
@@ -415,6 +437,7 @@ class TestSessionPermissionsRoutes:
     @pytest.mark.trust_harness
     def test_ceiling_caps_git_raw_kept(self, vault, stub_store):
         self._register(stub_store)
+        _write_capabilities(vault, self.WS)
         _write_json(
             vault / "workspaces" / self.WS / "config.json",
             {"permissions": {"git": "read"}},
