@@ -70,6 +70,7 @@ from pydantic import BaseModel
 from session.addendum import (
     addendum_total_chars,
     bump_addendum_rev,
+    reconcile_addendum_with_stored,
     remove_addendum_entry,
     update_addendum_entry,
     write_addendum_entry,
@@ -247,6 +248,41 @@ def _live_bridges(session_id: str) -> List[Tuple[Any, List[Any]]]:
     return live
 
 
+def _refresh_from_stored(store, session_id: str, session) -> str:
+    """Bring the LIVE session's addendum up to the stored generation.
+
+    The live object is the runtime authority, but it is only as new as the last
+    mutation that went through IT: an entry another writer persisted through the
+    store (the cold path's ``mutate_session``, a second tab, a resumed session on
+    another bridge) is on disk and not in this object.  Answering the read from
+    the live copy alone therefore reports a generation the model will never see
+    -- and, worse, ``_write_through`` persists that live object wholesale, so the
+    next accepted write would DELETE the newer stored entries.
+
+    The rule is not re-implemented here: ``reconcile_addendum_with_stored`` owns
+    the adopt / keep / union decision for both this read seam and the snapshot
+    save (``SessionManager._reconcile_addendum``), so the two cannot disagree
+    about which generation wins.  A live copy carrying mutations the record has
+    not seen yet keeps them (``'keep'``): its generation is newer.
+
+    Returns the outcome (``'none'`` / ``'keep'`` / ``'adopt'`` / ``'union'``) so
+    the caller can log it.  Never raises for an unreadable record: the reader is
+    best-effort by contract and ``stored_raw`` of any other shape simply
+    reconciles to ``'none'``.
+    """
+    reader = getattr(store, "read_stored_addendum", None)
+    if not callable(reader):
+        return "none"
+    stored_raw = reader(session_id, workspace_id=getattr(session, "workspace_id", None))
+    outcome = reconcile_addendum_with_stored(session, stored_raw)
+    if outcome in ("adopt", "union"):
+        logger.info(
+            "addendum resolve: session=%s refreshed live addendum from the "
+            "stored generation (%s)", session_id, outcome,
+        )
+    return outcome
+
+
 def _resolve_addendum_session(session_id: str):
     """Resolve the addendum authority for *session_id*; 404 when unknown.
 
@@ -264,6 +300,10 @@ def _resolve_addendum_session(session_id: str):
     through ``store.mutate_session`` -- one atomic read-modify-write under the
     file lock -- so the entry is there when the session is next resumed.
 
+    The live object is refreshed from the stored record before it is returned
+    (``_refresh_from_stored``): "live" answers "this process owns the session",
+    not "this process is the newest copy of it".
+
     Returns ``(store, bridges, session)``.  ``bridges`` is empty on the cold
     path; ``session`` is the live object on the live path and a freshly loaded
     copy on the cold path.
@@ -271,11 +311,13 @@ def _resolve_addendum_session(session_id: str):
     store = _get_store()
     bridges = _live_bridges(session_id)
     if bridges:
+        live = bridges[0][1][0]
+        outcome = _refresh_from_stored(store, session_id, live)
         logger.info(
-            "addendum resolve: session=%s authority=live live_bridges=%s",
-            session_id, _count(bridges),
+            "addendum resolve: session=%s authority=live live_bridges=%s reconciled=%s",
+            session_id, _count(bridges), outcome,
         )
-        return store, bridges, bridges[0][1][0]
+        return store, bridges, live
     session = store.load_session(session_id)
     if session is None:
         raise HTTPException(
