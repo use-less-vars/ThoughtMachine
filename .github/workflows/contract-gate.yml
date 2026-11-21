@@ -59,7 +59,7 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
           python -m pip install -e .
 
-      - name: Contract gate (only the tests named in docs/CONTRACTS.md)
+      - name: Contract gate (the tests docs/CONTRACTS.md cites, plus the gate-only additions)
         run: |
           set +e
           start=$(date +%s)
@@ -70,6 +70,7 @@ jobs:
             tests/trust/test_gate_contract.py \
             tests/test_worker_is_a_real_process.py \
             tests/test_contracts_ledger_parity.py \
+            tests/test_invariants_ledger_parity.py \
             tests/test_verify_doc_citations.py \
             tests/test_ceiling_value_fail_closed.py \
             tests/test_ceiling_map_completeness.py \

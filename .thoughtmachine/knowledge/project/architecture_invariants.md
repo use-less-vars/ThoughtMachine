@@ -31,6 +31,8 @@ a pointer instead.
 
 ## 1. The container permission envelope
 
+**Contract:** GAP — no heading in docs/CONTRACTS.md names the envelope. Contract 2 owns only the ceiling cap (route 1 of §1a), not the `(network_mode, workspace_mode)` pair being threaded into the pool key, the mount and the drift refusal; those are pinned by `tests/docker/test_pool_envelope_keying.py`, `tests/test_container_exec_drift.py` and `tests/test_resolve_container_config_fail_closed.py`, none of which the contract gate runs.
+
 **Invariant.** A container's isolation envelope is `(network_mode,
 workspace_mode)` resolved from the *session's effective permissions capped by
 the on-disk workspace ceiling*. It is **threaded** through creation, naming,
@@ -92,6 +94,8 @@ third, exception last.
 
 ## 2. Host access: one chokepoint, checked at the point of action
 
+**Contract:** GAP — no heading in docs/CONTRACTS.md names the host chokepoint. The killswitch, the grain vocabulary and the cwd containment are pinned by `tests/test_tool_import_declaration_match.py`, `tests/test_host_port.py` and `tests/test_host_resource_policy.py`, none of which the contract gate runs.
+
 **Invariant.** Every command that leaves the sandbox for the host passes through
 `thoughtmachine/host_port.py::host_run`, which re-checks authority **at the
 point of action** — not at the point where a tool author remembered to check it.
@@ -141,7 +145,7 @@ refuses a mismatch. `ask` is never an authorized value in `AUTHORIZED_VALUES`
 
 ---
 
-## 3. How to add an invariant here
+## How to add an invariant here
 
 1. It has already broken something (or nearly did) — this is not a place for
    design intent.
