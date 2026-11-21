@@ -72,6 +72,7 @@ HASHED_MEMBERS = [
     ".thoughtmachine/knowledge/project/ORCHESTRATOR_GUIDE.md",
     ".thoughtmachine/knowledge/project/CI_PROCESS.md",
     ".thoughtmachine/knowledge/project/INFRA_ONBOARDING.md",
+    "docs/HANDOFF_INFRA67.md",
 ]
 
 QUEUE_HEADING = "## First task (from the live queue)"

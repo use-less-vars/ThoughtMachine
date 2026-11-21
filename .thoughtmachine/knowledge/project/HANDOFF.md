@@ -26,6 +26,7 @@ bbe67b25 docs(ticket): file merge-gate-is-rulesets-not-classic-protection (C93 f
 8. `.thoughtmachine/knowledge/project/ORCHESTRATOR_GUIDE.md` -- how to run workers without believing the brief. - sha256:dfb01550569ee64826e30b5e54cb97b8916db6803323d2a3cbea8ae0807fec40
 9. `.thoughtmachine/knowledge/project/CI_PROCESS.md` -- what CI actually runs, and what this repo cannot see. - sha256:85a02df0358a432461bf3041c863786e40c745d37ab600d264da0c2798a3120c
 10. `.thoughtmachine/knowledge/project/INFRA_ONBOARDING.md` -- the environment you are working in. - sha256:9ecc0d49b3c30a2fab767562308aa32d6c870fb43c7085cd83ddf6cb221351ea
+11. `docs/HANDOFF_INFRA67.md` -- the outgoing seat's handoff to the next generation. - sha256:9f8c847ac3c64c4f60fcca8864a60faf982ea3ee712abcaee33ba5ef0b274943
 
 ## First task (from the live queue)
 

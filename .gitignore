@@ -485,3 +485,11 @@ web_ui/frontend/.dist-build-stamp
 # is a catch-all, so the negation is required or the file is never versioned and
 # vanishes on the next clone.
 !docs/design-worker-presence.md
+
+# Infra 67 handoff (2026-11-21): the outgoing seat's handoff to the next
+# generation -- a member of `scripts/gen_handoff.py`'s MANIFEST, so HANDOFF.md
+# records its sha256 and `scripts/check_kb_staleness.sh --check` fails the build
+# when its bytes move. `docs/*` above is a catch-all, so this negation is what
+# makes the file versioned at all: without it the pin reports the member MISSING
+# on every fresh clone while the router that names it survives.
+!docs/HANDOFF_INFRA67.md

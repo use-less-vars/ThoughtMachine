@@ -57,6 +57,7 @@ MANIFEST = [
     (f"{KB}/ORCHESTRATOR_GUIDE.md", "how to run workers without believing the brief."),
     (f"{KB}/CI_PROCESS.md", "what CI actually runs, and what this repo cannot see."),
     (f"{KB}/INFRA_ONBOARDING.md", "the environment you are working in."),
+    ("docs/HANDOFF_INFRA67.md", "the outgoing seat's handoff to the next generation."),
 ]
 
 # Manifest entries that are LISTED but carry NO recorded digest.
