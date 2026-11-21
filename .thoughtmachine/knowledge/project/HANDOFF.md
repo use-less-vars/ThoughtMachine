@@ -19,7 +19,7 @@ bbe67b25 docs(ticket): file merge-gate-is-rulesets-not-classic-protection (C93 f
 1. `.thoughtmachine/knowledge/project/PRIORITIES.md` -- the live work queue. **Read first.**
 2. `docs/CONTROL_PLANE.md` -- the pause/stop/timeout contract. Doctrine. - sha256:3ecd6a73af659c1daf21c541ec0a5f1edd3dd2c1187028bbe2e7f6ae5402d0e1
 3. `.thoughtmachine/knowledge/project/MANDATORY_STOP.md` -- the read-on-entry rules; none of them are optional. - sha256:ca47ffe5df0e3b242bfd22543794ef4e8b03ec78b169fc9fb24851c08b76e9d1
-4. `.thoughtmachine/knowledge/project/architecture_invariants.md` -- the invariants a design must not re-derive. - sha256:d7364ff4686a59dc118d3cb9dbde7a516d64c3e3bf80853756e9e2b713da9645
+4. `.thoughtmachine/knowledge/project/architecture_invariants.md` -- the invariants a design must not re-derive. - sha256:ce041fe38a591105e19aa0ef08c25495bc7c5fdc8b92cda4fd97d176867c9b0e
 5. `docs/ARCHITECTURE_MACHINE_MODEL.md` -- what runs where, and what stops it. - sha256:042d4f47e3a5187e1cae3fb4ae73164ac27c07dddf761ff0ef0c7a1cb8f0acf4
 6. `.thoughtmachine/knowledge/project/machine_history_and_vision.md` -- the incidents behind the rules, and what they are for. - sha256:fd0f890bf88e0dc4e70e9202e647013ffa959a6e1a216f1b33af9584e1fa6799
 7. `.thoughtmachine/knowledge/project/vision_ledger.md` -- the five standing commitments (V1-V5). - sha256:5a01a13c684e94f5bc0e762807b8183d9e06f283b20caf3389aec662149ff930

@@ -1,11 +1,16 @@
 # Contracts — the invariants this machine guarantees
 
 This ledger names the invariants the machine actually guarantees, each with the exact code site that
-enforces it and a test that would FAIL if that enforcement were removed. It is the input to the fast
-contract gate (`.github/workflows/contract-gate.yml`), which runs only the tests named here.
-It does not claim the wider suite is worthless — it claims that these three invariants are the
-merge-blocking guarantees: a change that breaks one of them must not reach `dev`, and a change that
-breaks anything else is still caught by the main matrix.
+enforces it and a test that would FAIL if that enforcement were removed. Every test it names is run by
+the fast contract gate (`.github/workflows/contract-gate.yml`), which runs more than it names: the gate
+enumerates eighteen test files today and this ledger cites ten of them, because
+`tests/test_contracts_ledger_parity.py` enforces *cited ⊆ run* rather than equality, and the uncited
+extras are gate-only additions explained in that workflow's own header. Parity with the other ledger —
+the invariant list in `.thoughtmachine/knowledge/project/architecture_invariants.md` — is enforced by
+`tests/test_invariants_ledger_parity.py`, so every numbered invariant there must name a contract here
+or an explicit gap. It does not claim the wider suite is worthless — it claims that these three
+invariants are the merge-blocking guarantees: a change that breaks one of them must not reach `dev`,
+and a change that breaks anything else is still caught by the main matrix.
 
 Verdict vocabulary: **ENFORCED** — the code site enforces it and a named test fails on removal.
 **PARTIAL** — enforced, but at least one part of the invariant is not pinned by the tests named here.
@@ -253,11 +258,11 @@ What the trigger blocks and job names add to that table:
   contract gate, while it does run the other five workflows. Those five run on `push` to `dev` and
   `master` and on `pull_request`.
 - `contract-gate` is the only workflow with any relationship to this document, and that relationship is
-  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of sixteen
+  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of eighteen
   test files** — no glob, no `-m` expression. Two consequences worth knowing: a new test that proves a
   contract does not join the gate by existing (it must be added to the workflow *and* cited here), and
-  the parity check described in the previous section is itself one of the sixteen, so it fails the
-  gate it is part of. Note the direction: the gate runs sixteen files and this ledger cites nine of
+  the parity check described in the previous section is itself one of the eighteen, so it fails the
+  gate it is part of. Note the direction: the gate runs eighteen files and this ledger cites ten of
   them, because the parity check enforces *cited ⊆ run*, not equality. The job carries
   `timeout-minutes: 10` and separately reports wall time against a stated 120-second budget; that
   budget is observed, not enforced.
