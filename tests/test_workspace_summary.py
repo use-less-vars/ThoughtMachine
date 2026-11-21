@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from security.security_gate import get_workspace_capabilities
 from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 
 from web_ui.backend import workspace_routes
@@ -71,9 +72,10 @@ def _patch_summary_deps(monkeypatch, tmp_path):
         lambda ws: {"fs_read": "read", "fs_write": "write"},
     )
 
-    # Capability loader returns None -> fully-permissive default.
-    monkeypatch.setattr(workspace_routes, "load_workspace_capabilities",
-                        lambda ws_id: None)
+    # Capabilities are NOT patched: the summary resolves them through the
+    # fail-closed security gate, and the canonical vault root above makes that
+    # resolution hermetic (no capabilities.json was written, so the gate
+    # reports its restrictive profile).
 
     import session.session_registry as sreg
 
@@ -160,7 +162,17 @@ def test_summary_full_payload(tmp_path, monkeypatch):
     assert result["root_path"] == "/tmp/ws-root"
     assert result["allow_host_resources"] is True
     assert result["permissions"] == {"fs_read": "read", "fs_write": "write"}
-    assert result["capabilities"] == WorkspaceCapabilities.default().to_dict()
+    # Display parity with the gate: with no capabilities.json saved the gate
+    # fails CLOSED, so the summary must report that profile verbatim - never
+    # the fully-permissive ``WorkspaceCapabilities.default()`` (which is what
+    # the summary used to advertise while the gate denied network/git/docker
+    # /write).
+    assert result["capabilities"] == get_workspace_capabilities("ws-1").to_dict()
+    assert result["capabilities"] != WorkspaceCapabilities.default().to_dict()
+    assert result["capabilities"]["allow_network"] is False
+    assert result["capabilities"]["allow_docker"] is False
+    assert result["capabilities"]["filesystem_write"] is False
+    assert result["capabilities"]["git_available"] is False
     assert result["dockerfile"] == {
         "path": str(tmp_path / "workspaces" / "ws-1" / "Dockerfile"),
         "content": "FROM x\n",
@@ -231,6 +243,38 @@ def test_summary_missing_assets_and_empty_sections(tmp_path, monkeypatch):
     assert result["containers_listed"] == 0
     assert result["tools"] == ["shell_exec"]
     assert result["resource_catalog"] == []
+
+
+def test_summary_capabilities_track_the_saved_file(tmp_path, monkeypatch):
+    """The summary's capabilities are the gate's resolution at request time:
+    verbatim when a profile is saved, fail-closed when the file is missing or
+    corrupt.  Nothing is invented locally."""
+    _patch_registry(monkeypatch)
+    _patch_summary_deps(monkeypatch, tmp_path)
+
+    caps_path = tmp_path / "workspaces" / "ws-1" / "capabilities.json"
+
+    # Nothing saved -> the gate's restrictive profile.
+    before = asyncio.run(workspace_routes.get_workspace_overview("ws-1"))
+    assert before["capabilities"] == get_workspace_capabilities("ws-1").to_dict()
+    assert before["capabilities"]["git_available"] is False
+    assert before["capabilities"]["filesystem_write"] is False
+
+    # A saved permissive profile is reported verbatim (same key set).
+    saved = WorkspaceCapabilities.default().to_dict()
+    _write_json(caps_path, saved)
+    after = asyncio.run(workspace_routes.get_workspace_overview("ws-1"))
+    assert after["capabilities"] == get_workspace_capabilities("ws-1").to_dict()
+    assert after["capabilities"]["git_available"] is True
+    assert after["capabilities"]["filesystem_write"] is True
+    assert set(after["capabilities"]) == set(saved)
+
+    # A corrupt file fails closed in the gate, and the summary follows it.
+    caps_path.write_text("{not json", encoding="utf-8")
+    corrupt = asyncio.run(workspace_routes.get_workspace_overview("ws-1"))
+    assert corrupt["capabilities"] == get_workspace_capabilities("ws-1").to_dict()
+    assert corrupt["capabilities"]["git_available"] is False
+    assert corrupt["capabilities"]["allow_network"] is False
 
 
 def test_summary_unknown_workspace_404(monkeypatch):
