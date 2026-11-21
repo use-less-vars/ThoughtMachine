@@ -134,7 +134,7 @@ def _allow(monkeypatch):
 def _install_manager(monkeypatch, manager):
     monkeypatch.setattr(
         server_module, "_make_container_manager",
-        lambda workspace_id, workspace_path="": manager)
+        lambda workspace_id, workspace_path="", session_id=None: manager)
     return manager
 
 
