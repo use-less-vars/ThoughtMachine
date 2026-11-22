@@ -13,7 +13,9 @@ import io
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
+import threading
 
 import pytest
 from pathlib import Path
@@ -221,3 +223,163 @@ def temp_session_dir():
 def session_store(temp_session_dir):
     """Return a FileSystemSessionStore pointing at the temp directory."""
     return FileSystemSessionStore(sessions_dir=str(temp_session_dir), enable_session_history_pruning=False)
+
+
+# ---------------------------------------------------------------------------
+# Thread / bridge census, local mirror of the one in the root ``tests/``
+# conftest.
+#
+# This directory is its own pytest root (``testpaths`` lists it separately), so
+# the root conftest's fixtures -- autouse ones included -- never apply here, and
+# nine of these modules build a ``WebAgentBridge`` / start a ``WorkerThread`` /
+# subscribe to the process-global ``EventBus``.  Without a reaper those tests
+# leak into each other exactly like the ones under ``tests/`` did.
+#
+# Deliberately self-contained: a lazy import of the same three repo symbols, no
+# import of anything under ``tests/`` and no dependency on a root-conftest
+# fixture (this root must stay runnable on its own).  The duplication is ~60
+# lines and is the price of two independent pytest roots; a shared helper module
+# would make this root import the other root's test package.
+#
+# Reaping is autouse and unconditional; the assertion is opt-in per test with
+# ``@pytest.mark.thread_census`` only (there is no measured allow-list for this
+# root yet, so nothing is enforced here by default).
+# ---------------------------------------------------------------------------
+
+_WEBUI_REAP_JOIN_TIMEOUT = 5.0
+
+
+def _webui_worker_registry():
+    from tools.workspace.worker_registry import WorkerRegistry
+
+    return WorkerRegistry.get_instance()
+
+
+def _webui_is_worker_thread(obj):
+    return (
+        isinstance(obj, threading.Thread)
+        and callable(getattr(obj, "kill", None))
+        and hasattr(obj, "worker_name")
+    )
+
+
+def _webui_reap_bridges(bridges):
+    for bridge in bridges:
+        try:
+            bridge.stop()
+        except Exception as exc:
+            print("thread census: bridge.stop() failed for %r: %s" % (bridge, exc),
+                  file=sys.stderr)
+            for name in ("_unsubscribe_security_events", "_unsubscribe_worker_events"):
+                try:
+                    getattr(bridge, name, lambda: None)()
+                except Exception:
+                    pass
+
+
+def _webui_reap_worker_threads(threads_before, keys_before):
+    try:
+        registered = _webui_worker_registry().get_all_workers()
+    except Exception:
+        registered = {}
+    candidates = [thread for key, thread in registered.items()
+                  if key not in keys_before and _webui_is_worker_thread(thread)]
+    for ident, thread in threading.enumerate():
+        if ident in threads_before or any(thread is c for c in candidates):
+            continue
+        if _webui_is_worker_thread(thread):
+            candidates.append(thread)
+    survivors = []
+    for thread in candidates:
+        try:
+            thread.kill()
+        except Exception as exc:
+            print("thread census: kill() failed for %r: %s" % (thread, exc),
+                  file=sys.stderr)
+        try:
+            thread.join(_WEBUI_REAP_JOIN_TIMEOUT)
+        except Exception as exc:
+            print("thread census: join() failed for %r: %s" % (thread, exc),
+                  file=sys.stderr)
+        try:
+            if thread.is_alive():
+                survivors.append(thread)
+        except Exception:
+            pass
+    return survivors
+
+
+def _webui_bus_counts():
+    from agent.events import global_event_bus
+
+    counts = {}
+    for event_type, callbacks in list(global_event_bus._subscribers.items()):
+        counts[getattr(event_type, "value", str(event_type))] = len(callbacks)
+    return counts
+
+
+@pytest.fixture(autouse=True)
+def _webui_thread_bridge_census(request, monkeypatch):
+    """Reap the threads and bridges a test leaves; ``thread_census`` asserts."""
+    from web_ui.backend.bridge import WebAgentBridge
+
+    enforced = request.node.get_closest_marker("thread_census") is not None
+    threads_before = {id(t) for t in threading.enumerate()}
+    try:
+        keys_before = set(_webui_worker_registry().get_all_workers())
+    except Exception:
+        keys_before = set()
+    counts_before = _webui_bus_counts() if enforced else {}
+
+    bridges_created = []
+    original_init = WebAgentBridge.__init__
+
+    def _webui_tracking_init(self, *args, **kwargs):
+        bridges_created.append(self)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(WebAgentBridge, "__init__", _webui_tracking_init)
+
+    try:
+        yield
+    finally:
+        try:
+            _webui_reap_bridges(bridges_created)
+        except Exception as exc:
+            print("thread census: bridge reaping failed: %s" % (exc), file=sys.stderr)
+        survivors = []
+        try:
+            survivors = _webui_reap_worker_threads(threads_before, keys_before)
+        except Exception as exc:
+            print("thread census: thread reaping failed: %s" % (exc), file=sys.stderr)
+        if not enforced:
+            return
+        problems = []
+        try:
+            keys_now = set(_webui_worker_registry().get_all_workers())
+        except Exception:
+            keys_now = set(keys_before)
+        for key in sorted(keys_now - keys_before, key=repr):
+            problems.append("worker registry still holds %r" % (key,))
+        for ident, thread in threading.enumerate():
+            if id(thread) not in threads_before:
+                problems.append("thread still alive: %r" % (thread.name,))
+        for thread in survivors:
+            problems.append("worker thread survived kill()+join: %r" % (thread,))
+        counts_now = _webui_bus_counts()
+        for event_type in sorted(counts_now):
+            count = counts_now[event_type]
+            if count > counts_before.get(event_type, 0):
+                problems.append(
+                    "bus global gained subscribers for %r: %d -> %d"
+                    % (event_type, counts_before.get(event_type, 0), count)
+                )
+        if problems:
+            pytest.fail(
+                "thread/bridge census: this test left process-global state behind "
+                "(the autouse reaper already ran, so these survived ``kill()`` + "
+                "%.1fs join and ``WebAgentBridge.stop()``):\n"
+                % _WEBUI_REAP_JOIN_TIMEOUT
+                + "\n".join("  - " + line for line in problems[:20]),
+                pytrace=False,
+            )
