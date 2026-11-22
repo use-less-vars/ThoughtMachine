@@ -182,6 +182,61 @@ DEFAULT_RUNTIME_MODE` and `300 assert resolve_runtime_mode({}) == DEFAULT_RUNTIM
 the constant itself, so flipping `DEFAULT_RUNTIME_MODE` to `MODE_THREAD` keeps every assertion in this
 file green. The literal value `MODE_PROCESS` is not asserted anywhere — see Known gaps.
 
+## Contract 5: An unreadable permission is UNKNOWN, never assurance
+
+**Invariant:** When a permission value cannot be read, every surface renders it as unknown. A failed
+read must not become a claim in either direction — not "host resources are forbidden, this workspace
+can withstand untrusted content", and not a purpose preset published as the agent's effective grant. It
+must not change the SHAPE of a permission table either: an empty panel and an em-dash both make no
+claim, while a table resized out of synthesised unknowable rows is still a fabricated surface.
+
+**Enforcement sites:** `web_ui/frontend/src/components/workspace/WorkspaceDetailPage.jsx:583` —
+`const hostResourcesKnown = typeof summary?.allow_host_resources === 'boolean'`; both the security-posture
+string and the host-execution card are gated on it, and the unknown branch carries its own
+`wdp-posture-unknown` class instead of the green `-safe` or amber `-host` colour that would read as a
+verdict. `web_ui/frontend/src/store/workspaceStore.js:416` — `permissions = []` in the
+`fetchWorkspaceConfig` else-branch; the `else if (purpose)` fallback that published
+`purpose.defaults.permissions` as `effective` (with a ceiling fabricated from `PERMISSION_CEILINGS`) is
+deleted, and the truthful branch keeps
+`ceiling: Object.prototype.hasOwnProperty.call(wc, name) ? wc[name] : undefined` so an absent ceiling
+stays undefined and the panel renders its em-dash.
+
+**Mutation-proof tests:** `web_ui/frontend/src/components/workspace/WorkspaceDetailPage.unknownPosture.test.jsx`
+— three cases: `allow_host_resources` absent, `allow_host_resources: null`, and a failed summary fetch.
+The first two assert `queryByText(POSTURE_SAFE)` and `queryByText(POSTURE_HOST)` are both null and that
+the unknown string renders with `wdp-posture-unknown`, so neither side of the branch is vacuous: restoring
+"unknown → the forbidden string" turns both red (measured by hand, 2 failed). The third case dies if a
+failed fetch ever starts rendering a posture claim. `web_ui/frontend/src/store/__tests__/workspaceStore.unknownEffective.test.jsx`
+— an HTTP 500 and a throwing fetch, each asserted at the store (no permission row carries a defined
+`effective` or `ceiling`) and at the rendered sidebar (the empty state appears and none of the preset's own
+values `write`/`banned`/`ask`/`read` appears anywhere). Restoring the preset fallback turns both red
+(measured by hand, 2 failed).
+
+**Verdict:** ENFORCED for these two surfaces, BY MANUAL MUTATION — NOT BY A GATE. This tree carries no
+mutation-testing configuration at all: no Stryker config, no `mutation` script in
+`web_ui/frontend/package.json`, no mutmut or cosmic-ray. The two mutation proofs recorded in this
+contract's commit message are hand measurements, not a CI check, and nothing will re-run them.
+`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of eighteen files under
+`tests/`, so it cannot run these JS suites — which is also why the JS paths above are cited without the
+backticked repo-relative form that `tests/test_contracts_ledger_parity.py` parses. What does run them is
+`platform-matrix.yml`'s `web-ui-frontend-suite` job (vitest over `src`), which cannot detect a mutation.
+
+**Deferred — unreadable-value lies this contract does not yet cover. Each is a named follow-up, not a
+pass:**
+
+1. `web_ui/frontend/src/components/SessionWorkspaceTab.jsx` — the capability pills are labelled as
+   *merged* capabilities, so a pill cannot say which resource granted it; a merged value reads as a
+   direct one.
+2. `web_ui/frontend/src/data/permissionVocab.js` — `effectivePermissionLabel('ask')` prints a
+   deferral ("ask") inside the column that reports an outcome, so a question is rendered as an answer.
+3. `web_ui/frontend/src/components/ConfigPanel.jsx` — `if (!sessionPerms) return;` makes a save a
+   silent no-op: nothing is written and nothing is said, so an unreadable permission surface produces a
+   success-shaped silence.
+4. `web_ui/frontend/src/store/workspaceStore.js:457` with
+   `web_ui/frontend/src/components/SessionSidebar.jsx:340` — a container read that failed (`tryGet`
+   returns null) becomes `[]`, and an HTTP 200 empty payload renders identically: "No containers for this
+   workspace." An unreadable set and an empty set are the same pixels.
+
 ## Known gaps
 
 1. **Contract 3 — the literal default is unproven (GAP).** No test in the tree asserts

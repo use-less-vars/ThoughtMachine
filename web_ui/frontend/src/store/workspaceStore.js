@@ -40,6 +40,9 @@ const PERMISSION_CEILINGS = {
   container:  true,
 }
 
+// --- The six resources the Permissions panel always lists (canonical order) ---
+const PERMISSION_RESOURCE_NAMES = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash']
+
 // --- Safety advisory per risk level ---
 function advisoryForRisk(risk) {
   switch (risk) {
@@ -392,21 +395,25 @@ const useWorkspaceStore = create((set, get) => ({
       // resource absent from workspace_ceiling (including the present-but-empty
       // {} 'never restrictive' case) keeps an undefined ceiling so the panel
       // renders its em-dash placeholder instead of echoing the effective value.
+      //
+      // Contract 5 (docs/CONTRACTS.md): when the endpoint could not be read the
+      // answer is UNKNOWN -- never the purpose preset. The rows stay EMPTY: the
+      // panel's own empty state ("No permission data for this workspace.") is
+      // the unknown rendering, and six synthesized unknown rows are not emitted,
+      // because a failed read must not change the SHAPE of a table any more than
+      // it may change a value inside it.
       const ep = permsData && permsData.effective_permissions
       const wc = (permsData && permsData.workspace_ceiling) || {}
       let permissions = []
       if (ep) {
-        permissions = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash'].map((name) => ({
+        permissions = PERMISSION_RESOURCE_NAMES.map((name) => ({
           name,
           ceiling: Object.prototype.hasOwnProperty.call(wc, name) ? wc[name] : undefined,
           effective: ep[name],
         }))
-      } else if (purpose) {
-        permissions = Object.entries(purpose.defaults.permissions || {}).map(([name, effective]) => ({
-          name,
-          ceiling: PERMISSION_CEILINGS[name] || effective,
-          effective,
-        }))
+      } else {
+        // Unreadable -> no rows. See the Contract 5 note above.
+        permissions = []
       }
 
       // The endpoint also reports permission contradictions (a session value

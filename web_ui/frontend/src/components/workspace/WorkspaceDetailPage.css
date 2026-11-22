@@ -230,6 +230,18 @@
   color: #a6e3a1;
 }
 
+/* Contract 5: an unreadable permission surface renders UNKNOWN -- neither the
+   green "safe" colour nor the amber "host allowed" one, which would both read
+   as a claim about a value this page never managed to read. */
+.wdp-posture-unknown {
+  color: #9399b2;
+}
+
+.wdp-host-unknown {
+  color: #9399b2;
+  font-size: 0.82rem;
+}
+
 .wdp-posture-host {
   color: #f9e2af;
 }
