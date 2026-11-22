@@ -319,7 +319,7 @@ def _webui_bus_counts():
 
 
 @pytest.fixture(autouse=True)
-def _webui_thread_bridge_census(request, monkeypatch):
+def _webui_thread_bridge_census(request):
     """Reap the threads and bridges a test leaves; ``thread_census`` asserts."""
     from web_ui.backend.bridge import WebAgentBridge
 
@@ -338,11 +338,25 @@ def _webui_thread_bridge_census(request, monkeypatch):
         bridges_created.append(self)
         original_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(WebAgentBridge, "__init__", _webui_tracking_init)
+    WebAgentBridge.__init__ = _webui_tracking_init
 
     try:
         yield
     finally:
+        # Patched and restored by hand, deliberately NOT via ``monkeypatch``:
+        # this fixture is autouse, so requesting ``monkeypatch`` would create it
+        # before every module/tests-level autouse fixture and push its undo
+        # *after* their teardown -- a teardown re-reading a global the test
+        # patched would then see the patched garbage (see
+        # tests/test_fixture_teardown_ordering.py for the same defect in
+        # tests/conftest.py).  Restore FIRST here, before the reaping and before
+        # any assertion, so no fixture tearing down alongside this one ever
+        # observes the tracking ``__init__``.
+        try:
+            if WebAgentBridge.__init__ is _webui_tracking_init:
+                WebAgentBridge.__init__ = original_init
+        except Exception as exc:
+            print("thread census: __init__ restore failed: %s" % (exc), file=sys.stderr)
         try:
             _webui_reap_bridges(bridges_created)
         except Exception as exc:
