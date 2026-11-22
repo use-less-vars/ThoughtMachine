@@ -2,7 +2,7 @@
 
 ThoughtMachine is a capability management platform. An operator grants an AI agent controlled access to computer capabilities. The security layer is the product - grants are enforced structurally, in code, not by prompt. The state layer is what makes the security layer legible - every container, every permission, every state change is visible and reconcilable. A machine that is safe but opaque is a machine you cannot use. A machine that is visible but unsafe is a machine you should not. ThoughtMachine is both.
 
-V2 was the era where the security layer was the product. That layer is built and tested. This is the era where the state layer stops lying - every subsystem that holds state now reconciles, or reports that it cannot. The machine is safe; the machine is now also honest.
+V2 was the era where the security layer was the product. That layer is built and tested. This is the era where the state layer stops lying - every subsystem that holds state now reconciles, or reports that it cannot. The machine is safe; whether it is also honest is not something this file gets to assert. Check it where it is checked: `docs/CONTRACTS.md` names the test that proves each invariant, and `tests/test_contracts_ledger_parity.py` fails when a cited test disappears or stops running in the contract gate; the vision ledger (`.thoughtmachine/knowledge/project/vision_ledger.md`) carries the graded verdicts. Where both are silent, `docs/DIRECTION_2026-11-22.md` records what is not yet proven, and when.
 
 - **Isolated execution.** Agent-generated code runs in a Docker container that has
   no network and a read-only root filesystem by default; relax the policy when a
