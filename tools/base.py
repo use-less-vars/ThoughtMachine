@@ -107,6 +107,14 @@ class ToolBase(BaseModel):
     # layer would silently degrade it to the shared '<no-session>' scope.
     requires_authenticated_session: ClassVar[bool] = False
 
+    # SECURITY (F4): True for tools whose actions are scoped to ONE workspace and
+    # must never accept that workspace from the caller. Like ``session_id``, the
+    # workspace id is then an AUTHORITY FACT: ToolExecutor pops any
+    # caller-supplied ``workspace_id`` before validation and injects its own
+    # resolved id at the single pin site. False everywhere else -- a tool that
+    # declares a public ``workspace_id`` (e.g. a credential scope) keeps it.
+    pinned_workspace_id: ClassVar[bool] = False
+
     # True only for tools that build a CHILD AGENT in the same session trust
     # domain (e.g. the Worker tool).  Such a tool may receive the live provider
     # api key inside the injected ``agent_config`` dict; every handover is

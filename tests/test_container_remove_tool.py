@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
+from agent.config.defaults import WORKSPACE_ID_LABEL
 from tools import TOOL_CLASSES
 from tools.container_control import ContainerRemoveTool
 import tools.container_control as container_control
@@ -31,11 +32,20 @@ def _parse(result: str) -> dict:
     return json.loads(result)
 
 
-def _manager(lifecycle_class="ephemeral", remove_result=None):
-    """Build a MagicMock manager whose container classifies as given."""
+def _manager(lifecycle_class="ephemeral", remove_result=None, workspace_id="ws-1"):
+    """Build a MagicMock manager whose container classifies as given.
+
+    The container is owned by this manager's workspace (its
+    ``thoughtmachine.workspace_id`` label matches ``manager.workspace_id``), so
+    the ownership check passes; foreign / unverifiable ownership is covered by
+    tests/test_container_remove_scope.py.
+    """
     manager = MagicMock()
+    manager.workspace_id = workspace_id
     manager.class_of.return_value = lifecycle_class
-    manager.client.containers.get.return_value = MagicMock()
+    container = MagicMock()
+    container.labels = {WORKSPACE_ID_LABEL: workspace_id}
+    manager.client.containers.get.return_value = container
     if remove_result is not None:
         manager.remove.return_value = remove_result
     return manager
@@ -66,7 +76,9 @@ class TestContainerRemoveToolParameters:
         assert tool.workspace_id is None
 
     def test_workspace_id_is_forwarded_to_make_manager(self):
-        manager = _manager(remove_result={"status": "removed", "name": "tm-x"})
+        manager = _manager(
+            remove_result={"status": "removed", "name": "tm-x"}, workspace_id="ws-9"
+        )
         tool = ContainerRemoveTool(container_id_or_name="abc123", workspace_id="ws-9")
         with patch.object(
             ContainerRemoveTool, "_make_manager", return_value=manager
