@@ -166,6 +166,7 @@ def write_command(
     fence: CommandFence,
     *,
     reason: Optional[str] = None,
+    control_seq: Optional[int] = None,
 ) -> bool:
     """Atomically write a fenced command into *worker_dir*.
 
@@ -184,9 +185,21 @@ def write_command(
     ``reason`` is optional diagnostics, emitted only when given, so a plain
     command's payload stays byte-identical to the old one apart from the
     fence.
+
+    ``control_seq`` is the issuer's MONOTONIC control sequence number, emitted
+    only when given and only by an IN-PROCESS writer (``WorkerThread.pause`` /
+    ``resume`` / ``detach``), which bumps it immediately before writing.  It is
+    NOT part of the fence and is deliberately not validated by
+    :func:`fence_rejection_reason`: a payload written by another process (the
+    REST routes) cannot know this process's counter, so a command without one
+    stays valid and is obeyed exactly as before.  Its only consumer is the
+    issuing worker's own poller, which uses it to refuse a claim that a LATER
+    control write has already superseded.
     """
     payload: Dict[str, Any] = {"action": action}
     payload.update(fence.to_payload())
+    if control_seq is not None:
+        payload["control_seq"] = control_seq
     if reason is not None:
         payload["reason"] = reason
 

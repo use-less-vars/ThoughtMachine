@@ -224,15 +224,29 @@ def test_detach_cancels_an_in_flight_sleep(tmp_path):
     # or mis-fenced payload is quarantined by the consumer, so the fence is the
     # signal rather than bookkeeping.
     command = json.loads((tmp_path / "command.json").read_text())
+    # Assert the FENCE, not the exact payload shape.  Command payloads are
+    # additive by protocol: an extra key inside a known ``kind`` is ignored by
+    # readers and does not bump ``v`` (worker_runtime_protocol.py, additive-keys
+    # rule).  ``control_seq`` is the issuer's monotonic stamp and is explicitly
+    # NOT part of the fence (command_channel.py), so whole-dict equality here
+    # would red on every unrelated additive field while proving nothing about
+    # the fence this test actually depends on.
     # ``epoch`` is ``_fence_epoch`` (3), NOT ``_generation`` (1): the stub keeps
     # the two apart so this assertion pins WHICH number the fence carries.
-    assert command == {
+    expected_fence = {
         "action": "stop",
         "session_id": "sess-stub",
         "worker_name": "stub-worker",
         "instance_id": 1,
         "epoch": 3,
-    }, command
+    }
+    assert {key: command[key] for key in expected_fence} == expected_fence, command
+    # The additive stamp must be present and sane, but its VALUE is not pinned:
+    # it is monotonic across the process, not restarted per incarnation.
+    assert "control_seq" in command, command
+    assert isinstance(command["control_seq"], int), command
+    assert not isinstance(command["control_seq"], bool), command
+    assert command["control_seq"] >= 1, command
 
 
 def test_new_query_clears_turn_cancel(tmp_path):
