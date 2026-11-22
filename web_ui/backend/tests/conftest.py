@@ -284,8 +284,8 @@ def _webui_reap_worker_threads(threads_before, keys_before):
         registered = {}
     candidates = [thread for key, thread in registered.items()
                   if key not in keys_before and _webui_is_worker_thread(thread)]
-    for ident, thread in threading.enumerate():
-        if ident in threads_before or any(thread is c for c in candidates):
+    for thread in threading.enumerate():
+        if id(thread) in threads_before or any(thread is c for c in candidates):
             continue
         if _webui_is_worker_thread(thread):
             candidates.append(thread)
