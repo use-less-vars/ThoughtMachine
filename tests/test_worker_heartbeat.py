@@ -112,7 +112,13 @@ class TestIdleHeartbeat(_RunSafetyPatches):
                 thread._heartbeat_tick()      # now=0.0 -> throttled
                 clock.now = 31.0
                 thread._heartbeat_tick()      # now=31.0 -> fires
-            hb_events = self.heartbeat_events()
+            # Select THIS worker's own heartbeat by name: the patched bus is
+            # process-global, so a leaked worker's heartbeat lands here too
+            # (see FakeMonotonic and the two payload tests below).
+            hb_events = [
+                e for e in self.heartbeat_events()
+                if e.data.get("worker_name") == "w-hb"
+            ]
             self.assertEqual(len(hb_events), 1)
             # In-memory heartbeat updated by the firing tick.
             self.assertIsNotNone(thread.last_heartbeat)
@@ -128,7 +134,63 @@ class TestIdleHeartbeat(_RunSafetyPatches):
                 thread._heartbeat_tick()      # now=31.0 -> fires, stamps 31.0
                 clock.now = 32.0
                 thread._heartbeat_tick()      # now=32.0 -> suppressed
-            self.assertEqual(len(self.heartbeat_events()), 1)
+            hb_events = [
+                e for e in self.heartbeat_events()
+                if e.data.get("worker_name") == "w-hb2"
+            ]
+            self.assertEqual(len(hb_events), 1)
+
+    def test_leaked_worker_heartbeat_does_not_break_the_idle_count(self):
+        """A worker leaked by another module must not inflate this count.
+
+        While these tests hold their patches both ``global_event_bus`` and
+        ``time.monotonic`` are process-global (see FakeMonotonic), so a
+        WorkerThread left alive by another test module in the same session
+        publishes its first WORKER_HEARTBEAT into THIS test's fake bus.  Its
+        ``_last_heartbeat_monotonic`` is still 0.0 -- it has not ticked yet --
+        so the fake clock at 31.0 clears the interval gate.  The leak is
+        INJECTED here rather than waited for: the real one is a sub-millisecond
+        race between a foreign thread's 2s tick and this test's patch window.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-hb-leak")
+            thread._last_heartbeat_monotonic = 0.0
+            leaked = make_thread(tmp, name="w-leaked", session_id="s2")
+            leaked._last_heartbeat_monotonic = 0.0
+            clock = FakeMonotonic(0.0)
+            with mock.patch("tools.workspace.worker.time.monotonic", clock):
+                thread._heartbeat_tick()      # now=0.0 -> throttled
+                clock.now = 31.0
+                leaked._heartbeat_tick()      # the leak: a foreign worker fires
+                thread._heartbeat_tick()      # now=31.0 -> fires
+            # Narrowed to this worker: the foreign heartbeat injected above is
+            # in the bus, and it is not this worker's.
+            hb_events = [
+                e for e in self.heartbeat_events()
+                if e.data.get("worker_name") == "w-hb-leak"
+            ]
+            self.assertEqual(len(hb_events), 1)
+
+    def test_duplicate_delivery_for_the_same_worker_is_still_counted_twice(self):
+        """The narrowed observable must still count a genuine second tick.
+
+        Without this pair, a filter that counted nothing at all would pass the
+        two idle tests.  Two ticks that each clear HEARTBEAT_INTERVAL_S for the
+        SAME worker are two deliveries and must read 2.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-hb-dup")
+            thread._last_heartbeat_monotonic = 0.0
+            clock = FakeMonotonic(31.0)
+            with mock.patch("tools.workspace.worker.time.monotonic", clock):
+                thread._heartbeat_tick()      # 31.0 - 0.0  >= 30 -> fires
+                clock.now = 62.0
+                thread._heartbeat_tick()      # 62.0 - 31.0 >= 30 -> fires again
+            hb_events = [
+                e for e in self.heartbeat_events()
+                if e.data.get("worker_name") == "w-hb-dup"
+            ]
+            self.assertEqual(len(hb_events), 2)
 
     def test_heartbeat_payload_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
