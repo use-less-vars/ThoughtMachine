@@ -4418,17 +4418,6 @@ class WorkerThread(threading.Thread):
                         _container_id = event.get("container_id")
                         _exec_id = event.get("exec_id")
                         _pid = event.get("pid")
-                        # Nested tool payloads (arguments/data/result) may
-                        # carry the execution identifiers instead.
-                        for _key in ("arguments", "data", "result"):
-                            _nested = event.get(_key)
-                            if isinstance(_nested, dict):
-                                if _container_id is None:
-                                    _container_id = _nested.get("container_id")
-                                if _exec_id is None:
-                                    _exec_id = _nested.get("exec_id")
-                                if _pid is None:
-                                    _pid = _nested.get("pid")
                         _exec_type = (
                             "container_exec" if (_container_id and _pid) else "subprocess"
                         )

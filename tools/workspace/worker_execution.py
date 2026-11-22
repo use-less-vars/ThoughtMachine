@@ -228,8 +228,11 @@ class ExecutionTracker:
           ContainerManager API — stopping the container kills its execs). On
           failure the container is force-removed via ``remove(container_id)``.
         - ``scoped_container``: ``stop(container_id)``.
-        - ``subprocess``: ``os.killpg`` when the pid is a process group, else
-          ``os.kill(pid, SIGTERM)``.
+        - ``subprocess``: ``os.killpg(pid, SIGTERM)`` when the pid is a process
+          GROUP LEADER, else ``os.kill(pid, SIGTERM)`` -- a non-leader must
+          never be handed to ``killpg``, which would signal the group it
+          shares with us.  A pid that is already gone is a silent success;
+          an unsafe pid (0/1/ours/itself/unresolvable group) is refused.
         - ``container_exec``: minimal ``docker exec <container> kill <pid>``
           (``exec_run`` when the manager exposes it, else the docker CLI).
           Without a pid, the container is stopped ONLY when it is
@@ -402,57 +405,201 @@ class ExecutionTracker:
              f"terminate_all: scoped_container {execution_id} — stop({container_id})")
         container_manager.stop(container_id)
 
+    def _kill_decision(self, pid) -> tuple:
+        """Decide HOW ``pid`` may be signalled: ``(mode, reason)``.
+
+        ``os.killpg`` signals a PROCESS GROUP, so a pid that merely LIVES in
+        our group must never be handed to it: on the usual shape (a plain
+        ``Popen`` child, no ``start_new_session``) the child is a non-leader in
+        the group the agent/test-runner itself lives in, and ``killpg`` on it
+        would signal us all.  A non-leader is nonetheless a perfectly
+        legitimate teardown target, so it must NOT be refused either -- the
+        refusal left such children alive and turned ``proc.wait(timeout=5.0)``
+        into a ``TimeoutExpired``.
+
+        Modes:
+
+        - ``("refuse", reason)``: signal NOTHING (log only).  ``reason`` is one
+          of ``invalid_pid`` (not int-convertible, or a ``bool``, which
+          ``int()`` would silently turn into 0/1), ``privileged_pid``
+          (``pid <= 1``: 0 means "my process group", 1 is init), ``self_pid``
+          (this very process) or ``unknown_process_group`` (``os.getpgid``
+          refused for a reason other than the pid being gone, so membership
+          cannot be established);
+        - ``("gone", "no_such_process")``: the pid no longer exists -- nothing
+          to signal and nothing to complain about, a silent SUCCESS;
+        - ``("group", "process_group_leader")``: the pid leads its own group,
+          so ``killpg(pid, ...)`` addresses exactly that group;
+        - ``("single", reason)``: ``os.kill(pid, ...)`` ONLY.  ``reason`` is
+          ``shares_own_process_group`` (a non-leader inside OUR group) or
+          ``not_group_leader``.
+        """
+        if isinstance(pid, bool):
+            return ("refuse", "invalid_pid")
+        try:
+            target = int(pid)
+        except (TypeError, ValueError):
+            return ("refuse", "invalid_pid")
+        if target <= 1:
+            return ("refuse", "privileged_pid")
+        if target == os.getpid():
+            return ("refuse", "self_pid")
+        try:
+            target_group = os.getpgid(target)
+        except ProcessLookupError:
+            return ("gone", "no_such_process")
+        except OSError:
+            return ("refuse", "unknown_process_group")
+        try:
+            own_group = os.getpgid(0)
+        except OSError:
+            return ("refuse", "unknown_process_group")
+        if target_group == own_group:
+            return ("single", "shares_own_process_group")
+        if target_group == target:
+            return ("group", "process_group_leader")
+        return ("single", "not_group_leader")
+
+    def _pid_is_alive(self, pid: int) -> bool:
+        """True while ``pid`` is a LIVE process (a zombie does not count).
+
+        Signal 0 alone is not enough: it still SUCCEEDS on a zombie, and an
+        exited-but-unreaped child is exactly what a ``Popen`` child becomes
+        when its parent has not called ``wait()`` yet.  Trusting signal 0 made
+        the escalation poll the whole grace period and then SIGKILL a corpse,
+        so the ``/proc`` state is consulted too: the state is the first field
+        AFTER THE LAST ``)`` of ``/proc/<pid>/stat`` (the comm field may itself
+        contain spaces and parentheses), and ``Z`` means dead.
+        """
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False  # definitely gone
+        except PermissionError:
+            return True  # exists, just not ours to signal
+        except OSError:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8",
+                      errors="replace") as handle:
+                data = handle.read()
+        except OSError:
+            return True  # no /proc (or unreadable): fall back to signal 0
+        end = data.rfind(")")
+        if end == -1:
+            return True
+        fields = data[end + 1:].split()
+        if not fields:
+            return True
+        return fields[0] != "Z"
+
     def _terminate_subprocess(self, worker_id, execution_id, details) -> None:
         pid = details.get("pid", details.get("process_id"))
         if pid is None:
             _log("WARNING", "workspace.lifecycle",
                  f"terminate_all: subprocess {execution_id} has no pid — skipping")
             return
+        mode, reason = self._kill_decision(pid)
+        if mode == "refuse":
+            _log("WARNING", "workspace.lifecycle",
+                 f"terminate_all: subprocess {execution_id} — "
+                 f"refusing to signal pid {pid!r} ({reason})")
+            return
+        if mode == "gone":
+            _log("DEBUG", "workspace.lifecycle",
+                 f"terminate_all: subprocess {execution_id} — "
+                 f"pid {pid!r} already gone ({reason})")
+            return
         try:
-            try:
-                os.killpg(int(pid), signal.SIGTERM)
-                _log("INFO", "workspace.lifecycle",
-                     f"terminate_all: subprocess {execution_id} — "
-                     f"killpg({pid}, SIGTERM)")
-            except (ProcessLookupError, PermissionError, OSError):
+            if mode == "group":
+                try:
+                    os.killpg(int(pid), signal.SIGTERM)
+                    _log("INFO", "workspace.lifecycle",
+                         f"terminate_all: subprocess {execution_id} — "
+                         f"killpg({pid}, SIGTERM)")
+                except PermissionError:
+                    # Not permitted to signal that group: we cannot establish
+                    # that it is ours, so a single-pid ``os.kill`` would be an
+                    # equally blind signal.  Refuse by name instead.
+                    _log("WARNING", "workspace.lifecycle",
+                         f"terminate_all: subprocess {execution_id} — not "
+                         f"permitted to killpg({pid}, SIGTERM) "
+                         f"(permission_denied); refusing single-pid fallback")
+                    return
+                except OSError:
+                    # Covers ProcessLookupError (no such group) and every other
+                    # killpg failure: keep the historical single-pid fallback.
+                    os.kill(int(pid), signal.SIGTERM)
+                    _log("INFO", "workspace.lifecycle",
+                         f"terminate_all: subprocess {execution_id} — "
+                         f"kill({pid}, SIGTERM)")
+            else:
+                # A non-leader (or a pid whose group is not its own) must
+                # never reach ``killpg``: signal that single process only.
                 os.kill(int(pid), signal.SIGTERM)
                 _log("INFO", "workspace.lifecycle",
                      f"terminate_all: subprocess {execution_id} — "
-                     f"kill({pid}, SIGTERM)")
+                     f"kill({pid}, SIGTERM) ({reason})")
             self._escalate_subprocess_kill(int(pid))
         except Exception as exc:
             _log("WARNING", "workspace.lifecycle",
                  f"terminate_all: subprocess {execution_id} kill failed: {exc}")
 
     def _escalate_subprocess_kill(self, pid: int) -> None:
-        """SIGKILL the process group if it is still alive after the grace period.
+        """SIGKILL ``pid`` only if it is still alive after the grace period.
 
-        Polls for process-group death with ``os.killpg(pid, 0)`` every 50ms up
-        to ``kill_grace_seconds``; only escalates to SIGKILL when the group is
-        still alive. A dead group (``ProcessLookupError``) returns immediately
-        so a successful SIGTERM never triggers an extra SIGKILL.
+        Liveness is polled with :meth:`_pid_is_alive` every 50ms up to
+        ``kill_grace_seconds``; a process that is already dead -- including a
+        ZOMBIE child, on which a bare signal-0 probe still succeeds -- returns
+        immediately, so a successful SIGTERM never burns the grace period and
+        never escalates a SIGKILL onto a corpse.
+
+        The kill *decision* is re-taken before the escalation, for two reasons:
+        the pid may have been recycled while we polled (a fresh target must be
+        re-judged), and the channel must match the original one -- a non-leader
+        is escalated with ``os.kill`` and never with ``killpg``, and a target we
+        may not signal is refused by name rather than degraded into a blind
+        single-pid SIGKILL.
         """
+        mode, reason = self._kill_decision(pid)
+        if mode == "refuse":
+            _log("WARNING", "workspace.lifecycle",
+                 f"subprocess {pid!r}: refusing to escalate to SIGKILL "
+                 f"({reason})")
+            return
+        if mode == "gone":
+            return  # already dead
         grace = getattr(self, "kill_grace_seconds", EXEC_KILL_GRACE)
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
-            try:
-                os.killpg(pid, 0)
-            except ProcessLookupError:
-                return  # already dead
-            except OSError:
-                pass
+            if not self._pid_is_alive(pid):
+                return  # dead or zombie: nothing to escalate
             time.sleep(0.05)
+        mode, reason = self._kill_decision(pid)
+        if mode == "refuse":
+            _log("WARNING", "workspace.lifecycle",
+                 f"subprocess {pid!r}: refusing to escalate to SIGKILL "
+                 f"({reason})")
+            return
+        if mode == "gone":
+            return
         try:
-            os.killpg(pid, signal.SIGKILL)
-            _log("INFO", "workspace.lifecycle",
-                 f"subprocess {pid} still alive after {grace}s grace — "
-                 f"killpg({pid}, SIGKILL)")
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
+            if mode == "group":
+                os.killpg(pid, signal.SIGKILL)
+                _log("INFO", "workspace.lifecycle",
+                     f"subprocess {pid} still alive after {grace}s grace — "
+                     f"killpg({pid}, SIGKILL)")
+            else:
                 os.kill(pid, signal.SIGKILL)
                 _log("INFO", "workspace.lifecycle",
                      f"subprocess {pid} still alive after {grace}s grace — "
-                     f"kill({pid}, SIGKILL)")
-            except Exception as exc:
-                _log("WARNING", "workspace.lifecycle",
-                     f"subprocess {pid} SIGKILL escalation failed: {exc}")
+                     f"kill({pid}, SIGKILL) ({reason})")
+        except PermissionError:
+            _log("WARNING", "workspace.lifecycle",
+                 f"subprocess {pid}: SIGKILL escalation not permitted "
+                 f"(permission_denied)")
+        except ProcessLookupError:
+            return  # died between the decision and the signal
+        except OSError as exc:
+            _log("WARNING", "workspace.lifecycle",
+                 f"subprocess {pid}: SIGKILL escalation failed: {exc}")

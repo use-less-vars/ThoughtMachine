@@ -350,26 +350,36 @@ def test_terminate_all_scoped_container_stops():
     assert cm.exec_stopped == []
 
 
-def test_terminate_all_subprocess_killpg_fallback_kill(monkeypatch):
+def test_terminate_all_subprocess_non_leader_killed_as_single_pid(monkeypatch):
+    """A NON-LEADER subprocess is signalled as one pid -- ``os.kill`` only.
+
+    ``os.killpg(pid, ...)`` on a non-leader signals the group the pid happens
+    to live in (on the CI shape: OUR group), so the group channel is not
+    admissible for it.  The single-pid ``os.kill(SIGTERM)`` is the kill; the
+    escalation probe then finds the pid already gone and adds no SIGKILL.
+    """
     calls = {"killpg": [], "kill": []}
 
     def fake_killpg(pid, sig):
         calls["killpg"].append((pid, sig))
-        raise ProcessLookupError("no such process group")
+        return None
 
     def fake_kill(pid, sig):
+        if sig == 0:
+            raise ProcessLookupError("no such process")  # the pid is gone
         calls["kill"].append((pid, sig))
 
+    # 4242 lives in group 5555 (it is NOT that group's leader); we live in 111.
+    monkeypatch.setattr("os.getpgid", lambda p: 5555 if p == 4242 else 111)
     monkeypatch.setattr("os.killpg", fake_killpg)
     monkeypatch.setattr("os.kill", fake_kill)
     tracker = ExecutionTracker()
     tracker.add("e1", {"type": "subprocess", "pid": 4242})
     tracker.terminate_all("w1", None, None)
-    # killpg(SIGTERM) fails -> kill(SIGTERM) fallback; the escalation path
-    # then probes liveness with killpg(pid, 0) and, seeing the group is
-    # already dead (ProcessLookupError), skips the SIGKILL.
-    assert calls["killpg"] == [(4242, signal.SIGTERM), (4242, 0)]
     assert calls["kill"] == [(4242, signal.SIGTERM)]
+    assert calls["killpg"] == [], (
+        f"a non-leader pid was signalled as a process group: {calls['killpg']!r}"
+    )
 
 
 def test_terminate_all_unknown_type_skipped():

@@ -8,7 +8,8 @@ ExecutionTracker (infra.workspace_lifecycle_manager):
      (default type "subprocess" otherwise).
   2. container_exec with container_id+pid -> minimal ``exec_run kill <pid>``,
      never a container stop; tracker cleared afterwards.
-  3. subprocess with pid -> os.kill(pid, SIGTERM) when killpg fails.
+  3. subprocess with a NON-LEADER pid -> os.kill(pid, SIGTERM) (a group
+     leader, by contrast, goes through os.killpg(pid, SIGTERM)).
   4. container_exec without pid + non-worker-owned container -> never stopped.
   8. container_exec without pid + worker-owned container -> stop(container_id).
 
@@ -195,11 +196,31 @@ class TestExecutionTrackerTermination(unittest.TestCase):
             self.assertEqual(tracker.active_count(), 0)
 
     def test_terminate_container_exec_subprocess_sigterm(self):
+        """A NON-LEADER subprocess is killed with the single-pid os.kill.
+
+        A plain ``Popen`` child (no ``start_new_session``) is a non-leader in
+        OUR process group, so ``os.killpg`` on it would signal every process
+        sharing our group -- the test runner included.  The admissible channel
+        is ``os.kill(pid, SIGTERM)``.
+        """
         tracker = ExecutionTracker()
         tracker.add("e1", {"type": "subprocess", "pid": 4242})
         killed = []
-        with mock.patch("os.killpg", side_effect=ProcessLookupError), \
-             mock.patch("os.kill", side_effect=lambda pid, sig: killed.append((pid, sig))):
+
+        def _kill(pid, sig):
+            if sig == 0:
+                raise ProcessLookupError("no such process")  # already gone
+            killed.append((pid, sig))
+
+        def _no_killpg(pid, sig):  # pragma: no cover - tripwire
+            raise AssertionError(
+                f"os.killpg({pid}, {sig}) was used for a non-leader subprocess"
+            )
+
+        # 4242 lives in group 9999 (it is NOT that group's leader); we are 111.
+        with mock.patch("os.getpgid", side_effect=lambda p: 9999 if p == 4242 else 111), \
+             mock.patch("os.killpg", side_effect=_no_killpg), \
+             mock.patch("os.kill", side_effect=_kill):
             tracker.terminate_all("w1", None, None)
         self.assertEqual(killed, [(4242, signal.SIGTERM)])
         self.assertEqual(tracker.active_count(), 0)
