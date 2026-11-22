@@ -734,7 +734,7 @@ def _census_fail(problems):
 
 
 @pytest.fixture(autouse=True)
-def _thread_bridge_census(request, monkeypatch):
+def _thread_bridge_census(request):
     """Reap the threads and bridges a test leaves; opt-in, assert a census."""
     global _CENSUS_SYMBOLS_OK
     if _CENSUS_SYMBOLS_OK:
@@ -761,11 +761,23 @@ def _thread_bridge_census(request, monkeypatch):
         bridges_created.append(self)
         original_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(bridge_class, "__init__", _census_tracking_init)
+    bridge_class.__init__ = _census_tracking_init
 
     try:
         yield
     finally:
+        # Patched and restored by hand, deliberately NOT via ``monkeypatch``:
+        # this fixture is autouse, so requesting ``monkeypatch`` would create it
+        # before every module/tests-level autouse fixture and push its undo
+        # *after* their teardown -- a teardown re-reading a global the test
+        # patched would then see the patched garbage.  Restore FIRST here, before
+        # the reaping and before any assertion, so no fixture tearing down
+        # alongside this one ever observes the tracking ``__init__``.
+        try:
+            if bridge_class.__init__ is _census_tracking_init:
+                bridge_class.__init__ = original_init
+        except Exception as exc:
+            print("thread census: __init__ restore failed: %s" % (exc), file=sys.stderr)
         try:
             _reap_bridges(bridges_created)
         except Exception as exc:
