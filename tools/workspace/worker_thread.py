@@ -1356,6 +1356,41 @@ def _resume_manual_only_paused(session_id: Optional[str]) -> list[str]:
     return resumed
 
 
+def _forget_manual_only_pause(
+    session_id: Optional[str],
+    worker_name: str,
+    instance_id: int = 1,
+) -> None:
+    """Drop ONE worker from *session_id*'s operator-latch record.
+
+    The worker-scoped half of :func:`_resume_manual_only_paused`, which pops the
+    WHOLE session at a user-turn boundary.  A channel ``resume`` is addressed to
+    one worker, so it must release exactly that worker's entry: the record and
+    ``WorkerThread._manual_only_pause`` are two halves of one fact, and
+    releasing one without the other is how they drifted apart.
+
+    Idempotent and defensive: releasing a latch that was never set, or a
+    bookkeeping failure, must never break the resume that triggered it -- the
+    same rule :func:`_record_manual_only_pause` follows.
+    """
+    if not session_id:
+        return
+    try:
+        with _MANUAL_ONLY_PAUSED_LOCK:
+            recorded = _MANUAL_ONLY_PAUSED.get(session_id)
+            if not recorded:
+                return
+            recorded.discard((worker_name, int(instance_id)))
+            if not recorded:
+                _MANUAL_ONLY_PAUSED.pop(session_id, None)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Manual-only pause: could not release worker '%s': %s",
+            worker_name,
+            exc,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
 # ---------------------------------------------------------------------------
@@ -2365,6 +2400,15 @@ class WorkerThread(threading.Thread):
         # (PeriodicStaleCheck).
         self._detach_requested: bool = False
         self._detached_at: Optional[float] = None
+        # MONOTONIC IN-PROCESS CONTROL SEQUENCE.  Bumped by every control write
+        # (``pause()`` / ``resume()`` / ``detach()``) immediately BEFORE it
+        # writes, and stamped into that command's payload.  ``_poll_command``
+        # re-checks it after the claim and BEFORE it acts, so a claimed command
+        # can never act on state that moved after it was claimed: the claim and
+        # the dispatch are not atomic, and a control write landing in that
+        # window is YOUNGER than the command being dispatched.
+        self._control_seq: int = 0
+        self._control_seq_lock = threading.Lock()
         # Digest of the last ``command.json`` payload that was deliberately NOT
         # acted on (an unknown action).  Lets _poll_command ignore a stray
         # command file without unlinking it -- an unlink there would race with
@@ -2849,7 +2893,12 @@ class WorkerThread(threading.Thread):
         # fence is what makes this signal deliverable at all.  Best effort --
         # ``write_command`` reports failure through its return value and never
         # raises, so a failed write cannot change the control flow of a detach.
-        write_command(self._worker_dir, "stop", self._fence())
+        # Bump BEFORE the write, so this stop is stamped strictly older than
+        # anything a LATER control write commits.
+        control_seq = self._next_control_seq()
+        write_command(
+            self._worker_dir, "stop", self._fence(), control_seq=control_seq
+        )
         # Unblock the input queue wait so the park flags are re-read.
         self._input_queue.put(_PARK_SENTINEL)
 
@@ -3016,7 +3065,11 @@ class WorkerThread(threading.Thread):
         # Write a PAUSE command for cross-process signalling (fenced, for the
         # same reason as stop(): an unaddressed payload is quarantined, and a
         # best-effort return value never changes this method's control flow).
-        write_command(self._worker_dir, "pause", self._fence())
+        # Bumped immediately before the write -- see _next_control_seq().
+        control_seq = self._next_control_seq()
+        write_command(
+            self._worker_dir, "pause", self._fence(), control_seq=control_seq
+        )
         # Unblock the input queue wait so it can check the pause event
         self._input_queue.put(_PARK_SENTINEL)
 
@@ -3064,7 +3117,11 @@ class WorkerThread(threading.Thread):
         # 'resume' branch mirrors this method.  It is also fenced to THIS
         # incarnation, so a leftover one is quarantined, never obeyed, by a
         # future incarnation with a different epoch.
-        write_command(self._worker_dir, "resume", self._fence())
+        # Bumped immediately before the write -- see _next_control_seq().
+        control_seq = self._next_control_seq()
+        write_command(
+            self._worker_dir, "resume", self._fence(), control_seq=control_seq
+        )
         self._park_event.clear()
         self._resume_event.set()
         # UNIT C: the worker is now actually running again, so the manual-only
@@ -3365,6 +3422,63 @@ class WorkerThread(threading.Thread):
             "generation": self._generation,
         }
 
+    def _next_control_seq(self) -> int:
+        """Bump and return this worker's monotonic in-process control sequence.
+
+        Called immediately BEFORE a control command is written, so the value
+        stamped into that payload is strictly older than the state the writer
+        then commits (``pause()`` parks, ``resume()`` unparks, ``detach()``
+        detaches).  A poller that claimed the payload and afterwards finds a
+        GREATER ``_control_seq`` therefore knows a later control write has
+        already landed and must not overwrite it.
+
+        The counter belongs to the thread object because only an in-process
+        writer can be ordered against it: a command written by another process
+        carries no stamp, and is compared against nothing (see
+        ``_poll_command``).
+        """
+        lock = getattr(self, "_control_seq_lock", None)
+        if lock is None:  # pragma: no cover - partially built / legacy object
+            self._control_seq = self._current_control_seq() + 1
+            return self._control_seq
+        with lock:
+            self._control_seq += 1
+            return self._control_seq
+
+    def _current_control_seq(self) -> int:
+        """The newest control sequence this worker has issued (``0`` if none)."""
+        try:
+            return int(self._control_seq)
+        except (AttributeError, TypeError, ValueError):  # pragma: no cover
+            return 0
+
+    def _release_manual_only_pause(self) -> None:
+        """Release the OPERATOR latch for THIS worker -- both halves at once.
+
+        The latch lives in two places: the ``_manual_only_pause`` attribute
+        (tray truth, spawn dedupe, query routing) and the session-scoped
+        ``_MANUAL_ONLY_PAUSED`` record that :func:`_resume_manual_only_paused`
+        consumes.  Clearing one alone leaves them disagreeing, which is what the
+        channel ``resume`` branch used to do: it cleared the attribute and left
+        the record claiming a running worker was operator-paused.
+
+        Deliberately NOT a call to :func:`_resume_manual_only_paused`: that is
+        the SESSION-scoped release and the wrong tool inside a single-command
+        dispatch.  It pops every target recorded for the session (resuming
+        sibling workers no command addressed) and it SKIPS a worker whose
+        ``_detach_requested``/``status`` still reads detached -- exactly the
+        state this branch is in when a channel resume follows a cross-process
+        'stop' -- so it would clear the record and leave the attribute set: the
+        same divergence, mirrored.  :func:`_forget_manual_only_pause` is that
+        function's worker-scoped half.
+        """
+        _forget_manual_only_pause(
+            getattr(self, "session_id", None) or _NO_SESSION_KEY,
+            self.worker_name,
+            getattr(self, "instance_id", 1) or 1,
+        )
+        self._manual_only_pause = False
+
     def _fence(self) -> CommandFence:
         """The identity fence every command addressed to THIS incarnation carries.
 
@@ -3660,6 +3774,32 @@ class WorkerThread(threading.Thread):
                 f"(instance_id={self.instance_id}): {reason}")
             return
 
+        # ── REVALIDATE, THEN DISPATCH ─────────────────────────────────
+        # The claim and the action are two separate steps: between them any
+        # in-process control write (pause / resume / detach) can land and
+        # commit NEWER state.  Dispatching the claim regardless lets a
+        # superseded command overwrite a younger decision -- a 'resume' claimed
+        # a moment before an operator's manual-only pause cleared the latch and
+        # lifted the park, and a 'stop' claimed a moment before a resume
+        # re-detached a worker that had just been resumed.
+        #
+        # NO stamp means another process wrote it (the REST routes build their
+        # own fence and cannot see this counter) or an older writer did: there
+        # is no local ordering to compare against, so it behaves exactly as it
+        # always has.  A cross-process 'stop' therefore cannot regress -- it was
+        # never stamped, hence never superseded by anything this process knows.
+        issued_seq = data.get("control_seq")
+        if type(issued_seq) is int and issued_seq < self._current_control_seq():  # noqa: E721
+            # DISCARD the claim: the state it was issued against is gone, so
+            # none of its branches may run -- no stop, no resume, no latch
+            # change.
+            discard(claimed)
+            log("INFO", "tools.worker",
+                f"Discarded a superseded command {data.get('action')!r} for worker "
+                f"'{self.worker_name}': issued at control seq {issued_seq}, "
+                f"superseded at {self._current_control_seq()}")
+            return
+
         action = data.get("action")
         if action == "stop":
             # PHASE 2.1a: a cross-process 'stop' DETACHES.  It must not
@@ -3723,9 +3863,11 @@ class WorkerThread(threading.Thread):
             discard(claimed)
             self._park_event.clear()
             self._resume_event.set()
-            # Mirrors WorkerThread.resume(): the worker keeps running, so
-            # the manual-only marker is stale and must be cleared too.
-            self._manual_only_pause = False
+            # Mirrors WorkerThread.resume(): the worker keeps running, so the
+            # operator latch is stale and must be released -- through the
+            # session record as well as the attribute, so the two cannot
+            # diverge (see _release_manual_only_pause).
+            self._release_manual_only_pause()
             # PHASE 2.1a: mirror WorkerThread.resume() (:1657-1663) -- a
             # resumed worker is no longer detached, so the markers go and
             # the registration is lifted BEFORE the park loop above
