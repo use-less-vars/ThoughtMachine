@@ -1006,8 +1006,8 @@ class ContainerRemoveTool(_ContainerControlBase):
         container's ``thoughtmachine.workspace_id`` label must match the
         caller's workspace; a mismatch (or an unresolvable caller workspace)
         fails closed so a session can never DELETE another workspace's
-        container. Returns None when ownership is confirmed or the container
-        carries no workspace label (legacy container).
+        container. Returns None only when ownership is CONFIRMED (matching
+        label); an unlabelled container is refused, not allowed through.
         """
         labels = getattr(container, "labels", None) or {}
         owner_ws = labels.get(WORKSPACE_ID_LABEL) if hasattr(labels, "get") else None
