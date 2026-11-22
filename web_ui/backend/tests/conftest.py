@@ -375,7 +375,7 @@ def _webui_thread_bridge_census(request):
             keys_now = set(keys_before)
         for key in sorted(keys_now - keys_before, key=repr):
             problems.append("worker registry still holds %r" % (key,))
-        for ident, thread in threading.enumerate():
+        for thread in threading.enumerate():
             if id(thread) not in threads_before:
                 problems.append("thread still alive: %r" % (thread.name,))
         for thread in survivors:

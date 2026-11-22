@@ -24,6 +24,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 from tools.workspace.worker import WorkerThread
 
 
@@ -87,3 +89,17 @@ def test_reaper_kills_and_joins_a_leaked_worker_thread(tmp_path, request):
         if worker.is_alive():
             worker.kill()
             worker.join(5.0)
+
+
+@pytest.mark.thread_census
+def test_the_census_assertion_half_runs_on_a_clean_test():
+    """The ENFORCED census must be exercised by some test, on every run.
+
+    ``_webui_thread_bridge_census`` returns early unless the test carries the
+    ``thread_census`` marker, so without a marked test the assertion half is
+    dead code that no run of this root ever executes -- which is how its
+    ``for ident, thread in threading.enumerate():`` stayed broken and untested.
+    A clean test must reach the census comparison and pass it; if the loop
+    regresses, this test errors at teardown instead of passing.
+    """
+    assert True
