@@ -2871,8 +2871,11 @@ class WorkerThread(threading.Thread):
         but never GATES them: a journal failure may not stop a worker from
         dying.
         """
-        # Synchronous lifecycle transition: 'killed' must be observable before
-        # the run loop acknowledges the stop event.
+        # Publish order (lifecycle invariant): a terminal status must never be
+        # observable before the latch it implies.  An observer that reads
+        # ``status == "killed"`` must be able to conclude the stop event is
+        # already set, so the latch is set FIRST and the status second.
+        self._stop_event.set()
         self.status = "killed"
         self._write_status_file()
         if journal_reason is not None:
@@ -2904,7 +2907,10 @@ class WorkerThread(threading.Thread):
         # queued for it is rejected (runtime channel + audit log) instead of
         # being silently dropped or started on a dead instance.
         self.reject_queued_queries("killed")
-        self._stop_event.set()
+        # The stop latch is already published above, before the status write:
+        # ``Event.set()`` is idempotent and nothing in this class clears this
+        # latch, so the late call that used to sit here was a pure no-op and
+        # the earliest publication is the authoritative one.
         # Cancel THIS worker's in-flight turn so a long-blocking tool (e.g.
         # ``sleep``) returns instead of waiting out the full block.  This is a
         # per-worker token, not a process-global interrupt: killing this worker
