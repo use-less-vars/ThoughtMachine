@@ -144,25 +144,88 @@ def _wait_until(predicate, timeout=10.0, interval=0.05):
     return False
 
 
+#: How long teardown waits for a killed worker thread to actually exit.
+WORKER_JOIN_TIMEOUT = 10.0
+#: How long the module-scope receipt waits for stragglers to settle.
+LEAK_SETTLE_TIMEOUT = 10.0
+
+
+def _is_live(t) -> bool:
+    """``t.is_alive()`` that tolerates an unstarted stub.
+
+    Some tests register a ``WorkerThread.__new__(WorkerThread)`` placeholder
+    (``Thread.__init__`` never ran) to drive a refusal path; such an object has
+    no thread to leak and ``is_alive()`` raises on it.
+    """
+    try:
+        return bool(t.is_alive())
+    except AssertionError:
+        return False
+
+
+def _live_worker_threads() -> set:
+    """Every ``WorkerThread`` still alive in this process right now."""
+    return {t for t in threading.enumerate() if isinstance(t, WorkerThread) and _is_live(t)}
+
+
+def _describe_worker(t: threading.Thread) -> str:
+    stop_event = getattr(t, "_stop_event", None)
+    return (
+        f"{t.name} (status={getattr(t, 'status', '?')!r}, "
+        f"detach_requested={getattr(t, '_detach_requested', '?')!r}, "
+        f"stop_event_set={bool(stop_event is not None and stop_event.is_set())})"
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+# pylint: disable=unused-argument
+def _no_worker_thread_leaks():
+    """MODULE-SCOPE receipt: this module may not leave a live WorkerThread behind.
+
+    ``stop()`` is a DETACH by design (PHASE 2.1a): it parks the thread and never
+    sets ``_stop_event``, so a teardown that only calls ``stop(); join()`` cannot
+    terminate it.  The parked thread keeps running in the interpreter (polling
+    ``command.json`` once a second) and leaks into later modules, where it can
+    wedge an unrelated required CI check.  This fixture turns the leak into a
+    hard failure naming the survivors instead of a silently swallowed stall.
+    """
+    before = _live_worker_threads()
+    yield
+    deadline = time.monotonic() + LEAK_SETTLE_TIMEOUT
+    survivors = _live_worker_threads() - before
+    while survivors and time.monotonic() < deadline:
+        time.sleep(0.05)
+        survivors = _live_worker_threads() - before
+    assert not survivors, (
+        f"{len(survivors)} WorkerThread(s) still alive after "
+        f"tests/test_worker_sync_query_timeout_containment.py finished (waited "
+        f"{LEAK_SETTLE_TIMEOUT:.0f}s): " + ", ".join(sorted(_describe_worker(t) for t in survivors))
+    )
+
+
 @pytest.fixture(autouse=True)
 def _registry_teardown():
     """run() does NOT unregister the thread — tests register manually and
-    must pop their entries afterwards; stop/join any stragglers so nothing
-    leaks into later tests."""
+    must pop their entries afterwards; kill (NOT ``stop()``, which only parks
+    the thread) and join any stragglers so nothing leaks into later tests."""
     with worker_module._registry_lock:
         preexisting = set(worker_module._worker_registry.keys())
     yield
     with worker_module._registry_lock:
         added = [k for k in worker_module._worker_registry.keys() if k not in preexisting]
         threads = [worker_module._worker_registry.pop(k, None) for k in added]
+    threads = [t for t in threads if t is not None]
     for t in threads:
-        if t is None:
+        if _is_live(t):
+            t.kill()
+    for t in threads:
+        if not _is_live(t):
             continue
-        try:
-            t.stop()
-        except Exception:
-            pass
-        t.join(timeout=5)
+        t.join(timeout=WORKER_JOIN_TIMEOUT)
+        assert not _is_live(t), (
+            f"worker {t.name} still alive {WORKER_JOIN_TIMEOUT:.0f}s after kill(); "
+            + _describe_worker(t)
+        )
 
 
 def _spawn_worker(tmp_path, monkeypatch, name, session_id, container_manager=None):
