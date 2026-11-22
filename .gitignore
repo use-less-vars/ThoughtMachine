@@ -485,3 +485,6 @@ web_ui/frontend/.dist-build-stamp
 # is a catch-all, so the negation is required or the file is never versioned and
 # vanishes on the next clone.
 !docs/design-worker-presence.md
+# Dated direction record (2026-11-22): ships with the repo so the README can
+# point at it and the next scoring pass can re-check its [N] tags.
+!docs/DIRECTION_2026-11-22.md
