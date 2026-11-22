@@ -121,11 +121,56 @@ BACKEND_PID=""
 VITE_PID=""
 BACKEND_LOG="$SCRIPT_DIR/logs/backend_startup.log"
 
+# ------------------------------------------------------------------- forensics
+# Crash forensics (scripts/crash_forensics.py). INSTRUMENTATION, NOT A GATE: every
+# call below is best-effort, so a forensic failure can never refuse, delay or crash
+# a boot -- a machine that will not start is worse than one that cannot explain a
+# crash. The module fails open (one warning, exit 0); the wrapper below fails open
+# too, and only speaks up for a failure the module could not report itself (bad
+# args, missing interpreter). Artifacts are append-only JSONL under logs/crash/
+# (git-ignored): nothing is truncated, no existing log is moved, and the vault is
+# never written. The heartbeat runs HERE, in the launcher's process tree, never
+# inside the backend, so it outlives the process it measures and can record the
+# death itself.
+FORENSICS="$SCRIPT_DIR/scripts/crash_forensics.py"
+CRASH_DIR="$SCRIPT_DIR/logs/crash"
+CRASH_KEEP=10               # backend-*.log archives retained
+HEARTBEAT_SECS=2            # heartbeat sampling interval
+FORENSICS_WARNED=0
+forensic() {
+    # Always returns 0 no matter what happens.
+    command -v python3 >/dev/null 2>&1 || return 0
+    [ -f "$FORENSICS" ] || return 0
+    local rc=0
+    python3 "$FORENSICS" "$@" || rc=$?
+    if [ "$rc" -ne 0 ] && [ "$FORENSICS_WARNED" -eq 0 ]; then
+        FORENSICS_WARNED=1
+        echo "  WARNING: crash forensics ($1) exited rc=$rc; startup continues." >&2
+    fi
+    return 0
+}
+
+# Wait for the backend and record WHY it ended. The rc is captured here and
+# returned unchanged, so every existing "BACKEND_RC=$?; exit" path behaves
+# exactly as before. record-exit runs BEFORE the caller prints or exits: on a
+# signal death it snapshots the log while those bytes still exist (the next
+# launch's tee truncates them).
+reap_backend() {
+    wait "$BACKEND_PID" 2>/dev/null
+    local rc=$?
+    forensic record-exit --rc "$rc" --log "$BACKEND_LOG" --dir "$CRASH_DIR"
+    return "$rc"
+}
+
 cleanup() {
     if [ -n "${VITE_PID:-}" ]; then
         kill "$VITE_PID" 2>/dev/null || true
         wait "$VITE_PID" 2>/dev/null || true
     fi
+    # Deliberately NOT instrumented: this path is the user's own Ctrl-C/TERM, it
+    # runs inside a trap where nothing may stall, and it already discards the rc
+    # with "|| true". User-initiated stops are recorded by kill_thoughtmachine.sh
+    # instead; this script records the deaths it did not ask for.
     if [ -n "${BACKEND_PID:-}" ]; then
         kill "$BACKEND_PID" 2>/dev/null || true
         wait "$BACKEND_PID" 2>/dev/null || true
@@ -179,6 +224,10 @@ PY
 start_backend() {
     # $1 = backend command line (kept word-split on purpose)
     mkdir -p "$SCRIPT_DIR/logs"
+    # Copy the previous run's log aside BEFORE tee truncates it, then bracket the
+    # boot with a header (so a crash during startup still has an environment).
+    forensic archive-log --log "$BACKEND_LOG" --dir "$CRASH_DIR" --keep "$CRASH_KEEP"
+    forensic header --dir "$CRASH_DIR" --argv "$1"
     echo "  Starting backend; console output mirrored to logs/backend_startup.log ..."
     # shellcheck disable=SC2086
     # The subshell execs the backend, so $! is the backend's own PID (tee's
@@ -186,9 +235,12 @@ start_backend() {
     ( exec $1 ) > >(tee "$BACKEND_LOG") 2>&1 &
     BACKEND_PID=$!
     echo "  Backend PID: $BACKEND_PID"
+    # Sample the backend from the launcher's tree until it is gone; backgrounded so
+    # it cannot delay the health gate, and it stops itself (one interval after death).
+    forensic heartbeat --pid "$BACKEND_PID" --dir "$CRASH_DIR" --interval "$HEARTBEAT_SECS" &
     if ! wait_for_backend "$BACKEND_PID" "$TM_BACKEND_PORT"; then
         kill "$BACKEND_PID" 2>/dev/null || true
-        wait "$BACKEND_PID" 2>/dev/null || true
+        reap_backend || true
         echo ""
         echo "Backend failed to start. See logs/backend_startup.log. Last lines:"
         tail -50 "$BACKEND_LOG" 2>/dev/null | sed 's/^/  /'
@@ -424,7 +476,7 @@ if $DOCTOR_MODE; then
     echo ""
     echo "BACKEND-HEALTHY"
     echo "  (--doctor: backend verified healthy; press Ctrl-C to stop)"
-    wait "$BACKEND_PID"
+    reap_backend
     BACKEND_RC=$?
     echo "  Backend exited (rc=$BACKEND_RC)."
     exit "$BACKEND_RC"
@@ -492,7 +544,7 @@ if ! $DEV_MODE; then
     echo ""
     echo "  Backend is running (PID $BACKEND_PID); serving the frontend on http://localhost:$TM_BACKEND_PORT."
     echo "  Stop it with Ctrl-C."
-    wait "$BACKEND_PID"
+    reap_backend
     BACKEND_RC=$?
     exit "$BACKEND_RC"
 fi
@@ -561,7 +613,7 @@ else
     echo "  Stop it with Ctrl-C; the frontend dev server is stopped automatically."
 fi
 echo ""
-wait "$BACKEND_PID"
+reap_backend
 BACKEND_RC=$?
 
 echo "  Backend exited (rc=$BACKEND_RC) - stopping the frontend dev server ..."
