@@ -39,6 +39,7 @@ from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from pydantic import Field
+from pydantic.json_schema import SkipJsonSchema
 
 from .base import ToolBase
 
@@ -991,18 +992,53 @@ class ContainerRemoveTool(_ContainerControlBase):
     """
     tool: Literal["ContainerRemoveTool"] = "ContainerRemoveTool"
 
+    # SECURITY (F4): removal is scoped to ONE workspace, exactly like the read
+    # path (ContainerStatusTool/ContainerListTool). ToolExecutor pops any
+    # caller-supplied ``workspace_id`` and injects its own resolved id, so the
+    # workspace that authorises the delete can never be chosen by the model.
+    pinned_workspace_id: ClassVar[bool] = True
+
     container_id_or_name: str = Field(
         ...,
         min_length=1,
         description="ID or name of the container to remove (returned by ContainerStartTool)."
     )
-    workspace_id: Optional[str] = Field(
+    workspace_id: SkipJsonSchema[Optional[str]] = Field(
         default=None,
-        description=(
-            "Optional workspace id; resolved from the registry workspace when "
-            "omitted."
-        ),
+        exclude=True,
+        description="Workspace id injected by ToolExecutor; never a caller argument.",
     )
+
+    def _workspace_ownership_refusal(self, manager, container) -> Optional[str]:
+        """Return a refusal message when the container is not owned by this workspace.
+
+        The delete path must be scoped exactly like the read path: the
+        container's ``thoughtmachine.workspace_id`` label must match the
+        caller's workspace; a mismatch (or an unresolvable caller workspace)
+        fails closed so a session can never DELETE another workspace's
+        container. Returns None only when ownership is CONFIRMED (matching
+        label); an unlabelled container is refused, not allowed through.
+        """
+        labels = getattr(container, "labels", None) or {}
+        owner_ws = labels.get(WORKSPACE_ID_LABEL) if hasattr(labels, "get") else None
+        caller_ws = getattr(manager, "workspace_id", None)
+        if not caller_ws or str(caller_ws) in ("", "default"):
+            return "cannot verify container ownership: this session's workspace is unknown"
+        if owner_ws and str(owner_ws) != str(caller_ws):
+            return (f"container belongs to workspace `{owner_ws}`; "
+                    f"this session is `{caller_ws}`.")
+        if not owner_ws:
+            # ASYMMETRY (deliberate): the READ path (ContainerStatusTool)
+            # warns and proceeds on an unlabelled legacy container, because
+            # inspecting one is harmless.  DELETE must not: an unlabelled
+            # container is indistinguishable from another workspace's, and a
+            # delete cannot be undone or reviewed afterwards.  So this layer
+            # fails CLOSED here where the read layer fails open.
+            return (
+                "cannot verify container ownership: container carries no "
+                "workspace label"
+            )
+        return None
 
     def execute(self) -> str:
         start_time = time.time()
@@ -1033,6 +1069,18 @@ class ContainerRemoveTool(_ContainerControlBase):
                 container_id=self.container_id_or_name,
                 status="error",
                 error=str(e),
+                duration=time.time() - start_time,
+            )
+
+        # Ownership is checked BEFORE the lifecycle-class refusals: a container
+        # in another workspace must not even learn why it would be refused.
+        _refusal = self._workspace_ownership_refusal(manager, container)
+        if _refusal is not None:
+            return self._respond(
+                False,
+                container_id=self.container_id_or_name,
+                status="refused",
+                reason=_refusal,
                 duration=time.time() - start_time,
             )
 

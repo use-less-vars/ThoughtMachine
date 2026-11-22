@@ -488,6 +488,17 @@ class ToolExecutor:
             # injected below from this executor's own ``session_id``.
             tool_args.pop('session_id', None)
 
+            # SECURITY (F4): a tool that is scoped to ONE workspace must never
+            # receive that workspace from the caller either -- same reasoning,
+            # same place: dropped HERE before validation, so a hallucinated or
+            # disagreeing value is ignored rather than rejected, and it can
+            # never win.  Declaration-gated: only tools that declare
+            # ``pinned_workspace_id`` own the value, so a tool whose public
+            # ``workspace_id`` field is a genuine argument (e.g. a credential
+            # scope) keeps it.
+            if getattr(tool_class, 'pinned_workspace_id', False):
+                tool_args.pop('workspace_id', None)
+
             # SECURITY (C68): fail CLOSED when a tool whose actions reach a
             # session-scoped resource (worker spawn/park/journal) declares that
             # it needs an authenticated session and the executor has none.
@@ -556,6 +567,14 @@ class ToolExecutor:
             # resolution happened (instead of relying on ``locals()``).
             effective: Optional[Dict[str, Any]] = None
 
+            # SECURITY (F4): the workspace id is resolved INSIDE the gate branch
+            # below (the precedence there is security-relevant), but the
+            # pinned-tool injection at the session_id injection site needs a
+            # binding that exists even when the gate branch does not run -- so
+            # the seed (the explicitly passed workspace id) is hoisted here and
+            # the cascade in the branch refines it in place.
+            ws_id: Optional[str] = workspace_id or None
+
             if GATE_AVAILABLE and session_perms_obj is not None:
                 # Resolve the workspace ID the gate is entitled to enforce.
                 #
@@ -587,7 +606,6 @@ class ToolExecutor:
                 # over-privileges.
                 workspace_path = getattr(self.config, 'workspace_path', None)
                 required_categories = tool_class.get_required_categories(arguments)
-                ws_id = workspace_id or None
                 if not ws_id and session_id:
                     try:
                         _store = self._get_session_store()
@@ -798,6 +816,16 @@ class ToolExecutor:
             # Inject session_id only for tools that support it (e.g. Worker)
             if 'session_id' in valid_field_names:
                 tool_args['session_id'] = session_id
+
+            # SECURITY (F4): the pinned workspace id is injected from THIS
+            # executor's own resolution -- never from the caller, whose value
+            # was dropped before validation.  This is the single pin site for
+            # the workspace, mirroring the ``session_id`` injection above.
+            if (
+                getattr(tool_class, 'pinned_workspace_id', False)
+                and 'workspace_id' in valid_field_names
+            ):
+                tool_args['workspace_id'] = ws_id
 
             # Inject the calling worker's name (if any) for tools that declare
             # the field (e.g. ContainerStartTool / DockerCodeRunner), so
