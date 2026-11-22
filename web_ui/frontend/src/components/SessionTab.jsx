@@ -1476,6 +1476,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
             mode={mode}
             sessionId={currentSessionId}
             sessionReady={sessionReady}
+            /* The loaded session's own workspace, else the route's: a fresh
+             * session has no id yet, so this is the only way the server can
+             * place a first-turn pasted image durably. */
+            workspaceId={workspaceId || routeWorkspaceId}
           />
         </div>
         {/* Session list is rendered by App, not per-tab */}

@@ -32,7 +32,13 @@
  *
  * Props:
  *   sendCommand(command, payload)
- *   status, isRunning, config, mode, sessionId, sessionReady
+ *   status, isRunning, config, mode, sessionId, sessionReady, workspaceId
+ *
+ * `workspaceId` is the workspace this tab belongs to (the loaded session's own
+ * workspace, else the route's). A fresh session has no id yet, so it is the
+ * only thing that can tell the server where a FIRST-turn pasted image belongs;
+ * without it such an image stays cache-only and is gone after a reload
+ * (backend: `_resolve_ingest_workspace_id` in web_ui/backend/server.py).
  */
 
 import React, { useState, useRef } from 'react'
@@ -90,7 +96,7 @@ function probeImageDimensions(dataUrl) {
   })
 }
 
-function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId, sessionReady }) {
+function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId, sessionReady, workspaceId = null }) {
   const [query, setQuery] = useState('')
   const textareaRef = useRef(null)
   /* Attached images: {id, dataUrl, mediaType, size, width, height}. The ref
@@ -229,6 +235,10 @@ function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId, ses
       sendCommand('start_session', {
         query: trimmedQuery,
         config: { ...(config ?? {}), mode },
+        /* A brand-new session cannot be named by id, so name the workspace it
+         * is being started in: the server validates the id against the
+         * registry before writing any pasted image into it. */
+        ...(workspaceId ? { workspace_id: workspaceId } : {}),
         ...imagesEnvelope
       })
     }
