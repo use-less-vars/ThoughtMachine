@@ -43,6 +43,7 @@ monkeypatched instead (same seam as ``tests/test_bridge_stop_semantics.py``).
 """
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -52,6 +53,7 @@ import pytest
 import agent.events as events_mod
 from agent.events import EventType, create_event, global_event_bus
 from session.store import FileSystemSessionStore
+from tools.workspace.worker_thread import WorkerThread
 from web_ui.backend.bridge import WebAgentBridge
 
 # Every attribute the bridge uses to hold a handle on the global bus
@@ -239,3 +241,182 @@ def test_bridge_stores_a_non_none_subscription_for_every_global_sub(
         )
     finally:
         bridge.stop()
+
+
+# ---------------------------------------------------------------------------
+# Symptom pins: the leak is a COUNT, and "stop()" is not a kill.
+#
+# (A)-(C) above pin the detach behaviour one handle at a time.  The tests below
+# pin the two things a session actually feels:
+#
+#   (D) after a bridge is detached, the bus subscriber counts are back to the
+#       baseline they started from -- measured, not inferred from a handle;
+#   (E) positive control: WITHOUT the detach the counts do NOT come back.  A
+#       count assertion that cannot fail proves nothing, so the harness's
+#       sensitivity is pinned here;
+#   (F) ``WorkerThread.stop()`` is ``detach()``: the thread is still ALIVE
+#       after it, so a teardown built on ``stop()`` reaps nothing.  ``kill()``
+#       is what actually ends the run loop.
+# ---------------------------------------------------------------------------
+
+def _bus_counts():
+    """{event type value: subscriber count} for the global bus."""
+    return {
+        getattr(event_type, 'value', str(event_type)): len(callbacks)
+        for event_type, callbacks in global_event_bus._subscribers.items()
+    }
+
+
+def _wait_until(predicate, timeout=10.0, interval=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+class _FakeWorkerContext:
+    """Minimal ``WorkerContext`` stand-in (``run()`` reads a few methods only)."""
+
+    def __init__(self):
+        self.user_history = [{'role': 'system', 'content': 'test worker'}]
+
+    def compact_after_summary(self):
+        pass
+
+    def estimated_context_tokens(self):
+        return 10
+
+    def to_persistable_dict(self):
+        return {'user_history': self.user_history}
+
+
+class _FakeWorkerAgent:
+    """A stand-in agent; deliberately has NO ``state`` attribute."""
+
+
+def _spawn_worker_thread(tmp_path, monkeypatch, name="w-census", session_id="s-census"):
+    """A REAL ``WorkerThread``, started, parked and ``ready``.
+
+    Same recipe as ``tests/test_worker_detached_queue.py::_spawn_worker``: the
+    LLM/agent layer is faked so the run loop parks instead of taking a turn.
+    No Docker, no network, no LLM.
+    """
+    monkeypatch.setattr(WorkerThread, "_load_context",
+                        lambda self: _FakeWorkerContext())
+    monkeypatch.setattr(WorkerThread, "_save_context", lambda self: None)
+    monkeypatch.setattr(WorkerThread, "_heartbeat_tick", lambda self: None)
+    thread = WorkerThread(
+        name=name,
+        definition={"name": name, "system_prompt": "You are a test worker."},
+        agent_config={},
+        workspace_dir=tmp_path,
+        session_id=session_id,
+        max_container_count=4,
+        max_token_usage=None,
+        max_runtime_s=None,
+    )
+    thread._agent = _FakeWorkerAgent()
+    thread._last_elapsed_val = 0.0
+    thread.start()
+    assert _wait_until(lambda: thread.status == "ready"), (
+        f"worker {name!r} never reached ready "
+        f"(status={thread.status!r}, error={thread.error!r})"
+    )
+    return thread
+
+
+def test_detaching_a_bridge_returns_the_subscriber_counts_to_baseline(
+    clean_global_bus, tmp_path
+):
+    """(D) After the real teardown, every global-bus count is back to baseline.
+
+    This is the whole symptom in one assertion: a leaked bridge is not a lost
+    handle, it is a subscriber that the next ``WORKER_SPAWNED`` publish still
+    has to call.
+    """
+    baseline = _bus_counts()
+
+    bridge = _make_bridge(tmp_path, "counts-return", "session-counts-return")
+    try:
+        grown = _bus_counts()
+        assert grown != baseline, (
+            "precondition: constructing a bridge must add global subscribers; "
+            f"counts did not move ({grown!r})"
+        )
+        assert grown.get('worker_spawned', 0) == baseline.get('worker_spawned', 0) + 1, (
+            f"precondition: expected exactly one more WORKER_SPAWNED subscriber, "
+            f"{baseline.get('worker_spawned', 0)} -> {grown.get('worker_spawned', 0)}"
+        )
+    finally:
+        bridge.stop()
+
+    after = _bus_counts()
+    assert after == baseline, (
+        "a bridge detached via stop() left global-bus subscribers behind: "
+        f"{sorted(set(after) | set(baseline))!r} -- before={baseline!r} "
+        f"after={after!r}.  Every leaked subscriber is called on every later "
+        "publish, so the cost of one leak grows with the number of bridges the "
+        "process has ever built."
+    )
+
+
+def test_without_the_detach_the_counts_do_not_return(clean_global_bus, tmp_path):
+    """(E) Positive control: skip the detach and the counts stay up.
+
+    Without this, (D) would pass just as happily against a bus that never
+    recorded anything.
+    """
+    baseline = _bus_counts()
+    bridge = _make_bridge(tmp_path, "counts-stay", "session-counts-stay")
+    try:
+        # The control: NO stop() here, on purpose.
+        after = _bus_counts()
+        assert after != baseline, (
+            "control is broken: an undetached bridge did not change the "
+            f"subscriber counts ({after!r})"
+        )
+        assert after.get('worker_spawned', 0) == baseline.get('worker_spawned', 0) + 1, (
+            "control is broken: expected the undetached bridge to add exactly "
+            f"one WORKER_SPAWNED subscriber, got {after.get('worker_spawned', 0)}"
+        )
+    finally:
+        bridge.stop()
+
+    assert _bus_counts() == baseline, (
+        "the control's own bridge did not detach, so it would poison the rest "
+        "of the session"
+    )
+
+
+def test_worker_thread_stop_parks_it_and_kill_ends_it(tmp_path, monkeypatch):
+    """(F) ``stop()`` leaves a live thread; ``kill()`` is what ends it.
+
+    ``WorkerThread.stop`` (tools/workspace/worker_thread.py:2796) is an alias
+    for ``detach``: the thread stays ALIVE and parked.  Any teardown written
+    with ``stop()`` -- the shape a leak harness is tempted by -- therefore reaps
+    nothing at all.
+    """
+    thread = _spawn_worker_thread(tmp_path, monkeypatch)
+    try:
+        thread.stop()
+
+        assert thread.is_alive(), (
+            "WorkerThread.stop() must keep the thread alive (it is detach(), "
+            "not a kill); a reaper built on stop() reaps nothing"
+        )
+        assert thread.status == "detached", (
+            f"expected the detached status after stop(), got {thread.status!r}"
+        )
+
+        thread.kill()
+
+        assert _wait_until(lambda: not thread.is_alive()), (
+            "WorkerThread.kill() did not end the run loop within 10s "
+            f"(status={thread.status!r}, still alive={thread.is_alive()})"
+        )
+    finally:
+        if thread.is_alive():
+            thread.kill()
+            thread.join(5.0)

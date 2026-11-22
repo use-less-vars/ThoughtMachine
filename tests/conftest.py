@@ -11,6 +11,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import threading
 import subprocess
 import warnings
 
@@ -497,3 +498,320 @@ def _restore_provider_registry():
     finally:
         ProviderFactory._providers = saved
 
+
+# ---------------------------------------------------------------------------
+# Thread / bridge census: reap what a test spawns, then count what is left.
+#
+# Nothing in the suite used to end what it started.  A test that spawns a
+# ``WorkerThread`` leaves a live thread and its registry entry behind; a test
+# that builds a ``WebAgentBridge`` leaves that bridge subscribed to the
+# process-global ``EventBus`` and to every per-worker bus it discovered.  The
+# leak is invisible to the test that causes it and expensive for every test
+# after it in the same process: one ``WORKER_SPAWNED`` publish is dispatched
+# once per bridge the process has ever built, so a module's cost grows with the
+# number of tests that ran before it.
+#
+# This fixture makes that VISIBLE, per test:
+#
+#   * before -- snapshot the worker-registry key set, the live-thread set and
+#     (when the census is enforced) the subscriber counts of the global bus
+#     plus every registered per-worker bus;
+#   * after  -- reap what the test created.  ``kill()``, never ``stop()``:
+#     ``WorkerThread.stop`` is an alias for ``detach``
+#     (tools/workspace/worker_thread.py:2796) and leaves the thread ALIVE and
+#     parked, so a reaper built on ``stop()`` would reap nothing.  ``kill()``
+#     (same file, :2856) sets the latch the run loop is waiting on; the
+#     ``join`` is bounded.  Bridges the test constructed are detached through
+#     the bridge's real teardown path, ``WebAgentBridge.stop()``
+#     (web_ui/backend/bridge.py:2288), which is what ``close_session`` and the
+#     server shutdown path call;
+#   * then   -- assert the census (opt-in, see ``_CENSUS_MODULES``).
+#
+# The reaping half is autouse and unconditional and never fails a test (it
+# cannot: it never raises, and the census is skipped when the test already
+# failed).  The assertion half is opt-in so the harness can land without
+# turning a pre-existing leak into somebody else's red build:
+# ``_CENSUS_MODULES`` names the modules that are green with it enforced today,
+# and a test can also opt in with ``@pytest.mark.thread_census``.
+# ---------------------------------------------------------------------------
+
+_REAP_JOIN_TIMEOUT = 5.0
+
+# Modules (``request.module.__name__``) that opt in to the hard census
+# assertion.  Measured, not guessed: see the commit body for the blast radius
+# of enforcing it everywhere.
+_CENSUS_MODULES = frozenset({
+    "tests.test_event_bus_subscription_leak",
+})
+
+_CENSUS_MARKER = "thread_census"
+
+# Memoized: the symbol check imports three repo modules, so it runs once.
+_CENSUS_SYMBOLS_OK = False
+
+# Set by the ``pytest_runtest_makereport`` hook below: the call-phase report of
+# the test being torn down, so the census can stay quiet when the test itself
+# already failed (a second, confusing failure would bury the first).
+_CENSUS_CALL_REPORT = pytest.StashKey()
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if call.when == "call":
+        item.stash[_CENSUS_CALL_REPORT] = report
+    return report
+
+
+def _census_registry():
+    """The process-global ``WorkerRegistry`` singleton."""
+    from tools.workspace.worker_registry import WorkerRegistry
+
+    return WorkerRegistry.get_instance()
+
+
+def _census_buses():
+    """Every bus whose subscriber lists the census reads.
+
+    The process-global bus plus every per-worker bus the registry still holds.
+    Strong references are kept so the "after" counts are read off the same
+    objects: a bus that was merely dropped leaks no subscriber, and it must not
+    look like a leak just because it left the registry.
+    """
+    from agent.events import global_event_bus
+
+    buses = {"global": global_event_bus}
+    try:
+        registry = _census_registry()
+        with registry._bus_registry_lock:
+            per_worker = dict(registry._worker_event_bus_registry)
+    except Exception:
+        per_worker = {}
+    for key, bus in per_worker.items():
+        buses["worker%r" % (tuple(key),)] = bus
+    return buses
+
+
+def _census_bus_counts(buses):
+    """{bus label: ({event type value: subscriber count}, wildcard count)}."""
+    counts = {}
+    for label, bus in buses.items():
+        subscribers = getattr(bus, "_subscribers", None)
+        row = {}
+        if isinstance(subscribers, dict):
+            for event_type, callbacks in list(subscribers.items()):
+                row[getattr(event_type, "value", str(event_type))] = len(callbacks)
+        counts[label] = (row,
+                         len(getattr(bus, "_wildcard_subscribers", None) or ()))
+    return counts
+
+
+def _census_threads():
+    return {id(thread): thread for thread in threading.enumerate()}
+
+
+def _census_is_worker_thread(obj):
+    """Duck-typed ``WorkerThread`` check.
+
+    ``tests/tools/test_worker_registry.py`` registers plain strings and
+    ``MagicMock``s in the registry, so a reaper that trusted the registry alone
+    would end up calling ``.kill()`` on a ``str``.
+    """
+    return (
+        isinstance(obj, threading.Thread)
+        and callable(getattr(obj, "kill", None))
+        and hasattr(obj, "worker_name")
+    )
+
+
+def _census_symbols():
+    """Fail loudly if a symbol the harness reaps through was renamed.
+
+    A reaper that silently reaps nothing is worse than no reaper: it would keep
+    the census green while the leak kept growing.
+    """
+    from tools.workspace.worker_registry import WorkerRegistry
+    from tools.workspace.worker_thread import WorkerThread
+    from web_ui.backend.bridge import WebAgentBridge
+
+    required = (
+        (WorkerThread, "kill"),
+        (WorkerRegistry, "get_instance"),
+        (WorkerRegistry, "get_all_workers"),
+        (WebAgentBridge, "stop"),
+        (WebAgentBridge, "_unsubscribe_security_events"),
+        (WebAgentBridge, "_unsubscribe_worker_events"),
+    )
+    missing = ["%s.%s" % (owner.__name__, name)
+               for owner, name in required
+               if not callable(getattr(owner, name, None))]
+    if missing:
+        pytest.fail(
+            "thread/bridge census harness: required symbol(s) missing: "
+            + ", ".join(missing)
+            + " -- the reaper would silently reap nothing; fix the harness.",
+            pytrace=False,
+        )
+    return WebAgentBridge
+
+
+def _reap_bridges(bridges):
+    """Detach every bridge the test built, through its real teardown path."""
+    for bridge in bridges:
+        try:
+            bridge.stop()
+        except Exception as exc:
+            # A reaper may never mask the test's own failure, so it reports and
+            # keeps going rather than propagating.
+            print("thread census: bridge.stop() failed for %r: %s" % (bridge, exc),
+                  file=sys.stderr)
+            for name in ("_unsubscribe_security_events",
+                         "_unsubscribe_worker_events"):
+                try:
+                    getattr(bridge, name, lambda: None)()
+                except Exception:
+                    pass
+
+
+def _reap_worker_threads(threads_before, keys_before):
+    """``kill()`` and bounded-``join`` every worker thread the test left behind.
+
+    Candidates are the worker threads registered under a key the test added and
+    every worker thread that is alive now but was not alive before the test.
+    Returns the threads still alive after the bounded join.
+    """
+    candidates = []
+    try:
+        registered = _census_registry().get_all_workers()
+    except Exception:
+        registered = {}
+    for key, thread in registered.items():
+        if key not in keys_before and _census_is_worker_thread(thread):
+            candidates.append(thread)
+    for ident, thread in _census_threads().items():
+        if ident in threads_before or any(thread is c for c in candidates):
+            continue
+        if _census_is_worker_thread(thread):
+            candidates.append(thread)
+
+    survivors = []
+    for thread in candidates:
+        try:
+            thread.kill()
+        except Exception as exc:
+            print("thread census: kill() failed for %r: %s" % (thread, exc),
+                  file=sys.stderr)
+        try:
+            thread.join(_REAP_JOIN_TIMEOUT)
+        except Exception as exc:
+            print("thread census: join() failed for %r: %s" % (thread, exc),
+                  file=sys.stderr)
+        try:
+            if thread.is_alive():
+                survivors.append(thread)
+        except Exception:
+            pass
+    return survivors
+
+
+def _census_enforced(request):
+    name = getattr(getattr(request, "module", None), "__name__", "")
+    if name in _CENSUS_MODULES:
+        return True
+    return request.node.get_closest_marker(_CENSUS_MARKER) is not None
+
+
+def _census_fail(problems):
+    listed = "\n".join("  - " + line for line in problems[:20])
+    more = "" if len(problems) <= 20 else "\n  ... and %d more" % (len(problems) - 20)
+    pytest.fail(
+        "thread/bridge census: this test left process-global state behind "
+        "(the autouse reaper already ran, so these survived ``kill()`` + "
+        "%.1fs join and ``WebAgentBridge.stop()``):\n" % _REAP_JOIN_TIMEOUT
+        + listed + more,
+        pytrace=False,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _thread_bridge_census(request, monkeypatch):
+    """Reap the threads and bridges a test leaves; opt-in, assert a census."""
+    global _CENSUS_SYMBOLS_OK
+    if _CENSUS_SYMBOLS_OK:
+        from web_ui.backend.bridge import WebAgentBridge as bridge_class
+    else:
+        bridge_class = _census_symbols()
+        _CENSUS_SYMBOLS_OK = True
+
+    enforced = _census_enforced(request)
+    threads_before = _census_threads()
+    try:
+        keys_before = set(_census_registry().get_all_workers())
+    except Exception:
+        keys_before = set()
+    buses = _census_buses() if enforced else {}
+    bus_counts_before = _census_bus_counts(buses) if enforced else {}
+
+    bridges_created = []
+    original_init = bridge_class.__init__
+
+    def _census_tracking_init(self, *args, **kwargs):
+        # Recorded BEFORE the call: a bridge whose __init__ raises has already
+        # subscribed to the global bus in _subscribe_to_security_events.
+        bridges_created.append(self)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(bridge_class, "__init__", _census_tracking_init)
+
+    try:
+        yield
+    finally:
+        try:
+            _reap_bridges(bridges_created)
+        except Exception as exc:
+            print("thread census: bridge reaping failed: %s" % (exc), file=sys.stderr)
+        survivors = []
+        try:
+            survivors = _reap_worker_threads(threads_before, keys_before)
+        except Exception as exc:
+            print("thread census: thread reaping failed: %s" % (exc), file=sys.stderr)
+
+        if not enforced:
+            return
+        report = request.node.stash.get(_CENSUS_CALL_REPORT, None)
+        if report is not None and report.failed:
+            # The test already failed; a second failure here would bury it.
+            return
+
+        problems = []
+        try:
+            keys_now = set(_census_registry().get_all_workers())
+        except Exception:
+            keys_now = set(keys_before)
+        for key in sorted(keys_now - keys_before, key=repr):
+            problems.append("worker registry still holds %r" % (key,))
+        for key in sorted(keys_before - keys_now, key=repr):
+            problems.append("worker registry lost the pre-test entry %r" % (key,))
+        for ident, thread in _census_threads().items():
+            if ident not in threads_before:
+                problems.append("thread still alive: %r (%r)" % (thread.name, thread))
+        for thread in survivors:
+            problems.append("worker thread survived kill()+join: %r" % (thread,))
+        bus_counts_now = _census_bus_counts(buses)
+        for label in sorted(bus_counts_before):
+            row_before, wildcard_before = bus_counts_before[label]
+            row_now, wildcard_now = bus_counts_now.get(label, ({}, 0))
+            for event_type in sorted(row_now):
+                count = row_now[event_type]
+                if count > row_before.get(event_type, 0):
+                    problems.append(
+                        "bus %s gained subscribers for %r: %d -> %d"
+                        % (label, event_type, row_before.get(event_type, 0), count)
+                    )
+            if wildcard_now > wildcard_before:
+                problems.append(
+                    "bus %s gained wildcard subscribers: %d -> %d"
+                    % (label, wildcard_before, wildcard_now)
+                )
+        if problems:
+            _census_fail(problems)
