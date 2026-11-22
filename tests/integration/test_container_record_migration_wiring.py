@@ -667,6 +667,52 @@ def test_lifespan_boot_drift_scan_threads_capabilities_and_permissions(
     assert all(c["permissions"] is not None for c in calls)
 
 
+def test_boot_drift_scan_uses_gate_fail_closed_capabilities(monkeypatch, vault):
+    """No capabilities.json => the boot scan threads the GATE's fail-closed caps.
+
+    ``security.security_gate.get_workspace_capabilities`` fails CLOSED to the
+    deny-all sentinel when ``workspaces/<id>/capabilities.json`` is missing, so
+    that is the profile the gate enforces.  The boot scan used to re-derive the
+    profile locally with a ``WorkspaceCapabilities.default()`` fallback -- the
+    fully permissive default -- so every record was compared on the policy axis
+    against a profile the gate does not enforce.  The scan must thread the
+    gate's own answer.
+    """
+    server = _load_server()
+    ws = "ws-drift-failclosed"
+    _make_container_record(ws, "cid-a", vault)
+
+    _install_fake_docker(monkeypatch, _FakeClient([]))
+    _neutralise_sweeps(monkeypatch, server)
+    _record_log(monkeypatch, server)
+
+    from security.security_gate import get_workspace_capabilities
+    from thoughtmachine.container_record import drift as drift_module
+
+    seen = []
+
+    def fake_detect(record, containers, *, permissions=None, capabilities=None):
+        seen.append(capabilities)
+        return []
+
+    monkeypatch.setattr(drift_module, "detect_record_drift", fake_detect)
+
+    _run_lifespan(server)
+
+    assert seen, "the boot scan never invoked detect_record_drift"
+    # The fail-closed path is the one exercised here.
+    assert not (vault / "workspaces" / ws / "capabilities.json").exists()
+    expected = get_workspace_capabilities(ws).to_dict()
+    assert expected["allow_docker"] is False
+    assert expected["allow_network"] is False
+    assert expected["filesystem_write"] is False
+    assert expected["git_available"] is False
+    for caps in seen:
+        assert caps is not None
+        # The gate's own answer -- never ``WorkspaceCapabilities.default()``.
+        assert caps.to_dict() == expected
+
+
 def test_boot_drift_scan_loads_capabilities_once_per_workspace(
     monkeypatch, vault
 ):
@@ -682,18 +728,24 @@ def test_boot_drift_scan_loads_capabilities_once_per_workspace(
     _neutralise_sweeps(monkeypatch, server)
     _record_log(monkeypatch, server)
 
-    from thoughtmachine import workspace_capabilities as caps_module
+    from security import security_gate
     from thoughtmachine.container_record import drift as drift_module
 
     load_calls = []
 
     def counting_load(workspace_id):
         load_calls.append(workspace_id)
-        return None  # force the default-capabilities fallback
+        # The gate's fail-closed answer (a workspace with no capabilities file
+        # resolves to the deny-all sentinel, never a permissive default).
+        return security_gate._FAIL_CLOSED_CAPABILITIES
 
-    # The source imports ``load_workspace_capabilities`` lazily (function-local)
-    # so patching the module attribute is what the running code observes.
-    monkeypatch.setattr(caps_module, "load_workspace_capabilities", counting_load)
+    # The source resolves capabilities through the GATE (``from
+    # security.security_gate import get_workspace_capabilities``, function-local)
+    # so patching the gate's attribute is what the running code observes -- the
+    # boot scan must not re-derive the profile from the raw loader.
+    monkeypatch.setattr(
+        security_gate, "get_workspace_capabilities", counting_load
+    )
 
     scanned = []
 
