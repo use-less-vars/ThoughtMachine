@@ -273,9 +273,31 @@ def test_own_pid_is_refused(monkeypatch):
 # 4. our own process group: ONE pid, never the group
 # ---------------------------------------------------------------------------
 
+def _procfs_available() -> bool:
+    """True only when the Linux procfs is MOUNTED (``/proc/self`` is a dir).
+
+    Process groups are POSIX-wide; ``/proc`` is a Linux facility.  Darwin is
+    ``os.name == "posix"`` and has no procfs at all, so ``os.name`` can never
+    stand in for a ``/proc`` capability test -- which is why the old guard,
+    whose reason named ``/proc state``, was a no-op on macOS and the state
+    reads below fell through to a failure instead of a skip.  Same directory
+    probe as ``scripts/prove_worker_pid.py``.
+    """
+    return os.path.isdir("/proc/self")
+
+
 POSIX_ONLY = pytest.mark.skipif(
     os.name != "posix",
-    reason="process groups and /proc state are POSIX-only",
+    reason="requires POSIX process groups (os.killpg/os.getpgid)",
+)
+
+PROCFS_REQUIRED_REASON = (
+    "requires Linux procfs (/proc) to read a process state; "
+    "not available on this platform"
+)
+
+PROCFS_ONLY = pytest.mark.skipif(
+    not _procfs_available(), reason=PROCFS_REQUIRED_REASON
 )
 
 
@@ -665,36 +687,84 @@ def test_session_leader_child_is_killed_as_a_group(monkeypatch):
 # 11. a zombie child must not burn the grace period
 # ---------------------------------------------------------------------------
 
+# ``_proc_state`` has THREE outcomes, never two.  A single ``None`` used to
+# stand for both of the non-state ones, so on a platform without procfs "I
+# cannot look" was reported downstream in the grammar of "I looked, and the
+# child was not a zombie".
+_PROC_STATE_GONE = "GONE"
+_PROC_STATE_UNMEASURABLE = "UNMEASURABLE"
+
+
 def _proc_state(pid):
-    """The state character of ``/proc/<pid>/stat``, or ``None`` if unreadable.
+    """State character of ``/proc/<pid>/stat``, or a sentinel saying why not.
+
+    Returns the state character when the kernel answered, ``_PROC_STATE_GONE``
+    when procfs answered "no such pid" (the child was already reaped) and
+    ``_PROC_STATE_UNMEASURABLE`` when the state cannot be read at all (no
+    procfs mounted, or an entry that exists and is unreadable).
 
     The comm field may contain spaces and parentheses, so the state is the
     first field AFTER THE LAST ``)`` -- never a naive ``split()[2]``.
+
+    ``FileNotFoundError`` on its own does NOT mean "the process is gone": it
+    also means "this platform has no procfs".  The two are told apart by
+    probing ``/proc`` itself, so that inability-to-measure is never silently
+    reported as an observed death.
     """
     try:
         with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as handle:
             data = handle.read()
+    except FileNotFoundError:
+        if not _procfs_available():
+            return _PROC_STATE_UNMEASURABLE
+        return _PROC_STATE_GONE
     except OSError:
-        return None
+        # The entry could not be read (permissions, I/O error, ...): that is
+        # not an observation of the process state either.
+        return _PROC_STATE_UNMEASURABLE
     end = data.rfind(")")
     if end == -1:
-        return None
+        return _PROC_STATE_UNMEASURABLE
     fields = data[end + 1:].split()
-    return fields[0] if fields else None
+    return fields[0] if fields else _PROC_STATE_UNMEASURABLE
 
 
-def _wait_for_zombie(pid, timeout: float = 10.0) -> None:
+# Returned by ``_wait_for_zombie`` when the state could not be read: NOT a
+# pass and NOT a failure -- the case simply cannot be measured here.
+_NOT_MEASURED = "NOT_MEASURED"
+
+
+def _wait_for_zombie(pid, timeout: float = 10.0):
     """Block until ``pid`` is a zombie -- WITHOUT reaping it.
 
     ``proc.poll()`` / ``proc.wait()`` would reap the child and delete the very
     ``/proc`` entry the case is about, so the state is read straight from
     ``/proc`` instead.
+
+    Three outcomes, kept apart on purpose:
+
+    - ``None``: a zombie WAS measured (the caller may assert on it);
+    - ``_NOT_MEASURED``: the state cannot be read at all -- no procfs on this
+      platform, or an unreadable entry.  Nothing is claimed about the child;
+      the caller must skip with ``PROCFS_REQUIRED_REASON`` rather than report
+      a dead child;
+    - ``AssertionError``: the state WAS read, repeatedly, and was never ``Z``.
+      That is a real failure and still raises the historical message.  The
+      message is a claim about the child, so it must never be reachable by a
+      platform that simply cannot look.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         state = _proc_state(pid)
         if state == "Z":
-            return
+            return None
+        if state == _PROC_STATE_UNMEASURABLE:
+            return _NOT_MEASURED
+        if state == _PROC_STATE_GONE:
+            raise AssertionError(
+                f"pid {pid} has no /proc entry and was already reaped, so its "
+                "zombie state never became observable"
+            )
         time.sleep(0.01)
     raise AssertionError(
         f"pid {pid} never became a zombie within {timeout}s "
@@ -703,6 +773,7 @@ def _wait_for_zombie(pid, timeout: float = 10.0) -> None:
 
 
 @POSIX_ONLY
+@PROCFS_ONLY
 @pytest.mark.parametrize("new_session", [False, True])
 def test_zombie_child_does_not_burn_the_grace_period(monkeypatch, new_session):
     """An exited-but-unreaped child is DEAD: teardown returns, no grace burned.
@@ -710,6 +781,13 @@ def test_zombie_child_does_not_burn_the_grace_period(monkeypatch, new_session):
     Signal 0 still succeeds on a zombie, so a ``os.killpg(pid, 0)`` poll would
     sit out the whole grace period and then SIGKILL a corpse.  Liveness must
     therefore read the ``/proc`` state (``Z`` == dead).
+
+    Two capabilities are needed and they are NOT the same one: POSIX process
+    groups (``os.killpg``/``os.getpgid``, for the monkeypatch below) and the
+    Linux procfs (to OBSERVE the ``Z`` state this case is about).  The
+    ``PROCFS_ONLY`` marker is the collection-time guard; the in-body check
+    covers the same condition discovered at run time -- without it the case
+    would report an unreadable ``/proc`` as a child that never died.
     """
     _Logs().install(monkeypatch)
     killpg = _RecordingKillpg(forward=True)
@@ -717,7 +795,8 @@ def test_zombie_child_does_not_burn_the_grace_period(monkeypatch, new_session):
 
     proc = _spawn_sleeper(new_session=new_session, seconds="0.1")
     try:
-        _wait_for_zombie(proc.pid)
+        if _wait_for_zombie(proc.pid) == _NOT_MEASURED:
+            pytest.skip(PROCFS_REQUIRED_REASON)
         tracker = ExecutionTracker()
         tracker.kill_grace_seconds = 3.0
         tracker.add("e1", {"type": "subprocess", "pid": proc.pid})
