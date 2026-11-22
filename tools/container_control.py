@@ -1018,10 +1018,15 @@ class ContainerRemoveTool(_ContainerControlBase):
             return (f"container belongs to workspace `{owner_ws}`; "
                     f"this session is `{caller_ws}`.")
         if not owner_ws:
-            logger.warning(
-                "container %s has no workspace_id label; caller workspace "
-                "unknown, allowing removal (legacy container).",
-                self.container_id_or_name,
+            # ASYMMETRY (deliberate): the READ path (ContainerStatusTool)
+            # warns and proceeds on an unlabelled legacy container, because
+            # inspecting one is harmless.  DELETE must not: an unlabelled
+            # container is indistinguishable from another workspace's, and a
+            # delete cannot be undone or reviewed afterwards.  So this layer
+            # fails CLOSED here where the read layer fails open.
+            return (
+                "cannot verify container ownership: container carries no "
+                "workspace label"
             )
         return None
 

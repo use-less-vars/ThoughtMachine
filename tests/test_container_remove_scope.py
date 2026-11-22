@@ -90,6 +90,27 @@ def test_refuses_when_caller_workspace_unknown():
     manager.remove.assert_not_called()
 
 
+# -- (e) an UNLABELLED container fails CLOSED: delete is not read -------------
+
+
+def test_refuses_unlabelled_container():
+    """No workspace label means ownership is UNVERIFIABLE, so refuse.
+
+    The read path lets an unlabelled legacy container through (inspecting one is
+    harmless); delete must not: without the label there is no way to tell our
+    container from another workspace's, and a delete cannot be undone.
+    """
+    for labels in ({}, {"thoughtmachine.container_name": "tm-x"}):
+        manager = _manager("ws-a", labels)
+        result = _run(manager)
+
+        assert result["success"] is False, labels
+        assert result["status"] == "refused", labels
+        assert "cannot verify container ownership" in result["reason"], labels
+        assert "no workspace label" in result["reason"], labels
+        manager.remove.assert_not_called()
+
+
 # ── (b) the workspace id is a pinned authority fact, not an argument ─────────
 
 
