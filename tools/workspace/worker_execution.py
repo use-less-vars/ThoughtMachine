@@ -402,11 +402,62 @@ class ExecutionTracker:
              f"terminate_all: scoped_container {execution_id} — stop({container_id})")
         container_manager.stop(container_id)
 
+    def _kill_target_refusal(self, pid) -> Optional[str]:
+        """Return the refusal layer for ``pid``, or ``None`` when it is a safe target.
+
+        ``os.killpg`` signals a PROCESS GROUP, so an id that names this very
+        process (or the group this process lives in) turns a worker teardown
+        into suicide -- the whole agent/test-runner group takes the signal.
+        Every subprocess kill therefore passes this check first:
+
+        - ``invalid_pid``: not int-convertible (or a ``bool``, which ``int()``
+          would silently turn into 0/1);
+        - ``privileged_pid``: ``pid <= 1`` (0 means "my process group", 1 is
+          init);
+        - ``self_pid``: this very process;
+        - ``own_process_group``: the pid's group is the group we live in;
+        - ``unknown_process_group``: ``os.getpgid`` refused for any reason
+          other than the pid being gone, so group membership cannot be
+          established.
+
+        A ``ProcessLookupError`` from ``os.getpgid`` means the pid is already
+        gone: there is nothing to signal, which is an ACCEPT (``None``).
+        """
+        if isinstance(pid, bool):
+            return "invalid_pid"
+        try:
+            target = int(pid)
+        except (TypeError, ValueError):
+            return "invalid_pid"
+        if target <= 1:
+            return "privileged_pid"
+        if target == os.getpid():
+            return "self_pid"
+        try:
+            target_group = os.getpgid(target)
+        except ProcessLookupError:
+            return None  # already gone -- nothing to signal
+        except OSError:
+            return "unknown_process_group"
+        try:
+            own_group = os.getpgid(0)
+        except OSError:
+            return "unknown_process_group"
+        if target_group == own_group:
+            return "own_process_group"
+        return None
+
     def _terminate_subprocess(self, worker_id, execution_id, details) -> None:
         pid = details.get("pid", details.get("process_id"))
         if pid is None:
             _log("WARNING", "workspace.lifecycle",
                  f"terminate_all: subprocess {execution_id} has no pid — skipping")
+            return
+        refusal = self._kill_target_refusal(pid)
+        if refusal is not None:
+            _log("WARNING", "workspace.lifecycle",
+                 f"terminate_all: subprocess {execution_id} — "
+                 f"refusing to signal pid {pid!r} ({refusal})")
             return
         try:
             try:
@@ -414,7 +465,18 @@ class ExecutionTracker:
                 _log("INFO", "workspace.lifecycle",
                      f"terminate_all: subprocess {execution_id} — "
                      f"killpg({pid}, SIGTERM)")
-            except (ProcessLookupError, PermissionError, OSError):
+            except PermissionError:
+                # Not permitted to signal that group: we cannot establish
+                # that it is ours, so a single-pid ``os.kill`` would be an
+                # equally blind signal.  Refuse by name instead.
+                _log("WARNING", "workspace.lifecycle",
+                     f"terminate_all: subprocess {execution_id} — not "
+                     f"permitted to killpg({pid}, SIGTERM) "
+                     f"(permission_denied); refusing single-pid fallback")
+                return
+            except OSError:
+                # Covers ProcessLookupError (no such group) and every other
+                # killpg failure: keep the historical single-pid fallback.
                 os.kill(int(pid), signal.SIGTERM)
                 _log("INFO", "workspace.lifecycle",
                      f"terminate_all: subprocess {execution_id} — "
@@ -432,6 +494,14 @@ class ExecutionTracker:
         still alive. A dead group (``ProcessLookupError``) returns immediately
         so a successful SIGTERM never triggers an extra SIGKILL.
         """
+        refusal = self._kill_target_refusal(pid)
+        if refusal is not None:
+            # The pid may have been recycled during the grace period: re-check
+            # the target before escalating to SIGKILL.
+            _log("WARNING", "workspace.lifecycle",
+                 f"subprocess {pid!r}: refusing to escalate to SIGKILL "
+                 f"({refusal})")
+            return
         grace = getattr(self, "kill_grace_seconds", EXEC_KILL_GRACE)
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
@@ -439,15 +509,27 @@ class ExecutionTracker:
                 os.killpg(pid, 0)
             except ProcessLookupError:
                 return  # already dead
-            except OSError:
-                pass
+            except PermissionError:
+                # The liveness probe was refused: group membership cannot be
+                # established, so never escalate to SIGKILL.
+                _log("WARNING", "workspace.lifecycle",
+                     f"subprocess {pid}: liveness probe refused "
+                     f"(permission_denied) — not escalating to SIGKILL")
+                return
+            except OSError as exc:
+                _log("WARNING", "workspace.lifecycle",
+                     f"subprocess {pid}: liveness probe failed ({exc}) — "
+                     f"not escalating to SIGKILL")
+                return
             time.sleep(0.05)
         try:
             os.killpg(pid, signal.SIGKILL)
             _log("INFO", "workspace.lifecycle",
                  f"subprocess {pid} still alive after {grace}s grace — "
                  f"killpg({pid}, SIGKILL)")
-        except (ProcessLookupError, PermissionError, OSError):
+        except OSError:
+            # ProcessLookupError and PermissionError are OSErrors: the
+            # single-pid SIGKILL fallback covers them exactly as before.
             try:
                 os.kill(pid, signal.SIGKILL)
                 _log("INFO", "workspace.lifecycle",
