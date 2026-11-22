@@ -278,14 +278,24 @@ def test_sessionless_manager_applies_no_filter(monkeypatch):
 # ─────────────────────────── 8-9: robustness + regression ───────────────────────────
 
 
-def test_unreadable_isolation_no_reason_and_no_exception(monkeypatch):
-    """Case 8: unreadable/absent isolation attrs -> no raise, no reason key."""
+def test_unreadable_isolation_reports_unknown_never_within(monkeypatch):
+    """Case 8: unreadable isolation attrs -> ``envelope_status`` is "unknown".
+
+    INVERTED from the old expectation, which asserted only that NO
+    ``unavailable_reason`` key appeared and treated that silence as correct.
+    That was an over-claim: "we could not read the isolation axes" and "the row
+    is inside the session's grant" are DIFFERENT facts, and publishing only the
+    first -- as a missing key -- let a caller render an unprovable row as
+    compliant.  The row must now STATE its verdict (``"unknown"``) while the
+    reason key stays absent, because there is no enumerated violation to name.
+    """
     manager = _make_manager(containers=[_persistent("p1")], session_id="sessA")
     _patch_boundaries(monkeypatch, manager, live=(None, None), wanted=("none", "ro"))
 
     result = manager.list_containers()
 
     assert [row["container_id"] for row in result] == ["p1"]
+    assert result[0]["envelope_status"] == "unknown"
     assert "unavailable_reason" not in result[0]
 
 

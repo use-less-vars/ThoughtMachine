@@ -133,7 +133,7 @@ import threading
 from datetime import datetime, timezone
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import (
     Body,
@@ -260,6 +260,140 @@ from web_ui.backend.image_ingest import (
     IMAGE_ONLY_QUERY_PLACEHOLDER,
     ingest_incoming_images,
 )
+
+# ── Pasted images: WHICH workspace the bytes are written to ───────────────
+# A durable copy exists only when ingest is given a workspace id, and the id
+# that matters is the one the READ side will search: ``GET /api/session/{sid}/
+# image/{id}`` resolves the workspace from the session store first
+# (``session_routes._session_workspace_id``), so bytes written into any other
+# workspace are a guaranteed 404 after a reload.  The browser's WebSocket URL
+# carries no ``?project=`` (``frontend/src/apiBase.js:wsUrl``), so the
+# handshake pin alone left every browser paste cache-only: alive in this
+# process, gone after F5.  Both ingest call sites go through
+# ``_ingest_turn_images`` so they cannot drift apart.
+
+
+def _turn_session_id(msg: Dict[str, Any], bridge: Any) -> Optional[str]:
+    """The session this turn belongs to: the envelope's, else the bridge's."""
+    session_id = msg.get("session_id") if isinstance(msg, dict) else None
+    if session_id:
+        return session_id
+    if bridge is None:
+        return None
+    session_id = getattr(bridge, "_session_id", None)
+    if session_id:
+        return session_id
+    return getattr(getattr(bridge, "_loaded_session", None), "session_id", None)
+
+
+def _is_registered_workspace(workspace_id: str) -> bool:
+    """True when *workspace_id* names a workspace the registry knows.
+
+    The envelope's ``workspace_id`` is REQUEST INPUT, so it is never trusted on
+    its own: an id that does not name a registered workspace must not be able to
+    create a directory tree inside the vault.  Never raises -- a registry that
+    cannot answer makes the id unusable, not the turn fatal.
+    """
+    try:
+        from thoughtmachine.workspace_registry import WorkspaceRegistry
+        return WorkspaceRegistry.get_default().get_workspace(workspace_id) is not None
+    except Exception as exc:  # noqa: BLE001
+        log('WARNING', 'server.ws',
+            f'ingest: could not validate workspace_id {workspace_id!r}: {exc}')
+        return False
+
+
+def _envelope_workspace_id(msg: Dict[str, Any]) -> Optional[str]:
+    """The workspace the CLIENT named for this turn, if it names a real one.
+
+    A brand-new session has no id and no stored record before
+    ``start_session`` runs, so the browser cannot name it by session.  The one
+    piece of workspace identity it does hold is the workspace it is looking at,
+    which ``SessionTab`` passes down to ``QueryBar`` and ``QueryBar`` puts on
+    the envelope.  Validation is ``_is_registered_workspace``; anything else
+    resolves to ``None`` so the turn falls through to the next source.
+    """
+    workspace_id = msg.get("workspace_id") if isinstance(msg, dict) else None
+    if not isinstance(workspace_id, str) or not workspace_id:
+        return None
+    if not _is_registered_workspace(workspace_id):
+        log('WARNING', 'server.ws',
+            f'ingest: envelope workspace_id {workspace_id!r} is not a registered '
+            f'workspace -- ignoring it')
+        return None
+    return workspace_id
+
+
+def _resolve_ingest_workspace_id(
+    msg: Dict[str, Any],
+    bridge: Any,
+    session_store: FileSystemSessionStore,
+    handshake_ws_id: Optional[str],
+) -> Optional[str]:
+    """Durable workspace for this turn's pasted images, highest precedence first.
+
+    1. The SESSION BINDING (``msg['session_id']``, else the bridge's live
+       binding) through ``load_session_workspace_id`` -- the very same lookup
+       the read route performs, so the bytes land where
+       ``get_session_image`` will look for them.
+    2. The bridge's workspace binding (``_workspace_id``): a session that is
+       live but not persisted yet still names its workspace.
+    3. The workspace the client named on the envelope (``workspace_id``,
+       validated against the registry): the FIRST turn of a brand-new session
+       has no session binding yet, and this is the only identity the browser
+       holds for it.
+    4. The workspace pinned at the WebSocket handshake (``?project=``) -- the
+       only authority that can speak for a client that names no workspace.
+
+    Sources 1-2 outrank 3 because they are server-side state about a session
+    that already exists; the envelope id is request input, so it only decides
+    for a turn that no binding can describe.
+
+    ``None`` means no durable copy: ``ingest_incoming_images`` then caches the
+    bytes in this process only, and they die with it.
+    """
+    session_id = _turn_session_id(msg, bridge)
+    if session_id:
+        try:
+            workspace_id = session_store.load_session_workspace_id(session_id)
+        except Exception as exc:  # noqa: BLE001 -- a bad record must not drop the turn
+            log('WARNING', 'server.ws',
+                f'ingest: could not resolve the workspace of session {session_id}: {exc}')
+            workspace_id = None
+        if workspace_id:
+            return workspace_id
+    if bridge is not None:
+        workspace_id = getattr(bridge, "_workspace_id", None)
+        if workspace_id:
+            return workspace_id
+    workspace_id = _envelope_workspace_id(msg)
+    if workspace_id:
+        return workspace_id
+    return handshake_ws_id
+
+
+def _ingest_turn_images(
+    msg: Dict[str, Any],
+    bridge: Any,
+    session_store: FileSystemSessionStore,
+    handshake_ws_id: Optional[str],
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Validate/decode this turn's pasted images into their durable workspace.
+
+    Single entry point for both commands, so ``start_session`` and
+    ``continue_session`` cannot resolve the workspace differently.
+    """
+    raw = msg.get("images") if isinstance(msg, dict) else None
+    workspace_id = _resolve_ingest_workspace_id(
+        msg, bridge, session_store, handshake_ws_id,
+    )
+    if raw and workspace_id is None:
+        count = len(raw) if isinstance(raw, (list, tuple)) else 1
+        log('WARNING', 'server.ws',
+            f'ingest: no workspace resolved for session '
+            f'{_turn_session_id(msg, bridge)!r} -- {count} pasted image(s) are '
+            f'CACHE-ONLY (in-process) and will not survive a reload')
+    return ingest_incoming_images(raw, workspace_id=workspace_id)
 
 # ── WebSocket frame cap ──────────────────────────────────────────────────
 # 16 MiB is uvicorn 0.54.0's measured default (uvicorn/config.py:207); it is
@@ -1681,10 +1815,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # decodes them once, writes them into this connection's
                     # workspace image store and hands back ids only; a rejected
                     # image aborts the turn before any session is started.  The
-                    # workspace is pinned at handshake (D2), so the bytes land
-                    # in the same workspace the bridge will bootstrap from.
-                    images, image_error = ingest_incoming_images(
-                        msg.get("images"), workspace_id=_handshake_ws_id,
+                    # workspace is resolved by ``_ingest_turn_images`` (session
+                    # binding, then bridge, then the handshake pin of D2); no
+                    # bridge is passed because any bridge here belongs to the
+                    # PREVIOUS session and is stopped a few blocks below.
+                    images, image_error = _ingest_turn_images(
+                        msg, None, session_store, _handshake_ws_id,
                     )
                     if image_error:
                         await ws.send_json({"type": "status_message", "text": f"⚠ {image_error}"})
@@ -1737,9 +1873,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "continue_session":
                     query = msg.get("query", "")
-                    # Same handshake-pinned workspace as start_session above.
-                    images, image_error = ingest_incoming_images(
-                        msg.get("images"), workspace_id=_handshake_ws_id,
+                    # Same workspace resolution as start_session above, but
+                    # here the live bridge IS this session's, so it may name
+                    # the workspace (a brand-new session has no record yet).
+                    images, image_error = _ingest_turn_images(
+                        msg, bridge, session_store, _handshake_ws_id,
                     )
                     if image_error:
                         await ws.send_json({"type": "status_message", "text": f"⚠ {image_error}"})
@@ -4771,8 +4909,41 @@ def _resolve_workspace_path(workspace_id: str, workspace_path: str = ""):
     return _validate_workspace_path(entry.root_path, workspace_id)
 
 
-def _make_container_manager(workspace_id: str, workspace_path: str = ""):
+#: Request header naming the CALLING session for read-only container views.
+#: A ``session_id`` query parameter wins over it (see
+#: ``_request_session_id``); when neither is present the view has NO session
+#: grant to compare against and every row's ``envelope_status`` is
+#: ``"unknown"`` (never a silent "within").
+CONTAINER_VIEW_SESSION_HEADER = "X-Session-Id"
+
+
+def _request_session_id(request, query_value):
+    """Resolve the calling session id: query parameter, then header, else None.
+
+    Scope is deliberately narrow -- the id only SELECTS which session's grant a
+    READ-ONLY container view is compared against. It authorises nothing: the
+    permission store still decides what that session may do, and an unknown id
+    degrades to no grant (``"unknown"``), never to a broader one.
+    """
+    if isinstance(query_value, str) and query_value.strip():
+        return query_value.strip()
+    try:
+        header = request.headers.get(CONTAINER_VIEW_SESSION_HEADER)
+    except Exception:
+        header = None
+    if isinstance(header, str) and header.strip():
+        return header.strip()
+    return None
+
+
+def _make_container_manager(workspace_id: str, workspace_path: str = "",
+                            session_id: Optional[str] = None):
     """Build a ContainerManager for the workspace.
+
+    ``session_id`` binds the manager to a session so its container envelope
+    verdicts are computed against THAT session's grant; ``None`` (the
+    dashboard/no-session case) yields ``envelope_status="unknown"`` on every
+    row instead of a false "within".
 
     Returns None when the workspace path cannot be resolved; raises when the
     manager itself cannot be constructed. Lazy import avoids circular imports.
@@ -4785,7 +4956,7 @@ def _make_container_manager(workspace_id: str, workspace_path: str = ""):
     return ContainerManager(
         workspace_path=path,
         workspace_id=workspace_id,
-        session_id=None,
+        session_id=session_id,
         session_permissions=None,
         mem_limit=DEFAULT_MEM_LIMIT,
         cpu_quota=DEFAULT_CPU_QUOTA,
@@ -5030,6 +5201,34 @@ def _live_envelope_from_container(container):
     return envelope or None
 
 
+def _envelope_view_fields(manager, container, lifecycle_class=None):
+    """``(envelope_status, unavailable_reason)`` for ONE view row; NEVER raises.
+
+    ``envelope_status`` is ALWAYS one of ``ENVELOPE_STATUSES``: a verdict that
+    cannot be computed -- or one the manager reports outside that vocabulary --
+    degrades to ``ENVELOPE_UNKNOWN``, which is a "cannot tell" and never a
+    silent "within".  ``unavailable_reason`` is returned ONLY for
+    ``ENVELOPE_OUTSIDE``; every other verdict yields ``None``.
+    """
+    from infra.container_manager import (
+        ENVELOPE_OUTSIDE,
+        ENVELOPE_STATUSES,
+        ENVELOPE_UNKNOWN,
+    )
+
+    if container is None:
+        return ENVELOPE_UNKNOWN, None
+    try:
+        status, reason = manager.envelope_verdict(container, lifecycle_class)
+    except Exception:
+        return ENVELOPE_UNKNOWN, None
+    if status not in ENVELOPE_STATUSES:
+        return ENVELOPE_UNKNOWN, None
+    if status == ENVELOPE_OUTSIDE and isinstance(reason, str) and reason:
+        return status, reason
+    return status, None
+
+
 def _recordless_view_entry(container, manager, workspace_id):
     """Build a view entry for a LIVE container that has NO record.
 
@@ -5053,7 +5252,9 @@ def _recordless_view_entry(container, manager, workspace_id):
         status = manager.status(container_id)
     except Exception:
         status = None
-    return {
+    envelope_status, unavailable_reason = _envelope_view_fields(
+        manager, container, lifecycle or None)
+    entry = {
         "id": container_id,
         "name": name,
         "note": "",
@@ -5066,10 +5267,16 @@ def _recordless_view_entry(container, manager, workspace_id):
         "live": True,
         "unrecorded": True,
         "live_envelope": _live_envelope_from_container(container),
+        "envelope_status": envelope_status,
     }
+    if unavailable_reason is not None:
+        entry["unavailable_reason"] = unavailable_reason
+    return entry
 
 
-def _container_view_entry(record, manager, workspace_id, live=None, live_envelope=None):
+def _container_view_entry(record, manager, workspace_id, live=None,
+                          live_envelope=None, envelope_status=None,
+                          unavailable_reason=None):
     """Build one container-view entry dict from a record (+ its live status).
 
     Entry keys: ``id, name, note, kind, state, intent_snapshot, permissions,
@@ -5109,7 +5316,17 @@ def _container_view_entry(record, manager, workspace_id, live=None, live_envelop
         except Exception:
             status = None
     state = _map_container_view_state(status, getattr(record, "state", ""))
-    return {
+    from infra.container_manager import (
+        ENVELOPE_OUTSIDE,
+        ENVELOPE_STATUSES,
+        ENVELOPE_UNKNOWN,
+    )
+
+    if envelope_status not in ENVELOPE_STATUSES:
+        envelope_status = ENVELOPE_UNKNOWN
+    if envelope_status != ENVELOPE_OUTSIDE or not unavailable_reason:
+        unavailable_reason = None
+    entry = {
         "id": record.id,
         "name": getattr(record, "name", "") or "",
         "note": getattr(record, "notes", "") or "",
@@ -5122,7 +5339,11 @@ def _container_view_entry(record, manager, workspace_id, live=None, live_envelop
         "live": live,
         "unrecorded": False,
         "live_envelope": live_envelope,
+        "envelope_status": envelope_status,
     }
+    if unavailable_reason is not None:
+        entry["unavailable_reason"] = unavailable_reason
+    return entry
 
 
 def _build_container_view_entries(manager, workspace_id):
@@ -5141,6 +5362,7 @@ def _build_container_view_entries(manager, workspace_id):
     full set.  Each entry carries the three-class ``kind``
     (``ephemeral``|``persistent``|``resource``); the UI splits them.
     """
+    from infra.container_manager import ENVELOPE_UNKNOWN
     from thoughtmachine.container_record import api as _cr_api
 
     records = _cr_api.list_records(workspace_id) or []
@@ -5173,9 +5395,19 @@ def _build_container_view_entries(manager, workspace_id):
         live_envelope = (
             _live_envelope_from_container(matched_container)
             if matched_container is not None else None)
+        if matched_container is None:
+            # No live container: there is nothing to compare against, so the
+            # verdict is UNKNOWN -- never "within".
+            env_status, env_reason = ENVELOPE_UNKNOWN, None
+        else:
+            env_status, env_reason = _envelope_view_fields(
+                manager, matched_container,
+                getattr(record, "lifecycle_class", "") or None)
         entries.append(
             _container_view_entry(record, manager, workspace_id,
-                                  live=live_marker, live_envelope=live_envelope))
+                                  live=live_marker, live_envelope=live_envelope,
+                                  envelope_status=env_status,
+                                  unavailable_reason=env_reason))
 
     if live_containers is not None:
         for container in live_containers:
@@ -5249,10 +5481,27 @@ def _original_created_by(manager, container_id, actor):
 
 
 @app.get("/api/workspace/{workspace_id}/containers")
-def workspace_containers(workspace_id: str, workspace_path: str = ""):
-    """List containers for the workspace."""
+def workspace_containers(request: Request, workspace_id: str,
+                         workspace_path: str = "", session_id: str = ""):
+    """List containers for the workspace.
+
+    ``session_id`` -- as a query parameter, or failing that the
+    ``X-Session-Id`` header (see ``_request_session_id``) -- selects the session
+    whose grant each row's ``envelope_status`` is compared against. With no
+    session there is nothing to compare against, so every row reports
+    ``envelope_status="unknown"`` and a warning names this layer; a missing
+    session must never render as "within bounds".
+    """
+    caller_session = _request_session_id(request, session_id)
+    if caller_session is None:
+        log("WARNING", "server.workspace_containers",
+            "containers view has no calling session (query 'session_id' or "
+            f"'{CONTAINER_VIEW_SESSION_HEADER}' header); every row will report "
+            "envelope_status='unknown' because this layer cannot compare against "
+            "a session grant")
     try:
-        manager = _make_container_manager(workspace_id, workspace_path)
+        manager = _make_container_manager(
+            workspace_id, workspace_path, session_id=caller_session)
     except WorkspacePathForbiddenError as exc:
         return _json_error(str(exc), status_code=403)
     except WorkspacePathError as exc:

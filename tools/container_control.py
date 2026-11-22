@@ -783,6 +783,14 @@ class ContainerListTool(_ContainerControlBase):
     workspaces, or unlabeled ones, never appear. This tool never raises —
     failures are returned in the JSON response.
 
+    Every row carries ``envelope_status``: ``"within"`` when the live container
+    is inside THIS session's grant, ``"outside"`` when it is more permissive
+    (``unavailable_reason`` then names what it needs), and ``"unknown"`` when
+    the verdict cannot be computed (no session, unresolvable policy, or
+    unreadable isolation attrs) — ``"unknown"`` is not a pass. The rows are
+    passed through verbatim: a row that does not carry a key is never defaulted
+    here.
+
     Returns JSON with structure:
     {
       "success": bool,
@@ -794,7 +802,9 @@ class ContainerListTool(_ContainerControlBase):
           "status": str,
           "uptime_seconds": int | null,
           "workspace_id": str,
-          "note": str
+          "note": str,
+          "envelope_status": "within" | "outside" | "unknown",
+          "unavailable_reason": str (present ONLY when envelope_status == "outside")
         }
       ],
       "count": int,

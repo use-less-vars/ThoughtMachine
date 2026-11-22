@@ -6,7 +6,9 @@ Covers
 - ContainerManager.list_containers(): daemon query scoped by the exact
   ``thoughtmachine.workspace_id`` label that ``start()`` applies; the exact
   {container_id, name, image, status, uptime_seconds, workspace_id, note}
-  dict shape; uptime from ``attrs['State']['StartedAt']`` with None guards;
+  dict shape plus the ALWAYS-PRESENT ``envelope_status`` verdict (a
+  session-less manager reads ``unknown``); uptime from
+  ``attrs['State']['StartedAt']`` with None guards;
   daemon-error resilience.
 - ContainerListTool: the zero-parameter tool wrapper — success JSON with
   ``containers``/``count``, required_categories, error JSON on failure.
@@ -195,8 +197,12 @@ class TestContainerManagerListContainers:
         for entry in result:
             assert set(entry.keys()) == {
                 "container_id", "name", "image", "status", "uptime_seconds",
-                "workspace_id", "note", "labels",
+                "workspace_id", "note", "labels", "envelope_status",
             }
+            # Every row carries exactly one of the closed verdict set; this
+            # manager has no session, so it must never claim "within".
+            assert entry["envelope_status"] in {"within", "outside", "unknown"}
+            assert entry["envelope_status"] == "unknown"
         by_id = {e["container_id"]: e for e in result}
         assert set(by_id) == {"abc123", "def456"}
         assert by_id["abc123"] == {
@@ -208,6 +214,7 @@ class TestContainerManagerListContainers:
             "workspace_id": "ws-1",
             "note": "",
             "labels": {"thoughtmachine.workspace_id": "ws-1"},
+            "envelope_status": "unknown",
         }
         # uptime == now - StartedAt (≈3600s, allowing a little clock drift)
         assert isinstance(by_id["abc123"]["uptime_seconds"], int)

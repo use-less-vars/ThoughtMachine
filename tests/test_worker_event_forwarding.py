@@ -85,10 +85,35 @@ def _frame(*, stream=None, status="running"):
 
 
 class Recorder:
-    def __init__(self):
+    """Collects the events handed to it, optionally narrowed to ONE stream.
+
+    ``event_type`` / ``session_id`` exist because a recorder on the PROCESS-WIDE
+    ``global_event_bus`` is not measuring the property under test: that bus is
+    shared with every other live publisher in the interpreter, so an unfiltered
+    recorder counts a leaked worker's or watchdog's event as if the frame under
+    test had produced it -- which is how ``== 1`` came to read 2 on CI.
+
+    Both default to ``None`` = count everything, which is what the per-worker
+    buses want: those are private to the worker under test.
+
+    Narrowing does NOT deduplicate and does not swallow a second delivery of the
+    frame under test: any deviation in type or session reads as 0, a second
+    delivery reads as 2, and both fail the ``== 1`` claim loudly.  See
+    ``test_the_observable_catches_a_double_delivery_of_the_same_frame`` and
+    ``test_the_observable_ignores_a_stray_event_from_another_publisher``.
+    """
+
+    def __init__(self, event_type=None, session_id=None):
         self.events = []
+        self._event_type = event_type
+        self._session_id = session_id
 
     def __call__(self, event):
+        if self._event_type is not None and event.type is not self._event_type:
+            return
+        if self._session_id is not None:
+            if getattr(event.metadata, "session_id", None) != self._session_id:
+                return
         self.events.append(event)
 
 
@@ -104,10 +129,21 @@ def registry():
 
 @pytest.fixture
 def global_recorder():
-    recorder = Recorder()
-    global_event_bus.subscribe(None, recorder)
+    """Counts deliveries of THIS session's ``worker_status`` on the global bus.
+
+    The claim these tests make is "the frame under test reached the global
+    stream once", not "nothing else in the process published while we were
+    looking": ``global_event_bus`` is process-wide, so a wildcard recorder here
+    also counts whatever a leaked publisher from an earlier test happened to
+    emit in the same window (that is a stray, not a delivery). Subscribing to the
+    frame's own event type, and filtering on the session the frame carries, is
+    what makes the observable match the claim -- while ``== 1`` still has to
+    hold, so a duplicate delivery of that frame is still a failure.
+    """
+    recorder = Recorder(event_type=EventType.WORKER_STATUS, session_id=SESSION)
+    global_event_bus.subscribe(EventType.WORKER_STATUS, recorder)
     yield recorder
-    global_event_bus.unsubscribe(None, recorder)
+    global_event_bus.unsubscribe(EventType.WORKER_STATUS, recorder)
 
 
 def _deliver(handle, frame):
@@ -197,6 +233,101 @@ def test_legacy_frame_without_stream_is_treated_as_global(
     assert len(global_recorder.events) == 1
     assert global_recorder.events[0].type is EventType.WORKER_STATUS
     assert on_worker.events == []
+
+
+# ---------------------------------------------------------------------------
+# Tests OF the observable above: ``global_recorder`` must still catch a DOUBLE
+# delivery of the frame under test, and must not count somebody else's event.
+# ---------------------------------------------------------------------------
+
+
+STRAY_SESSION = "sess-stray-not-ours"
+
+
+def _publish_strays():
+    """The two shapes of unrelated event a live publisher can emit mid-test.
+
+    One FOREIGN type (what a leaked container or security publisher emits) and
+    one ``WORKER_STATUS`` for ANOTHER session (what a leaked worker of an
+    earlier test emits). Both go on the SAME process-wide bus the frame under
+    test is delivered to, and both are returned so a test can name exactly what
+    it published instead of counting whatever else arrived.
+    """
+    from agent.events import create_event
+
+    strays = [
+        create_event(
+            EventType.CONTAINER_REMOVED,
+            {"container_id": "c-stray", "name": "stray", "reason": "removed"},
+            source="leaked_container_manager",
+            session_id=STRAY_SESSION,
+        ),
+        create_event(
+            EventType.WORKER_STATUS,
+            {"worker_name": "someone-else", "status": "running"},
+            source="leaked_watchdog",
+            session_id=STRAY_SESSION,
+        ),
+    ]
+    for stray in strays:
+        global_event_bus.publish(stray)
+    return strays
+
+
+def test_the_observable_catches_a_double_delivery_of_the_same_frame(
+    registry, global_recorder
+):
+    """The same frame delivered twice must read as 2, not 1.
+
+    The anti-rubber-stamp half: whatever narrows the observable must not
+    DEDUPLICATE, or the ``== 1`` claim would stay green on a frame that was
+    really republished twice.
+    """
+    handle = WorkerRuntimeHandle(FakeWorker(), mode=MODE_PROCESS)
+    frame = _frame(stream=None, status="running")
+
+    _deliver(handle, frame)
+    assert len(global_recorder.events) == 1
+
+    _deliver(handle, frame)
+
+    # Exactly the assertion the legacy test makes, applied to a real double
+    # delivery: it FAILS (2, not 1), so ``== 1`` is still load-bearing.
+    assert len(global_recorder.events) == 2
+    assert [e.type for e in global_recorder.events] == [EventType.WORKER_STATUS] * 2
+    assert [e.data["status"] for e in global_recorder.events] == ["running", "running"]
+
+
+def test_the_observable_ignores_a_stray_event_from_another_publisher(
+    registry, global_recorder
+):
+    """A leaked publisher's event is not this frame's delivery.
+
+    The CI shape, reproduced without threads: the frame under test is delivered
+    while unrelated events are published on the same process-wide bus. A
+    witness recorder narrowed to the strays' own session proves those strays
+    really did reach the bus, so "the observable ignored them" cannot be
+    vacuous.
+    """
+    handle = WorkerRuntimeHandle(FakeWorker(), mode=MODE_PROCESS)
+    _deliver(handle, _frame(stream=None, status="running"))
+
+    # The witness is narrowed to the stray session as well: counting "whatever
+    # is on the process-wide bus" would make the non-vacuity claim exactly as
+    # fragile as the claim it is guarding.
+    witness = Recorder(session_id=STRAY_SESSION)
+    global_event_bus.subscribe(None, witness)
+    try:
+        strays = _publish_strays()
+    finally:
+        global_event_bus.unsubscribe(None, witness)
+
+    # Non-vacuity: both strays really were published on the global bus.
+    assert witness.events == strays
+    # ...and the observable under test counts the ONE delivery it claims.
+    assert len(global_recorder.events) == 1
+    assert global_recorder.events[0].metadata.session_id == SESSION
+    assert global_recorder.events[0].data == {"worker_name": WORKER, "status": "running"}
 
 
 def test_thread_mode_registers_no_parent_bus(registry, global_recorder):

@@ -52,7 +52,7 @@ class _FakeManager:
 def _install(monkeypatch, manager):
     monkeypatch.setattr(
         server_module, "_make_container_manager",
-        lambda workspace_id, workspace_path="": manager,
+        lambda workspace_id, workspace_path="", session_id=None: manager,
     )
     return manager
 
@@ -118,7 +118,7 @@ class TestContainerLogsRoute:
 
     @pytest.mark.trust_harness
     def test_manager_construction_failure_is_503(self, monkeypatch):
-        def _boom(workspace_id, workspace_path=""):
+        def _boom(workspace_id, workspace_path="", session_id=None):
             raise RuntimeError("boom")
         monkeypatch.setattr(server_module, "_make_container_manager", _boom)
         assert _get().status_code == 503
@@ -127,5 +127,5 @@ class TestContainerLogsRoute:
     def test_unresolvable_workspace_is_404(self, monkeypatch):
         monkeypatch.setattr(
             server_module, "_make_container_manager",
-            lambda workspace_id, workspace_path="": None)
+            lambda workspace_id, workspace_path="", session_id=None: None)
         assert _get().status_code == 404

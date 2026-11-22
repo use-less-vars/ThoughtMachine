@@ -556,6 +556,21 @@ def _exec_drift_decision(live_net, live_ws, want_net, want_ws):
     return "warn", "config_differs_not_more_permissive"
 
 
+# ── session-envelope verdict vocabulary ─────────────────────────────────────
+#: The live container is within the calling session's grant on every compared
+#: axis, and BOTH axes were readable.
+ENVELOPE_WITHIN = "within"
+#: The live container is MORE permissive than the calling session may have on at
+#: least one axis -- a real, enumerated drift.
+ENVELOPE_OUTSIDE = "outside"
+#: The verdict could not be computed: no session, no resolvable policy, or the
+#: isolation attrs were unreadable.  This is NOT a pass -- silence must never
+#: read as "within".
+ENVELOPE_UNKNOWN = "unknown"
+#: The closed set of verdicts; every published row carries exactly one.
+ENVELOPE_STATUSES = (ENVELOPE_WITHIN, ENVELOPE_OUTSIDE, ENVELOPE_UNKNOWN)
+
+
 def _restart_policy_rank(restart_policy):
     """Permissiveness rank for a restart policy (None -> None, unknown -> 3)."""
     if restart_policy is None:
@@ -4173,10 +4188,16 @@ class ContainerManager:
         consulted read-only as a fallback when the container has no record).
         Returns a list of dicts with the 8 base keys ``container_id``,
         ``name``, ``image``, ``status``, ``uptime_seconds``, ``workspace_id``,
-        ``note``, ``labels`` — PLUS an OPTIONAL 9th key
-        ``unavailable_reason``, present ONLY when the row's isolation is MORE
-        permissive than the CALLING session's grant (the key is ABSENT when the
-        row is within bounds).
+        ``note``, ``labels`` — PLUS an ALWAYS-PRESENT 9th key
+        ``envelope_status`` (one of ``ENVELOPE_WITHIN`` | ``ENVELOPE_OUTSIDE`` |
+        ``ENVELOPE_UNKNOWN``; see :meth:`envelope_verdict`) and an OPTIONAL 10th
+        key ``unavailable_reason``, present ONLY when ``envelope_status`` is
+        ``ENVELOPE_OUTSIDE`` (the key is ABSENT for every other verdict).
+
+        ``ENVELOPE_UNKNOWN`` is NOT a pass: a manager with no session, an
+        unresolvable session policy, or unreadable isolation attrs reports
+        UNKNOWN, so a row whose compliance cannot be proven never reads as
+        "within bounds".
 
         SESSION SCOPING: ephemeral rows (``class_of`` == ``LIFECYCLE_EPHEMERAL``)
         are visible ONLY to the session that owns the container NAME
@@ -4208,6 +4229,8 @@ class ContainerManager:
                 + re.escape(_safe_session_tag(session_id))
                 + r"-[0-9a-f]{8}$"
             )
+        # One policy resolution per listing call, not one per row.
+        wanted_cache = {}
         for container in containers:
             # Skip hidden resource containers (e.g. the git sandbox from
             # infra/resource_container_manager.py, label thoughtmachine.resource):
@@ -4254,66 +4277,141 @@ class ContainerManager:
                 "labels": dict(container.labels or {}),
                 "note": self._read_note(container),
             }
-            # Envelope tag: PERSISTENT rows only, and only when this manager has
-            # a session (otherwise there is no session grant to compare against).
-            if session_id is not None and lifecycle_class == LIFECYCLE_PERSISTENT:
-                try:
-                    reason = self._session_envelope_unavailable_reason(container)
-                except Exception:
-                    reason = None
-                if reason is not None:
-                    row["unavailable_reason"] = reason
+            # Envelope verdict: EVERY row carries ``envelope_status``. A manager
+            # with no session (UI/dashboard) reads UNKNOWN, never "within": the
+            # absence of a grant to compare against is not evidence of compliance.
+            # ``unavailable_reason`` stays an OPTIONAL key -- set ONLY for an
+            # OUTSIDE row.
+            envelope_status, reason = self.envelope_verdict(
+                container, lifecycle_class, wanted_cache=wanted_cache
+            )
+            row["envelope_status"] = envelope_status
+            if reason is not None:
+                row["unavailable_reason"] = reason
             result.append(row)
         return result
 
-    def _session_envelope_unavailable_reasons(self, container):
-        """Reason string when ``container`` is MORE permissive than this session.
+    def _envelope_wanted(self, lifecycle_class, cache=None):
+        """This session's wanted ``_ComputedContainerConfig``, or ``None``.
 
-        Reuses the exec-drift envelope comparison (NEVER raises):
-
-        * live isolation via the module-level ``_exec_live_isolation`` (default
-          non-strict; returns ``(None, None)`` when unreadable);
-        * this session's wanted ``(network_mode, workspace_mode)`` via
-          ``_compute_config(..., LIFECYCLE_PERSISTENT)`` -- the SAME call shape
-          the enforcement path uses (``_check_exec_drift`` ~:2157 and the build
-          gate ~:3517), in its NON-strict form.  A resolution failure yields the
-          plain ``("none", "ro")`` sentinel (not a
-          ``_ComputedContainerConfig``), which proves NO grant -> return None;
-        * ``_exec_drift_decision`` rules; ONLY ``decision == "deny"`` (the live
-          container is MORE permissive than the session may have) yields a
-          string.  ``run``/``warn`` yield ``None``.  Only the network + workspace
-          axes are compared (never mem_limit/cpu_quota/oom_score_adj).
-
-        Returns ``None`` on any failure or when the row is within bounds.
+        The SAME call shape the enforcement path uses (``_check_exec_drift`` and
+        the build gate), in its NON-strict form.  A resolution failure yields the
+        plain ``("none", "ro")`` sentinel, which is NOT a
+        ``_ComputedContainerConfig`` and therefore proves NO grant: callers must
+        read it as "the policy could not be resolved", never as "the policy is
+        none/ro".  Memoised in ``cache`` when one is supplied, so a listing call
+        resolves the policy once rather than once per row.
         """
+        if cache is not None and lifecycle_class in cache:
+            return cache[lifecycle_class]
+        wanted = None
         try:
-            live_net, live_ws = _exec_live_isolation(container)
             cfg = self._compute_config(
                 getattr(self, "workspace_path", None),
                 getattr(self, "workspace_id", None),
                 getattr(self, "session_permissions", None),
-                LIFECYCLE_PERSISTENT,
-            )
-            if not isinstance(cfg, _ComputedContainerConfig):
-                return None
-            want_net, want_ws = cfg[0], cfg[1]
-            # Isolate each axis by neutralising the other, so an unmet
-            # requirement on one axis never MASKS an unmet one on the other;
-            # this enumerates ALL unmet requirements, not just the first.
-            net_decision, net_reason = _exec_drift_decision(
-                live_net, want_ws, want_net, want_ws
-            )
-            ws_decision, ws_reason = _exec_drift_decision(
-                want_net, live_ws, want_net, want_ws
+                lifecycle_class,
             )
         except Exception:
-            return []
+            cfg = None
+        if isinstance(cfg, _ComputedContainerConfig):
+            wanted = cfg
+        if cache is not None:
+            cache[lifecycle_class] = wanted
+        return wanted
+
+    def _session_envelope_status(self, container, lifecycle_class, *,
+                                 wanted_cache=None):
+        """``(ENVELOPE_* verdict, reasons)`` for ``container`` vs this session.
+
+        * no ``lifecycle_class`` or no ``session_id`` -> ``ENVELOPE_UNKNOWN``
+          (there is no session grant to compare against, and UNKNOWN is NOT a
+          pass);
+        * unreadable isolation attrs (``_exec_live_isolation`` raising, or
+          returning ``(None, None)``) -> ``ENVELOPE_UNKNOWN``;
+        * an unresolvable wanted policy -> ``ENVELOPE_UNKNOWN``;
+        * live MORE permissive on either axis -> ``ENVELOPE_OUTSIDE`` plus the
+          enumerated reasons;
+        * one axis readable and within bounds while the other is unreadable ->
+          ``ENVELOPE_UNKNOWN`` (half a proof is not a proof);
+        * otherwise -> ``ENVELOPE_WITHIN``.
+
+        Only the network + workspace axes are compared (never
+        mem_limit/cpu_quota/oom_score_adj).
+        """
+        if not lifecycle_class:
+            return ENVELOPE_UNKNOWN, []
+        if getattr(self, "session_id", None) is None:
+            return ENVELOPE_UNKNOWN, []
+        try:
+            live_net, live_ws = _exec_live_isolation(container)
+        except Exception:
+            return ENVELOPE_UNKNOWN, []
+        wanted = self._envelope_wanted(lifecycle_class, wanted_cache)
+        if wanted is None:
+            return ENVELOPE_UNKNOWN, []
+        want_net, want_ws = wanted[0], wanted[1]
+        # Isolate each axis by neutralising the other, so an unmet requirement on
+        # one axis never MASKS an unmet one on the other; this enumerates ALL
+        # unmet requirements, not just the first.
+        net_decision, net_reason = _exec_drift_decision(
+            live_net, want_ws, want_net, want_ws
+        )
+        ws_decision, ws_reason = _exec_drift_decision(
+            want_net, live_ws, want_net, want_ws
+        )
         reasons = []
         if net_decision == "deny" and net_reason == "network_more_permissive":
             reasons.append("needs network:write; session has network:none")
         if ws_decision == "deny" and ws_reason == "workspace_more_permissive":
             reasons.append("needs filesystem:write; session has filesystem:read")
-        return reasons
+        if reasons:
+            return ENVELOPE_OUTSIDE, reasons
+        if live_net is None or live_ws is None:
+            return ENVELOPE_UNKNOWN, []
+        return ENVELOPE_WITHIN, []
+
+    def envelope_verdict(self, container, lifecycle_class=None, *,
+                         wanted_cache=None):
+        """Public: ``(ENVELOPE_* verdict, reason_or_None)`` for ``container``.
+
+        ``reason`` is the ``"; "``-joined unmet-requirement string and is
+        populated ONLY for ``ENVELOPE_OUTSIDE`` (``None`` for every other
+        verdict, including ``ENVELOPE_UNKNOWN``).  ``lifecycle_class`` defaults
+        to ``self.class_of(container)``.
+
+        RECOMPUTED on every call from the LIVE envelope and this session's grant
+        -- never cached, never stale.  NEVER raises: any failure degrades to
+        ``(ENVELOPE_UNKNOWN, None)``, which is a "cannot tell", never a pass.
+        """
+        try:
+            if lifecycle_class is None:
+                lifecycle_class = self.class_of(container)
+            status, reasons = self._session_envelope_status(
+                container, lifecycle_class, wanted_cache=wanted_cache
+            )
+        except Exception:
+            return ENVELOPE_UNKNOWN, None
+        if status == ENVELOPE_OUTSIDE and reasons:
+            return status, "; ".join(reasons)
+        return status, None
+
+    def _session_envelope_unavailable_reasons(self, container):
+        """Reason list when ``container`` is MORE permissive than this session.
+
+        Backwards-compatible view over :meth:`_session_envelope_status` evaluated
+        at ``LIFECYCLE_PERSISTENT`` (the class this helper has always used).
+        Returns ``[]`` when the row is within bounds OR when the verdict is
+        ``ENVELOPE_UNKNOWN`` (a caller asking only for reasons has nothing to
+        report for "cannot tell"; use :meth:`envelope_verdict` to see the
+        UNKNOWN).  NEVER raises.
+        """
+        try:
+            return self._session_envelope_status(
+                container, LIFECYCLE_PERSISTENT
+            )[1]
+        except Exception:
+            return []
 
     def _session_envelope_unavailable_reason(self, container):
         """Single reason string (``"; "``-joined) or ``None`` when within bounds.
@@ -4335,7 +4433,7 @@ class ContainerManager:
         within bounds.  NEVER raises.
         """
         try:
-            return self._session_envelope_unavailable_reason(container)
+            return self.envelope_verdict(container)[1]
         except Exception:
             return None
 
