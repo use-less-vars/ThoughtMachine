@@ -9,10 +9,10 @@ enumerates twenty-one test files today and this ledger cites ten of them, becaus
 extras are gate-only additions explained in that workflow's own header. Parity with the other ledger —
 the invariant list in `.thoughtmachine/knowledge/project/architecture_invariants.md` — is enforced by
 `tests/test_invariants_ledger_parity.py`, so every numbered invariant there must name a contract here
-or an explicit gap. What the gate does is re-run these tests and fail the job when one is red; it does
-not mutate the code to show that a test *can* fail — this tree carries no mutation-testing
-configuration — so a green gate states that the named tests passed, which is a statement about the
-tests, not a proof about the control. It does not claim the wider suite is worthless — it claims that
+or an explicit gap. What the gate does is re-run these tests and fail the job when one is red; it also
+runs a mutation spot check: the one guard `scripts/mutation_specs.py` declares — an enumerated set,
+not a sweep of the tree — so a green gate states the named tests passed, a statement about the tests,
+not a proof about the control. It does not claim the wider suite is worthless — it claims that
 these three invariants are the merge-blocking ones: Contract Gate is among the contexts `dev` requires
 (measured; see *What CI actually runs — and what this document does not claim* below), so a change
 that turns one of the twenty-one files red cannot merge — provided the named test detects the break,
@@ -20,8 +20,8 @@ which is the verdict column's claim and not the gate's — and a change that bre
 still caught by the main matrix.
 
 Verdict vocabulary: **ENFORCED** — the code site enforces it and a named test fails when that behaviour
-is broken; removal was tried by hand only where this document records that it was tried, and the gate
-itself never mutates anything.
+is broken; removal was tried by hand only where this document records that it was tried. The gate mutates
+only the guards `scripts/mutation_specs.py` declares (one today); a SURVIVED verdict is a finding.
 **PARTIAL** — enforced, but at least one part of the invariant is not pinned by the tests named here.
 **GAP** — a part of the invariant has no detecting test at all.
 
@@ -217,7 +217,7 @@ exactly why `343` / `349` assert the value outright. Scope, stated honestly: the
 `.github/workflows/contract-gate.yml` runs it on every pull request against `dev`, so Contract 3 is
 enforced wherever that command runs and never by `pytest` alone. Running in CI is not the same as
 blocking a merge: requiredness is a property of the branch ruleset on `dev`, which the workflow file
-cannot state and this document does not verify.
+cannot state — but it is measured: ruleset 24214086 requires `Mutation gate (contracts)` on `dev`.
 
 ## Contract 5: An unreadable permission is UNKNOWN, never assurance
 
@@ -249,14 +249,18 @@ failed fetch ever starts rendering a posture claim. `web_ui/frontend/src/store/_
 values `write`/`banned`/`ask`/`read` appears anywhere). Restoring the preset fallback turns both red
 (measured by hand, 2 failed).
 
-**Verdict:** ENFORCED for these two surfaces, BY MANUAL MUTATION — NOT BY A GATE. This tree carries no
-mutation-testing configuration at all: no Stryker config, no `mutation` script in
-`web_ui/frontend/package.json`, no mutmut or cosmic-ray. The two mutation proofs recorded in this
-contract's commit message are hand measurements, not a CI check, and nothing will re-run them.
-`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty-one files under
-`tests/`, so it cannot run these JS suites — which is also why the JS paths above are cited without the
-backticked repo-relative form that `tests/test_contracts_ledger_parity.py` parses. What does run them is
-`platform-matrix.yml`'s `web-ui-frontend-suite` job (vitest over `src`), which cannot detect a mutation.
+**Verdict:** ENFORCED for these two surfaces, BY MANUAL MUTATION — NOT BY A GATE. This tree's only
+mutation-testing configuration is the Python one: `scripts/mutation_specs.py` declares one guard
+(Contract 3's `DEFAULT_RUNTIME_MODE` flip) and `scripts/mutation_gate.py` runs it in the `Mutation gate
+(contracts)` job, which ruleset 24214086 requires on `dev` (measured 2026-11-23T15:20+01:00). That
+registry names no JS file, so it cannot re-run these two proofs: what this contract's commit message
+records stays a hand measurement. The negative claims here are checked, not assumed: no Stryker config,
+no `mutation` script in `web_ui/frontend/package.json`, no mutmut or cosmic-ray. The gate workflow
+`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty-one files
+under `tests/`, so it cannot run these JS suites — which is also why the JS paths above are cited
+without the backticked repo-relative form that `tests/test_contracts_ledger_parity.py` parses. What
+does run them is `platform-matrix.yml`'s `web-ui-frontend-suite` job (vitest over `src`), which cannot
+detect a mutation.
 
 **Deferred — unreadable-value lies this contract does not yet cover. Each is a named follow-up, not a
 pass:**
@@ -284,9 +288,9 @@ pass:**
    `tests/test_worker_is_a_real_process.py:343` and `:349`, and the flip is a declared mutation
    (`contract-3-default-mode`) that `scripts/mutation_gate.py` reports KILLED. The other files named
    here are still comparisons against the constant and still would not notice the flip; what stops
-   them from mattering is that one literal, which is the file the mutation declaration names. What
-   remains open is automation, not the claim — the gate is not yet wired into CI. Contract 3 is cited
-   as ENFORCED for exactly this reason.
+   them from mattering is that one literal, which is the file the mutation declaration names. The
+   automation that was open is now closed: the gate runs in CI and ruleset 24214086 requires it on
+   `dev`. Contract 3 is cited as ENFORCED for exactly this reason.
 2. **Contract 2 — two of the three deciders are unproven by anything named here (GAP).**
    `tests/trust/test_gate_contract.py` imports only `check_required_categories` (its line 25); neither
    `check_atomic_operation` (`security/security_gate.py::check_atomic_operation`) nor
