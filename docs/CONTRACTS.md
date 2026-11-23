@@ -303,8 +303,14 @@ open item below.
 | `.github/workflows/cross-platform-smoke.yml` — "Cross-Platform Smoke" | `linux-install`, `windows-smoke`, `macos-launcher` | 3 of 3 | — |
 | `.github/workflows/first_start_ci.yml` — "First-Start CI" | `first-start` | 1 of 1 | — |
 | `.github/workflows/platform-matrix.yml` — "Platform Matrix" | `ubuntu-suite`, `linux-install-smoke`, `linux-e2e-auth`, `windows-import-smoke`, `windows-thin-pytest`, `web-ui-backend-suite`, `web-ui-frontend-suite` | 7 of 7 | — |
-| `.github/workflows/platform-matrix-macos.yml` — "Platform Matrix (macOS, advisory)" | `macos-suite`, `macos-install-smoke`, `macos-docker-probe` | 0 of 3 | all three |
+| `.github/workflows/platform-matrix-macos.yml` — "Platform Matrix (macOS, advisory)" | `macos-suite`, `macos-install-smoke`, `macos-docker-probe` | 3 of 3 | — |
 | `.github/workflows/python-version-matrix.yml` — "Python Version Matrix" | `unit-tests` (matrix over `python-version`), `installer-contract`, `windows-python-314` | 3 of 3 | — |
+
+The advisory column is empty as of this revision: no job in any of the six files carries
+`continue-on-error`. The three macOS jobs did until their job-level mask was removed, which is why the
+file is still named "(macOS, advisory)" and why each of its job `name:` values still ends in
+"(advisory)" — stale text retained so the check-run contexts did not change, not a claim that the
+jobs can be ignored.
 
 What the trigger blocks and job names add to that table:
 
@@ -324,11 +330,15 @@ What the trigger blocks and job names add to that table:
 - `platform-matrix.yml`'s `linux-e2e-auth` job skips itself unless auth-relevant files changed, and the
   change detection is written to *run* rather than skip when it cannot decide. A skip in that job is
   therefore not evidence that the auth path was exercised.
-- One advisory surface, visible in the workflow text: `.github/workflows/platform-matrix-macos.yml`
-  labels itself "(macOS, advisory)" and all three of its jobs carry `continue-on-error: true`. Those
-  three of the eighteen jobs cannot fail their run. `.github/workflows/platform-matrix.yml`'s
-  `web-ui-backend-suite` job was the fourth until C91 made it BLOCKING (no `continue-on-error`, and
-  its name no longer carries the "(advisory)" suffix).
+- No advisory surface is left in the workflow text. `.github/workflows/platform-matrix-macos.yml`
+  was the last one: all three of its jobs carried `continue-on-error: true`, so those three of the
+  eighteen could not fail their run. The mask is gone — no job in any of the six files carries
+  `continue-on-error` — so all eighteen fail their own workflow run on a red result. What remains is
+  naming and protection, not masking: none of the three macOS check names is in `REQUIRED_CHECKS`, so
+  a red macOS job fails the `platform-matrix-macos.yml` run without blocking a merge.
+  `.github/workflows/platform-matrix.yml`'s `web-ui-backend-suite` job was the fourth advisory job
+  until C91 made it BLOCKING (no `continue-on-error`, and its name no longer carries the
+  "(advisory)" suffix).
 
 **RESOLVED — measured, and the stored count is not the in-tree count.** The operator read the live
 `dev` ruleset with admin credentials on 2026-11-19: it stores **twelve** required-check entries, of

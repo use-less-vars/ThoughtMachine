@@ -242,8 +242,9 @@ jobs:
   #   (iii) `doctor --check-docker` NAMES its Docker verdict in its own terms
   #         (doctor_checks.py:115-139).
   # It does NOT assert the SUBSTRATE class (Docker Desktop + VirtioFS host
-  # integration): that is environment-/licence-dependent and stays with the
-  # advisory macos-docker-probe in platform-matrix.yml.
+  # integration): that is environment-/licence-dependent and stays with
+  # macos-docker-probe in platform-matrix-macos.yml (gating there, and absent
+  # from REQUIRED_CHECKS).
   # A fourth assertion (iv) - `--check-only` reaching [8/8] with rc 0 - is
   # OMITTED on purpose: it hinges on the [1/8] venv, [5/8] node, [6/8] vault
   # and [7/8] locale checks, which cannot be proven deterministically from

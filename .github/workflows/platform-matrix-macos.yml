@@ -1,14 +1,22 @@
-# Platform Matrix CI - macOS jobs (advisory)
+# Platform Matrix CI - macOS jobs
 # ---------------------------------------------------------------------------
 # The three macOS jobs below were moved verbatim out of platform-matrix.yml.
-# All of them are advisory (continue-on-error: true), so they are kept in their
-# own workflow: platform-matrix.yml is required by branch protection and must
-# carry only the Linux/Windows jobs, where a red result actually blocks a merge.
+# None of them is advisory: no job here carries `continue-on-error`, so a red
+# job fails this workflow's run. They live in their own workflow so the macOS
+# verdict is reported on its own run instead of colouring the run that carries
+# the Linux/Windows check names. None of these three check names is in
+# REQUIRED_CHECKS (scripts/apply_branch_protection.sh), so a red here is
+# reported and does not block a merge -- it is no longer hidden.
+#
+# The trailing "(advisory)" in this file's `name:` and in the three job `name:`
+# values is a stale label left in place so the check-run contexts do not change
+# here; the jobs themselves are gating.
 #
 # The triggers, permissions and PYTHON_VERSION value are the ones
-# platform-matrix.yml uses. The job bodies are byte-identical to the definitions
-# removed from that file: no action versions changed, no new secrets, no new
-# inputs, no new conditionals.
+# platform-matrix.yml uses. The job bodies are the definitions removed from that
+# file, unchanged in behaviour since: the only later edits are comments, one log
+# string and the removal of the job-level `continue-on-error` -- no action
+# versions changed, no new secrets, no new inputs, no new conditionals.
 #
 # Anti-vacuity is unchanged in shape: macos-suite still runs
 # scripts/ci_assert_collected.py before the suite, with the same marker
@@ -29,9 +37,10 @@
 # margin below the measurement that ubuntu-suite uses, for the reason spelled
 # out under that job's assert step in platform-matrix.yml.
 #
-# A floor that is too HIGH here can never block a merge: macos-suite is
-# advisory (continue-on-error: true), so a red result is reported and ignored.
-# The reverse -- too low -- is the failure mode worth guarding, hence the
+# A floor that is too HIGH here fails macos-suite for a reason that says
+# nothing about the code: no job here is advisory (`continue-on-error` is gone),
+# so that red reads as a red macOS verdict. The reverse -- too low -- is the
+# failure mode worth guarding, hence the
 # measurement above rather than the old number.
 #
 # macOS install note: install.sh supports Darwin (it runs the same prerequisite
@@ -41,7 +50,9 @@
 # manual venv + pip install if the installer left no usable .venv, so the backend
 # can still be started and probed.
 #
-# Every job here is advisory: a red macOS run is reported, never merge-blocking.
+# No job here is advisory: a red macOS job fails this workflow's run. The three
+# check names are absent from REQUIRED_CHECKS, so that red does not block a
+# merge -- but a green run now means the jobs passed.
 # ---------------------------------------------------------------------------
 name: Platform Matrix (macOS, advisory)
 
@@ -58,12 +69,11 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  # macOS: full suite (advisory).
+  # macOS: full suite (gating: a red suite fails this workflow's run).
   # -------------------------------------------------------------------------
   macos-suite:
     name: macOS - full test suite (advisory)
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,7 +102,8 @@ jobs:
         run: python -m pytest -m "not docker and not e2e" --timeout 600 -ra
 
   # -------------------------------------------------------------------------
-  # macOS: install + startup smoke (advisory).
+  # macOS: install + startup smoke (gating: a red smoke fails this workflow's
+  # run).
   #
   # Reports the host facts (uname -m / sw_vers / id -u / id -g), selects the
   # best available installer (prefer a macOS-specific script if one is added,
@@ -103,7 +114,6 @@ jobs:
   macos-install-smoke:
     name: macOS - install/startup smoke (advisory)
     runs-on: macos-latest
-    continue-on-error: true
     env:
       PORT: "8000"
     steps:
@@ -132,7 +142,7 @@ jobs:
             INSTALLER="bash install.sh"
           fi
           echo "SELECTED_INSTALLER: ${INSTALLER}"
-          ${INSTALLER} || echo "INSTALLER_EXIT=$? (non-fatal: advisory job)"
+          ${INSTALLER} || echo "INSTALLER_EXIT=$? (non-fatal: the next step rebuilds the venv if this left none)"
 
       - name: Fallback - ensure a usable environment
         run: |
@@ -194,7 +204,7 @@ jobs:
               print("execution_mode:", getattr(tool, "_last_execution_mode", "?"))
               print("failure_reason:", getattr(tool, "_last_failure_reason", "?"))
               print("fallback_used:", getattr(tool, "_last_fallback_used", "?"))
-          except Exception as exc:  # noqa: BLE001 - advisory probe
+          except Exception as exc:  # noqa: BLE001 - the probe prints the error, not raise
               print("GIT_READ_PROBE_ERROR:", repr(exc))
           PY
           else
@@ -206,7 +216,8 @@ jobs:
         run: pkill -f "uvicorn web_ui.backend.server:app" 2>/dev/null || true
 
   # -------------------------------------------------------------------------
-  # macOS: Docker Desktop availability probe (advisory).
+  # macOS: Docker Desktop availability probe (gating: a red probe fails this
+  # workflow's run; the probe skips cleanly when Docker is absent).
   #
   # WHAT THIS PROVES (when Docker Desktop is present and the daemon is up):
   #   * the Docker CLI + daemon are reachable from the macOS runner,
@@ -225,7 +236,6 @@ jobs:
   macos-docker-probe:
     name: macOS - Docker availability probe (advisory)
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4

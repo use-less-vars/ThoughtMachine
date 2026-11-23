@@ -148,9 +148,9 @@ that API response.
 | Windows Python 3.14 gate proof | python-version-matrix.yml | windows-python-314 | **required** |
 | Windows - thin pytest slice | platform-matrix.yml | windows-thin-pytest | **required** |
 | Windows venv + smoke script | cross-platform-smoke.yml | windows-smoke | **required** |
-| macOS - full test suite (advisory) | platform-matrix-macos.yml | macos-suite | advisory — not required |
-| macOS - install/startup smoke (advisory) | platform-matrix-macos.yml | macos-install-smoke | advisory — not required |
-| macOS - Docker availability probe (advisory) | platform-matrix-macos.yml | macos-docker-probe | advisory — not required |
+| macOS - full test suite (advisory) | platform-matrix-macos.yml | macos-suite | not required (gating) |
+| macOS - install/startup smoke (advisory) | platform-matrix-macos.yml | macos-install-smoke | not required (gating) |
+| macOS - Docker availability probe (advisory) | platform-matrix-macos.yml | macos-docker-probe | not required (gating) |
 
 Only eleven of those eighteen are enforced today — see *Enforced on `dev` today*
 above. The `gating` column records the script's intent, not the ruleset's state.
@@ -185,13 +185,16 @@ measurement. It has now been measured: it reports green on PR #401 in roughly
 (an unobserved required context parks `dev` at "Expected" forever); the
 evidence that overrode it is newer.
 
-The three macOS names stay out, and for a measured reason rather than a guessed
-one: on PR #401, `macOS - full test suite (advisory)` **concluded failure** while
-its workflow run stayed green (`continue-on-error: true`). So these checks do
-report, and they can report red without blocking anything. Requiring one would
-either block a merge on the very red macOS runner the advisory flag exists to
-absorb, or — if GitHub does not count a `continue-on-error` check as passing for
-a required context — park `dev` at "Expected". Neither is wanted.
+The three macOS names stay out, and what keeps them out has changed. On PR #401,
+`macOS - full test suite (advisory)` **concluded failure** while its workflow run
+stayed green, because the job carried `continue-on-error: true`. That flag is
+gone: a red macOS job now fails the `platform-matrix-macos.yml` run, so the
+failure is visible in the run conclusion. The three names are still not
+required, and that is now a recorded decision rather than a consequence of the
+workflow text: the same job was measured red, and requiring it would block a
+merge on that runner rather than on the code. If it is ever required, do it on a
+measured green run, and note that these are the only contexts in this table
+whose job gates its own workflow while protection ignores it.
 
 ## Keeping the list honest: `--verify-names FILE`
 
@@ -211,8 +214,9 @@ things:
   "Expected — waiting for status to be reported", and with
   `enforce_admins: true` only `--unprotect` gets past it. Exits **1**.
 * **present but not required** → a check runs that protection does not gate on.
-  Informational: the three macOS advisory names are *meant* to appear here, and
-  so does every newly added job. Exits **0**.
+  Informational: the three macOS names are *meant* to appear here — they gate
+  their own workflow and are not required — and so does every newly added job.
+  Exits **0**.
 
 Exit 2 is a usage error (file missing or unreadable). Run it after any job
 rename, and after any change to `REQUIRED_CHECKS`.
