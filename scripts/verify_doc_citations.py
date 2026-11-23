@@ -70,9 +70,33 @@ Extracted citation forms
           basename lookup anywhere in the worktree (a spec may say
           ``worker_thread.py`` for ``tools/workspace/worker_thread.py``), and
           only fails when no file of that name exists at all.
+4. SYMBOL ``path/to/file.py::symbol`` -- the symbol that OWNS the behaviour,
+          because a line number is not a root: it moves whenever somebody inserts
+          a line above it, and it says nothing at all when the code under it is
+          replaced. A dotted name follows nesting
+          (``path/to/file.py::Class.method``), and the citation may PIN a line
+          range that must lie inside that symbol
+          (``path/to/file.py::Class.method:123-456``) when the prose is about
+          those particular lines. The name is looked up in the module's AST:
+          ``FunctionDef``/``AsyncFunctionDef``/``ClassDef`` by qualified dotted
+          name -- and by bare name only when the module defines that name exactly
+          once, so ``::start`` in a file with five ``start`` methods is a miss
+          rather than a guess -- plus module-level ``Assign``/``AnnAssign``
+          targets, so a constant is citable too. A HIT supplies the citation's
+          line span (the symbol's first..last line), which then goes through the
+          same in-bounds check as a written range; a MISS is its own failure
+          category, ``symbol not defined in <path>``, never a silent pass. A
+          SYMBOL citation of a non-``.py`` file is a LOUD failure: there is no AST
+          to index, and accepting the name anyway would make the citation
+          unfalsifiable. A SYMBOL also names its file for SHORT inheritance (rule
+          1a and 1b above) -- the PATH only: a following ``:123`` cites another
+          line of the same file, which the symbol's own range constrains not at
+          all.
 
 Checks per citation: (a) the file exists, (b) every cited line number lies in
-1..len(file lines). No sampling -- every match is emitted.
+1..len(file lines) -- for a SYMBOL, the line numbers it resolves to -- and (c)
+for a SYMBOL, the symbol exists in that file's AST and any pinned range lies
+inside it. No sampling -- every match is emitted.
 
 Per-worker runtime artefacts written under the vault worker dir (``command.json``,
 ``context.json``, ``status.json``, ``heartbeat.json``) are named in the prose but
@@ -89,6 +113,7 @@ Exit code 0 when every citation resolves, 1 otherwise, 2 on a usage error.
 
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from dataclasses import dataclass, field
@@ -105,6 +130,12 @@ RUNTIME_ARTEFACTS = {"command.json", "context.json", "status.json", "heartbeat.j
 
 # path.ext:LINE or path.ext:LINE-LINE
 FULL_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,6}):(\d+)(?:-(\d+))?")
+# path.py::symbol, dotted for nesting, optionally pinned to LINE / LINE-LINE
+SYMBOL_RE = re.compile(
+    r"(?<![\w./-])([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,6})"
+    r"::([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"(?::(\d+)(?:-(\d+))?)?"
+)
 # bare :LINE / :LINE-LINE (not part of a FULL match -- spans are filtered later)
 SHORT_RE = re.compile(r"(?<![\w./:]):(\d+)(?:-(\d+))?")
 # bare file reference
@@ -126,9 +157,10 @@ TABLE_ROW_RE = re.compile(r"^\s*\|")
 class Citation:
     doc_line: int          # line number in the spec doc
     raw: str               # citation exactly as written
-    kind: str              # FULL | SHORT | BARE
+    kind: str              # FULL | SHORT | SYMBOL | BARE
     target: str            # referenced path (as written / resolved for SHORT)
-    lines: tuple = ()      # cited line numbers
+    symbol: str = ""       # SYMBOL only: the dotted name cited inside the file
+    lines: tuple = ()      # cited line numbers (resolved span for a SYMBOL)
     resolved: str = ""     # worktree-relative path actually used
     exists: bool = False
     n_matches: int = 0     # basename matches when resolved by basename
@@ -147,6 +179,7 @@ class DocResult:
     doc_lines: list = field(default_factory=list)
     cites: list = field(default_factory=list)
     missing: list = field(default_factory=list)
+    symbol_missing: list = field(default_factory=list)
     out_of_bounds: list = field(default_factory=list)
     unresolved: list = field(default_factory=list)
     excluded: list = field(default_factory=list)
@@ -154,7 +187,7 @@ class DocResult:
 
     @property
     def failures(self) -> list:
-        return self.missing + self.out_of_bounds + self.unresolved
+        return self.missing + self.symbol_missing + self.out_of_bounds + self.unresolved
 
     @property
     def clean(self) -> int:
@@ -181,6 +214,66 @@ def _basename_index(root: Path = ROOT) -> dict:
         index.setdefault(p.name, []).append(p)
     _BASENAME_CACHE[root] = index
     return index
+
+
+_SYMBOL_CACHE: dict = {}
+
+
+def _module_symbols(tree) -> dict:
+    """Map every citable name in one module's AST to its (first, last) line span.
+
+    Definitions at any depth are keyed by their QUALIFIED dotted name, so
+    ``Class.method`` reaches a method and ``Class`` the class itself. A definition
+    is additionally reachable by its bare name, but only when the module defines
+    that bare name exactly once -- a file with five ``start`` methods must make
+    ``::start`` a miss rather than a coin flip. Module-level ``Assign`` and
+    ``AnnAssign`` targets are keyed by name and span the whole statement, which is
+    what makes a constant like ``DEFAULT_RUNTIME_MODE`` citable at all.
+    """
+    spans: dict = {}
+    bare: dict = {}
+    defined: dict = {}
+
+    def walk(node, prefix: str = "") -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{prefix}{child.name}"
+                spans[name] = (child.lineno, child.end_lineno)
+                bare[child.name] = (child.lineno, child.end_lineno)
+                defined[child.name] = defined.get(child.name, 0) + 1
+                walk(child, f"{name}.")
+            else:
+                walk(child, prefix)
+
+    walk(tree)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        else:
+            continue
+        for name in names:
+            spans[name] = (node.lineno, node.end_lineno)
+    for name, span in bare.items():
+        if defined[name] == 1:
+            spans.setdefault(name, span)
+    return spans
+
+
+def _symbol_index(path: Path) -> dict:
+    """The symbol spans of one Python file, parsed once and cached per path."""
+    cached = _SYMBOL_CACHE.get(path)
+    if cached is not None:
+        return cached
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except SyntaxError:
+        spans: dict = {}
+    else:
+        spans = _module_symbols(tree)
+    _SYMBOL_CACHE[path] = spans
+    return spans
 
 
 def _ends_block(line: str) -> bool:
@@ -263,14 +356,19 @@ def extract(doc_lines: list, code_spans: list) -> tuple:
             section_last = ""   # a heading ends the section -- nothing inherits across
         is_table_row = bool(TABLE_ROW_RE.match(line))
 
-        # Rule (a)'s candidate namings: FULL citations plus BARE paths that sit
-        # inside a code span, in position order so a SHORT can take the nearest
-        # PRECEDING one. Nothing after the SHORT on its own line ever binds it.
+        # Rule (a)'s candidate namings: FULL and SYMBOL citations plus BARE paths
+        # that sit inside a code span, in position order so a SHORT can take the
+        # nearest PRECEDING one. Nothing after the SHORT on its own line ever
+        # binds it. A SYMBOL contributes its PATH only: a following ``:123`` cites
+        # another line of the same file, which the symbol's range does not bound.
         full_spans = [m.span() for m in FULL_RE.finditer(line)]
+        symbol_hits = list(SYMBOL_RE.finditer(line))
+        ref_spans = full_spans + [m.span() for m in symbol_hits]
         line_refs = [(m.start(), m.group(1)) for m in FULL_RE.finditer(line)]
+        line_refs += [(m.start(), m.group(1)) for m in symbol_hits]
         bare_in_code = set()
         for m in BARE_RE.finditer(line):
-            if any(s <= m.start() < e for s, e in full_spans):
+            if any(s <= m.start() < e for s, e in ref_spans):
                 continue   # the path half of a FULL citation
             if not _inside_code(code_spans, i - 1, m.start()):
                 continue
@@ -281,19 +379,26 @@ def extract(doc_lines: list, code_spans: list) -> tuple:
         line_refs.sort()
 
         matches = [(m.start(), "FULL", m) for m in FULL_RE.finditer(line)]
+        matches += [(m.start(), "SYMBOL", m) for m in symbol_hits]
         for m in SHORT_RE.finditer(line):
-            if any(s <= m.start() < e for s, e in full_spans):
+            if any(s <= m.start() < e for s, e in ref_spans):
                 continue
             matches.append((m.start(), "SHORT", m))
         for m in BARE_RE.finditer(line):
-            if any(s <= m.start() < e for s, e in full_spans):
+            if any(s <= m.start() < e for s, e in ref_spans):
                 continue
             matches.append((m.start(), "BARE", m))
 
         for pos, kind, m in sorted(matches, key=lambda t: t[0]):
+            symbol = ""
             if kind == "FULL":
                 target = m.group(1)
                 nums = tuple(int(g) for g in (m.group(2), m.group(3)) if g)
+                section_last = target
+            elif kind == "SYMBOL":
+                target = m.group(1)
+                symbol = m.group(2)
+                nums = tuple(int(g) for g in (m.group(3), m.group(4)) if g)
                 section_last = target
             elif kind == "SHORT":
                 before = [p for at, p in line_refs if at < pos]
@@ -315,7 +420,8 @@ def extract(doc_lines: list, code_spans: list) -> tuple:
                 if m.group(0).rsplit("/", 1)[-1] not in RUNTIME_ARTEFACTS:
                     section_last = m.group(0)
                 continue
-            cites.append(Citation(doc_line=i, raw=m.group(0), kind=kind, target=target, lines=nums))
+            cites.append(Citation(doc_line=i, raw=m.group(0), kind=kind, target=target,
+                                  symbol=symbol, lines=nums))
     return cites, bare_outside
 
 
@@ -354,6 +460,28 @@ def verify(cites: list, basenames: dict, root: Path = ROOT) -> None:
             cache[path] = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
         c.n_lines = cache[path]
 
+        if c.kind == "SYMBOL":
+            if path.suffix != ".py":
+                c.in_bounds = False
+                c.note = ("symbol citation on a non-Python file -- symbols are indexed from "
+                          "the AST of a *.py file, and this one has none")
+                continue
+            span = _symbol_index(path).get(c.symbol)
+            if span is None:
+                c.in_bounds = False
+                c.note = f"symbol not defined in {c.resolved}"
+                continue
+            first, last = span
+            if c.lines:
+                outside = [n for n in c.lines if not (first <= n <= last)]
+                if outside:
+                    c.in_bounds = False
+                    c.note = (f"pinned line(s) outside symbol {c.symbol} "
+                              f"({first}-{last}): " + ", ".join(str(n) for n in outside))
+                    continue
+            else:
+                c.lines = span   # the symbol's own span, checked for bounds below
+
         if c.lines:
             out = [n for n in c.lines if not (1 <= n <= c.n_lines)]
             c.in_bounds = not out
@@ -383,8 +511,14 @@ def check_doc(doc: Path, root: Path = ROOT) -> DocResult:
 
     unresolved = [c for c in cites if c.kind == "SHORT" and not c.target]
     excluded = [c for c in cites if c.note.startswith("runtime artefact")]
+    # The note prefix separates "this symbol does not exist" from a pinned line
+    # range that lies outside an existing symbol, which is an ordinary bounds
+    # failure and must keep failing as one.
+    symbol_missing = [c for c in cites
+                      if c.kind == "SYMBOL" and c.exists and c.note.startswith("symbol")]
     missing = [c for c in cites if not c.exists and c not in unresolved and c not in excluded]
-    out_of_bounds = [c for c in cites if c.exists and not c.in_bounds]
+    out_of_bounds = [c for c in cites
+                     if c.exists and not c.in_bounds and c not in symbol_missing]
 
     return DocResult(
         doc=doc,
@@ -393,6 +527,7 @@ def check_doc(doc: Path, root: Path = ROOT) -> DocResult:
         doc_lines=doc_lines,
         cites=cites,
         missing=missing,
+        symbol_missing=symbol_missing,
         out_of_bounds=out_of_bounds,
         unresolved=unresolved,
         excluded=excluded,
@@ -403,7 +538,7 @@ def check_doc(doc: Path, root: Path = ROOT) -> DocResult:
 def _show(c: Citation) -> str:
     lines = ",".join(str(n) for n in c.lines) if c.lines else "-"
     return (
-        f"[{c.kind:5}] doc:{c.doc_line:<4} {c.raw:<52} -> {c.resolved or c.target:<58} "
+        f"[{c.kind:6}] doc:{c.doc_line:<4} {c.raw:<52} -> {c.resolved or c.target:<58} "
         f"lines={lines:<12} file_lines={c.n_lines:<6} "
         f"exists={'Y' if c.exists else 'N'} in_bounds={'Y' if c.in_bounds else 'N'}"
         + (f"  # {c.note}" if c.note else "")
@@ -416,6 +551,7 @@ def _report_doc(result: DocResult, verbose: bool) -> None:
     print(f"citations extracted: {len(result.cites)}  "
           f"(FULL={sum(c.kind == 'FULL' for c in result.cites)}, "
           f"SHORT={sum(c.kind == 'SHORT' for c in result.cites)}, "
+          f"SYMBOL={sum(c.kind == 'SYMBOL' for c in result.cites)}, "
           f"BARE={sum(c.kind == 'BARE' for c in result.cites)})")
     print(f"  bare refs in prose (outside backtick spans, not citations): "
           f"{len(result.bare_outside_code)}")
@@ -431,6 +567,7 @@ def _report_doc(result: DocResult, verbose: bool) -> None:
     print("=" * 160)
     print(f"TOTAL checked: {len(result.cites)}")
     print(f"  files missing      : {len(result.missing)}")
+    print(f"  symbols not defined: {len(result.symbol_missing)}")
     print(f"  lines out of bounds: {len(result.out_of_bounds)}")
     print(f"  unresolved shorthand: {len(result.unresolved)}")
     print(f"  excluded (runtime) : {len(result.excluded)}")
@@ -443,8 +580,8 @@ def _report_doc(result: DocResult, verbose: bool) -> None:
                   + (f" (file has {c.n_lines} lines)" if c.n_lines else "")
                   + f"\n      | {result.doc_lines[c.doc_line - 1].strip()}")
     else:
-        print(f"RESULT: OK ({result.label}) -- every citation resolves to an "
-              f"existing file with in-bounds lines")
+        print(f"RESULT: OK ({result.label}) -- every citation resolves to an existing "
+              f"file with in-bounds lines, and every SYMBOL to a symbol that file defines")
 
 
 def _parse_args(args: list) -> tuple:

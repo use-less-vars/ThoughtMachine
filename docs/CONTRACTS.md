@@ -31,12 +31,13 @@ itself never mutates anything.
 by the caller (the model hallucinating one, or an attacker injecting one into the arguments) never
 reaches the tool as an authority fact.
 
-**Enforcement site:** `tools/base.py:85-88` — `ToolBase.session_id` (with the C68 comment at
-`tools/base.py:77-84`), the reader that consumes the fact at `tools/base.py:308-313`
+**Enforcement site:** `tools/base.py::ToolBase` — `ToolBase.session_id` (with the C68 comment at
+`:77-84`), the reader that consumes the fact at
+`tools/base.py::ToolBase._resolve_registry_workspace`
 (`session_id = getattr(self, 'session_id', None)`, then a `SessionRegistry` lookup), and the authority
 pair in `agent/core/tool_executor.py` that makes a caller-supplied value unreachable: the discard at
-`agent/core/tool_executor.py:489` (`tool_args.pop('session_id', None)`, before validation) and the
-injection at `agent/core/tool_executor.py:798-800` (`tool_args['session_id'] = session_id`, from the
+`agent/core/tool_executor.py::ToolExecutor._execute_single_tool` (`tool_args.pop('session_id', None)`,
+before validation) and the injection at `:818` (`tool_args['session_id'] = session_id`, from the
 executor's own authenticated value):
 
 ```python
@@ -71,7 +72,7 @@ permission profile is the deny-all shape rather than a permissive default; and e
 decision denies on an unknown category, on a value the session does not grant, and on ASK with no
 interactive approver.
 
-**Enforcement site:** `security/security_gate.py:1104` — `get_effective_permissions`, whose disk-mode
+**Enforcement site:** `security/security_gate.py::get_effective_permissions` — whose disk-mode
 exception handlers force the deny-all sentinels (`1210-1212` for the unreadable-store handler, its
 unreadable-grant twin at `1240-1241`, and the unusable-ceiling handler at `1276-1293`, which denies
 rather than keeping an un-capped, fail-open session):
@@ -82,9 +83,10 @@ rather than keeping an un-capped, fail-open session):
             workspace_permissions = _DISK_FAIL_CLOSED_CEILING
 ```
 
-plus the allow/deny deciders `check_required_categories` (`security/security_gate.py:1713-1894`),
-`check_atomic_operation` (`security/security_gate.py:1605-1640`) and `check_requires_resource`
-(`security/security_gate.py:1643-1710`):
+plus the allow/deny deciders `check_required_categories`
+(`security/security_gate.py::check_required_categories`), `check_atomic_operation`
+(`security/security_gate.py::check_atomic_operation`) and `check_requires_resource`
+(`security/security_gate.py::check_requires_resource`):
 
 ```python
         allowed = effective.get(category)
@@ -97,17 +99,17 @@ plus the allow/deny deciders `check_required_categories` (`security/security_gat
         if result is False:
 ```
 
-`_denial_layer_label` (`security/security_gate.py:723-735`) is NOT an enforcement point: it returns
-denial-message text and is called only from `_denial_clause` (`security/security_gate.py:738`, the
-call at `:762`). It can
+`_denial_layer_label` (`security/security_gate.py::_denial_layer_label`) is NOT an enforcement point:
+it returns denial-message text and is called only from `_denial_clause`
+(`security/security_gate.py::_denial_clause`, the call at `:762`). It can
 neither allow nor deny a call and must not be cited as the trust boundary.
 
 **Value direction — which way an unusable ceiling fails.** `apply_workspace_ceiling`
-(`security/security_gate.py:281`) answers two questions that are easy to conflate. An unknown ceiling
+(`security/security_gate.py::apply_workspace_ceiling`) answers two questions that are easy to conflate. An unknown ceiling
 **value** on a KNOWN resource — a level token outside that resource's vocabulary, or a value of the
 wrong type for it — is fail-**CLOSED**: it is logged and the grain is denied outright (`banned`, or
 `False` for the boolean `container` grain) via `_ceiling_fail_closed_value`
-(`security/security_gate.py:272-278`, used at `:457`, `:491` and `:504`), so a typo in a security
+(`security/security_gate.py::_ceiling_fail_closed_value`, used at `:457`, `:491` and `:504`), so a typo in a security
 ceiling can never silently mean "no restriction". An unknown ceiling **resource** key stays
 fail-**OPEN** (warn and ignore, `:355-362`), because a workspace map written by a newer build must not
 break session resolution; the *mapping-missing* case is no longer silent either (`:363-377`, see
@@ -118,7 +120,8 @@ invariant, not an implementation detail: (1) unknown resource key → warn, igno
 recognised resource with no session-side mapping → warn, skip (`:363-377`); (3) `host_bash` is
 intercepted onto its own scale `banned < ask < allow` before generic rank normalisation (`:390-433`),
 so an `ask` ceiling over an `allow` grant caps to `banned` instead of fabricating a prompt level;
-(4) legacy spellings are translated by `_CEILING_VALUE_ALIASES` (`security/security_gate.py:263-266`)
+(4) legacy spellings are translated by `_CEILING_VALUE_ALIASES`
+(`security/security_gate.py::_CEILING_VALUE_ALIASES`)
 subject to a two-way legality guard — translated only when the raw token is NOT already legal *and*
 the target IS (`:471-479`) — so `full` caps to `write` on `git`/`filesystem`/`network` while a legal
 `full` on `mcp` is untouched; (5) vocabulary membership, else fail closed (`:480-492`); (6)
@@ -160,9 +163,10 @@ and `check_requires_resource` are not imported by either cited file — see Know
 `DEFAULT_RUNTIME_MODE = MODE_PROCESS`, and process mode is answered by a real OS child process, not by
 the calling interpreter.
 
-**Enforcement site:** `tools/workspace/worker_runtime.py:90` (`DEFAULT_RUNTIME_MODE = MODE_PROCESS`,
-resolver at `tools/workspace/worker_runtime.py:357`) and the substrate in
-`tools/workspace/worker_runtime_process.py:486-495`:
+**Enforcement site:** `tools/workspace/worker_runtime.py::DEFAULT_RUNTIME_MODE`
+(`DEFAULT_RUNTIME_MODE = MODE_PROCESS`, resolver at
+`tools/workspace/worker_runtime.py::resolve_runtime_mode`) and the substrate in
+`tools/workspace/worker_runtime_process.py::ProcessWorkerRuntime.start`:
 
 ```python
         process = context.Process(
@@ -256,8 +260,9 @@ pass:**
    exactly this reason.
 2. **Contract 2 — two of the three deciders are unproven by anything named here (GAP).**
    `tests/trust/test_gate_contract.py` imports only `check_required_categories` (its line 25); neither
-   `check_atomic_operation` (`security/security_gate.py:1605-1640`) nor `check_requires_resource`
-   (`security/security_gate.py:1643-1710`) is imported or called by `tests/test_security_gate_disk.py`
+   `check_atomic_operation` (`security/security_gate.py::check_atomic_operation`) nor
+   `check_requires_resource` (`security/security_gate.py::check_requires_resource`) is imported or
+   called by `tests/test_security_gate_disk.py`
    or `tests/trust/test_gate_contract.py`. Their `ASK`-is-denied, unknown-resource and
    malformed-`operation_required` branches have no detecting test in this ledger.
 3. **Contract 2 — `_denial_layer_label` is untested (GAP, cosmetic).** Correctly not cited as
@@ -265,8 +270,9 @@ pass:**
    decision.
 4. **Contract 2 — the ceiling-value fail-OPEN asymmetry (CLOSED).**
    An unknown workspace-ceiling *value* used to be fail-open in `apply_workspace_ceiling`; it is now
-   fail-CLOSED (vocabulary guard `security/security_gate.py:480-492`, rank guard `:496-505`, deny
-   value `_ceiling_fail_closed_value` `:272-278`) and pinned by `tests/test_ceiling_value_fail_closed.py`
+   fail-CLOSED (vocabulary guard `security/security_gate.py::apply_workspace_ceiling:480-492`, rank
+   guard `:496-505`, deny value
+   `security/security_gate.py::_ceiling_fail_closed_value`) and pinned by `tests/test_ceiling_value_fail_closed.py`
    and `tests/test_permission_hierarchy.py`, both cited above and both run by the gate. Only the
    unknown-*resource* side stays fail-open, and that is a deliberate forward-compatibility choice,
    not a lingering asymmetry.
@@ -276,8 +282,9 @@ pass:**
    drop one half without the other noticing.
 6. **Contract 2 — the `ci` ceiling was a silent no-op (CLOSED).** `ci` was a recognised ceiling
    resource with no entry in `_WORKSPACE_RESOURCE_MAP`, so a configured `ci` ceiling applied nothing
-   and logged nothing. The mapping now exists (`security/security_gate.py:221`), a mapping-less
-   resource warns instead of skipping silently (`security/security_gate.py:363-377`), and
+   and logged nothing. The mapping now exists (`security/security_gate.py::_WORKSPACE_RESOURCE_MAP`), a
+   mapping-less resource warns instead of skipping silently
+   (`security/security_gate.py::apply_workspace_ceiling:363-377`), and
    `tests/test_ceiling_map_completeness.py` fails if any catalog resource loses its mapping.
 7. **The design spec is not citation-checked (GAP, tracked).** Every citation in this ledger is now
    machine-checked: the gate runs `scripts/verify_doc_citations.py --doc docs/CONTRACTS.md`. The
