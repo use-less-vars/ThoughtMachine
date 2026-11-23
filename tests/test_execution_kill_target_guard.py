@@ -37,6 +37,12 @@ SUCCESS (``gone``).
 10. A ``start_new_session=True`` child goes down the ``group`` path.
 11. A zombie child (exited, NOT reaped) must not burn the grace period: the
    liveness poll reads ``/proc/<pid>/stat`` state instead of trusting signal 0.
+12. An UNREADABLE process state (no ``/proc`` at all, or an entry that exists
+   and cannot be read) must degrade toward ALIVE, never toward DEAD: the
+   escalation burns the whole grace period and STILL issues the kill.
+   CHARACTERISATION test -- behaviour already correct by accident, no
+   capability guard, the unreadable condition is injected at the seam
+   production code already uses.
 
 Run with::
 
@@ -45,6 +51,7 @@ Run with::
 
 from __future__ import annotations
 
+import builtins
 import os
 import signal
 import subprocess
@@ -273,9 +280,31 @@ def test_own_pid_is_refused(monkeypatch):
 # 4. our own process group: ONE pid, never the group
 # ---------------------------------------------------------------------------
 
+def _procfs_available() -> bool:
+    """True only when the Linux procfs is MOUNTED (``/proc/self`` is a dir).
+
+    Process groups are POSIX-wide; ``/proc`` is a Linux facility.  Darwin is
+    ``os.name == "posix"`` and has no procfs at all, so ``os.name`` can never
+    stand in for a ``/proc`` capability test -- which is why the old guard,
+    whose reason named ``/proc state``, was a no-op on macOS and the state
+    reads below fell through to a failure instead of a skip.  Same directory
+    probe as ``scripts/prove_worker_pid.py``.
+    """
+    return os.path.isdir("/proc/self")
+
+
 POSIX_ONLY = pytest.mark.skipif(
     os.name != "posix",
-    reason="process groups and /proc state are POSIX-only",
+    reason="requires POSIX process groups (os.killpg/os.getpgid)",
+)
+
+PROCFS_REQUIRED_REASON = (
+    "requires Linux procfs (/proc) to read a process state; "
+    "not available on this platform"
+)
+
+PROCFS_ONLY = pytest.mark.skipif(
+    not _procfs_available(), reason=PROCFS_REQUIRED_REASON
 )
 
 
@@ -331,9 +360,11 @@ class _RecordingKill:
         return [pid for pid, sent in self.calls if sent == sig]
 
 
-def _spawn_sleeper(new_session: bool = False, seconds: str = "30"):
+def _spawn_sleeper(new_session: bool = False, seconds: str = "30", stdout=None):
     """A real ``sleep`` child; ``new_session`` makes it its own group leader."""
-    return subprocess.Popen(["sleep", seconds], start_new_session=new_session)
+    return subprocess.Popen(
+        ["sleep", seconds], start_new_session=new_session, stdout=stdout
+    )
 
 
 def _reap(proc) -> None:
@@ -665,36 +696,84 @@ def test_session_leader_child_is_killed_as_a_group(monkeypatch):
 # 11. a zombie child must not burn the grace period
 # ---------------------------------------------------------------------------
 
+# ``_proc_state`` has THREE outcomes, never two.  A single ``None`` used to
+# stand for both of the non-state ones, so on a platform without procfs "I
+# cannot look" was reported downstream in the grammar of "I looked, and the
+# child was not a zombie".
+_PROC_STATE_GONE = "GONE"
+_PROC_STATE_UNMEASURABLE = "UNMEASURABLE"
+
+
 def _proc_state(pid):
-    """The state character of ``/proc/<pid>/stat``, or ``None`` if unreadable.
+    """State character of ``/proc/<pid>/stat``, or a sentinel saying why not.
+
+    Returns the state character when the kernel answered, ``_PROC_STATE_GONE``
+    when procfs answered "no such pid" (the child was already reaped) and
+    ``_PROC_STATE_UNMEASURABLE`` when the state cannot be read at all (no
+    procfs mounted, or an entry that exists and is unreadable).
 
     The comm field may contain spaces and parentheses, so the state is the
     first field AFTER THE LAST ``)`` -- never a naive ``split()[2]``.
+
+    ``FileNotFoundError`` on its own does NOT mean "the process is gone": it
+    also means "this platform has no procfs".  The two are told apart by
+    probing ``/proc`` itself, so that inability-to-measure is never silently
+    reported as an observed death.
     """
     try:
         with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as handle:
             data = handle.read()
+    except FileNotFoundError:
+        if not _procfs_available():
+            return _PROC_STATE_UNMEASURABLE
+        return _PROC_STATE_GONE
     except OSError:
-        return None
+        # The entry could not be read (permissions, I/O error, ...): that is
+        # not an observation of the process state either.
+        return _PROC_STATE_UNMEASURABLE
     end = data.rfind(")")
     if end == -1:
-        return None
+        return _PROC_STATE_UNMEASURABLE
     fields = data[end + 1:].split()
-    return fields[0] if fields else None
+    return fields[0] if fields else _PROC_STATE_UNMEASURABLE
 
 
-def _wait_for_zombie(pid, timeout: float = 10.0) -> None:
+# Returned by ``_wait_for_zombie`` when the state could not be read: NOT a
+# pass and NOT a failure -- the case simply cannot be measured here.
+_NOT_MEASURED = "NOT_MEASURED"
+
+
+def _wait_for_zombie(pid, timeout: float = 10.0):
     """Block until ``pid`` is a zombie -- WITHOUT reaping it.
 
     ``proc.poll()`` / ``proc.wait()`` would reap the child and delete the very
     ``/proc`` entry the case is about, so the state is read straight from
     ``/proc`` instead.
+
+    Three outcomes, kept apart on purpose:
+
+    - ``None``: a zombie WAS measured (the caller may assert on it);
+    - ``_NOT_MEASURED``: the state cannot be read at all -- no procfs on this
+      platform, or an unreadable entry.  Nothing is claimed about the child;
+      the caller must skip with ``PROCFS_REQUIRED_REASON`` rather than report
+      a dead child;
+    - ``AssertionError``: the state WAS read, repeatedly, and was never ``Z``.
+      That is a real failure and still raises the historical message.  The
+      message is a claim about the child, so it must never be reachable by a
+      platform that simply cannot look.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         state = _proc_state(pid)
         if state == "Z":
-            return
+            return None
+        if state == _PROC_STATE_UNMEASURABLE:
+            return _NOT_MEASURED
+        if state == _PROC_STATE_GONE:
+            raise AssertionError(
+                f"pid {pid} has no /proc entry and was already reaped, so its "
+                "zombie state never became observable"
+            )
         time.sleep(0.01)
     raise AssertionError(
         f"pid {pid} never became a zombie within {timeout}s "
@@ -703,6 +782,7 @@ def _wait_for_zombie(pid, timeout: float = 10.0) -> None:
 
 
 @POSIX_ONLY
+@PROCFS_ONLY
 @pytest.mark.parametrize("new_session", [False, True])
 def test_zombie_child_does_not_burn_the_grace_period(monkeypatch, new_session):
     """An exited-but-unreaped child is DEAD: teardown returns, no grace burned.
@@ -710,6 +790,13 @@ def test_zombie_child_does_not_burn_the_grace_period(monkeypatch, new_session):
     Signal 0 still succeeds on a zombie, so a ``os.killpg(pid, 0)`` poll would
     sit out the whole grace period and then SIGKILL a corpse.  Liveness must
     therefore read the ``/proc`` state (``Z`` == dead).
+
+    Two capabilities are needed and they are NOT the same one: POSIX process
+    groups (``os.killpg``/``os.getpgid``, for the monkeypatch below) and the
+    Linux procfs (to OBSERVE the ``Z`` state this case is about).  The
+    ``PROCFS_ONLY`` marker is the collection-time guard; the in-body check
+    covers the same condition discovered at run time -- without it the case
+    would report an unreadable ``/proc`` as a child that never died.
     """
     _Logs().install(monkeypatch)
     killpg = _RecordingKillpg(forward=True)
@@ -717,7 +804,8 @@ def test_zombie_child_does_not_burn_the_grace_period(monkeypatch, new_session):
 
     proc = _spawn_sleeper(new_session=new_session, seconds="0.1")
     try:
-        _wait_for_zombie(proc.pid)
+        if _wait_for_zombie(proc.pid) == _NOT_MEASURED:
+            pytest.skip(PROCFS_REQUIRED_REASON)
         tracker = ExecutionTracker()
         tracker.kill_grace_seconds = 3.0
         tracker.add("e1", {"type": "subprocess", "pid": proc.pid})
@@ -734,3 +822,146 @@ def test_zombie_child_does_not_burn_the_grace_period(monkeypatch, new_session):
     finally:
         _reap(proc)
 
+
+# ---------------------------------------------------------------------------
+# 12. an UNREADABLE process state degrades toward ALIVE, never toward DEAD
+# ---------------------------------------------------------------------------
+
+
+class _UnreadableProcStat:
+    """Make ``/proc/<pid>/stat`` UNREADABLE -- and nothing else.
+
+    INJECTION SEAM: ``open`` INSIDE ``tools.workspace.worker_execution``, i.e.
+    the module global that shadows the builtin for every function of that
+    module.  ``_pid_is_alive`` therefore runs UNMODIFIED: its ``os.kill(pid, 0)``
+    probe, its ``except OSError`` arm, ``_kill_decision``,
+    ``_terminate_subprocess``, the ``kill_grace_seconds`` poll and the SIGKILL
+    escalation are all real production code.  Only the one read that a host
+    without a usable procfs cannot perform is faked.
+
+    That is the HIGHEST seam that still exercises real escalation logic:
+    patching ``_pid_is_alive``, ``_escalate_subprocess_kill`` or the tracker
+    itself would replace the very behaviour this test pins.  Every other path,
+    and every other pid, is forwarded to the real ``open``.
+    """
+
+    def __init__(self, pid: int, error: type) -> None:
+        self.path = f"/proc/{pid}/stat"
+        self.error = error
+        self.attempts = 0
+        self._real = builtins.open
+
+    def __call__(self, file, *args, **kwargs):
+        if str(file) == self.path:
+            self.attempts += 1
+            raise self.error(self.path)
+        return self._real(file, *args, **kwargs)
+
+    def install(self, monkeypatch) -> "_UnreadableProcStat":
+        monkeypatch.setattr(worker_execution_module, "open", self, raising=False)
+        return self
+
+
+def _spawn_exited_child(new_session: bool = True):
+    """A real child that has EXITED and is NOT reaped (a zombie).
+
+    Reuses :func:`_spawn_sleeper`; the only addition is ``stdout=PIPE``.  EOF on
+    that pipe is a REAP-FREE, platform-independent proof that the child exited:
+    the write end closes when the process exits, and reading it never calls
+    ``wait``.  ``proc.poll()`` / ``proc.wait()`` would reap the child, and
+    ``_wait_for_zombie`` needs a procfs this test must not require.
+    """
+    proc = _spawn_sleeper(
+        new_session=new_session, seconds="0.1", stdout=subprocess.PIPE
+    )
+    assert proc.stdout is not None
+    assert proc.stdout.read() == b"", "the child wrote to the pipe before exiting"
+    proc.stdout.close()
+    return proc
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError])
+def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
+    """CHARACTERISATION test (NOT red-first): unreadable state reads as ALIVE.
+
+    This test documents behaviour that is already correct BY ACCIDENT.  It is
+    not a bug reproduction and it did not start red: it is written so that it
+    goes red only if that accident is later "tidied" in the wrong direction.
+
+    The behaviour: ``worker_execution._pid_is_alive`` catches ``OSError`` around
+    the ``/proc/<pid>/stat`` read and returns ``True`` -- "assume ALIVE".  That
+    is the conservative direction, and it is what keeps teardown safe on a host
+    with no usable procfs: a genuinely exited child still answers signal 0 (a
+    zombie does), and its state cannot be read, so liveness must never be
+    inferred as "dead" from an inability to measure.
+
+    Pinned here, on a child that really has EXITED and is NOT reaped (exactly
+    the zombie a ``Popen`` child becomes before ``wait()``), with the state read
+    made unreadable at the seam production code already uses:
+
+    (a) the escalation BURNS the whole grace period rather than concluding the
+        target is dead, and
+    (b) a kill IS still issued at the end of it -- teardown is not silently
+        skipped, it SIGKILLs a corpse.
+
+    So the price of "cannot measure" is a wasted grace period: never a live
+    target left running, and never a false "already dead" that skips the kill.
+    Only ``False`` from ``_pid_is_alive`` short-circuits the escalation, which
+    is why mapping the unreadable case onto DEAD is observable in BOTH halves:
+    it returns immediately (no burn) AND issues no SIGKILL.
+
+    No capability guard: the unreadable condition is INJECTED, so this runs on
+    every platform.  ``POSIX_ONLY`` is not a capability skip for this case --
+    the whole file needs POSIX process groups (``os.killpg`` / ``os.getpgid``)
+    to observe a group kill at all, on Linux and on Darwin alike.
+
+    Both ``OSError`` shapes are covered because they are two different absences:
+    a Darwin host has no ``/proc`` at all (``FileNotFoundError``), while a
+    present-but-unreadable entry raises ``PermissionError``.  Both reach the
+    same ``except OSError`` arm.
+    """
+    logs = _Logs().install(monkeypatch)
+    killpg = _RecordingKillpg(forward=True)
+    monkeypatch.setattr("os.killpg", killpg)
+
+    proc = _spawn_exited_child(new_session=True)
+    try:
+        unreadable = _UnreadableProcStat(proc.pid, error).install(monkeypatch)
+
+        grace = 1.0
+        tracker = ExecutionTracker()
+        tracker.kill_grace_seconds = grace
+        tracker.add("e1", {"type": "subprocess", "pid": proc.pid})
+
+        started = time.monotonic()
+        tracker.terminate_all("w1", None, None)
+        elapsed = time.monotonic() - started
+
+        assert unreadable.attempts > 0, (
+            "the process-state read was never attempted, so nothing was proved "
+            "about the unreadable case"
+        )
+        assert elapsed >= grace * 0.9, (
+            f"escalation returned after {elapsed:.2f}s on an UNREADABLE state: "
+            f"it did not burn the {grace}s grace period, so an unmeasurable "
+            "process was degraded toward DEAD instead of toward ALIVE"
+        )
+        assert elapsed < grace + 2.0, (
+            f"teardown took {elapsed:.2f}s for a {grace}s grace period: the "
+            "poll is not bounded by kill_grace_seconds"
+        )
+        assert proc.pid in killpg.signalled(signal.SIGKILL), (
+            "no SIGKILL was issued after the grace period: an unreadable state "
+            f"silently skipped the escalation ({killpg.calls!r})"
+        )
+        assert any(
+            "still alive after" in message
+            for _level, _component, message in logs.entries
+        ), (
+            "the escalation did not report the burned grace period: "
+            f"{logs.entries!r}"
+        )
+        assert tracker.active_count() == 0
+    finally:
+        _reap(proc)
