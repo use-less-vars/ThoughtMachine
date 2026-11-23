@@ -175,9 +175,9 @@ a timeout); a late reply may satisfy the next query.
   riding in the payload (`worker_runtime_process.py` constant, ~`:106`), and one acceptability
   rule shared with the child (`CANCEL_TERMINAL_STATUSES`, `worker_runtime.py:98`).
 - Timeouts are distinguished from death by *which exception* a caller gets
-  (`WorkerQueryTimeout` vs `WorkerRuntimeLost`, both documented at
-  `worker_runtime_process.py:14-21`), which is the right shape: death is a lost runtime, not a
-  slow query.
+  (`WorkerQueryTimeout` vs `WorkerRuntimeLost`, defined at
+  `worker_runtime_process.py:160` and `:135` respectively), which is the right shape: death is a
+  lost runtime, not a slow query.
 - **The held late reply is absent.** There is no supervisor-side buffer for a `Respond` that
   arrives while a worker is parked; grep finds no `held_reply` / `deferred_reply` / `late_reply`
   mechanism in `tools/workspace/`. A reply frame that arrives for an unknown or already-satisfied
