@@ -1995,6 +1995,43 @@ body {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+   Respond tool call (rendered as an ordinary assistant message)
+   ────────────────────────────────────────────────────────────────────────── */
+
+.respond-tool-call {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.respond-attachment {
+  margin: 0;
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.respond-attachment-chip {
+  cursor: pointer;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--accent, #646cff);
+  user-select: none;
+}
+
+.respond-attachment-chip:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.respond-attachment-body {
+  padding: 0 0.6rem 0.6rem;
+  border-top: 1px solid var(--border, #333);
+  margin-top: 0.2rem;
+  padding-top: 0.5rem;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
    Truncatable content (long tool results)
    ────────────────────────────────────────────────────────────────────────── */
 

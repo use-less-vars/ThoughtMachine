@@ -120,6 +120,136 @@ function ToolCallContent({ content }) {
   )
 }
 
+/* ── Tool-argument decoding (defensive) ──
+ *
+ * The backend stores a tool call as
+ *     json.dumps({"name": ..., "arguments": args_obj})
+ * where `args_obj` is whatever `json.loads(func["arguments"])` produced — but
+ * when that first parse FAILS the backend keeps the raw STRING instead
+ * (`args_obj = args_str`, session_manager.py:686 / bridge.py:2737 — do not fix
+ * there, the bridge is shared). That outer json.dumps then re-escapes it, so
+ * `arguments` can reach the client as a *string containing an encoded JSON
+ * document*:
+ *
+ *     "{\"content\": \"# Heading\\n\\n…\", \"report_title\": \"…\"}"
+ *
+ * One JSON.parse of msg.content therefore yields `arguments` as a string, and
+ * JSON.stringify()-ing that for display shows the escapes literally
+ * (`\"content\":`, `\n`, `\u2014`). So decode by hand: parse while the value
+ * is still a string, with a small bound so a pathological payload cannot spin.
+ *
+ * Returns { ok, value }. `ok === false` means "not an argument object — render
+ * the raw text instead". Never throws.
+ */
+const MAX_ARGUMENT_DECODE_DEPTH = 2
+
+function parseToolArguments(value) {
+  let current = value
+  for (let depth = 0; depth <= MAX_ARGUMENT_DECODE_DEPTH; depth += 1) {
+    if (typeof current !== 'string') break
+    try {
+      current = JSON.parse(current)
+    } catch (e) {
+      return { ok: false, value: null }
+    }
+  }
+  if (current && typeof current === 'object' && !Array.isArray(current)) {
+    return { ok: true, value: current }
+  }
+  return { ok: false, value: null }
+}
+
+/* ── Respond tool call ──
+ *
+ * `Respond` is not an ordinary tool: its arguments ARE the assistant's answer
+ * (a markdown `content` document plus an optional report attachment). Rendering
+ * it as tool JSON showed the operator escaped markdown source instead of the
+ * message they were meant to read, so this ONE tool goes through the same
+ * markdown pipeline (ReactMarkdown + remark-gfm) and the same CSS class
+ * (`assistant-markdown`) as ordinary assistant text. Every other tool keeps
+ * ToolCallContent untouched.
+ */
+const RESPOND_TOOL_NAME = 'respond'
+
+function toolCallName(content) {
+  try {
+    const parsed = JSON.parse(content)
+    return parsed && typeof parsed.name === 'string' ? parsed.name : null
+  } catch (e) {
+    return null
+  }
+}
+
+function isRespondToolCall(content) {
+  const name = toolCallName(content)
+  return name !== null && name.trim().toLowerCase() === RESPOND_TOOL_NAME
+}
+
+function RespondToolCallContent({ content }) {
+  /* Controlled disclosure: the report body is NOT mounted while collapsed, so
+   * a long report costs nothing until the operator asks for it. */
+  const [reportOpen, setReportOpen] = useState(false)
+
+  const envelope = (() => {
+    try {
+      return JSON.parse(content)
+    } catch (e) {
+      return null
+    }
+  })()
+  const argsResult = parseToolArguments(envelope ? envelope.arguments : undefined)
+
+  /* Malformed payload: fall back to the previous raw display (never blank). */
+  if (!argsResult.ok) {
+    return <pre className="tool-call-raw">{content}</pre>
+  }
+
+  const args = argsResult.value
+  const body = typeof args.content === 'string' ? args.content : ''
+  const reportTitle = typeof args.report_title === 'string' ? args.report_title : ''
+  const reportBody = typeof args.report_body === 'string' ? args.report_body : ''
+
+  return (
+    <div className="respond-tool-call">
+      {body ? (
+        <div className="assistant-markdown">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+        </div>
+      ) : null}
+
+      {/* Report attachment: a chip labelled with its title; the body only
+          appears once expanded. There is no report download route in the
+          backend, so this is a disclosure, not a download button. */}
+      {reportBody ? (
+        <details
+          className="respond-attachment"
+          open={reportOpen}
+          onToggle={(e) => setReportOpen(e.currentTarget.open)}
+        >
+          <summary className="respond-attachment-chip">
+            📎 {reportTitle || 'Report attachment'}
+          </summary>
+          {reportOpen ? (
+            <div className="assistant-markdown respond-attachment-body">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{reportBody}</ReactMarkdown>
+            </div>
+          ) : null}
+        </details>
+      ) : null}
+
+      {/* The raw JSON stays reachable for debugging, collapsed by default. */}
+      <details className="tool-call-details respond-raw">
+        <summary className="tool-call-summary">
+          🛠️ Tool Call: <strong>{toolCallName(content)}</strong> (raw)
+        </summary>
+        <div className="tool-call-body">
+          <pre className="tool-call-args">{JSON.stringify(args, null, 2)}</pre>
+        </div>
+      </details>
+    </div>
+  )
+}
+
 /* ── Assistant message with optional reasoning block ──
  *
  * Streaming fast path: while a message is still being received (msg.is_streaming)
@@ -324,7 +454,9 @@ function MessageContent({ msg, sessionId }) {
     case 'tool_call':
       return (
         <>
-          <ToolCallContent content={msg.content} />
+          {isRespondToolCall(msg.content)
+            ? <RespondToolCallContent content={msg.content} />
+            : <ToolCallContent content={msg.content} />}
           {/* Paired result: the call and its outcome share ONE bubble now, so
               the outcome is rendered below the args.  Unpaired results never
               reach this path — they keep role 'tool_result'. */}
