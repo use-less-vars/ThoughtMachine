@@ -102,3 +102,75 @@ jobs:
         if: always()
         run: |
           echo "contract-gate pytest wall time: ${CONTRACT_GATE_SECONDS:-unknown}s (budget 120s)"
+
+  # ---------------------------------------------------------------------------
+  # Mutation gate (contracts)
+  #
+  # This job runs scripts/mutation_gate.py, which reads the mutations declared in
+  # tests/mutation_gate/specs.py. Three things about it are worth stating
+  # plainly, because a workflow that describes its own enforcement in flattering
+  # terms is worse than no workflow at all:
+  #
+  # 1. It mutates ONE declared guard at a time -- today exactly one,
+  #    `contract-3-default-mode`, the one-token rewrite of
+  #    `DEFAULT_RUNTIME_MODE = MODE_PROCESS` in tools/workspace/worker_runtime.py
+  #    -- runs ONLY the tests that are supposed to notice that mutation,
+  #    restores the file, and verifies the restoration by sha256 before scoring
+  #    anything. It is a spot check of claims made in docs/CONTRACTS.md, not a
+  #    sweep of the tree, and the number of contracts it covers is the number of
+  #    entries in the registry -- nothing wider.
+  # 2. A verdict of SURVIVED is a finding about the CONTRACT, not an error in the
+  #    gate. It means the "test that would fail if this were removed" the ledger
+  #    claims does not fail: the guard can be deleted with every named test still
+  #    green. The gate exits non-zero for SURVIVED on purpose, and that is the
+  #    signal this job exists to surface.
+  # 3. Whether this job BLOCKS a merge is a property of the GitHub ruleset on
+  #    `dev`, NOT a property of this file. This file cannot verify its own
+  #    requiredness -- nothing in it can tell whether a run is advisory or
+  #    blocking -- so it makes no claim about it. All this job does is make the
+  #    gate RUN on every pull request; running is strictly weaker than enforcing.
+  # ---------------------------------------------------------------------------
+  mutation-gate:
+    name: Mutation gate (contracts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      # No `|| true`, no continue-on-error: a gate that cannot fail is not a
+      # control. The gate's own output is already the readable report --
+      # `MUTATION <name>: <VERDICT>` per subject and one `GATE_SUMMARY ...` line
+      # -- so nothing is parsed or re-summarised here. --timeout 300 bounds each
+      # mutation's own pytest run; the job's timeout-minutes bounds the whole
+      # thing, so a hung pytest cannot burn the runner.
+      - name: Mutation gate (one declared guard at a time; non-zero exit is a finding)
+        run: |
+          set +e
+          start=$(date +%s)
+          python3 scripts/mutation_gate.py --timeout 300
+          status=$?
+          end=$(date +%s)
+          seconds=$((end - start))
+          echo "MUTATION_GATE_SECONDS=${seconds}" >> "$GITHUB_ENV"
+          exit $status
+
+      - name: "Report mutation gate wall time (each mutation bounded at 300s)"
+        if: always()
+        run: |
+          echo "mutation-gate wall time: ${MUTATION_GATE_SECONDS:-unknown}s"
+
