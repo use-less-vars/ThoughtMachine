@@ -1,5 +1,5 @@
 # tests/test_host_port_kill_switch.py
-"""CI AST kill-switch: no module under ``tools/`` may reach the host directly.
+"""CI AST kill-switch: no module in a scanned tree may reach the host directly.
 
 Every host process is supposed to funnel through ``thoughtmachine/host_port.py``
 (``host_run()`` / ``host_run_async()``), which is where the grain check, the
@@ -15,9 +15,10 @@ module explains *why* it has none) is not mistaken for the construct itself.
 
 Rules pinned here
 -----------------
-1. Only :data:`SANCTIONED_MODULES` -- ``tools/host_resource_policy.py`` and
-   ``tools/host_bash_tool.py`` -- may touch the host process surface inside
-   ``tools/``.  They are the policy checker and the host-run bridge; everything
+1. Only :data:`SANCTIONED_MODULES` -- ``tools/host_resource_policy.py``,
+   ``tools/host_bash_tool.py`` and ``thoughtmachine/host_port.py`` -- may touch
+   the host process surface inside the :data:`SCAN_ROOTS` trees.  They are the
+   policy checker, the host-run bridge and the chokepoint itself; everything
    else must call ``host_run()``.
 2. Every other offender must appear in :data:`ALLOWED_OFFENDERS` by its exact
    repository-relative path with the reason it still needs the surface.  The
@@ -47,10 +48,27 @@ import pytest
 #: Repository root, derived from this file (``<root>/tests/<this file>``).
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: Directories scanned for a direct host-process surface (recursively).
-#: ``thoughtmachine/host_port.py`` -- the chokepoint itself -- is deliberately
-#: outside this root and is pinned by ``tests/test_tool_import_declaration_match.py``.
-SCAN_ROOTS = ("tools",)
+#: Directories scanned for a direct host-process surface (recursively), in
+#: alphabetical order: the eight source trees that ship Python which can spawn.
+#: ``thoughtmachine/host_port.py`` -- the chokepoint itself -- is inside
+#: ``thoughtmachine`` and is named in :data:`SANCTIONED_MODULES` rather than
+#: excused by a hole in the roots.
+#:
+#: Two gaps are named rather than papered over.  ``tests/`` is the deliberate
+#: exclusion (589 ``*.py`` files): spawning is the thing under test there, so a
+#: fixture that runs a subprocess is doing its job.  The five top-level ``*.py``
+#: files at the project root (``start_windows.py`` among them, and it imports
+#: ``subprocess``) sit outside a directory-only tuple and are not scanned.
+SCAN_ROOTS = (
+    "agent",
+    "infra",
+    "mcp_examples",
+    "scripts",
+    "security",
+    "thoughtmachine",
+    "tools",
+    "web_ui",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +78,9 @@ SCAN_ROOTS = ("tools",)
 SANCTIONED_MODULES = (
     "tools/host_resource_policy.py",
     "tools/host_bash_tool.py",
+    # The chokepoint: host_run() / host_run_async() live here, so this is the
+    # one module that is *supposed* to import subprocess and spawn.
+    "thoughtmachine/host_port.py",
 )
 
 
@@ -69,9 +90,104 @@ SANCTIONED_MODULES = (
 
 ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
     (
+        "infra/containers/executor.py",
+        "docker image rebuild reads the committed requirements through a "
+        "`subprocess.run([\"git\", \"show\", \"HEAD:requirements.txt\"])` call "
+        "(line 1302, `cwd=` the workspace, no timeout) instead of GitReadTool / "
+        "SandboxedExecution, and never calls host_run(); that path therefore has "
+        "neither the grain check nor the kill switch. Tracked debt, not approved "
+        "design.",
+    ),
+    (
+        "infra/workspace_lifecycle_manager.py",
+        "`import subprocess` at line 38 with no call site anywhere in the module "
+        "(grep for `subprocess` finds the import and the module docstring, and "
+        "nothing else). Tracked debt: delete the import, then delete this "
+        "entry.",
+    ),
+    (
+        "mcp_examples/test_client.py",
+        "hand-run example client: `subprocess.Popen([sys.executable, "
+        "\"internet_search_server.py\"], stdin/stdout/stderr=PIPE, text=True)` at "
+        "lines 68 and 126 drives the example MCP stdio server through the "
+        "handshake. Imported by nothing outside ``mcp_examples/`` and absent from "
+        "[project.scripts], so no agent tool call reaches it. Tracked debt, not "
+        "approved design.",
+    ),
+    (
+        "scripts/ci_assert_collected.py",
+        "CI anti-vacuity step: `subprocess.run([sys.executable, \"-m\", "
+        "\"pytest\", \"--collect-only\", \"-q\", <targets>], capture_output=True, "
+        "text=True)` at line 143 counts the collected tests. Invoked as `python "
+        "scripts/ci_assert_collected.py` from .github/workflows/platform-matrix.yml "
+        "and platform-matrix-macos.yml -- a CI path, not a tool path. Tracked debt, "
+        "not approved design.",
+    ),
+    (
+        "scripts/ci_doctor_poller.py",
+        "CI helper with no caller in the tree today (grep finds the filename only "
+        "inside this file): `subprocess.run([\"pkill\", \"-f\", "
+        "\"web_ui.backend.server\"])` at line 118 in cleanup(), and "
+        "`subprocess.Popen(shlex.split(args.doctor_cmd), stdout=<log file>, "
+        "stderr=STDOUT)` at line 157 -- both aimed at the doctor wrapper's own "
+        "process tree. Tracked debt, not approved design.",
+    ),
+    (
+        "scripts/doctor_checks.py",
+        "host health probes: the `_run()` helper (`subprocess.run` at line 52, "
+        "captured text, per-call timeout) runs `id -nG`, `docker info/ps/rm`, `ss "
+        "-ltn`, `lsof`, `node --version`, `python3 -c ...` and `pip install -r "
+        "requirements`. Reached from .github/workflows/cross-platform-smoke.yml, "
+        "install_thoughtmachine.sh:294 and `thoughtmachine/doctor.py:32` (`from "
+        "scripts import doctor_checks`) -- and doctor.py is the audited "
+        "off-the-tool-path launcher pinned by "
+        "test_doctor_exception_stays_off_the_tool_path. Tracked debt, not approved "
+        "design.",
+    ),
+    (
+        "scripts/gen_handoff.py",
+        "onboarding/knowledge-base generator: `subprocess.check_output(args, "
+        "text=True, encoding=\"utf-8\")` at line 86 behind `sh()`, whose only "
+        "callers are `git rev-parse --show-toplevel`, `git rev-parse --short dev` "
+        "and `git log -1/-5 dev` (lines 302-323). Run by hand and from tests; "
+        "nothing in agent/, tools/ or web_ui/ imports it. Tracked debt, not "
+        "approved design.",
+    ),
+    (
+        "scripts/verify_fix.py",
+        "red-before gate documented in scripts/verify_fix.md: `_git()` spawns `git "
+        "<args>` with a timeout (line 399) plus `git rev-parse --show-toplevel` "
+        "(line 409), and `run_pytest()` spawns `[sys.executable, \"-m\", "
+        "\"pytest\", <selector>, \"-q\"]` (line 488) in a throwaway worktree. A "
+        "human/CI verification path, not a tool path. Tracked debt, not approved "
+        "design.",
+    ),
+    (
+        "security/sandboxed_execution.py",
+        "SandboxedExecution.run() spawns the command itself via `subprocess.run` "
+        "(line 145, with its own permission / metachar / timeout policy), so the "
+        "module is a second chokepoint that never calls host_run() and the kill "
+        "switch and cwd containment do not apply on that path. Tracked debt, not "
+        "approved design.",
+    ),
+    (
+        "thoughtmachine/doctor.py",
+        "`thoughtmachine doctor` self-check: its function-local `_run()` helper "
+        "shells out to python3/docker (`subprocess.run` at line 47, with "
+        "`subprocess.CompletedProcess` annotated at line 45) to report host "
+        "health. A dev/ops diagnostic invoked by the human launcher "
+        "(`python3 -m thoughtmachine.doctor`), not reachable from an agent tool "
+        "call -- and that reachability claim is itself pinned by "
+        "test_doctor_exception_stays_off_the_tool_path in "
+        "tests/test_tool_import_declaration_match.py. Tracked debt, not approved "
+        "design: migrate it onto host_run() the day it becomes reachable.",
+    ),
+    (
         "tools/ci_read_tool.py",
-        "spawns the `gh` CLI for CI monitoring (`subprocess.run` at line 260) "
-        "under its own `ci:read` grain; not routed through host_run yet.",
+        "resolves the repository origin with `subprocess.run([\"git\", "
+        "\"remote\", \"get-url\", \"origin\"])` (line 260) after the "
+        "`allow-host-resources` precheck at lines 250-258; the git lookup itself "
+        "is not routed through host_run() yet.",
     ),
     (
         "tools/git_info_tool.py",
@@ -98,6 +214,25 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
         "tools/workspace/worker_execution.py",
         "container teardown fallback: `docker exec <id> kill <pid>` via "
         "`subprocess.run` (line 384) in terminate_all().",
+    ),
+    (
+        "web_ui/backend/server.py",
+        "three import-time `subprocess.run` git lookups (`git rev-parse HEAD` "
+        "line 456, `git rev-parse --abbrev-ref HEAD` line 478, `git status "
+        "--porcelain` line 497, each `timeout=5.0`) feeding the /health payload, "
+        "plus the frontend build at line 6730 (`vite build`, else `npm run "
+        "build`, `timeout=120`, PATH prefixed with node_modules/.bin, "
+        "`subprocess.TimeoutExpired` handled at line 6746). None of them consults "
+        "the host permission grains and none calls host_run(). Tracked debt, not "
+        "approved design.",
+    ),
+    (
+        "web_ui/backend/tests/test_auth_boundary.py",
+        "test-only surface: `test_the_trust_flag_is_false_on_a_fresh_import` runs "
+        "`sys.executable -c ...` (line 582, `timeout=180`) because a fresh "
+        "import is the only way to read the shipped default; routing it through "
+        "host_run() would change what the test measures and it is not a "
+        "production surface. Tracked debt, not approved design.",
     ),
 )
 
@@ -279,8 +414,9 @@ def test_tools_tree_has_no_unsanctioned_host_process_surface():
         if rel_path not in sanctioned and rel_path not in allowed
     }
     assert not unlisted, (
-        "Host-process kill-switch tripped: module(s) under tools/ reach the host "
-        "directly instead of going through thoughtmachine.host_port.host_run().\n"
+        "Host-process kill-switch tripped: module(s) in the scanned trees "
+        f"{SCAN_ROOTS} reach the host directly instead of going through "
+        "thoughtmachine.host_port.host_run().\n"
         f"{_describe(unlisted)}\n"
         "Fix the module by calling host_run()/host_run_async(), or -- if the "
         "surface genuinely has to stay -- add an exact-path entry with its reason "
@@ -293,7 +429,8 @@ def test_scan_finds_the_known_offenders():
     """Positive control: the real-tree scan is not silently returning nothing."""
     offenders = scan_paths(_scanned_files())
     assert offenders, (
-        "The host-process scan found nothing anywhere under tools/. Either the "
+        f"The host-process scan found nothing anywhere under {SCAN_ROOTS}. "
+        "Either the "
         "scan is broken (it must at least see the known offenders) or the "
         "allowlist has gone stale."
     )
@@ -354,7 +491,7 @@ def test_allowlist_has_not_grown():
     added = sorted(discovered - allowlisted)
     removed = sorted(allowlisted - discovered)
     assert not added, (
-        "New unsanctioned host-process offender(s) appeared under tools/:\n  "
+        f"New unsanctioned host-process offender(s) appeared under {SCAN_ROOTS}:\n  "
         + "\n  ".join(added)
         + "\nMigrate them to host_run() or add an exact-path reason to ALLOWED_OFFENDERS."
     )

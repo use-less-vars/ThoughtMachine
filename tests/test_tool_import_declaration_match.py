@@ -48,8 +48,25 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: Directories scanned for ``subprocess`` imports (recursively; ``__pycache__``
-#: is skipped).
-SCAN_ROOTS = ("thoughtmachine", "tools")
+#: is skipped), in alphabetical order: the eight source trees that ship Python
+#: which can spawn.  Widened (F2) past the tool path -- an import is a
+#: declaration of intent wherever it lives.
+#:
+#: Two gaps are named rather than papered over.  ``tests/`` is the deliberate
+#: exclusion (589 ``*.py`` files): spawning is the thing under test there, so a
+#: fixture that runs a subprocess is doing its job.  The five top-level ``*.py``
+#: files at the project root (``start_windows.py`` among them, and it imports
+#: ``subprocess``) sit outside a directory-only tuple and are not scanned.
+SCAN_ROOTS = (
+    "agent",
+    "infra",
+    "mcp_examples",
+    "scripts",
+    "security",
+    "thoughtmachine",
+    "tools",
+    "web_ui",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +126,62 @@ ALLOWED_EXCEPTIONS = (
     # fallback used by terminate_all() when no container exec callable is
     # available.  Container plumbing, not host-execution tooling.
     "tools/workspace/worker_execution.py",
+    # -- WIDENED ROOTS (F2): trees outside the tool path that still spawn -----
+    # Imported function-locally inside the docker image rebuild, which reads the
+    # committed requirements with `git show HEAD:requirements.txt` (infra/
+    # containers/executor.py:1302) instead of GitReadTool/SandboxedExecution.
+    # Build plumbing that predates the chokepoint -- tracked debt, not design.
+    "infra/containers/executor.py",
+    # `import subprocess` at infra/workspace_lifecycle_manager.py:38 with no
+    # call site anywhere in the module: a dead import the reader has to check.
+    # Delete the import and this entry together.
+    "infra/workspace_lifecycle_manager.py",
+    # Second chokepoint: SandboxedExecution.run() spawns the command itself to
+    # enforce its own permission / metachar / timeout policy, so it has the
+    # import without ever calling host_run().  Tracked debt, not design.
+    "security/sandboxed_execution.py",
+    # Web backend: import-time `git rev-parse/status` probes for the /health
+    # payload (web_ui/backend/server.py:456/478/497) and the vite/npm frontend
+    # build (line 6730).  Neither consults the host grains.  Tracked debt.
+    "web_ui/backend/server.py",
+    # Test-only: `test_the_trust_flag_is_false_on_a_fresh_import` spawns
+    # `sys.executable -c ...` (web_ui/backend/tests/test_auth_boundary.py:582)
+    # to read a fresh import's default.  Not a production surface.
+    "web_ui/backend/tests/test_auth_boundary.py",
+    # -- WIDENED ROOTS (F2): scripts/ and mcp_examples/ ----------------------
+    # Hand-run example client: `subprocess.Popen([sys.executable,
+    # 'internet_search_server.py'], stdin/stdout/stderr=PIPE, text=True)` at
+    # mcp_examples/test_client.py:68 and :126 speaks the MCP stdio handshake to
+    # the example server.  Imported by nothing outside mcp_examples/, absent
+    # from [project.scripts]: not a tool path.
+    "mcp_examples/test_client.py",
+    # CI anti-vacuity step: `subprocess.run([sys.executable, "-m", "pytest",
+    # "--collect-only", "-q", <targets>])` at scripts/ci_assert_collected.py:143.
+    # Invoked as `python scripts/ci_assert_collected.py` from the platform-matrix
+    # workflows -- a CI path, not a tool path.
+    "scripts/ci_assert_collected.py",
+    # CI helper with no caller in the tree today: `subprocess.run(["pkill", "-f",
+    # "web_ui.backend.server"])` (line 118) and
+    # `Popen(shlex.split(args.doctor_cmd), stdout=<log>, stderr=STDOUT)`
+    # (line 157), both aimed at the doctor wrapper's own process tree.  Tracked
+    # debt, not design.
+    "scripts/ci_doctor_poller.py",
+    # Host health probes (`id -nG`, `docker info/ps/rm`, `ss -ltn`, `lsof`,
+    # `node --version`, `pip install -r requirements`) through `_run()` ->
+    # `subprocess.run` at line 52.  Reached from cross-platform-smoke.yml,
+    # install_thoughtmachine.sh:294 and `from scripts import doctor_checks` in
+    # thoughtmachine/doctor.py:32 -- i.e. only through the doctor module, whose
+    # off-the-tool-path status is pinned by
+    # test_doctor_exception_stays_off_the_tool_path below.
+    "scripts/doctor_checks.py",
+    # Onboarding generator: `subprocess.check_output` at line 86 behind `sh()`,
+    # whose only callers are `git rev-parse` / `git log` reads (lines 302-323).
+    # Run by hand and from tests; nothing in agent/, tools/ or web_ui/ imports it.
+    "scripts/gen_handoff.py",
+    # Red-before gate: `subprocess.run(["git", ...])` (lines 399, 409) and
+    # `[sys.executable, "-m", "pytest", <selector>, "-q"]` (line 488) in a
+    # throwaway worktree.  Human/CI verification path, not a tool path.
+    "scripts/verify_fix.py",
 )
 
 
@@ -151,6 +224,15 @@ DOCTOR_TOKENS = (DOCTOR_DOTTED, "thoughtmachine/doctor")
 #: ALLOWED_EXCEPTIONS) so that adding a file to the allowlist AND to the tree
 #: still fails until a human updates this tuple deliberately.
 PINNED_IMPORTERS = (
+    "infra/containers/executor.py",
+    "infra/workspace_lifecycle_manager.py",
+    "mcp_examples/test_client.py",
+    "scripts/ci_assert_collected.py",
+    "scripts/ci_doctor_poller.py",
+    "scripts/doctor_checks.py",
+    "scripts/gen_handoff.py",
+    "scripts/verify_fix.py",
+    "security/sandboxed_execution.py",
     "thoughtmachine/doctor.py",
     "thoughtmachine/host_port.py",
     "tools/ci_read_tool.py",
@@ -159,6 +241,8 @@ PINNED_IMPORTERS = (
     "tools/mcp_client.py",
     "tools/mcp_server_connect.py",
     "tools/workspace/worker_execution.py",
+    "web_ui/backend/server.py",
+    "web_ui/backend/tests/test_auth_boundary.py",
 )
 
 
