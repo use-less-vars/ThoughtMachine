@@ -50,7 +50,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: Directories scanned for ``subprocess`` imports (recursively; ``__pycache__``
 #: is skipped).  Widened (F2) past the tool path: an import is a declaration of
 #: intent wherever it lives, so every tree that can spawn is scanned.
-SCAN_ROOTS = ("infra", "security", "thoughtmachine", "tools", "web_ui")
+SCAN_ROOTS = ("agent", "infra", "security", "thoughtmachine", "tools", "web_ui")
 
 
 # ---------------------------------------------------------------------------

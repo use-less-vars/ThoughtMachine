@@ -15,10 +15,11 @@ module explains *why* it has none) is not mistaken for the construct itself.
 
 Rules pinned here
 -----------------
-1. Only :data:`SANCTIONED_MODULES` -- ``tools/host_resource_policy.py`` and
-   ``tools/host_bash_tool.py`` -- may touch the host process surface inside the
-   :data:`SCAN_ROOTS` trees.  They are the policy checker and the host-run
-   bridge; everything else must call ``host_run()``.
+1. Only :data:`SANCTIONED_MODULES` -- ``tools/host_resource_policy.py``,
+   ``tools/host_bash_tool.py`` and ``thoughtmachine/host_port.py`` -- may touch
+   the host process surface inside the :data:`SCAN_ROOTS` trees.  They are the
+   policy checker, the host-run bridge and the chokepoint itself; everything
+   else must call ``host_run()``.
 2. Every other offender must appear in :data:`ALLOWED_OFFENDERS` by its exact
    repository-relative path with the reason it still needs the surface.  The
    allowlist is a path -> reason map matched by whole string: no prefixes, no
@@ -47,10 +48,11 @@ import pytest
 #: Repository root, derived from this file (``<root>/tests/<this file>``).
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: Directories scanned for a direct host-process surface (recursively).
-#: ``thoughtmachine/host_port.py`` -- the chokepoint itself -- is deliberately
-#: outside this root and is pinned by ``tests/test_tool_import_declaration_match.py``.
-SCAN_ROOTS = ("tools", "security", "infra", "web_ui")
+#: Directories scanned for a direct host-process surface (recursively).  Every
+#: tree that can spawn is here; ``thoughtmachine/host_port.py`` -- the chokepoint
+#: itself -- is inside ``thoughtmachine`` and is named in :data:`SANCTIONED_MODULES`
+#: rather than excused by a hole in the roots.
+SCAN_ROOTS = ("tools", "security", "infra", "web_ui", "agent", "thoughtmachine")
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,9 @@ SCAN_ROOTS = ("tools", "security", "infra", "web_ui")
 SANCTIONED_MODULES = (
     "tools/host_resource_policy.py",
     "tools/host_bash_tool.py",
+    # The chokepoint: host_run() / host_run_async() live here, so this is the
+    # one module that is *supposed* to import subprocess and spawn.
+    "thoughtmachine/host_port.py",
 )
 
 
@@ -80,10 +85,9 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
     (
         "infra/workspace_lifecycle_manager.py",
         "`import subprocess` at line 38 with no call site anywhere in the module "
-        "(a dead import, kept only because the module docstring talks about "
-        "reaping subprocesses); the scan is import-level, so this entry records "
-        "the declaration rather than a spawn. Tracked debt: delete the import, "
-        "then delete this entry.",
+        "(grep for `subprocess` finds the import and the module docstring, and "
+        "nothing else). Tracked debt: delete the import, then delete this "
+        "entry.",
     ),
     (
         "security/sandboxed_execution.py",
@@ -92,6 +96,18 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
         "module is a second chokepoint that never calls host_run() and the kill "
         "switch and cwd containment do not apply on that path. Tracked debt, not "
         "approved design.",
+    ),
+    (
+        "thoughtmachine/doctor.py",
+        "`thoughtmachine doctor` self-check: its function-local `_run()` helper "
+        "shells out to python3/docker (`subprocess.run` at line 47, with "
+        "`subprocess.CompletedProcess` annotated at line 45) to report host "
+        "health. A dev/ops diagnostic invoked by the human launcher "
+        "(`python3 -m thoughtmachine.doctor`), not reachable from an agent tool "
+        "call -- and that reachability claim is itself pinned by "
+        "test_doctor_exception_stays_off_the_tool_path in "
+        "tests/test_tool_import_declaration_match.py. Tracked debt, not approved "
+        "design: migrate it onto host_run() the day it becomes reachable.",
     ),
     (
         "tools/ci_read_tool.py",
