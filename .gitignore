@@ -494,3 +494,7 @@ web_ui/frontend/.dist-build-stamp
 # committed, and gone on the next clone -- while the superseded record it names
 # survives and the chain breaks at exactly the point it claims continuity.
 !docs/DIRECTION_2026-11-22_GEN67.md
+# Second host-execution chokepoint design brief: public-tier design doc, same genre
+# and same reason as the host-port line above -- `docs/*` is a catch-all, so without
+# this negation the brief is never versioned and vanishes on the next clone.
+!docs/design-second-chokepoint.md
