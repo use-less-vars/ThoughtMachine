@@ -56,6 +56,7 @@ import builtins
 import os
 import signal
 import subprocess
+import sys
 import time
 
 from pathlib import Path
@@ -861,6 +862,14 @@ class _NoProcfs:
     silently proved NOTHING there while passing here.  Injecting them is what
     lets the read be reached on every POSIX host.  Every other pid, and every
     signal other than the ``0`` probe, is forwarded to the real call.
+
+    Every seam is RECORDED, in call order: which seam was asked, with which
+    pid, and what it returned or raised.  A seam production never reaches is
+    therefore visible by ABSENCE -- which is the finding, not a gap in the
+    evidence: on a host that answers one of the two POSIX probes differently,
+    the trace names that probe and the point where the path stopped, instead of
+    only reporting ``attempts == 0``.  ``report()`` renders it, and the first
+    assertion uses it as its failure message; nothing is printed on success.
     """
 
     def __init__(self, pid: int, error: type) -> None:
@@ -871,26 +880,110 @@ class _NoProcfs:
         self._real_open = builtins.open
         self._real_getpgid = os.getpgid
         self._real_kill = os.kill
+        self.trace: list[str] = []
+        self.platform: list[str] = []
+
+    # -- trace: every seam ASKED for, in call order -------------------------
+    @staticmethod
+    def _describe(exc: BaseException) -> str:
+        """``Type(errno=N)`` when the exception carries an errno, else ``Type``."""
+        errno = getattr(exc, "errno", None)
+        if isinstance(errno, int):
+            return f"{type(exc).__name__}(errno={errno})"
+        return type(exc).__name__
+
+    def _record(self, call: str, outcome: str) -> None:
+        self.trace.append(f"{len(self.trace) + 1:02d} {call} -> {outcome}")
+
+    def _observe(self, func, *args) -> str:
+        """Call a PRISTINE seam and describe what it did (return value/raise)."""
+        try:
+            return f"returned {func(*args)!r}"
+        except BaseException as exc:
+            return f"raised {self._describe(exc)}"
+
+    def _measure_platform(self) -> None:
+        """The host's OWN answers for the target pid, ONCE, before patching.
+
+        This is the context the trace has to be read in: the same two probes the
+        injections below answer are asked here with the PRISTINE functions, so
+        the report shows what this host would really have said -- and therefore
+        whether an injection is the only thing standing between the host's own
+        answer and the subject read.
+        """
+        self.platform = [
+            f"sys.platform={sys.platform!r} os.name={os.name!r} "
+            f"/proc is a dir={os.path.isdir('/proc')!r} "
+            f"error injected for the read={self.error.__name__}",
+            f"real os.getpgid({self.pid}) -> "
+            f"{self._observe(self._real_getpgid, self.pid)}",
+            f"real os.kill({self.pid}, 0) -> "
+            f"{self._observe(self._real_kill, self.pid, 0)}",
+        ]
+
+    def report(self) -> str:
+        """The whole trace, one event per line, then the install-time context."""
+        events = ([f"  {event}" for event in self.trace]
+                  or ["  <no seam was ever asked>"])
+        context = ([f"  {line}" for line in self.platform]
+                   or ["  <install never ran>"])
+        return "\n".join(
+            [f"seam trace for pid {self.pid} (in the order production asked):"]
+            + events
+            + ["host context, measured with the PRISTINE functions at "
+               "install time:"]
+            + context
+        )
 
     # -- (3) the seam this test is about: the state read --------------------
     def open(self, file, *args, **kwargs):
         if str(file) == self.path:
             self.attempts += 1
+            self._record(f"open({self.path!r})",
+                         f"raised {self.error.__name__} (injected)")
             raise self.error(self.path)
-        return self._real_open(file, *args, **kwargs)
+        try:
+            handle = self._real_open(file, *args, **kwargs)
+        except BaseException as exc:
+            self._record(f"open({str(file)!r})",
+                         f"raised {self._describe(exc)} (forwarded)")
+            raise
+        self._record(f"open({str(file)!r})",
+                     "returned a file object (forwarded)")
+        return handle
 
     # -- (1)(2) the POSIX probes that run BEFORE the read -------------------
     def getpgid(self, target):
         if target == self.pid:
+            self._record(f"getpgid({target!r})",
+                         f"returned {self.pid!r} (injected: own group leader)")
             return self.pid  # its own group leader
-        return self._real_getpgid(target)
+        try:
+            group = self._real_getpgid(target)
+        except BaseException as exc:
+            self._record(f"getpgid({target!r})",
+                         f"raised {self._describe(exc)} (forwarded)")
+            raise
+        self._record(f"getpgid({target!r})", f"returned {group!r} (forwarded)")
+        return group
 
     def kill(self, target, sig):
         if target == self.pid and sig == 0:
+            self._record(f"kill({target!r}, {sig!r})",
+                         "returned None (injected: signal 0 still finds it)")
             return None  # signal 0 still finds it
-        return self._real_kill(target, sig)
+        try:
+            result = self._real_kill(target, sig)
+        except BaseException as exc:
+            self._record(f"kill({target!r}, {sig!r})",
+                         f"raised {self._describe(exc)} (forwarded)")
+            raise
+        self._record(f"kill({target!r}, {sig!r})",
+                     f"returned {result!r} (forwarded)")
+        return result
 
     def install(self, monkeypatch) -> "_NoProcfs":
+        self._measure_platform()
         monkeypatch.setattr(worker_execution_module, "open", self.open,
                             raising=False)
         monkeypatch.setattr(os, "getpgid", self.getpgid)
@@ -983,7 +1076,7 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
 
         assert no_procfs.attempts > 0, (
             "the process-state read was never attempted, so nothing was proved "
-            "about the unreadable case"
+            "about the unreadable case\n" + no_procfs.report()
         )
         assert elapsed >= grace * 0.9, (
             f"escalation returned after {elapsed:.2f}s on an UNREADABLE state: "
