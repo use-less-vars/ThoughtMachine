@@ -29,7 +29,7 @@ amended by R3** — the `visual` tool is the one bounded exception to synchronou
 | Premise (as stated in the rulings / prior draft) | Verdict | Evidence | Action |
 |---|---|---|---|
 | `Worker` tool routes `action='stop'` to a terminate path | verified | `tools/workspace/worker_thread.py:3582` — `"stop": lambda: self._action_stop(workers),`; `:5243` — `def _action_stop(self, workers: list) -> dict:` | rewritten (Q1) |
-| `_action_stop` blocks on a join, saves context, reclaims containers, pops the registry | verified | `:5362` — `_join_budget = max(30, thread._timeout_seconds)`; `:5389-5390` — `thread._save_context()` / `thread._cleanup_worker_containers()`; `:5398` — `_worker_registry.pop((sid, self.worker_name, iid), None)` | rewritten (Q1) |
+| `_action_stop` blocks on a join, saves context, reclaims containers, pops the registry | **false** — it DETACHES, and a detach reclaims nothing | `tools/workspace/worker_thread.py::Worker._action_stop` resolves the instance (`_resolve_worker_thread`: current session first, then a same-session sweep) and calls `thread.stop()` → `tools/workspace/worker_thread.py::WorkerThread.stop` is an ALIAS for `tools/workspace/worker_thread.py::WorkerThread.detach` (`status = "detaching"` → park flags → `_set_detached_registration(True)` → `status = "detached"` → a fenced `stop` command write → `_input_queue.put(_PARK_SENTINEL)`), then `compact_after_summary()` / `_save_context()` / `_write_status_file()`, returning `{"status": "detached"}`. Its own comment says it: `A DETACH reclaims nothing: no join, no container cleanup and` / `no registry pop — the thread is parked, not terminated.` The join is `tools/workspace/worker_thread.py::Worker._wait_for_worker_exit` (`_join_budget = max(30, int(_timeout_seconds or WORKER_TIMEOUT_SECONDS))`) plus the join loop in `tools/workspace/worker_thread.py::Worker._action_reset`; the container reclaim is `tools/workspace/worker_thread.py::WorkerThread._cleanup_worker_containers` (from `run()`'s teardown, the query-timeout path and reset); the registry pops are in `tools/workspace/worker_thread.py::Worker._action_reset` and the detached-TTL kill `tools/workspace/worker_manager.py::PeriodicStaleCheck._check_detached_ttl` → `_kill_detached_worker` → `_forget_worker` | rewritten (Q1) |
 | `stop()` is cooperative and writes `command.json` | verified | `tools/workspace/worker_thread.py::WorkerThread.stop` — `"""Signal the worker to stop after completing its current task."""`; `tools/workspace/worker_thread.py::WorkerThread.stop` — `cmd_path.write_text(json.dumps({"action": "stop"}), encoding="utf-8")` | rewritten (Q1) |
 | `resume()` refuses a stopped instance | verified | `tools/workspace/worker_thread.py::WorkerThread.resume` — `if self._stop_event.is_set() or self.status in ("stopping", "stopped"):`; `tools/workspace/worker_thread.py::WorkerThread.resume` — `Callers that need a query to run` / `after a stop must spawn a fresh instance instead.` | rewritten (Q1) |
 | A pause/detach primitive already exists (event pair + park loop) | verified | `tools/workspace/worker_thread.py:2365-2366` — `self._park_event = threading.Event()` / `self._resume_event = threading.Event()`; `tools/workspace/worker_thread.py:5039` and `tools/workspace/worker_thread.py:5357` — `while self._park_event.is_set() and not self._stop_event.is_set():`; `tools/workspace/worker_thread.py:5056`/`tools/workspace/worker_thread.py:5368` — `self._resume_event.wait(1.0)` | reused as the detach mechanism (Q1) |
@@ -311,9 +311,19 @@ drain, or parent-agent call can resume a detached worker on its own.
   `tests/test_bridge_stop_semantics.py`; the frontend
   `web_ui/frontend/src/components/__tests__/SessionTab.stop_resume.test.jsx`; new tests
   for `detached` → `query` → `ready` and for detached-TTL kill.
-- Risk: **high** — the registry pop (`:5398`) and container reclaim (`:5390`) are what
-  currently prevent leaked daemon threads; detaching means *deliberately* keeping both
-  alive, so the TTL reaper becomes load-bearing.
+- Risk: **high** — the join (`tools/workspace/worker_thread.py::Worker._wait_for_worker_exit`,
+  and the join loop in `tools/workspace/worker_thread.py::Worker._action_reset`), the container
+  reclaim (`tools/workspace/worker_thread.py::WorkerThread._cleanup_worker_containers`) and the
+  registry pop (`tools/workspace/worker_thread.py::Worker._action_reset`) are what currently
+  prevent leaked daemon threads, and none of them is on the detach path —
+  `tools/workspace/worker_thread.py::Worker._action_stop` reclaims nothing. Detaching means
+  *deliberately* keeping the thread, its containers and its registry entry alive, so the
+  detached-TTL kill becomes load-bearing:
+  `tools/workspace/worker_manager.py::PeriodicStaleCheck._check_detached_ttl` kills a worker
+  detached past `WORKER_TIMEOUT_SECONDS`, then
+  `tools/workspace/worker_manager.py::PeriodicStaleCheck._kill_detached_worker` and
+  `tools/workspace/worker_manager.py::PeriodicStaleCheck._forget_worker` reclaim its containers
+  and drop its registry entry.
 
 ---
 
@@ -933,9 +943,9 @@ in-memory fast path (`:1227-1231`, `thread.kill()` / `thread.stop()`) swallows e
 (`:1232` — `pass  # The file-based command will still work`). Three consequences: a second
 cancel is indistinguishable from the first and re-stamps the same optimistic status; a cancel
 that reaches *nothing* (worker already gone, file already unlinked) still answers `ok`; and the
-reverse verb **is** fenced — `resume()` answers `{"status": "refused", …}`
-(`:1665-1672`) when a stop is in flight. Refusing a no-op resume while accepting a no-op cancel
-is the defect.
+reverse verb **is** fenced — the resume route answers `{"status": "refused", …}`
+(`web_ui/backend/workspace_routes.py::resume_worker`) when a stop is in flight. Refusing a
+no-op resume while accepting a no-op cancel is the defect.
 
 Normative rule: **cancellation is a monotone, idempotent state transition keyed by
 `request_id`; the first writer wins.**
@@ -946,7 +956,7 @@ Normative rule: **cancellation is a monotone, idempotent state transition keyed 
 | cancel B | `cancelling` | `{"status": "cancelling", "request_id": B, "superseded_by": A, "terminal_expected": <ts>}` | **no** `status.json` rewrite, no second event, no new timer |
 | cancel B with a stronger reason (`operator_kill` over `worker_budget`) | `cancelling` | as above, `reason` = B's, escalation rung advanced | one event, `rung=2` |
 | cancel after terminal | `cancelled` / `killed` | `{"status": "already_terminal", "terminal": "killed", "reason": <first>, "request_id": A}` | none |
-| resume while cancelling | `cancelling` | `{"status": "refused", "reason": "cancel in flight", "request_id": A}` — keeps today's shape (`:1665`) | none |
+| resume while a stop is in flight | `killed`, or the stop event set | `{"status": "refused", "name": <name>, "workers_refused": [{"worker_name": <name>, "instance_id": <n>, "reason": "stop already in flight"}], "note": "Stop already in flight for the matching worker instance; the resume command was written but the live instance will not honour it. Spawn a fresh instance instead."}` — today's real shape, from `web_ui/backend/workspace_routes.py::resume_worker`, emitted exactly when `tools/workspace/worker_thread.py::WorkerThread.resume` returns `False` (its stop event is set, or the status is `killed`); a *detached* worker is revivable on purpose. Correction: there is no `cancelling` status and no `"cancel in flight"` string anywhere in the tree, and `cancel()` answers a verdict (`"accepted"` / `"refused"`), not a status dict | none |
 | resume after terminal | terminal | `{"status": "refused", "reason": "instance is gone; spawn a fresh instance"}` | none |
 
 One writer per fact: the token file (Q2B) records the *request*; `status.json` is written by
