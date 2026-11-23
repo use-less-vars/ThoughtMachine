@@ -255,10 +255,16 @@ These are factual, present-tense limitations — not roadmap items.
    (`platform-matrix-macos.yml`) — gate too: their job-level `continue-on-error: true` was
    removed, so a red job fails that workflow's run. None of the four is in
    `REQUIRED_CHECKS`, so a red blocks no merge; it is now visible in the run conclusion
-   instead of hidden. What stays weak is inside `macos-install-smoke`: its health probe
-   echoes `HEALTH_UNREACHABLE` and passes, so a backend that never starts is reported but
-   not failed. The gating job proves the launcher paths; `macos-suite` proves the
-   Docker-free suite on macOS.
+   instead of hidden. What stays weak is only the installer itself inside
+   `macos-install-smoke`: its exit status is swallowed, and the tolerance is paid for by
+   the next step, which re-tests `-x .venv/bin/python` and rebuilds the venv when none was
+   left, so the artefact is present or the job is red. The health probe asserts:
+   `/api/health` must answer within 30 attempts at 2s (a backend that never starts fails
+   the step, naming port, attempt count and window), while `/api/health/containers` remains
+   informational and is labelled as such in the log — Docker presence is
+   `macos-docker-probe`'s assertion, and asserting it here would report a missing Docker as
+   a broken macOS startup. The gating job proves the launcher paths; `macos-suite` proves
+   the Docker-free suite on macOS.
 
 ---
 

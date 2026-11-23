@@ -106,13 +106,20 @@ collection count drops (an empty selection cannot pass silently). The
   `continue-on-error`). It is not in `REQUIRED_CHECKS`, so it cannot block a
   merge; it can no longer conclude green while red, and that was the mask.
 - **`macos-install-smoke`** — gating install/start attempts that bypass the
-  launcher and call `uvicorn` directly; the installer failure path is still
-  swallowed inside the step
-  (`INSTALLER_EXIT=... (non-fatal: the next step rebuilds the venv if this left none)`)
-  and the health probe only logs `HEALTH_UNREACHABLE` rather than exiting
-  non-zero. Treat a green run here as "nothing crashed hard", not as evidence
-  that macOS startup works — that tolerance, not the job-level flag, is the
-  remaining hole.
+  launcher and call `uvicorn` directly. The installer failure path is still
+  swallowed inside its step
+  (`INSTALLER_EXIT=... (non-fatal: the next step rebuilds the venv if this left none)`),
+  but that tolerance is paid for one step later: `Fallback - ensure a usable
+  environment` re-tests `-x .venv/bin/python` and builds the venv when the
+  installer left none, so the step ends with the artefact present or red. The
+  health probe now asserts: `/api/health` must answer within 30 attempts at 2s
+  intervals, otherwise the step exits non-zero, naming the port, the attempt
+  count and the window and stating that the backend was launched but never
+  reachable. `/api/health/containers` stays informational and says so in the log
+  (Docker presence is `macos-docker-probe`'s assertion; asserting it here would
+  report "Docker missing" as "macOS startup broken"). A green run here now means
+  the environment existed and the backend answered `/api/health`; it does not
+  prove the installer exited 0.
 - **`macos-docker-probe`** — gating: does the Docker CLI and Docker Desktop exist,
   does `docker info` answer, do container `--user` and `git` behave. Its own comment
   states what it cannot prove: macOS bind-mount host-ownership under VirtioFS/gRPC-FUSE

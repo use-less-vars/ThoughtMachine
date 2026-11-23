@@ -110,6 +110,19 @@ jobs:
   # otherwise `bash install.sh`, which installs on Darwin too), then starts the
   # backend and probes the health endpoints. If the installer left no usable
   # .venv, the job falls back to a manual venv so the probes still run.
+  #
+  # What a green here means, step by step. The installer is allowed to fail ONLY
+  # because a later step asserts its artefact:
+  #   1. `Select and run installer (best effort)` MAY fail. install.sh is driven
+  #      on Darwin, where its apt / docker-group branches cannot apply, and the
+  #      installer is not the thing this job proves.
+  #   2. `Fallback - ensure a usable environment` re-tests `-x .venv/bin/python`
+  #      and builds the venv when the installer left none, so that step ends
+  #      with the artefact present or red -- that is what makes (1) defensible.
+  #   3. `Start backend and probe health endpoints` must NOT fail silently: it is
+  #      the only step that proves the application starts. Green there now means
+  #      `/api/health` answered within the probe window, and nothing weaker; a
+  #      server that dies at import is a red step with the measurement in it.
   # -------------------------------------------------------------------------
   macos-install-smoke:
     name: macOS - install/startup smoke (advisory)
@@ -157,33 +170,49 @@ jobs:
           fi
 
       - name: Start backend and probe health endpoints
+        # ASSERTS /api/health. /api/health/containers is informational only: its
+        # availability depends on the container manager being usable on the
+        # runner, and Docker presence is decided by the separate
+        # macos-docker-probe job. Asserting it here would report "Docker missing"
+        # as "macOS startup broken" -- a false red is the same defect as a false
+        # green.
         run: |
           set -x
           .venv/bin/python -m uvicorn web_ui.backend.server:app --host 127.0.0.1 --port "${PORT}" &
           SERVER_PID=$!
           echo "SERVER_PID=${SERVER_PID}"
 
+          ATTEMPTS=30
+          INTERVAL=2
           ok=0
-          for i in $(seq 1 30); do
+          for i in $(seq 1 "${ATTEMPTS}"); do
             if curl -fsS "http://127.0.0.1:${PORT}/api/health" -o /tmp/health.json; then
               ok=1
+              echo "HEALTH_OK after ${i} attempt(s): $(cat /tmp/health.json)"
               break
             fi
-            sleep 2
+            sleep "${INTERVAL}"
           done
-          if [ "${ok}" -eq 1 ]; then
-            echo "HEALTH_OK: $(cat /tmp/health.json)"
-          else
-            echo "HEALTH_UNREACHABLE after 60s"
-          fi
 
+          # Informational, NOT asserted (see this step's comment).
           if curl -fsS "http://127.0.0.1:${PORT}/api/health/containers" -o /tmp/health_containers.json; then
-            echo "HEALTH_CONTAINERS: $(cat /tmp/health_containers.json)"
+            echo "HEALTH_CONTAINERS (informational, not asserted): $(cat /tmp/health_containers.json)"
           else
-            echo "HEALTH_CONTAINERS_UNREACHABLE"
+            echo "HEALTH_CONTAINERS_UNREACHABLE (informational, not asserted; Docker presence is decided by macos-docker-probe)"
           fi
 
+          # Release the port before deciding, so a failing job does not leave a
+          # uvicorn holding it.
           kill "${SERVER_PID}" 2>/dev/null || true
+
+          # The assertion. This is the LAST command in the step, and its exit
+          # status is the step's: `if <false>; then ...; fi` returns 0, and the
+          # failing branch ends in an explicit `exit 1`.
+          if [ "${ok}" -ne 1 ]; then
+            echo "FAIL: backend was launched (SERVER_PID=${SERVER_PID}) but http://127.0.0.1:${PORT}/api/health never answered" >&2
+            echo "FAIL: measured ${ATTEMPTS} attempts at ${INTERVAL}s apart (up to $((ATTEMPTS * INTERVAL))s window); the process was started and is now being reported as never reachable" >&2
+            exit 1
+          fi
 
       - name: Containerized git_read status probe (only if Docker present)
         run: |
