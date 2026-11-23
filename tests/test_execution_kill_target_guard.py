@@ -869,7 +869,15 @@ class _NoProcfs:
     evidence: on a host that answers one of the two POSIX probes differently,
     the trace names that probe and the point where the path stopped, instead of
     only reporting ``attempts == 0``.  ``report()`` renders it, and the first
-    assertion uses it as its failure message; nothing is printed on success.
+    assertion uses it as its failure message.
+
+    A trace that only exists on FAILURE cannot compare a red run with a green
+    one, so ``summary()`` is written to stderr on EVERY run, pass or fail, under
+    the stable greppable prefix ``PROC_SEAM_TRACE summary:`` -- ``read=no`` is
+    the whole question in one bit, and ``first=`` names the seam that answered
+    first.  Setting ``PROC_SEAM_TRACE`` to anything but ``""``/``"0"`` also
+    dumps the full trace of a PASSING run; unset, nothing but the summary line
+    is written and behaviour is unchanged.
     """
 
     def __init__(self, pid: int, error: type) -> None:
@@ -920,6 +928,19 @@ class _NoProcfs:
             f"real os.kill({self.pid}, 0) -> "
             f"{self._observe(self._real_kill, self.pid, 0)}",
         ]
+
+    def summary(self, elapsed: float) -> str:
+        """ONE line, stable prefix: the fingerprint a GREEN run must also leave."""
+        if self.trace:
+            first = self.trace[0].split(" ", 1)[1]  # drop the ordinal
+        else:
+            first = "<no seam was ever asked>"
+        return (
+            f"PROC_SEAM_TRACE summary: pid={self.pid} "
+            f"attempts={self.attempts} events={len(self.trace)} "
+            f"read={'yes' if self.attempts else 'no'} "
+            f"first={first} elapsed={elapsed:.3f}"
+        )
 
     def report(self) -> str:
         """The whole trace, one event per line, then the install-time context."""
@@ -989,6 +1010,22 @@ class _NoProcfs:
         monkeypatch.setattr(os, "getpgid", self.getpgid)
         monkeypatch.setattr(os, "kill", self.kill)
         return self
+
+
+def _emit_seam_fingerprint(no_procfs: _NoProcfs, elapsed: float) -> None:
+    """Write the seam fingerprint to stderr on EVERY run, pass or fail.
+
+    A trace that only exists on FAILURE cannot compare a red run with a green
+    one, so the summary line is unconditional -- ``read=`` is the whole question
+    in one bit and ``first=`` names the seam that answered first.  When
+    ``PROC_SEAM_TRACE`` is set to anything other than ``""``/``"0"`` the FULL
+    trace and its install-time context are dumped as well, including on a
+    passing run.  No other configuration is read; when the variable is unset
+    nothing changes but the summary line.
+    """
+    print(no_procfs.summary(elapsed), file=sys.stderr, flush=True)
+    if os.environ.get("PROC_SEAM_TRACE", "") not in ("", "0"):
+        print(no_procfs.report(), file=sys.stderr, flush=True)
 
 
 def _spawn_exited_child(new_session: bool = True):
@@ -1073,6 +1110,10 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
         started = time.monotonic()
         tracker.terminate_all("w1", None, None)
         elapsed = time.monotonic() - started
+
+        # BEFORE the assertions: a RED run must leave the same fingerprint a
+        # GREEN one does, otherwise the two runs cannot be compared.
+        _emit_seam_fingerprint(no_procfs, elapsed)
 
         assert no_procfs.attempts > 0, (
             "the process-state read was never attempted, so nothing was proved "
