@@ -107,7 +107,7 @@ jobs:
   # Mutation gate (contracts)
   #
   # This job runs scripts/mutation_gate.py, which reads the mutations declared in
-  # tests/mutation_gate/specs.py. Three things about it are worth stating
+  # scripts/mutation_specs.py. Three things about it are worth stating
   # plainly, because a workflow that describes its own enforcement in flattering
   # terms is worse than no workflow at all:
   #

@@ -77,7 +77,7 @@ Exit codes: 0 all KILLED; 1 something SURVIVED or was REFUSED; 2 RESTORE_FAILED;
 3 nothing declared (a sweep of zero mutations is not a pass); 4 internal
 inconsistency (the verdict counts must sum to the number that ran).
 
-The registry is ``tests/mutation_gate/specs.py``: data, not code.  It is
+The registry is ``scripts/mutation_specs.py``: data, not code.  It is
 deliberately EMPTY in the commit that introduces this harness, so the gate
 refuses (exit 3) instead of reporting a green sweep over nothing.
 """
@@ -133,7 +133,7 @@ EXIT_INTERNAL = 4
 ZERO_MESSAGE = "MUTATIONS_DECLARED=0 - a sweep of zero mutations is not a pass"
 
 DEFAULT_TIMEOUT_S = 900.0
-DEFAULT_SPECS_RELPATH = Path("tests") / "mutation_gate" / "specs.py"
+DEFAULT_SPECS_RELPATH = Path("scripts") / "mutation_specs.py"
 
 _HERE = Path(__file__).resolve().parent
 
@@ -204,7 +204,7 @@ class Result:
 def _self_register() -> None:
     """Make ``import mutation_gate`` in a specs file resolve to *this* module.
 
-    ``tests/mutation_gate/specs.py`` writes ``from mutation_gate import
+    ``scripts/mutation_specs.py`` writes ``from mutation_gate import
     Mutation``.  When this file is executed as a script the module object is
     ``__main__``, so without this alias the import would build a *second*
     module object (and a second ``Mutation`` class), and every ``isinstance``

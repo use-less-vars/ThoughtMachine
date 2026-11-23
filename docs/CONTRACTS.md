@@ -178,8 +178,9 @@ absent, so the default is the thing under test; and `343 assert DEFAULT_RUNTIME_
 `349 assert resolve_runtime_mode({}) == "process"` spell the default out as a literal, so a one-token
 flip of the constant is a red test rather than a green one.
 
-**Mutation gate:** the claim is not left to a human reading `assert` lines. `scripts/mutation_gate.py`
-is pointed at `tests/mutation_gate/specs.py`, which declares one mutation for this contract:
+**Mutation gate:** the claim is not left to a human reading `assert` lines. The mutation is declared in
+`scripts/mutation_specs.py`, data rather than a test, and run by `scripts/mutation_gate.py`; the registry
+declares one mutation for this contract:
 `contract-3-default-mode` — the exact substring `DEFAULT_RUNTIME_MODE = MODE_PROCESS` rewritten to
 `DEFAULT_RUNTIME_MODE = MODE_THREAD` in `tools/workspace/worker_runtime.py` — with
 tests/test_worker_is_a_real_process.py as the file whose greenness the contract stands on:
