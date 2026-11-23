@@ -53,6 +53,7 @@ Run with::
 from __future__ import annotations
 
 import builtins
+import functools
 import os
 import platform
 import signal
@@ -310,6 +311,131 @@ PROCFS_ONLY = pytest.mark.skipif(
 )
 
 
+def _exc_tag(exc: BaseException) -> str:
+    """``Type(errno=..., strerror=..., msg=...)`` -- enough to name an ESRCH.
+
+    Diagnostic only: a raw ``repr`` of an ``OSError`` hides the platform detail
+    (Darwin answers ``ESRCH`` where Linux succeeds) that is the whole question.
+    """
+    try:
+        return "%s(errno=%r, strerror=%r, msg=%r)" % (
+            type(exc).__name__,
+            getattr(exc, "errno", None),
+            getattr(exc, "strerror", None),
+            str(exc),
+        )
+    except Exception:  # pragma: no cover - diagnostic only
+        return "<untaggable %s>" % type(exc).__name__
+
+
+def _short(value, limit: int = 120) -> str:
+    """``repr(value)`` truncated to ``limit`` chars; never raises."""
+    try:
+        text = repr(value)
+    except Exception:  # pragma: no cover - diagnostic only
+        return "<unreprable %s>" % type(value).__name__
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _read_proc_stat(pid) -> str:
+    """The REAL ``/proc/<pid>/stat`` head, or the exception -- diagnostic only."""
+    try:
+        with builtins.open("/proc/%s/stat" % (pid,), "r",
+                           encoding="utf-8", errors="replace") as handle:
+            return handle.read(200)
+    except Exception as exc:
+        return "raised " + _exc_tag(exc)
+
+
+class _CallTrace:
+    """Ordered ENTRY/RETURN record of the methods the teardown path uses.
+
+    Installed as INSTANCE attributes via ``setattr``, so every
+    ``self.<name>`` lookup inside production code hits the recorder.  An
+    instance attribute is NOT a descriptor, so ``self`` is not passed to it:
+    the recorder receives exactly the call arguments production supplied.
+    Pass-through ONLY: arguments, return value and any exception are recorded
+    and forwarded unchanged, so nothing the assertions observe moves.
+
+    An ABSENT entry is the answer this exists to produce: if
+    ``_escalate_subprocess_kill`` never appears, the early return happened in
+    ``_terminate_subprocess`` (between the SIGTERM and the escalation); if it
+    appears but ``_pid_is_alive`` does not, the escalation returned at its own
+    re-taken ``refuse`` / ``gone`` arm before the poll.
+    """
+
+    TRACED = (
+        "terminate_all",
+        "_terminate_subprocess",
+        "_kill_decision",
+        "_escalate_subprocess_kill",
+        "_pid_is_alive",
+    )
+
+    def __init__(self) -> None:
+        self.events = []
+        self.installed = {}
+        self.failures = {}
+        self._depth = 0
+
+    def install(self, tracker, monkeypatch) -> "_CallTrace":
+        for name in self.TRACED:
+            try:
+                original = getattr(tracker, name)
+            except AttributeError as exc:
+                self.failures[name] = "missing attribute: " + _exc_tag(exc)
+                continue
+            self.installed[name] = (
+                "was an instance attribute" if name in vars(tracker)
+                else "bound method -> instance attribute"
+            )
+            monkeypatch.setattr(tracker, name, self._recorder(name, original))
+        return self
+
+    def _recorder(self, name, original):
+        @functools.wraps(original)
+        def recorder(*args, **kwargs):
+            shown = ", ".join(
+                [_short(arg, 60) for arg in args]
+                + ["%s=%s" % (key, _short(val, 60))
+                   for key, val in kwargs.items()]
+            )
+            depth = self._depth
+            self.events.append((depth, "CALL %s(%s)" % (name, shown)))
+            self._depth += 1
+            try:
+                result = original(*args, **kwargs)
+            except BaseException as exc:
+                self._depth -= 1
+                self.events.append(
+                    (depth, "RAISE %s -> %s" % (name, _exc_tag(exc)))
+                )
+                raise
+            self._depth -= 1
+            self.events.append(
+                (depth, "RET   %s -> %s" % (name, _short(result, 80)))
+            )
+            return result
+
+        return recorder
+
+    def counts(self) -> dict:
+        """How many times each traced method was ENTERED."""
+        found = {}
+        for _depth, text in self.events:
+            verb, _sep, rest = text.partition(" ")
+            if verb != "CALL":
+                continue
+            name = rest.split("(", 1)[0]
+            found[name] = found.get(name, 0) + 1
+        return found
+
+    def absent(self) -> list:
+        """Traced methods that were NEVER entered -- the diagnostic's answer."""
+        found = self.counts()
+        return [name for name in self.TRACED if name not in found]
+
+
 class _RecordingKillpg:
     """Records ``os.killpg`` and forwards it -- EXCEPT on OUR own group.
 
@@ -321,27 +447,46 @@ class _RecordingKillpg:
 
     def __init__(self, forward: bool = True) -> None:
         self.calls = []
+        # ``forwards`` names the OUTCOME of every forward, exception included:
+        # a Darwin ``ESRCH`` from the real ``os.killpg`` used to be swallowed by
+        # production's ``except OSError`` and was invisible from the outside.
+        self.forwards = []
         self._forward = forward
         self._real = os.killpg
 
     def __call__(self, pid, sig):
         self.calls.append((pid, sig))
         if pid == os.getpgid(0):
-            raise AssertionError(
+            exc = AssertionError(
                 f"os.killpg({pid}, {sig}) targets OUR OWN process group"
             )
+            self.forwards.append(
+                (pid, sig, "NOT forwarded, blocked here: " + _exc_tag(exc))
+            )
+            raise exc
         try:
             own_group = os.getpgid(pid) == os.getpgid(0)
         except OSError:
             own_group = False
         if own_group:
-            raise AssertionError(
+            exc = AssertionError(
                 f"os.killpg({pid}, {sig}) targets a pid whose process group IS "
                 "ours -- forwarding it would take this test process down"
             )
+            self.forwards.append(
+                (pid, sig, "NOT forwarded, blocked here: " + _exc_tag(exc))
+            )
+            raise exc
         if not self._forward:
+            self.forwards.append((pid, sig, "NOT forwarded (forward=False)"))
             return None
-        return self._real(pid, sig)
+        try:
+            result = self._real(pid, sig)
+        except BaseException as exc:
+            self.forwards.append((pid, sig, "raised " + _exc_tag(exc)))
+            raise
+        self.forwards.append((pid, sig, result))
+        return result
 
     def signalled(self, sig):
         return [pid for pid, sent in self.calls if sent == sig]
@@ -869,6 +1014,12 @@ class _NoProcfs:
         self.path = f"/proc/{pid}/stat"
         self.error = error
         self.attempts = 0
+        # EVERY seeded call, injected or forwarded, in order:
+        # ``(name, target, sig-or-None, result-or-exception-tag)``.  This is
+        # what shows whether production ever reached ``kill(pid, 0)``, whether
+        # the ``killpg -> OSError -> os.kill`` fallback fired, and what the
+        # forwarded call did on this host.
+        self.calls = []
         self._real_open = builtins.open
         self._real_getpgid = os.getpgid
         self._real_kill = os.kill
@@ -877,19 +1028,52 @@ class _NoProcfs:
     def open(self, file, *args, **kwargs):
         if str(file) == self.path:
             self.attempts += 1
-            raise self.error(self.path)
-        return self._real_open(file, *args, **kwargs)
+            exc = self.error(self.path)
+            self.calls.append(
+                ("open", self.path, None, "raised " + _exc_tag(exc))
+            )
+            raise exc
+        try:
+            result = self._real_open(file, *args, **kwargs)
+        except BaseException as exc:
+            self.calls.append(
+                ("open", _short(file, 60), None, "raised " + _exc_tag(exc))
+            )
+            raise
+        self.calls.append(("open", _short(file, 60), None, "ok"))
+        return result
 
     # -- (1)(2) the POSIX probes that run BEFORE the read -------------------
     def getpgid(self, target):
         if target == self.pid:
+            self.calls.append(
+                ("getpgid", target, None,
+                 "%r (INJECTED: own group leader)" % (self.pid,))
+            )
             return self.pid  # its own group leader
-        return self._real_getpgid(target)
+        try:
+            result = self._real_getpgid(target)
+        except BaseException as exc:
+            self.calls.append(
+                ("getpgid", target, None, "raised " + _exc_tag(exc))
+            )
+            raise
+        self.calls.append(("getpgid", target, None, result))
+        return result
 
     def kill(self, target, sig):
         if target == self.pid and sig == 0:
+            self.calls.append(
+                ("kill", target, sig, "ok (INJECTED: liveness probe)")
+            )
             return None  # signal 0 still finds it
-        return self._real_kill(target, sig)
+        try:
+            result = self._real_kill(target, sig)
+        except BaseException as exc:
+            self.calls.append(("kill", target, sig, "raised " + _exc_tag(exc)))
+            raise
+        self.calls.append(("kill", target, sig, result))
+        return result
 
     def install(self, monkeypatch) -> "_NoProcfs":
         monkeypatch.setattr(worker_execution_module, "open", self.open,
@@ -978,16 +1162,60 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
         tracker.kill_grace_seconds = grace
         tracker.add("e1", {"type": "subprocess", "pid": proc.pid})
 
+        # -- DIAGNOSTIC instrumentation: installed BEFORE the call ---------
+        # Pass-through recorders on the four methods the subprocess teardown
+        # path uses (plus ``terminate_all`` as the boundary marker).  They must
+        # be in place BEFORE ``terminate_all`` runs, which is the only reason
+        # this part is not inside the ``DIAG_UNAVAILABLE`` block below; it is
+        # guarded the same way and it changes no return value, argument or
+        # exception, so the assertions see exactly what they would see alone.
+        trace = _CallTrace()
+        try:
+            trace.install(tracker, monkeypatch)
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            print("DIAG_UNAVAILABLE trace-install", repr(exc))
+
         started = time.monotonic()
         tracker.terminate_all("w1", None, None)
         elapsed = time.monotonic() - started
 
-        # -- DIAGNOSTIC: which seam returned BEFORE the state read? --------
+        # -- DIAGNOSTIC: snapshot the WHOLE teardown path, not just the seams
         # A host-dependent early return must name itself here instead of
-        # surfacing as a bare ``assert 0 > 0`` elsewhere.
+        # surfacing as a bare ``assert 0 > 0`` elsewhere, and the seams alone
+        # cannot say WHERE the path stopped: the call record, the decisions, the
+        # forwarded signals and the log lines are what separate "never entered
+        # the escalation" from "entered it and concluded the target was dead".
+        #
+        # Every reading is copied out FIRST, while the tracker is still in the
+        # state production left it.  The probes at the end deliberately provoke
+        # more calls through the same instrumented seams, so a later read would
+        # be contaminated by the diagnostic's own traffic.
         try:
             attempts_so_far = no_procfs.attempts
-            decision = tracker._kill_decision(proc.pid)
+            prod_calls = list(no_procfs.calls)
+            prod_events = list(trace.events)
+            prod_counts = trace.counts()
+            prod_absent = trace.absent()
+            prod_killpg = list(killpg.calls)
+            prod_forwards = list(killpg.forwards)
+            prod_sigkill = killpg.signalled(signal.SIGKILL)
+            prod_entries = list(logs.entries)
+            grace_attr = getattr(
+                tracker, "kill_grace_seconds", "<ABSENT>"
+            )
+
+            def _probe(label, fn):
+                """Ask a host question directly; never let it break the test."""
+                try:
+                    print(
+                        "PROC_GUARD_DIAG probe %s -> %r" % (label, fn())
+                    )
+                except BaseException as exc:  # diagnostic only
+                    print(
+                        "PROC_GUARD_DIAG probe %s raised %s"
+                        % (label, _exc_tag(exc))
+                    )
+
             # ``monkeypatch`` stores a FRESH bound method per access, so ``is``
             # on ``no_procfs.getpgid`` is always False; ``__self__`` is the
             # identity that actually says WHICH object is installed.
@@ -1004,15 +1232,113 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
                 "PROC_GUARD_DIAG platform=%s %s"
                 % (platform.system(), platform.release())
             )
+            print(
+                "PROC_GUARD_DIAG python=%s os.name=%r procfs_mounted=%r"
+                % (
+                    platform.python_version(),
+                    os.name,
+                    _procfs_available(),
+                )
+            )
             print("PROC_GUARD_DIAG seams %r" % (seams,))
+            print(
+                "PROC_GUARD_DIAG trace_installed=%r "
+                "trace_install_failures=%r"
+                % (trace.installed, trace.failures)
+            )
+            print(
+                "PROC_GUARD_DIAG grace attr=%r type=%s module_default=%r"
+                % (
+                    grace_attr,
+                    type(grace_attr).__name__,
+                    getattr(
+                        worker_execution_module, "EXEC_KILL_GRACE", "<ABSENT>"
+                    ),
+                )
+            )
+            burned = (
+                "yes (the poll sat out the grace period)"
+                if elapsed >= grace * 0.9
+                else "no (the path returned without polling)"
+            )
+            print(
+                "PROC_GUARD_DIAG elapsed=%.4f grace=%.4f burned=%s"
+                % (elapsed, grace, burned)
+            )
             print(
                 "PROC_GUARD_DIAG attempts=%r target_pid=%r self_pid=%r"
                 % (attempts_so_far, proc.pid, os.getpid())
             )
-            print("PROC_GUARD_DIAG decision=%r" % (decision,))
+            print("PROC_GUARD_DIAG trace_counts=%r" % (prod_counts,))
+            print("PROC_GUARD_DIAG trace_absent=%r" % (prod_absent,))
+            for depth, text in prod_events:
+                print(
+                    "PROC_GUARD_DIAG call %s%s" % ("  " * depth, text)
+                )
             print(
                 "PROC_GUARD_DIAG killpg_calls=%r sigkill_targets=%r"
-                % (killpg.calls, killpg.signalled(signal.SIGKILL))
+                % (prod_killpg, prod_sigkill)
+            )
+            for fwd_pid, fwd_sig, fwd_outcome in prod_forwards:
+                print(
+                    "PROC_GUARD_DIAG killpg_forward pid=%r sig=%r -> %s"
+                    % (fwd_pid, fwd_sig, fwd_outcome)
+                )
+            for call_index, call_entry in enumerate(prod_calls):
+                print(
+                    "PROC_GUARD_DIAG seam_call[%d] %r"
+                    % (call_index, call_entry)
+                )
+            print(
+                "PROC_GUARD_DIAG logs(%d) %r"
+                % (len(prod_entries), [_short(entry) for entry in prod_entries])
+            )
+            for level, component, message in prod_entries:
+                print(
+                    "PROC_GUARD_DIAG log %s %s: %s"
+                    % (level, component, _short(message, 200))
+                )
+            # -- probes: what does THIS host say, asked directly? ----------
+            # These run LAST and through the real functions wherever possible,
+            # so the recorded production traffic above stays unpolluted.
+            print("PROC_GUARD_DIAG probes (asked after the snapshot above)")
+            _probe(
+                "decision(%r)" % (proc.pid,),
+                lambda: tracker._kill_decision(proc.pid),
+            )
+            _probe(
+                "real_getpgid(%r)" % (proc.pid,),
+                lambda: no_procfs._real_getpgid(proc.pid),
+            )
+            _probe(
+                "real_kill(%r, 0)" % (proc.pid,),
+                lambda: no_procfs._real_kill(proc.pid, 0),
+            )
+            _probe(
+                "real_proc_stat(%r)" % (proc.pid,),
+                lambda: _read_proc_stat(proc.pid),
+            )
+            _probe("getpgid(0)", lambda: os.getpgid(0))
+            _probe(
+                "real_killpg",
+                lambda: (
+                    killpg._real,
+                    getattr(killpg._real, "__module__", None),
+                ),
+            )
+            _probe(
+                "tracker_executions", lambda: dict(tracker._executions)
+            )
+            _probe("active_count", lambda: tracker.active_count())
+            _probe("attempts_after_probes", lambda: no_procfs.attempts)
+            print(
+                "PROC_GUARD_DIAG trace_after_probes=%r"
+                % (
+                    [
+                        text
+                        for _depth, text in trace.events[len(prod_events):]
+                    ],
+                )
             )
         except Exception as exc:  # pragma: no cover - diagnostic only
             print("DIAG_UNAVAILABLE", repr(exc))
