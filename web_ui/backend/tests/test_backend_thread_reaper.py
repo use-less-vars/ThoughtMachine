@@ -20,7 +20,6 @@ Run:  python3 -m pytest web_ui/backend/tests/test_backend_thread_reaper.py -q
 
 from __future__ import annotations
 
-import sys
 import threading
 from pathlib import Path
 
@@ -29,31 +28,23 @@ import pytest
 from tools.workspace.worker import WorkerThread
 
 
-def _backend_conftest():
-    """The conftest module pytest itself loaded for this root.
+def test_reaper_kills_and_joins_a_leaked_worker_thread(
+    tmp_path, request, _webui_reaper
+):
+    """The reaper must reap, driven directly with the fixture's own shapes.
 
-    Looked up in ``sys.modules`` rather than imported: this root has no
-    ``__init__.py``, so a re-import would execute a second copy of the module and
-    the test would then be exercising a reaper that no fixture ever calls.
+    The reaper is handed over by the ``_webui_reaper`` fixture rather than
+    looked up in ``sys.modules``: this root has no ``__init__.py``, so its
+    conftest is imported under the bare name ``conftest`` and that key belongs
+    to whichever non-package conftest was imported last -- see the fixture's
+    docstring.
     """
-    for module in list(sys.modules.values()):
-        filename = getattr(module, "__file__", None) or ""
-        if filename.endswith("web_ui/backend/tests/conftest.py"):
-            return module
-    raise AssertionError(
-        "web_ui/backend/tests/conftest.py is not among the imported modules -- "
-        "the backend root's conftest was not loaded for this run"
-    )
-
-
-def test_reaper_kills_and_joins_a_leaked_worker_thread(tmp_path, request):
-    conftest = _backend_conftest()
     # The reaper only protects tests it actually runs for.
     assert "_webui_thread_bridge_census" in request.fixturenames
 
     threads_before = {id(t) for t in threading.enumerate()}
     try:
-        keys_before = set(conftest._webui_worker_registry().get_all_workers())
+        keys_before = set(_webui_reaper.worker_registry().get_all_workers())
     except Exception:
         keys_before = set()
 
@@ -78,7 +69,7 @@ def test_reaper_kills_and_joins_a_leaked_worker_thread(tmp_path, request):
             "enumerate() loop is the only branch that can find it"
         )
 
-        survivors = conftest._webui_reap_worker_threads(threads_before, keys_before)
+        survivors = _webui_reaper.reap_worker_threads(threads_before, keys_before)
 
         assert survivors == [], "the reaper reported survivor(s) after kill()+join"
         assert not worker.is_alive(), "the leaked worker is still alive after reaping"
