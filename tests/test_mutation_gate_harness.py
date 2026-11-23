@@ -64,6 +64,16 @@ def test_guard_refuses():
     assert guarded_answer() == "refused"
 '''
 
+#: The same test, already red on the pristine tree: it asserts a value neither
+#: the unmutated nor the mutated module produces.  Without a baseline this
+#: pre-existing failure is indistinguishable from a kill.
+FIXTURE_TEST_ALWAYS_RED = '''from fixture_module import guarded_answer
+
+
+def test_guard_refuses():
+    assert guarded_answer() == "never produced"
+'''
+
 # --- the declared mutations, one per case ----------------------------------
 
 KILLED_BODY = """\
@@ -133,9 +143,9 @@ def _sha256(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_fixture(root: pathlib.Path) -> pathlib.Path:
+def _write_fixture(root: pathlib.Path, test_body: str = FIXTURE_TEST) -> pathlib.Path:
     (root / "fixture_module.py").write_text(FIXTURE_MODULE, encoding="utf-8")
-    (root / "test_fixture_guard.py").write_text(FIXTURE_TEST, encoding="utf-8")
+    (root / "test_fixture_guard.py").write_text(test_body, encoding="utf-8")
     return root / "fixture_module.py"
 
 
@@ -192,8 +202,8 @@ class Drive:
         )
 
 
-def _drive(root: pathlib.Path, body: str, *extra: str) -> Drive:
-    target = _write_fixture(root)
+def _drive(root: pathlib.Path, body: str, *extra: str, test_body: str = FIXTURE_TEST) -> Drive:
+    target = _write_fixture(root, test_body)
     specs = _write_specs(root, body)
     sha_before = _sha256(target)
     proc = _run_gate(root, specs, *extra)
@@ -333,6 +343,146 @@ def test_only_an_undeclared_name_is_not_a_pass(tmp_path):
     assert "MUTATION_NOT_DECLARED" in proc.stderr
     assert "MUTATIONS_DECLARED=0 - a sweep of zero mutations is not a pass" in proc.stderr
     assert _sha256(target) == sha_before
+
+
+# --- (h) a red baseline refuses: an unearned KILLED is the worst verdict ---
+
+
+def test_a_red_baseline_is_refused_rather_than_scored_as_a_kill(tmp_path):
+    target = _write_fixture(tmp_path, FIXTURE_TEST_ALWAYS_RED)
+    specs = _write_specs(tmp_path, KILLED_BODY)
+    sha_before = _sha256(target)
+
+    proc = _run_gate(tmp_path, specs)
+    run = Drive(proc, target, sha_before, _sha256(target))
+
+    verdict = run.sole_verdict()
+    assert verdict == "REFUSED", run.context()
+    assert verdict != "KILLED", (
+        "a test that was already failing must never be scored as a kill\n" + run.context()
+    )
+    assert "baseline-not-green" in run.proc.stderr, run.context()
+    assert "already red cannot witness a mutation" in run.proc.stderr, run.context()
+    assert "killed=0" in run.proc.stdout, run.context()
+    assert run.proc.returncode != 0, run.context()
+    assert run.sha_after == run.sha_before, run.context()
+
+
+# --- (i) a red baseline writes nothing at all ------------------------------
+
+
+def test_a_red_baseline_never_applies_the_mutation(tmp_path):
+    target = _write_fixture(tmp_path, FIXTURE_TEST_ALWAYS_RED)
+    specs = _write_specs(tmp_path, KILLED_BODY)
+    sha_before = _sha256(target)
+
+    proc = _run_gate(tmp_path, specs)
+    run = Drive(proc, target, sha_before, _sha256(target))
+
+    assert run.sole_verdict() == "REFUSED", run.context()
+    assert run.sha_after == run.sha_before, run.context()
+    assert target.read_text(encoding="utf-8") == FIXTURE_MODULE, (
+        "the mutation was applied even though the baseline was red\n" + run.context()
+    )
+
+
+# --- (j) a green baseline does not turn a real kill into a refusal ----------
+
+
+def test_a_green_baseline_still_lets_a_real_kill_through(case_runs):
+    assert len(case_runs) > 0, "a loop over zero cases is not a pass"
+    run = case_runs["killed"]
+    assert run.sole_verdict() == "KILLED", run.context()
+    assert "baseline-not-green" not in run.proc.stderr, (
+        "the baseline turned a real kill into a refusal\n" + run.context()
+    )
+    assert run.proc.returncode == 0, run.context()
+    assert "killed=1 survived=0 refused=0" in run.proc.stdout, run.context()
+
+
+# --- (k) a baseline that cannot run is a refusal, not a kill ---------------
+
+
+def test_an_uncollectable_baseline_is_refused_not_killed(tmp_path):
+    # The fixture test is fine; the declared node id is what does not exist.
+    target = _write_fixture(tmp_path)
+    specs = _write_specs(tmp_path, UNCOLLECTABLE_BODY)
+    sha_before = _sha256(target)
+
+    proc = _run_gate(tmp_path, specs)
+    run = Drive(proc, target, sha_before, _sha256(target))
+
+    verdict = run.sole_verdict()
+    assert verdict == "REFUSED", run.context()
+    assert verdict != "KILLED", run.context()
+    assert "tests-not-collectable" in run.proc.stderr, run.context()
+    assert "baseline" in run.proc.stderr, run.context()
+    match = PYTEST_EXIT.search(run.proc.stderr)
+    assert match is not None, run.context()
+    assert int(match.group("code")) not in (0, 1), run.context()
+    assert run.sha_after == run.sha_before, run.context()
+
+
+# --- (l) RESTORE_FAILED, made reachable without breaking the filesystem ----
+
+RESTORE_FAILURE_RUNNER = '''\
+"""Child process: run the gate with a restore that always reports a problem."""
+
+import importlib.util
+import sys
+
+_spec = importlib.util.spec_from_file_location("mutation_gate_restore_probe", {gate!r})
+gate = importlib.util.module_from_spec(_spec)
+# dataclasses resolve annotations through sys.modules, so register before exec.
+sys.modules["mutation_gate_restore_probe"] = gate
+_spec.loader.exec_module(gate)
+
+
+def _broken_restore(self):
+    return "sha256 after restore is deadbeef, expected " + self.original_sha
+
+
+gate._AppliedMutation.restore = _broken_restore
+sys.exit(gate.main(["--root", {root!r}, "--specs", {specs!r}]))
+'''
+
+
+def test_restore_failure_is_loud_and_exits_two(tmp_path):
+    target = _write_fixture(tmp_path)
+    specs = _write_specs(tmp_path, KILLED_BODY)
+    sha_before = _sha256(target)
+    runner = tmp_path / "run_with_broken_restore.py"
+    runner.write_text(
+        RESTORE_FAILURE_RUNNER.format(gate=str(GATE), root=str(tmp_path), specs=str(specs)),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(runner)],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=HARNESS_TIMEOUT_S,
+    )
+
+    verdicts = {
+        match.group("name"): match.group("verdict") for match in VERDICT_LINE.finditer(proc.stdout)
+    }
+    assert verdicts.get("fixture-guard-removed") == "RESTORE_FAILED", proc.stdout + proc.stderr
+    assert proc.returncode == 2, (
+        "a restore failure must exit 2, not 1\n" + proc.stdout + proc.stderr
+    )
+    assert "RESTORE_FAILED -- THE TREE IS NOT CLEAN" in proc.stderr, proc.stderr
+    # The recovery route has to be in the banner: backup path, hash, commands.
+    assert "restore  : cp " in proc.stderr, proc.stderr
+    assert "sha256sum" in proc.stderr, proc.stderr
+    assert sha_before in proc.stderr, proc.stderr
+    assert "exit=2" in proc.stdout, proc.stdout
+    # And the banner is not crying wolf: the tree really is dirty, so this test
+    # would fail if the restore had quietly worked after all.
+    assert target.read_text(encoding="utf-8") == FIXTURE_MODULE.replace(
+        "return True", "return False", 1
+    ), "the fixture was restored, so RESTORE_FAILED was not exercised\n" + proc.stdout
 
 
 # --- the CLI -------------------------------------------------------------

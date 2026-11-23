@@ -22,7 +22,8 @@ Verdicts -- this vocabulary is the whole contract of the tool
     the gate.
 ``REFUSED``
     The mutation could not be applied: the file is missing, ``old`` is absent,
-    ``old`` occurs more than once, or the named test ids are not collectable.
+    ``old`` occurs more than once, or the named test ids are not collectable or
+    were already failing before the mutation (``baseline-not-green``).
     A refusal is NEVER a pass and always makes the process exit non-zero; the
     reason is printed on stderr.
 ``RESTORE_FAILED``
@@ -46,6 +47,19 @@ run in the tree tests the mutation.  So the original bytes are hashed before,
 written back in a ``finally``, re-hashed, and compared; a copy also goes to a
 ``.bak`` file in a temp dir, an ``atexit`` hook restores, and SIGINT/SIGTERM
 restore before dying.
+
+Why there is a baseline
+-----------------------
+``KILLED`` is a DELTA, not a property of the mutation: it claims the named
+tests went from green to red *because* of the change.  A delta needs both
+endpoints measured, so before the target file is touched the harness runs the
+same pytest command against the unmutated tree.  If those tests are already
+failing -- a flake, a missing dependency, someone else's red -- the run is
+refused as ``baseline-not-green``: a test which is already red cannot witness a
+mutation.  Without that check a pre-existing failure would be scored as
+``KILLED``, which is the one verdict everybody trusts, and the gate would be
+reporting that the control is real on the strength of a failure it did not
+cause.  ``KILLED`` therefore means "green before, red after" and nothing else.
 
 Usage
 -----
@@ -103,6 +117,7 @@ REFUSE_FILE_MISSING = "file-missing"
 REFUSE_ANCHOR_ABSENT = "anchor-absent"
 REFUSE_ANCHOR_AMBIGUOUS = "anchor-ambiguous"
 REFUSE_TESTS_NOT_COLLECTABLE = "tests-not-collectable"
+REFUSE_BASELINE_RED = "baseline-not-green"
 REFUSE_PATH_ESCAPES_ROOT = "path-escapes-root"
 REFUSE_NOT_TEXT = "not-a-text-file"
 REFUSE_NO_OP = "no-op"
@@ -473,6 +488,44 @@ def _last_line(text: str) -> str:
     return ""
 
 
+def _baseline(mutation: Mutation, root: Path, timeout: float) -> str:
+    """Run the named tests against the UNMUTATED tree before anything is written.
+
+    Returns an empty string when the baseline is green (the only state in which
+    a mutation may be applied), otherwise the refusal detail.  ``KILLED`` is a
+    delta; the green endpoint has to be measured, not assumed.
+    """
+
+    try:
+        proc = subprocess.run(
+            _pytest_command(mutation),
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_child_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"{REFUSE_TIMEOUT}: the baseline run of the named tests did not finish "
+            f"within {timeout:g}s; a timed-out baseline is not green"
+        )
+    except OSError as exc:
+        return f"{REFUSE_TESTS_NOT_COLLECTABLE}: could not start pytest for the baseline: {exc}"
+
+    last = _last_line(proc.stdout) or _last_line(proc.stderr)
+    if proc.returncode == 0:
+        return ""
+    if proc.returncode == 1:
+        return (
+            f"{REFUSE_BASELINE_RED}: pytest exit 1 before the mutation was applied "
+            f"({last}); a test which is already red cannot witness a mutation"
+        )
+    # 5 (no tests ran) in particular: the named tests never executed, so there
+    # is no baseline and no evidence in either direction.
+    return f"{REFUSE_TESTS_NOT_COLLECTABLE}: baseline pytest exit {proc.returncode} ({last})"
+
+
 def _apply_and_run(prepared: _Prepared, root: Path, timeout: float) -> tuple[str, str]:
     """Write the mutation, run the named tests, map the exit code to a verdict."""
 
@@ -523,6 +576,12 @@ def run_mutation(mutation: Mutation, root: Path, timeout: float) -> Result:
         prepared = _prepare(mutation, root)
     except _Refused as refusal:
         return Result(mutation, REFUSED, f"{refusal.reason}: {refusal.detail}")
+
+    # Always on, and before the target file is touched: a baseline that is red
+    # (or did not run at all) would make whatever pytest says next meaningless.
+    baseline_problem = _baseline(mutation, root, timeout)
+    if baseline_problem:
+        return Result(mutation, REFUSED, baseline_problem)
 
     active = _AppliedMutation(mutation, prepared.target, prepared.original, prepared.backup)
     _ACTIVE = active
