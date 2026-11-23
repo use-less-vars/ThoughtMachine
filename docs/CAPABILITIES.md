@@ -257,8 +257,10 @@ These are factual, present-tense limitations — not roadmap items.
    `REQUIRED_CHECKS`, so a red blocks no merge; it is now visible in the run conclusion
    instead of hidden. What stays weak is only the installer itself inside
    `macos-install-smoke`: its exit status is swallowed, and the tolerance is paid for by
-   the next step, which re-tests `-x .venv/bin/python` and rebuilds the venv when none was
-   left, so the artefact is present or the job is red. The health probe asserts:
+   the next step, which tests the interpreter it was handed by importing `uvicorn` and
+   `web_ui.backend.server` — the module the launch step is about to run — and installs into the
+   venv when that import fails, so the artefact is USABLE or the job is red. Mere presence was
+   never the claim. The health probe asserts:
    `/api/health` must answer within 30 attempts at 2s (a backend that never starts fails
    the step, naming port, attempt count and window), while `/api/health/containers` remains
    informational and is labelled as such in the log — Docker presence is

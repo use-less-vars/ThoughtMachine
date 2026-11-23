@@ -1,18 +1,27 @@
-# Contracts — the invariants this machine guarantees
+# Contracts — the invariants this machine names, and what pins each one
 
 This ledger names the invariants the machine actually guarantees, each with the exact code site that
-enforces it and a test that would FAIL if that enforcement were removed. Every test it names is run by
+enforces it and a test that fails when the behaviour it pins is broken — proved by hand, where it has
+been proved, and marked GAP where it has not. Every test it names is run by
 the fast contract gate (`.github/workflows/contract-gate.yml`), which runs more than it names: the gate
 enumerates eighteen test files today and this ledger cites ten of them, because
 `tests/test_contracts_ledger_parity.py` enforces *cited ⊆ run* rather than equality, and the uncited
 extras are gate-only additions explained in that workflow's own header. Parity with the other ledger —
 the invariant list in `.thoughtmachine/knowledge/project/architecture_invariants.md` — is enforced by
 `tests/test_invariants_ledger_parity.py`, so every numbered invariant there must name a contract here
-or an explicit gap. It does not claim the wider suite is worthless — it claims that these three
-invariants are the merge-blocking guarantees: a change that breaks one of them must not reach `dev`,
-and a change that breaks anything else is still caught by the main matrix.
+or an explicit gap. What the gate does is re-run these tests and fail the job when one is red; it does
+not mutate the code to show that a test *can* fail — this tree carries no mutation-testing
+configuration — so a green gate states that the named tests passed, which is a statement about the
+tests, not a proof about the control. It does not claim the wider suite is worthless — it claims that
+these three invariants are the merge-blocking ones: Contract Gate is among the contexts `dev` requires
+(measured; see *What CI actually runs — and what this document does not claim* below), so a change
+that turns one of the eighteen files red cannot merge — provided the named test detects the break,
+which is the verdict column's claim and not the gate's — and a change that breaks anything else is
+still caught by the main matrix.
 
-Verdict vocabulary: **ENFORCED** — the code site enforces it and a named test fails on removal.
+Verdict vocabulary: **ENFORCED** — the code site enforces it and a named test fails when that behaviour
+is broken; removal was tried by hand only where this document records that it was tried, and the gate
+itself never mutates anything.
 **PARTIAL** — enforced, but at least one part of the invariant is not pinned by the tests named here.
 **GAP** — a part of the invariant has no detecting test at all.
 
