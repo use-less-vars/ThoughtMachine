@@ -138,6 +138,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Same step, same keys as `macos-suite` above: the installer builds the
+      # venv with whichever `python3` is on PATH, so the only way this job can
+      # choose its interpreter is to put the declared one on PATH first.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
       - name: Report host facts
         run: |
           echo "uname -m : $(uname -m)"
@@ -180,6 +189,29 @@ jobs:
             .venv/bin/python -m pip install -r requirements.txt
             .venv/bin/python -m pip install -e .
           fi
+
+          # MEASURED, not assumed. `env.PYTHON_VERSION` now selects the
+          # interpreter through `Set up Python`, but install.sh builds the venv
+          # from whatever `python3` is on PATH, so the venv is where a
+          # runner-image change lands first -- and it landed once as a pip
+          # solver error three steps away from its cause: on a 3.15 venv,
+          # `fast-json-repair>=0.2.0` has no candidate (every 0.2.x wheel is
+          # `Requires-Python >=3.11,<3.15`). Name that mismatch here, in this
+          # job's own words, instead of letting pip describe it.
+          PINNED="${{ env.PYTHON_VERSION }}"
+          ACTUAL="$(.venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+          echo "VENV_PYTHON: $(.venv/bin/python -V 2>&1)"
+          echo "ENV_PYTHON_VERSION: ${PINNED}"
+          case "${ACTUAL}" in
+            "${PINNED}"|"${PINNED}".*)
+              echo "VENV_INTERPRETER_OK: .venv is Python ${ACTUAL}, the version this workflow declares"
+              ;;
+            *)
+              echo "FAIL: .venv was built with Python ${ACTUAL}, but env.PYTHON_VERSION is ${PINNED}" >&2
+              echo "FAIL: the venv interpreter is chosen by whichever python3 is on PATH (install.sh -> scripts/doctor_checks.py --ensure-venv), so it must be pinned on PATH by the Set up Python step in this job" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Start backend and probe health endpoints
         # ASSERTS /api/health. /api/health/containers is informational only: its
