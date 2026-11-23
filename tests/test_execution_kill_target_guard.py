@@ -1006,9 +1006,11 @@ class _NoProcfs:
        GROUP PROBE but absorbs the target pid's failure instead of re-raising
        it -- so production's ``except OSError`` fallback is not what ends the
        story on a host that refuses an all-corpse group.
-    3. ``os.kill(pid, ...)`` succeeds for the liveness probe ``0`` AND for the
-       ``SIGTERM`` the single-pid fallback would send, so that host cannot end
-       the story one step later either.
+    3. ``os.kill(pid, <signal>)`` is a PROBE too: EVERY signal aimed at the
+       target is made for real and its answer RECORDED, but answered as
+       accepted -- the liveness probe ``0``, the ``SIGTERM`` the single-pid
+       fallback sends and the ``SIGKILL`` the escalation sends alike -- so no
+       signal aimed at the target can end the story before the state read.
     4. ``open`` INSIDE ``tools.workspace.worker_execution`` -- the module global
        that shadows the builtin for every function of that module -- raises the
        parametrised ``OSError`` for ``/proc/<pid>/stat``, counting attempts.
@@ -1034,20 +1036,15 @@ class _NoProcfs:
     handler returns BEFORE ``_escalate_subprocess_kill`` is ever entered:
     ``attempts == 0``, ``elapsed == 0.00s``.  Injecting all three is what lets
     the read be reached on every POSIX host, and what the escalation then did is
-    now ASSERTED from the trace instead of assumed.  Every other pid, and every
-    signal the fallback does not send, is forwarded to the real call.
+    now ASSERTED from the trace instead of assumed.  Every signal aimed at any
+    OTHER pid is forwarded to the real call, untouched.
     """
 
-    def __init__(self, pid: int, error: type,
-                 answer_signals: tuple = (0,)) -> None:
+    def __init__(self, pid: int, error: type) -> None:
         self.pid = pid
         self.path = f"/proc/{pid}/stat"
         self.error = error
         self.attempts = 0
-        # Which signals ``os.kill(pid, ...)`` ANSWERS for the target instead of
-        # forwarding: ``0`` is the liveness probe, ``SIGTERM`` is the single-pid
-        # fallback production takes when the group probe fails.
-        self.answer_signals = tuple(answer_signals)
         # EVERY seeded call, injected or forwarded, in order:
         # ``(name, target, sig-or-None, result-or-exception-tag)``.  This is
         # what shows whether production ever reached ``kill(pid, 0)``, whether
@@ -1096,16 +1093,27 @@ class _NoProcfs:
         return result
 
     def kill(self, target, sig):
-        if target == self.pid and sig in self.answer_signals:
-            if sig == 0:
-                outcome = "ok (INJECTED: liveness probe)"
-            else:
-                outcome = (
-                    "ok (INJECTED: group probe failed, the single-pid "
-                    "fallback was accepted)"
+        if target == self.pid:
+            # A PROBE, exactly like the group probe: the REAL call is made, so
+            # what THIS host answered is on the record, but the answer handed
+            # to production is "accepted" for EVERY signal -- the ``0``
+            # liveness probe, the ``SIGTERM`` of the single-pid fallback and
+            # the ``SIGKILL`` of the escalation alike -- so that a host which
+            # refuses a signal aimed at a corpse cannot end the story before
+            # the unreadable state is ever read.
+            try:
+                result = self._real_kill(target, sig)
+            except BaseException as exc:
+                self.calls.append(
+                    ("kill", target, sig,
+                     "raised " + _exc_tag(exc) + " -- answered as accepted")
                 )
-            self.calls.append(("kill", target, sig, outcome))
-            return None  # signal 0 still finds it / the fallback is accepted
+                return None
+            self.calls.append(
+                ("kill", target, sig,
+                 "%r (INJECTED: answered as accepted)" % (result,))
+            )
+            return result
         try:
             result = self._real_kill(target, sig)
         except BaseException as exc:
@@ -1203,9 +1211,7 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
     killpg = _RecordingKillpg(forward=True, absorb_failure_for=proc.pid)
     monkeypatch.setattr("os.killpg", killpg)
     try:
-        no_procfs = _NoProcfs(
-            proc.pid, error, answer_signals=(0, signal.SIGTERM)
-        ).install(monkeypatch)
+        no_procfs = _NoProcfs(proc.pid, error).install(monkeypatch)
 
         grace = 1.0
         tracker = ExecutionTracker()
