@@ -26,8 +26,13 @@
 #                      starting anything (also honors TM_CHECK_ONLY=1).
 #
 #  The backend is always started in the background; its stdout+stderr are
-#  mirrored to the console AND to logs/backend_startup.log (via tee). The
-#  script polls http://127.0.0.1:<TM_BACKEND_PORT>/api/health for up to 30 s before
+#  mirrored to the console AND appended to logs/backend_startup.log (via
+#  `tee -a`). The previous run's log is rotated first to
+#  logs/backend_startup.<UTC>.log (newest 5 kept). Every backend death is
+#  appended to logs/backend_death.log -- raw status, decoded cause ("exit N" /
+#  "signal N SIGNAME"), launcher pid/pgid/sid, cwd and the startup-log tail --
+#  plus one topology record per launch. The script polls
+#  http://127.0.0.1:<TM_BACKEND_PORT>/api/health for up to 30 s before
 #  considering the backend up. The frontend is only started after the
 #  backend is healthy.
 #===============================================================================
@@ -121,6 +126,162 @@ BACKEND_PID=""
 VITE_PID=""
 BACKEND_LOG="$SCRIPT_DIR/logs/backend_startup.log"
 
+# ---------------------------------------------------------------------------
+# Crash receipt: an append-only witness for backend deaths.
+#
+# The witness must not be the victim: every record is appended with ">>" and is
+# written *before* this process can die, so a backend that is SIGKILLed (and a
+# launcher that is killed with it) still leaves a parseable trace behind.  The
+# file is private (0600) and never truncated.  Record kinds:
+#   backend_exit|ts=..|pid=..|status=..|cause=..|launcher=..|pgid=..|sid=..|cwd=..
+#   tail|..                        last RECEIPT_TAIL lines of the startup log
+#   topology|ts=..|role=..|..      once per launch: launcher + backend
+#   kill_switch|..                 written by kill_thoughtmachine.sh
+# ---------------------------------------------------------------------------
+DEATH_LOG="$SCRIPT_DIR/logs/backend_death.log"
+RECEIPT_KEEP=5          # rotated backend_startup.*.log files to retain
+RECEIPT_TAIL=60         # startup-log lines copied into the receipt at death
+RECEIPT_LINE_MAX=500    # per-line truncation for those copied lines
+BACKEND_EXIT_RECORDED=0
+
+# ISO-8601 local time with its UTC offset, e.g. 2025-01-31T09:15:02+0100.
+receipt_ts() {
+    date +%Y-%m-%dT%H:%M:%S%z
+}
+
+# decode_wait_status <raw wait status> -> "exit N" | "signal N SIGNAME"
+# bash reports a signal-killed child as 128+N, so 137 => signal 9 SIGKILL.
+# The status is capped at 255, so a plain "exit 255" is indistinguishable from
+# signal 127; 129..165 (signals 1..37) is decoded as a signal, the rest as an
+# exit code -- which is what every real death (0, 1, 2, 137, 143) falls into.
+decode_wait_status() {
+    local rc="${1:-0}" signo signame
+    case "$rc" in
+        ''|*[!0-9]*) printf 'unknown %s' "${rc:-empty}"; return 0 ;;
+    esac
+    if [ "$rc" -gt 128 ] && [ "$rc" -le 165 ]; then
+        signo=$((rc - 128))
+        case "$signo" in
+            1)  signame=SIGHUP    ;;
+            2)  signame=SIGINT    ;;
+            3)  signame=SIGQUIT   ;;
+            6)  signame=SIGABRT   ;;
+            9)  signame=SIGKILL   ;;
+            11) signame=SIGSEGV   ;;
+            13) signame=SIGPIPE   ;;
+            14) signame=SIGALRM   ;;
+            15) signame=SIGTERM   ;;
+            17) signame=SIGCHLD   ;;
+            18) signame=SIGCONT   ;;
+            19) signame=SIGSTOP   ;;
+            *)  signame="SIG$signo" ;;
+        esac
+        printf 'signal %s %s' "$signo" "$signame"
+    else
+        printf 'exit %s' "$rc"
+    fi
+}
+
+# Make sure the receipt exists and stays private.  "umask 077" + "chmod 600"
+# so the witness cannot be read by whoever is allowed to kill the backend.
+receipt_init() {
+    mkdir -p "$SCRIPT_DIR/logs" 2>/dev/null || true
+    ( umask 077; : >> "$DEATH_LOG" ) 2>/dev/null || true
+    chmod 600 "$DEATH_LOG" 2>/dev/null || true
+}
+
+# Append one already-formatted record line (never truncate, never rewrite).
+receipt_write() {
+    receipt_init
+    printf '%s\n' "$*" >> "$DEATH_LOG"
+}
+
+# Append the tail of the current startup log, one truncated line per record.
+receipt_write_log_tail() {
+    [ -f "$BACKEND_LOG" ] || return 0
+    receipt_init
+    tail -n "$RECEIPT_TAIL" "$BACKEND_LOG" 2>/dev/null \
+        | while IFS= read -r _line; do
+              printf 'tail|%s\n' "${_line:0:RECEIPT_LINE_MAX}"
+          done >> "$DEATH_LOG"
+    return 0
+}
+
+# Rotate the startup log before every launch.  tee used to truncate the log on
+# start, destroying the previous run's evidence, so a non-empty log is moved
+# aside first and the newest RECEIPT_KEEP rotated files are kept.
+# $BACKEND_LOG itself keeps its exact name (other tools read that path).
+rotate_backend_log() {
+    [ -s "$BACKEND_LOG" ] || return 0
+    local stamp dest old n
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    dest="$SCRIPT_DIR/logs/backend_startup.$stamp.log"
+    # Two launches inside the same UTC second must never overwrite each other.
+    n=1
+    while [ -e "$dest" ]; do
+        dest="$SCRIPT_DIR/logs/backend_startup.$stamp.$n.log"
+        n=$((n + 1))
+    done
+    mv "$BACKEND_LOG" "$dest" 2>/dev/null || return 0
+    # Keep the well-known path present for readers that tail it.
+    : >> "$BACKEND_LOG"
+    ls -1t "$SCRIPT_DIR"/logs/backend_startup.*.log 2>/dev/null \
+        | tail -n "+$((RECEIPT_KEEP + 1))" \
+        | while IFS= read -r old; do rm -f "$old" 2>/dev/null || true; done
+    return 0
+}
+
+# The launcher's process-group / session ids, for attributing a kill later.
+launcher_pgid() { ps -o pgid= -p "$$" 2>/dev/null | tr -d ' \n'; }
+launcher_sid()  { ps -o sid=  -p "$$" 2>/dev/null | tr -d ' \n'; }
+
+# Once per launch: who launched whom, so a death can be attributed to a process
+# group instead of a bare number.
+record_topology() {
+    [ -n "${BACKEND_PID:-}" ] || return 0
+    local ts role pid row
+    ts="$(receipt_ts)"
+    receipt_init
+    for role in launcher backend; do
+        if [ "$role" = "launcher" ]; then pid="$$"; else pid="$BACKEND_PID"; fi
+        row="$(ps -o pid=,ppid=,pgid=,sid=,cmd= -p "$pid" 2>/dev/null \
+               | tr -s ' ' ' ' | sed 's/^ //;s/ $//')"
+        [ -n "$row" ] || continue
+        printf 'topology|ts=%s|role=%s|%s\n' "$ts" "$role" "$row" >> "$DEATH_LOG"
+    done
+    return 0
+}
+
+# Record the backend's death.  Idempotent: the first caller wins, so the
+# INT/TERM and EXIT paths can never overwrite a status recorded earlier.
+record_backend_exit() {
+    [ "${BACKEND_EXIT_RECORDED:-0}" = "1" ] && return 0
+    BACKEND_EXIT_RECORDED=1
+    local status="${1:-0}" cause
+    cause="$(decode_wait_status "$status")"
+    receipt_write "backend_exit|ts=$(receipt_ts)|pid=${BACKEND_PID:-unknown}|status=$status|cause=$cause|launcher=$$|pgid=$(launcher_pgid)|sid=$(launcher_sid)|cwd=$PWD" || true
+    receipt_write_log_tail || true
+    return 0
+}
+
+# EXIT trap: covers the paths that do not record explicitly (dev mode,
+# --doctor, early exits).  The launcher exits with the backend's raw wait
+# status on those paths, so the trap status *is* the backend's status.
+record_launcher_exit() {
+    if [ -n "${BACKEND_PID:-}" ] && [ "${BACKEND_EXIT_RECORDED:-0}" != "1" ]; then
+        record_backend_exit "${1:-0}"
+    fi
+    return 0
+}
+
+# Sourced?  Then only define: `source ./start_thoughtmachine.sh` gets the
+# receipt functions and returns, while an executed file always launches.  This
+# is a check on how we were invoked, not a flag -- no environment variable can
+# make the launcher silently not launch.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
+
 cleanup() {
     if [ -n "${VITE_PID:-}" ]; then
         kill "$VITE_PID" 2>/dev/null || true
@@ -128,10 +289,14 @@ cleanup() {
     fi
     if [ -n "${BACKEND_PID:-}" ]; then
         kill "$BACKEND_PID" 2>/dev/null || true
-        wait "$BACKEND_PID" 2>/dev/null || true
+        # Capture the real status of the backend we just asked to stop: the
+        # receipt must say "signal 15 SIGTERM", not the launcher's exit code.
+        wait "$BACKEND_PID" 2>/dev/null
+        record_backend_exit "$?"
     fi
 }
 trap 'cleanup; exit 130' INT TERM
+trap 'record_launcher_exit $?' EXIT
 
 # Poll GET http://127.0.0.1:<TM_BACKEND_PORT>/api/health for up to 30 s (30 x 1 s).
 # Returns 0 when the backend answers 200; 1 on timeout or early exit.
@@ -180,15 +345,21 @@ start_backend() {
     # $1 = backend command line (kept word-split on purpose)
     mkdir -p "$SCRIPT_DIR/logs"
     echo "  Starting backend; console output mirrored to logs/backend_startup.log ..."
+    # Move the previous run's log aside first; nothing may truncate it.
+    rotate_backend_log
     # shellcheck disable=SC2086
     # The subshell execs the backend, so $! is the backend's own PID (tee's
-    # PID is not captured); tee truncates the log on start.
-    ( exec $1 ) > >(tee "$BACKEND_LOG") 2>&1 &
+    # PID is not captured).  tee -a, never tee: the log is rotated above, so
+    # appending is safe and a second writer can never truncate the evidence.
+    ( exec $1 ) > >(tee -a "$BACKEND_LOG") 2>&1 &
     BACKEND_PID=$!
     echo "  Backend PID: $BACKEND_PID"
+    record_topology
     if ! wait_for_backend "$BACKEND_PID" "$TM_BACKEND_PORT"; then
         kill "$BACKEND_PID" 2>/dev/null || true
-        wait "$BACKEND_PID" 2>/dev/null || true
+        wait "$BACKEND_PID" 2>/dev/null
+        _backend_rc=$?
+        record_backend_exit "$_backend_rc"
         echo ""
         echo "Backend failed to start. See logs/backend_startup.log. Last lines:"
         tail -50 "$BACKEND_LOG" 2>/dev/null | sed 's/^/  /'
@@ -494,6 +665,8 @@ if ! $DEV_MODE; then
     echo "  Stop it with Ctrl-C."
     wait "$BACKEND_PID"
     BACKEND_RC=$?
+    # Record the death before exiting; the launcher must not leave silently.
+    record_backend_exit "$BACKEND_RC"
     exit "$BACKEND_RC"
 fi
 
