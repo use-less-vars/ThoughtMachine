@@ -16,11 +16,18 @@ on `pull_request` (all PRs, any base branch) and on `push` limited to `dev` and
 | Workflow | Jobs | Notes |
 | --- | --- | --- |
 | `cross-platform-smoke.yml` | `linux-install`, `windows-smoke`, `macos-launcher` | all gating |
-| `platform-matrix.yml` | `ubuntu-suite`, `linux-install-smoke`, `windows-import-smoke`, `windows-thin-pytest`, `macos-suite`, `macos-install-smoke`, `macos-docker-probe`, `web-ui-backend-suite`, `web-ui-frontend-suite` | 5 gating, 4 advisory |
+| `platform-matrix.yml` | `ubuntu-suite`, `linux-install-smoke`, `windows-import-smoke`, `windows-thin-pytest`, `web-ui-backend-suite`, `web-ui-frontend-suite` | 5 gating, 1 advisory (`web-ui-backend-suite`; `docs/CONTRACTS.md` records it as blocking since C91) |
 | `python-version-matrix.yml` | `unit-tests` (Python 3.11–3.14), `installer-contract`, `windows-python-314` | all gating |
 | `first_start_ci.yml` | `first-start` | gating |
 
-So a PR on any branch is covered by all four. A **push** to any branch other than
+`platform-matrix-macos.yml` holds `macos-suite`, `macos-install-smoke` and
+`macos-docker-probe`. All three gate — the job-level `continue-on-error` was
+removed — and none is in `REQUIRED_CHECKS`, so a red macOS job fails
+`platform-matrix-macos.yml`'s run without blocking a merge. This table's counts
+predate that split, and predate `contract-gate.yml`, which it does not list
+at all.
+
+So a PR on any branch is covered by the workflows above. A **push** to any branch other than
 `dev` or `master` runs nothing at all — which is the reason for the push-then-merge
 rule above: an unpushed branch has no CI result, and a locally-merged branch never
 gets one. Each workflow also sets `concurrency: group: <workflow>-${{ github.ref }}`
@@ -48,11 +55,13 @@ Gating (a failure fails its own workflow run):
 - `python-version-matrix.yml` — `unit-tests`, `installer-contract`,
   `windows-python-314`.
 - `first_start_ci.yml` — `first-start`.
+- `platform-matrix-macos.yml` — `macos-suite`, `macos-install-smoke`,
+  `macos-docker-probe` (gating since the job-level `continue-on-error` was
+  removed; none of the three is in `REQUIRED_CHECKS`).
 
 Advisory (`continue-on-error: true`, never fails its workflow):
 
-- `platform-matrix.yml` — `macos-suite`, `macos-install-smoke`, `macos-docker-probe`.
-- `platform-matrix.yml` — `web-ui-backend-suite` is likewise advisory, for an
+- `platform-matrix.yml` — `web-ui-backend-suite` is advisory, for an
   unrelated reason: `web_ui/backend/tests/` is outside the main `testpaths`, so it
   is collected and run as a separate advisory suite.
 
@@ -84,22 +93,34 @@ collection count drops (an empty selection cannot pass silently). The
 - **`windows-import-smoke`** / **`windows-thin-pytest`** — import of
   `web_ui.backend.server` only, and a thin Docker-free slice of four test files.
   Neither is the suite.
-- **`macos-launcher`** — the only gating macOS job. Three assertions: the port check
-  uses the `lsof` fallback and reports a real verdict; `--check-tools` marks `ss`
+- **`macos-launcher`** — gating, and the only macOS job that exercises the launch
+  paths. Three assertions: the port check uses the `lsof` fallback and reports a
+  real verdict; `--check-tools` marks `ss`
   critical and the launcher prints its Darwin skip marker; `--check-docker` reports
   a usable Docker or a named reason. Proves the launcher code paths. **Does not
   prove the application starts** — there is no uvicorn, no `/api/health`. That
   assertion is omitted deliberately (its preflight depends on venv/node/vault/locale
   state that cannot be proven deterministically), and the macOS Docker substrate
-  (Docker Desktop + VirtioFS) is left to the advisory probe.
-- **`macos-suite`** — the same suite as `ubuntu-suite`, advisory. Its result is
-  recorded and readable, but it cannot fail a merge.
-- **`macos-install-smoke`** — advisory install/start attempts that bypass the
-  launcher and call `uvicorn` directly; the installer failure path is swallowed
-  (`INSTALLER_EXIT=... (non-fatal: advisory job)`) and the health probe only logs
-  `HEALTH_UNREACHABLE` rather than exiting non-zero. Treat a green run here as
-  "nothing crashed hard", not as evidence that macOS startup works.
-- **`macos-docker-probe`** — advisory: does the Docker CLI and Docker Desktop exist,
+  (Docker Desktop + VirtioFS) is left to `macos-docker-probe`.
+- **`macos-suite`** — the same suite as `ubuntu-suite`, gating (no
+  `continue-on-error`). It is not in `REQUIRED_CHECKS`, so it cannot block a
+  merge; it can no longer conclude green while red, and that was the mask.
+- **`macos-install-smoke`** — gating install/start attempts that bypass the
+  launcher and call `uvicorn` directly. The installer failure path is still
+  swallowed inside its step
+  (`INSTALLER_EXIT=... (non-fatal: the next step rebuilds the venv if this left none)`),
+  but that tolerance is paid for one step later: `Fallback - ensure a usable
+  environment` re-tests `-x .venv/bin/python` and builds the venv when the
+  installer left none, so the step ends with the artefact present or red. The
+  health probe now asserts: `/api/health` must answer within 30 attempts at 2s
+  intervals, otherwise the step exits non-zero, naming the port, the attempt
+  count and the window and stating that the backend was launched but never
+  reachable. `/api/health/containers` stays informational and says so in the log
+  (Docker presence is `macos-docker-probe`'s assertion; asserting it here would
+  report "Docker missing" as "macOS startup broken"). A green run here now means
+  the environment existed and the backend answered `/api/health`; it does not
+  prove the installer exited 0.
+- **`macos-docker-probe`** — gating: does the Docker CLI and Docker Desktop exist,
   does `docker info` answer, do container `--user` and `git` behave. Its own comment
   states what it cannot prove: macOS bind-mount host-ownership under VirtioFS/gRPC-FUSE
   is not native-Linux uid mapping.

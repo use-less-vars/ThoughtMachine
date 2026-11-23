@@ -1,14 +1,22 @@
-# Platform Matrix CI - macOS jobs (advisory)
+# Platform Matrix CI - macOS jobs
 # ---------------------------------------------------------------------------
 # The three macOS jobs below were moved verbatim out of platform-matrix.yml.
-# All of them are advisory (continue-on-error: true), so they are kept in their
-# own workflow: platform-matrix.yml is required by branch protection and must
-# carry only the Linux/Windows jobs, where a red result actually blocks a merge.
+# None of them is advisory: no job here carries `continue-on-error`, so a red
+# job fails this workflow's run. They live in their own workflow so the macOS
+# verdict is reported on its own run instead of colouring the run that carries
+# the Linux/Windows check names. None of these three check names is in
+# REQUIRED_CHECKS (scripts/apply_branch_protection.sh), so a red here is
+# reported and does not block a merge -- it is no longer hidden.
+#
+# The trailing "(advisory)" in this file's `name:` and in the three job `name:`
+# values is a stale label left in place so the check-run contexts do not change
+# here; the jobs themselves are gating.
 #
 # The triggers, permissions and PYTHON_VERSION value are the ones
-# platform-matrix.yml uses. The job bodies are byte-identical to the definitions
-# removed from that file: no action versions changed, no new secrets, no new
-# inputs, no new conditionals.
+# platform-matrix.yml uses. The job bodies are the definitions removed from that
+# file, unchanged in behaviour since: the only later edits are comments, one log
+# string and the removal of the job-level `continue-on-error` -- no action
+# versions changed, no new secrets, no new inputs, no new conditionals.
 #
 # Anti-vacuity is unchanged in shape: macos-suite still runs
 # scripts/ci_assert_collected.py before the suite, with the same marker
@@ -29,9 +37,10 @@
 # margin below the measurement that ubuntu-suite uses, for the reason spelled
 # out under that job's assert step in platform-matrix.yml.
 #
-# A floor that is too HIGH here can never block a merge: macos-suite is
-# advisory (continue-on-error: true), so a red result is reported and ignored.
-# The reverse -- too low -- is the failure mode worth guarding, hence the
+# A floor that is too HIGH here fails macos-suite for a reason that says
+# nothing about the code: no job here is advisory (`continue-on-error` is gone),
+# so that red reads as a red macOS verdict. The reverse -- too low -- is the
+# failure mode worth guarding, hence the
 # measurement above rather than the old number.
 #
 # macOS install note: install.sh supports Darwin (it runs the same prerequisite
@@ -41,7 +50,9 @@
 # manual venv + pip install if the installer left no usable .venv, so the backend
 # can still be started and probed.
 #
-# Every job here is advisory: a red macOS run is reported, never merge-blocking.
+# No job here is advisory: a red macOS job fails this workflow's run. The three
+# check names are absent from REQUIRED_CHECKS, so that red does not block a
+# merge -- but a green run now means the jobs passed.
 # ---------------------------------------------------------------------------
 name: Platform Matrix (macOS, advisory)
 
@@ -58,12 +69,11 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  # macOS: full suite (advisory).
+  # macOS: full suite (gating: a red suite fails this workflow's run).
   # -------------------------------------------------------------------------
   macos-suite:
     name: macOS - full test suite (advisory)
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,23 +102,50 @@ jobs:
         run: python -m pytest -m "not docker and not e2e" --timeout 600 -ra
 
   # -------------------------------------------------------------------------
-  # macOS: install + startup smoke (advisory).
+  # macOS: install + startup smoke (gating: a red smoke fails this workflow's
+  # run).
   #
   # Reports the host facts (uname -m / sw_vers / id -u / id -g), selects the
   # best available installer (prefer a macOS-specific script if one is added,
   # otherwise `bash install.sh`, which installs on Darwin too), then starts the
   # backend and probes the health endpoints. If the installer left no usable
   # .venv, the job falls back to a manual venv so the probes still run.
+  #
+  # What a green here means, step by step. The installer is allowed to fail ONLY
+  # because a later step asserts its artefact:
+  #   1. `Select and run installer (best effort)` MAY fail. install.sh is driven
+  #      on Darwin, where its apt / docker-group branches cannot apply, and the
+  #      installer is not the thing this job proves.
+  #   2. `Fallback - ensure a usable environment` tests whether `.venv` is
+  #      USABLE -- its interpreter imports exactly what the next step launches,
+  #      `uvicorn` + `web_ui.backend.server` -- not merely present, and installs
+  #      when it cannot: an interpreter that exists but cannot import is the
+  #      same as no venv. That step therefore ends with a WORKING artefact or
+  #      red -- which is what makes (1) defensible. Existence was never enough:
+  #      a half-built venv (installer exited early) has `bin/python` and no
+  #      `uvicorn`, and the health step then died on `No module named uvicorn`.
+  #   3. `Start backend and probe health endpoints` must NOT fail silently: it is
+  #      the only step that proves the application starts. Green there now means
+  #      `/api/health` answered within the probe window, and nothing weaker; a
+  #      server that dies at import is a red step with the measurement in it.
   # -------------------------------------------------------------------------
   macos-install-smoke:
     name: macOS - install/startup smoke (advisory)
     runs-on: macos-latest
-    continue-on-error: true
     env:
       PORT: "8000"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Same step, same keys as `macos-suite` above: the installer builds the
+      # venv with whichever `python3` is on PATH, so the only way this job can
+      # choose its interpreter is to put the declared one on PATH first.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
       - name: Report host facts
         run: |
@@ -132,48 +169,94 @@ jobs:
             INSTALLER="bash install.sh"
           fi
           echo "SELECTED_INSTALLER: ${INSTALLER}"
-          ${INSTALLER} || echo "INSTALLER_EXIT=$? (non-fatal: advisory job)"
+          ${INSTALLER} || echo "INSTALLER_EXIT=$? (non-fatal: the next step rebuilds the venv if this left none)"
 
       - name: Fallback - ensure a usable environment
         run: |
-          if [ ! -x .venv/bin/python ]; then
-            echo "No .venv from installer; creating one manually (macOS fallback)."
-            python -m venv .venv
+          # USABILITY, not existence: `-x .venv/bin/python` is satisfied by a
+          # half-built venv whose interpreter cannot import uvicorn, so test
+          # whether it imports exactly what the next step launches --
+          # `uvicorn` plus `web_ui.backend.server`, its `:app` target -- and
+          # repair by installing when it does not. Repair runs the same
+          # commands as a fresh build, into whatever .venv exists, so it is
+          # idempotent; a healthy venv costs one import and no installs.
+          if .venv/bin/python -c "import uvicorn, web_ui.backend.server" 2>/dev/null; then
+            echo "Using the installer's .venv: it imports uvicorn and web_ui.backend.server."
+          else
+            echo "No USABLE .venv (missing, or it cannot import uvicorn/web_ui.backend.server); building one."
+            [ -x .venv/bin/python ] || python -m venv .venv
             .venv/bin/python -m pip install --upgrade pip
             .venv/bin/python -m pip install -r requirements.txt
             .venv/bin/python -m pip install -e .
-          else
-            echo "Using .venv created by the installer."
           fi
 
+          # MEASURED, not assumed. `env.PYTHON_VERSION` now selects the
+          # interpreter through `Set up Python`, but install.sh builds the venv
+          # from whatever `python3` is on PATH, so the venv is where a
+          # runner-image change lands first -- and it landed once as a pip
+          # solver error three steps away from its cause: on a 3.15 venv,
+          # `fast-json-repair>=0.2.0` has no candidate (every 0.2.x wheel is
+          # `Requires-Python >=3.11,<3.15`). Name that mismatch here, in this
+          # job's own words, instead of letting pip describe it.
+          PINNED="${{ env.PYTHON_VERSION }}"
+          ACTUAL="$(.venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+          echo "VENV_PYTHON: $(.venv/bin/python -V 2>&1)"
+          echo "ENV_PYTHON_VERSION: ${PINNED}"
+          case "${ACTUAL}" in
+            "${PINNED}"|"${PINNED}".*)
+              echo "VENV_INTERPRETER_OK: .venv is Python ${ACTUAL}, the version this workflow declares"
+              ;;
+            *)
+              echo "FAIL: .venv was built with Python ${ACTUAL}, but env.PYTHON_VERSION is ${PINNED}" >&2
+              echo "FAIL: the venv interpreter is chosen by whichever python3 is on PATH (install.sh -> scripts/doctor_checks.py --ensure-venv), so it must be pinned on PATH by the Set up Python step in this job" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Start backend and probe health endpoints
+        # ASSERTS /api/health. /api/health/containers is informational only: its
+        # availability depends on the container manager being usable on the
+        # runner, and Docker presence is decided by the separate
+        # macos-docker-probe job. Asserting it here would report "Docker missing"
+        # as "macOS startup broken" -- a false red is the same defect as a false
+        # green.
         run: |
           set -x
           .venv/bin/python -m uvicorn web_ui.backend.server:app --host 127.0.0.1 --port "${PORT}" &
           SERVER_PID=$!
           echo "SERVER_PID=${SERVER_PID}"
 
+          ATTEMPTS=30
+          INTERVAL=2
           ok=0
-          for i in $(seq 1 30); do
+          for i in $(seq 1 "${ATTEMPTS}"); do
             if curl -fsS "http://127.0.0.1:${PORT}/api/health" -o /tmp/health.json; then
               ok=1
+              echo "HEALTH_OK after ${i} attempt(s): $(cat /tmp/health.json)"
               break
             fi
-            sleep 2
+            sleep "${INTERVAL}"
           done
-          if [ "${ok}" -eq 1 ]; then
-            echo "HEALTH_OK: $(cat /tmp/health.json)"
-          else
-            echo "HEALTH_UNREACHABLE after 60s"
-          fi
 
+          # Informational, NOT asserted (see this step's comment).
           if curl -fsS "http://127.0.0.1:${PORT}/api/health/containers" -o /tmp/health_containers.json; then
-            echo "HEALTH_CONTAINERS: $(cat /tmp/health_containers.json)"
+            echo "HEALTH_CONTAINERS (informational, not asserted): $(cat /tmp/health_containers.json)"
           else
-            echo "HEALTH_CONTAINERS_UNREACHABLE"
+            echo "HEALTH_CONTAINERS_UNREACHABLE (informational, not asserted; Docker presence is decided by macos-docker-probe)"
           fi
 
+          # Release the port before deciding, so a failing job does not leave a
+          # uvicorn holding it.
           kill "${SERVER_PID}" 2>/dev/null || true
+
+          # The assertion. This is the LAST command in the step, and its exit
+          # status is the step's: `if <false>; then ...; fi` returns 0, and the
+          # failing branch ends in an explicit `exit 1`.
+          if [ "${ok}" -ne 1 ]; then
+            echo "FAIL: backend was launched (SERVER_PID=${SERVER_PID}) but http://127.0.0.1:${PORT}/api/health never answered" >&2
+            echo "FAIL: measured ${ATTEMPTS} attempts at ${INTERVAL}s apart (up to $((ATTEMPTS * INTERVAL))s window); the process was started and is now being reported as never reachable" >&2
+            exit 1
+          fi
 
       - name: Containerized git_read status probe (only if Docker present)
         run: |
@@ -194,7 +277,7 @@ jobs:
               print("execution_mode:", getattr(tool, "_last_execution_mode", "?"))
               print("failure_reason:", getattr(tool, "_last_failure_reason", "?"))
               print("fallback_used:", getattr(tool, "_last_fallback_used", "?"))
-          except Exception as exc:  # noqa: BLE001 - advisory probe
+          except Exception as exc:  # noqa: BLE001 - the probe prints the error, not raise
               print("GIT_READ_PROBE_ERROR:", repr(exc))
           PY
           else
@@ -206,7 +289,8 @@ jobs:
         run: pkill -f "uvicorn web_ui.backend.server:app" 2>/dev/null || true
 
   # -------------------------------------------------------------------------
-  # macOS: Docker Desktop availability probe (advisory).
+  # macOS: Docker Desktop availability probe (gating: a red probe fails this
+  # workflow's run; the probe skips cleanly when Docker is absent).
   #
   # WHAT THIS PROVES (when Docker Desktop is present and the daemon is up):
   #   * the Docker CLI + daemon are reachable from the macOS runner,
@@ -225,7 +309,6 @@ jobs:
   macos-docker-probe:
     name: macOS - Docker availability probe (advisory)
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4

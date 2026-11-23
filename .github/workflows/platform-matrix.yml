@@ -1,8 +1,9 @@
 # Platform Matrix CI (additive)
 # ---------------------------------------------------------------------------
 # Runs the project's test suite, an import smoke and a thin cross-platform test
-# slice across Linux / Windows. The macOS jobs are advisory and now live in
-# platform-matrix-macos.yml.
+# slice across Linux / Windows. The macOS jobs now live in
+# platform-matrix-macos.yml, where they are gating: no job there carries
+# `continue-on-error`, so a red macOS job fails that workflow's own run.
 #
 # The repository is PUBLIC, so GitHub-hosted runners consume free minutes for
 # all three operating systems; every job therefore runs on every push and
@@ -38,7 +39,9 @@
 #                                         NOT re-measured on Windows; the 77
 #                                         predates C91 and was left as it was.
 #
-# The macOS jobs (all advisory) moved to platform-matrix-macos.yml.
+# The macOS jobs moved to platform-matrix-macos.yml. They are gating there --
+# no job-level `continue-on-error` -- and none of the three names is in
+# REQUIRED_CHECKS.
 # ---------------------------------------------------------------------------
 name: Platform Matrix
 
@@ -101,9 +104,10 @@ jobs:
   #
   # Runs the real end-to-end smoke: it drives the real install.sh and the real
   # start_thoughtmachine.sh (on free TM_BACKEND_PORT / TM_FRONTEND_PORT
-  # values), then makes one live turn through the running backend. Unlike the
-  # macOS install-smoke job this one is NOT advisory: a failure fails the
-  # workflow (no continue-on-error).
+  # values), then makes one live turn through the running backend. A failure
+  # fails the workflow (no continue-on-error) -- as it now does for the macOS
+  # install-smoke job in platform-matrix-macos.yml, whose job-level
+  # continue-on-error was removed too.
   # -------------------------------------------------------------------------
   linux-install-smoke:
     name: Linux - install/startup smoke (blocking)

@@ -1,18 +1,27 @@
-# Contracts — the invariants this machine guarantees
+# Contracts — the invariants this machine names, and what pins each one
 
 This ledger names the invariants the machine actually guarantees, each with the exact code site that
-enforces it and a test that would FAIL if that enforcement were removed. Every test it names is run by
+enforces it and a test that fails when the behaviour it pins is broken — proved by hand, where it has
+been proved, and marked GAP where it has not. Every test it names is run by
 the fast contract gate (`.github/workflows/contract-gate.yml`), which runs more than it names: the gate
 enumerates eighteen test files today and this ledger cites ten of them, because
 `tests/test_contracts_ledger_parity.py` enforces *cited ⊆ run* rather than equality, and the uncited
 extras are gate-only additions explained in that workflow's own header. Parity with the other ledger —
 the invariant list in `.thoughtmachine/knowledge/project/architecture_invariants.md` — is enforced by
 `tests/test_invariants_ledger_parity.py`, so every numbered invariant there must name a contract here
-or an explicit gap. It does not claim the wider suite is worthless — it claims that these three
-invariants are the merge-blocking guarantees: a change that breaks one of them must not reach `dev`,
-and a change that breaks anything else is still caught by the main matrix.
+or an explicit gap. What the gate does is re-run these tests and fail the job when one is red; it does
+not mutate the code to show that a test *can* fail — this tree carries no mutation-testing
+configuration — so a green gate states that the named tests passed, which is a statement about the
+tests, not a proof about the control. It does not claim the wider suite is worthless — it claims that
+these three invariants are the merge-blocking ones: Contract Gate is among the contexts `dev` requires
+(measured; see *What CI actually runs — and what this document does not claim* below), so a change
+that turns one of the eighteen files red cannot merge — provided the named test detects the break,
+which is the verdict column's claim and not the gate's — and a change that breaks anything else is
+still caught by the main matrix.
 
-Verdict vocabulary: **ENFORCED** — the code site enforces it and a named test fails on removal.
+Verdict vocabulary: **ENFORCED** — the code site enforces it and a named test fails when that behaviour
+is broken; removal was tried by hand only where this document records that it was tried, and the gate
+itself never mutates anything.
 **PARTIAL** — enforced, but at least one part of the invariant is not pinned by the tests named here.
 **GAP** — a part of the invariant has no detecting test at all.
 
@@ -303,8 +312,14 @@ open item below.
 | `.github/workflows/cross-platform-smoke.yml` — "Cross-Platform Smoke" | `linux-install`, `windows-smoke`, `macos-launcher` | 3 of 3 | — |
 | `.github/workflows/first_start_ci.yml` — "First-Start CI" | `first-start` | 1 of 1 | — |
 | `.github/workflows/platform-matrix.yml` — "Platform Matrix" | `ubuntu-suite`, `linux-install-smoke`, `linux-e2e-auth`, `windows-import-smoke`, `windows-thin-pytest`, `web-ui-backend-suite`, `web-ui-frontend-suite` | 7 of 7 | — |
-| `.github/workflows/platform-matrix-macos.yml` — "Platform Matrix (macOS, advisory)" | `macos-suite`, `macos-install-smoke`, `macos-docker-probe` | 0 of 3 | all three |
+| `.github/workflows/platform-matrix-macos.yml` — "Platform Matrix (macOS, advisory)" | `macos-suite`, `macos-install-smoke`, `macos-docker-probe` | 3 of 3 | — |
 | `.github/workflows/python-version-matrix.yml` — "Python Version Matrix" | `unit-tests` (matrix over `python-version`), `installer-contract`, `windows-python-314` | 3 of 3 | — |
+
+The advisory column is empty as of this revision: no job in any of the six files carries
+`continue-on-error`. The three macOS jobs did until their job-level mask was removed, which is why the
+file is still named "(macOS, advisory)" and why each of its job `name:` values still ends in
+"(advisory)" — stale text retained so the check-run contexts did not change, not a claim that the
+jobs can be ignored.
 
 What the trigger blocks and job names add to that table:
 
@@ -324,11 +339,15 @@ What the trigger blocks and job names add to that table:
 - `platform-matrix.yml`'s `linux-e2e-auth` job skips itself unless auth-relevant files changed, and the
   change detection is written to *run* rather than skip when it cannot decide. A skip in that job is
   therefore not evidence that the auth path was exercised.
-- One advisory surface, visible in the workflow text: `.github/workflows/platform-matrix-macos.yml`
-  labels itself "(macOS, advisory)" and all three of its jobs carry `continue-on-error: true`. Those
-  three of the eighteen jobs cannot fail their run. `.github/workflows/platform-matrix.yml`'s
-  `web-ui-backend-suite` job was the fourth until C91 made it BLOCKING (no `continue-on-error`, and
-  its name no longer carries the "(advisory)" suffix).
+- No advisory surface is left in the workflow text. `.github/workflows/platform-matrix-macos.yml`
+  was the last one: all three of its jobs carried `continue-on-error: true`, so those three of the
+  eighteen could not fail their run. The mask is gone — no job in any of the six files carries
+  `continue-on-error` — so all eighteen fail their own workflow run on a red result. What remains is
+  naming and protection, not masking: none of the three macOS check names is in `REQUIRED_CHECKS`, so
+  a red macOS job fails the `platform-matrix-macos.yml` run without blocking a merge.
+  `.github/workflows/platform-matrix.yml`'s `web-ui-backend-suite` job was the fourth advisory job
+  until C91 made it BLOCKING (no `continue-on-error`, and its name no longer carries the
+  "(advisory)" suffix).
 
 **RESOLVED — measured, and the stored count is not the in-tree count.** The operator read the live
 `dev` ruleset with admin credentials on 2026-11-19: it stores **twelve** required-check entries, of

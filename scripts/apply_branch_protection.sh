@@ -99,13 +99,14 @@ REQUIRED_CHECKS=(
   # DELIBERATELY NOT REQUIRED -- commented out. Do not uncomment without a
   # reason recorded in docs/BRANCH_PROTECTION.md.
   #
-  # ADVISORY, and still visible: platform-matrix-macos.yml's three jobs all
-  # carry `continue-on-error: true`, so they cannot fail their workflow run --
-  # but they DO still report a check run, and it can conclude "failure"
-  # (measured on PR #401: `macOS - full test suite (advisory)` concluded
-  # failure while its run stayed green). Requiring one would either park `dev`
-  # at "Expected" or block a merge on the red macOS runner it was built to
-  # never block.
+  # GATING BUT NOT REQUIRED: platform-matrix-macos.yml's three jobs no longer
+  # carry `continue-on-error` (that mask was removed), so a red macOS job now
+  # FAILS that workflow's run and the failure shows in the run conclusion. They
+  # are still left out here deliberately: the same job was measured red on
+  # PR #401 (`macOS - full test suite (advisory)` concluded failure while its
+  # run stayed green), and requiring it would block a merge on that runner
+  # rather than on the code. Requiring one is a decision for a measured green
+  # macOS run -- record it in docs/BRANCH_PROTECTION.md first.
   # "macOS - full test suite (advisory)"
   # "macOS - install/startup smoke (advisory)"
   # "macOS - Docker availability probe (advisory)"
@@ -194,8 +195,9 @@ done
 #                           with ENFORCE_ADMINS=true, only --unprotect helps.
 #                           -> FAILS (exit 1).
 #   present, not required   a check runs that branch protection does not gate
-#                           on. Informational: the three macOS advisory names
-#                           are MEANT to land here, and so does every new job.
+#                           on. Informational: the three macOS names (gating in
+#                           their own workflow, not required here) are MEANT to
+#                           land here, and so does every new job.
 #
 # Exit: 0 = every required name present; 1 = a required name is absent;
 # 2 = usage error (file missing or unreadable). No network, no `gh` call.

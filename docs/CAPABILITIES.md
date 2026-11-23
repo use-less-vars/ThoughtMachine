@@ -249,11 +249,24 @@ These are factual, present-tense limitations — not roadmap items.
    - `SECURITY.md` covers only secret-handling; `docs/security_layer.md` is obsolete.
    - Per `docs/testing/test_inventory.md`, some areas are not covered by tests (e.g. the
      Respond tool, ToolPreset, and Vault).
-8. **Only one macOS CI job gates.** `macos-launcher` (`cross-platform-smoke.yml`) gates
-   since commit `b2203217` ("...add a gating macOS launcher preflight"); the other three
-   — `macos-suite`, `macos-install-smoke`, `macos-docker-probe` (`platform-matrix.yml`) —
-   are still **advisory** (`continue-on-error`). No transition date is recorded here; the
-   gating job proves the launcher paths, not that the application starts.
+8. **All four macOS CI jobs gate.** `macos-launcher` (`cross-platform-smoke.yml`) gates
+   since commit `b2203217` ("...add a gating macOS launcher preflight"), and the other three
+   — `macos-suite`, `macos-install-smoke`, `macos-docker-probe`
+   (`platform-matrix-macos.yml`) — gate too: their job-level `continue-on-error: true` was
+   removed, so a red job fails that workflow's run. None of the four is in
+   `REQUIRED_CHECKS`, so a red blocks no merge; it is now visible in the run conclusion
+   instead of hidden. What stays weak is only the installer itself inside
+   `macos-install-smoke`: its exit status is swallowed, and the tolerance is paid for by
+   the next step, which tests the interpreter it was handed by importing `uvicorn` and
+   `web_ui.backend.server` — the module the launch step is about to run — and installs into the
+   venv when that import fails, so the artefact is USABLE or the job is red. Mere presence was
+   never the claim. The health probe asserts:
+   `/api/health` must answer within 30 attempts at 2s (a backend that never starts fails
+   the step, naming port, attempt count and window), while `/api/health/containers` remains
+   informational and is labelled as such in the log — Docker presence is
+   `macos-docker-probe`'s assertion, and asserting it here would report a missing Docker as
+   a broken macOS startup. The gating job proves the launcher paths; `macos-suite` proves
+   the Docker-free suite on macOS.
 
 ---
 
@@ -298,7 +311,7 @@ python -m pytest -m docker
 | `cross-platform-smoke.yml` | Linux install smoke; Windows smoke (validates the `.bat` Python section parses under `cmd.exe`, Python 3.14, imports `web_ui.backend.server`, and runs `scripts/smoke_windows.ps1` polling `/api/health`). |
 | `python-version-matrix.yml` | Unit tests across Python 3.11–3.14; installer-contract check (floor-only) and a CRLF guard over the `.bat` files. |
 | `first_start_ci.yml` | First-start flow on `debian:13`; `--check-only` requires a Docker daemon; `daemon_down` / `lib_missing` are WARNING+continue in `--check-only`/`--doctor` but FATAL in `dev`/`prod`. |
-| `platform-matrix.yml` | Platform matrix: full suite on Ubuntu asserting the expected number of collected tests via `scripts/ci_assert_collected.py`; Windows import smoke; a thin Windows pytest selection (`test_container_registry.py`, `test_container_user_and_git_ownership.py`, `test_global_defaults.py`); macOS suite / install smoke / docker probe are **advisory** (`continue-on-error`). |
+| `platform-matrix.yml` | Platform matrix: full suite on Ubuntu asserting the expected number of collected tests via `scripts/ci_assert_collected.py`; Windows import smoke; a thin Windows pytest selection (`test_container_registry.py`, `test_container_user_and_git_ownership.py`, `test_global_defaults.py`); macOS suite / install smoke / docker probe were moved to `platform-matrix-macos.yml`, where they are **gating** (no `continue-on-error`) and, unlike the jobs above, not in `REQUIRED_CHECKS`. |
 
 **Endpoints.** Backend health is `GET /api/health` (distinct from the legacy `/health`,
 which no longer exists). The web UI is served at `http://127.0.0.1:8000` (dev uses Vite
