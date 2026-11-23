@@ -41,8 +41,9 @@ SUCCESS (``gone``).
    and cannot be read) must degrade toward ALIVE, never toward DEAD: the
    escalation burns the whole grace period and STILL issues the kill.
    CHARACTERISATION test -- behaviour already correct by accident, no
-   capability guard, the unreadable condition is injected at the seam
-   production code already uses.
+   capability guard: the unreadable read is injected at the seam production
+   code already uses, TOGETHER WITH the two POSIX probes that run before it,
+   so the arm is really exercised on Linux AND on Darwin.
 
 Run with::
 
@@ -828,37 +829,72 @@ def test_zombie_child_does_not_burn_the_grace_period(monkeypatch, new_session):
 # ---------------------------------------------------------------------------
 
 
-class _UnreadableProcStat:
-    """Make ``/proc/<pid>/stat`` UNREADABLE -- and nothing else.
+class _NoProcfs:
+    """Make the process state UNREADABLE -- and nothing else -- for ONE pid.
 
-    INJECTION SEAM: ``open`` INSIDE ``tools.workspace.worker_execution``, i.e.
-    the module global that shadows the builtin for every function of that
-    module.  ``_pid_is_alive`` therefore runs UNMODIFIED: its ``os.kill(pid, 0)``
-    probe, its ``except OSError`` arm, ``_kill_decision``,
-    ``_terminate_subprocess``, the ``kill_grace_seconds`` poll and the SIGKILL
-    escalation are all real production code.  Only the one read that a host
-    without a usable procfs cannot perform is faked.
+    THREE injections, all scoped to ``pid``, in the order production code
+    reaches them:
 
-    That is the HIGHEST seam that still exercises real escalation logic:
-    patching ``_pid_is_alive``, ``_escalate_subprocess_kill`` or the tracker
-    itself would replace the very behaviour this test pins.  Every other path,
-    and every other pid, is forwarded to the real ``open``.
+    1. ``os.getpgid(pid)`` answers ``pid``: the target is its OWN group leader,
+       so ``_kill_decision`` returns ``("group", "process_group_leader")``.
+    2. ``os.kill(pid, 0)`` succeeds: the signal-0 liveness probe still finds it.
+    3. ``open`` INSIDE ``tools.workspace.worker_execution`` -- the module global
+       that shadows the builtin for every function of that module -- raises the
+       parametrised ``OSError`` for ``/proc/<pid>/stat``, counting attempts.
+
+    (3) is the SUBJECT: ``_pid_is_alive`` keeps its ``os.kill(pid, 0)`` probe,
+    its ``except OSError`` arm, ``_kill_decision``, ``_terminate_subprocess``,
+    the ``kill_grace_seconds`` poll and the SIGKILL escalation as REAL
+    production code -- only the one read a host without a usable procfs cannot
+    perform is faked.  Patching ``_pid_is_alive``, ``_escalate_subprocess_kill``
+    or the tracker itself would replace the very behaviour this test pins.
+
+    (1) and (2) are NOT the subject.  They are the two POSIX probes production
+    runs BEFORE the read, and how a host answers them for an EXITED, UNREAPED
+    child is host-specific: Linux keeps the zombie findable (``os.getpgid``
+    returns its pgid, signal 0 succeeds, ``/proc/<pid>/stat`` shows ``Z``),
+    Darwin does not -- ``os.getpgid`` raises ``ESRCH``, so ``_kill_decision``
+    returns ``("gone", "no_such_process")`` and ``_terminate_subprocess``
+    returns BEFORE the poll ever starts.  Measured on Linux by substituting
+    them one at a time: ``attempts=0, elapsed=0.000s`` -- exactly the shape
+    macOS CI reported (``assert 0 > 0`` on ``attempts``), which means the test
+    silently proved NOTHING there while passing here.  Injecting them is what
+    lets the read be reached on every POSIX host.  Every other pid, and every
+    signal other than the ``0`` probe, is forwarded to the real call.
     """
 
     def __init__(self, pid: int, error: type) -> None:
+        self.pid = pid
         self.path = f"/proc/{pid}/stat"
         self.error = error
         self.attempts = 0
-        self._real = builtins.open
+        self._real_open = builtins.open
+        self._real_getpgid = os.getpgid
+        self._real_kill = os.kill
 
-    def __call__(self, file, *args, **kwargs):
+    # -- (3) the seam this test is about: the state read --------------------
+    def open(self, file, *args, **kwargs):
         if str(file) == self.path:
             self.attempts += 1
             raise self.error(self.path)
-        return self._real(file, *args, **kwargs)
+        return self._real_open(file, *args, **kwargs)
 
-    def install(self, monkeypatch) -> "_UnreadableProcStat":
-        monkeypatch.setattr(worker_execution_module, "open", self, raising=False)
+    # -- (1)(2) the POSIX probes that run BEFORE the read -------------------
+    def getpgid(self, target):
+        if target == self.pid:
+            return self.pid  # its own group leader
+        return self._real_getpgid(target)
+
+    def kill(self, target, sig):
+        if target == self.pid and sig == 0:
+            return None  # signal 0 still finds it
+        return self._real_kill(target, sig)
+
+    def install(self, monkeypatch) -> "_NoProcfs":
+        monkeypatch.setattr(worker_execution_module, "open", self.open,
+                            raising=False)
+        monkeypatch.setattr(os, "getpgid", self.getpgid)
+        monkeypatch.setattr(os, "kill", self.kill)
         return self
 
 
@@ -911,10 +947,17 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
     is why mapping the unreadable case onto DEAD is observable in BOTH halves:
     it returns immediately (no burn) AND issues no SIGKILL.
 
-    No capability guard: the unreadable condition is INJECTED, so this runs on
-    every platform.  ``POSIX_ONLY`` is not a capability skip for this case --
+    No capability guard is needed, but the injection is THREE-fold, not one:
+    the unreadable state read (the subject), plus the two POSIX probes that run
+    BEFORE it -- ``os.getpgid(pid)`` and ``os.kill(pid, 0)`` -- answered for the
+    target pid so that no host's view of a ZOMBIE can return before the read.
+    Linux finds an unreaped child through both; Darwin answers ``ESRCH`` from
+    ``os.getpgid``, ``_kill_decision`` returns ``("gone", ...)`` and the poll
+    never starts -- which is exactly why this test used to prove NOTHING on
+    macOS (``attempts == 0``) while passing on Linux.  ``_NoProcfs`` carries the
+    measured evidence.  ``POSIX_ONLY`` is not a capability skip for this case --
     the whole file needs POSIX process groups (``os.killpg`` / ``os.getpgid``)
-    to observe a group kill at all, on Linux and on Darwin alike.
+    to observe a group kill at all.
 
     Both ``OSError`` shapes are covered because they are two different absences:
     a Darwin host has no ``/proc`` at all (``FileNotFoundError``), while a
@@ -927,7 +970,7 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
 
     proc = _spawn_exited_child(new_session=True)
     try:
-        unreadable = _UnreadableProcStat(proc.pid, error).install(monkeypatch)
+        no_procfs = _NoProcfs(proc.pid, error).install(monkeypatch)
 
         grace = 1.0
         tracker = ExecutionTracker()
@@ -938,7 +981,7 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
         tracker.terminate_all("w1", None, None)
         elapsed = time.monotonic() - started
 
-        assert unreadable.attempts > 0, (
+        assert no_procfs.attempts > 0, (
             "the process-state read was never attempted, so nothing was proved "
             "about the unreadable case"
         )
