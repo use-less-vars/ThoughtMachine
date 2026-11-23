@@ -4,7 +4,7 @@ This ledger names the invariants the machine actually guarantees, each with the 
 enforces it and a test that fails when the behaviour it pins is broken — proved by hand, where it has
 been proved, and marked GAP where it has not. Every test it names is run by
 the fast contract gate (`.github/workflows/contract-gate.yml`), which runs more than it names: the gate
-enumerates twenty test files today and this ledger cites ten of them, because
+enumerates twenty-one test files today and this ledger cites ten of them, because
 `tests/test_contracts_ledger_parity.py` enforces *cited ⊆ run* rather than equality, and the uncited
 extras are gate-only additions explained in that workflow's own header. Parity with the other ledger —
 the invariant list in `.thoughtmachine/knowledge/project/architecture_invariants.md` — is enforced by
@@ -15,7 +15,7 @@ configuration — so a green gate states that the named tests passed, which is a
 tests, not a proof about the control. It does not claim the wider suite is worthless — it claims that
 these three invariants are the merge-blocking ones: Contract Gate is among the contexts `dev` requires
 (measured; see *What CI actually runs — and what this document does not claim* below), so a change
-that turns one of the twenty files red cannot merge — provided the named test detects the break,
+that turns one of the twenty-one files red cannot merge — provided the named test detects the break,
 which is the verdict column's claim and not the gate's — and a change that breaks anything else is
 still caught by the main matrix.
 
@@ -253,7 +253,7 @@ values `write`/`banned`/`ask`/`read` appears anywhere). Restoring the preset fal
 mutation-testing configuration at all: no Stryker config, no `mutation` script in
 `web_ui/frontend/package.json`, no mutmut or cosmic-ray. The two mutation proofs recorded in this
 contract's commit message are hand measurements, not a CI check, and nothing will re-run them.
-`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty files under
+`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty-one files under
 `tests/`, so it cannot run these JS suites — which is also why the JS paths above are cited without the
 backticked repo-relative form that `tests/test_contracts_ledger_parity.py` parses. What does run them is
 `platform-matrix.yml`'s `web-ui-frontend-suite` job (vitest over `src`), which cannot detect a mutation.
@@ -364,11 +364,11 @@ What the trigger blocks and job names add to that table:
   contract gate, while it does run the other five workflows. Those five run on `push` to `dev` and
   `master` and on `pull_request`.
 - `contract-gate` is the only workflow with any relationship to this document, and that relationship is
-  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of twenty
+  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of twenty-one
   test files** — no glob, no `-m` expression. Two consequences worth knowing: a new test that proves a
   contract does not join the gate by existing (it must be added to the workflow *and* cited here), and
-  the parity check described in the previous section is itself one of the twenty, so it fails the
-  gate it is part of. Note the direction: the gate runs twenty files and this ledger cites ten of
+  the parity check described in the previous section is itself one of the twenty-one, so it fails the
+  gate it is part of. Note the direction: the gate runs twenty-one files and this ledger cites ten of
   them, because the parity check enforces *cited ⊆ run*, not equality. The job carries
   `timeout-minutes: 10` and separately reports wall time against a stated 120-second budget; that
   budget is observed, not enforced.
