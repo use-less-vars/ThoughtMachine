@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import platform
 import signal
 import subprocess
 import time
@@ -981,9 +982,46 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
         tracker.terminate_all("w1", None, None)
         elapsed = time.monotonic() - started
 
+        # -- DIAGNOSTIC: which seam returned BEFORE the state read? --------
+        # A host-dependent early return must name itself here instead of
+        # surfacing as a bare ``assert 0 > 0`` elsewhere.
+        try:
+            attempts_so_far = no_procfs.attempts
+            decision = tracker._kill_decision(proc.pid)
+            # ``monkeypatch`` stores a FRESH bound method per access, so ``is``
+            # on ``no_procfs.getpgid`` is always False; ``__self__`` is the
+            # identity that actually says WHICH object is installed.
+            seams = {
+                "os.getpgid": getattr(os.getpgid, "__self__", None)
+                is no_procfs,
+                "os.kill": getattr(os.kill, "__self__", None) is no_procfs,
+                "module.open": getattr(
+                    worker_execution_module.open, "__self__", None
+                )
+                is no_procfs,
+            }
+            print(
+                "PROC_GUARD_DIAG platform=%s %s"
+                % (platform.system(), platform.release())
+            )
+            print("PROC_GUARD_DIAG seams %r" % (seams,))
+            print(
+                "PROC_GUARD_DIAG attempts=%r target_pid=%r self_pid=%r"
+                % (attempts_so_far, proc.pid, os.getpid())
+            )
+            print("PROC_GUARD_DIAG decision=%r" % (decision,))
+            print(
+                "PROC_GUARD_DIAG killpg_calls=%r sigkill_targets=%r"
+                % (killpg.calls, killpg.signalled(signal.SIGKILL))
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            print("DIAG_UNAVAILABLE", repr(exc))
+
         assert no_procfs.attempts > 0, (
-            "the process-state read was never attempted, so nothing was proved "
-            "about the unreadable case"
+            "something returned before the process-state read was attempted "
+            "-- PROC_GUARD_DIAG above names which seam (the patched "
+            "os.getpgid / os.kill probes, or module-level open) -- so nothing "
+            "was proved about the unreadable case"
         )
         assert elapsed >= grace * 0.9, (
             f"escalation returned after {elapsed:.2f}s on an UNREADABLE state: "
