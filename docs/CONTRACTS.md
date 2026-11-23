@@ -199,9 +199,11 @@ mutation-proven, and the literal default is now pinned instead of compared again
 remaining self-comparisons at `297 assert handle.mode == DEFAULT_RUNTIME_MODE` and `304 assert
 resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE` were true and stayed true across the flip, which is
 exactly why `343` / `349` assert the value outright. Scope, stated honestly: the gate is a script
-(`python3 scripts/mutation_gate.py`) that a human or a job runs — it is NOT yet wired into CI, so
-Contract 3 is enforced wherever that command runs and never by `pytest` alone. Wiring it in is the
-next step, not a property of this commit.
+(`python3 scripts/mutation_gate.py`) that a job runs — the `Mutation gate (contracts)` job in
+`.github/workflows/contract-gate.yml` runs it on every pull request against `dev`, so Contract 3 is
+enforced wherever that command runs and never by `pytest` alone. Running in CI is not the same as
+blocking a merge: requiredness is a property of the branch ruleset on `dev`, which the workflow file
+cannot state and this document does not verify.
 
 ## Contract 5: An unreadable permission is UNKNOWN, never assurance
 
