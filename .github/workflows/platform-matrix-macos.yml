@@ -116,9 +116,14 @@ jobs:
   #   1. `Select and run installer (best effort)` MAY fail. install.sh is driven
   #      on Darwin, where its apt / docker-group branches cannot apply, and the
   #      installer is not the thing this job proves.
-  #   2. `Fallback - ensure a usable environment` re-tests `-x .venv/bin/python`
-  #      and builds the venv when the installer left none, so that step ends
-  #      with the artefact present or red -- that is what makes (1) defensible.
+  #   2. `Fallback - ensure a usable environment` tests whether `.venv` is
+  #      USABLE -- its interpreter imports exactly what the next step launches,
+  #      `uvicorn` + `web_ui.backend.server` -- not merely present, and installs
+  #      when it cannot: an interpreter that exists but cannot import is the
+  #      same as no venv. That step therefore ends with a WORKING artefact or
+  #      red -- which is what makes (1) defensible. Existence was never enough:
+  #      a half-built venv (installer exited early) has `bin/python` and no
+  #      `uvicorn`, and the health step then died on `No module named uvicorn`.
   #   3. `Start backend and probe health endpoints` must NOT fail silently: it is
   #      the only step that proves the application starts. Green there now means
   #      `/api/health` answered within the probe window, and nothing weaker; a
@@ -159,14 +164,21 @@ jobs:
 
       - name: Fallback - ensure a usable environment
         run: |
-          if [ ! -x .venv/bin/python ]; then
-            echo "No .venv from installer; creating one manually (macOS fallback)."
-            python -m venv .venv
+          # USABILITY, not existence: `-x .venv/bin/python` is satisfied by a
+          # half-built venv whose interpreter cannot import uvicorn, so test
+          # whether it imports exactly what the next step launches --
+          # `uvicorn` plus `web_ui.backend.server`, its `:app` target -- and
+          # repair by installing when it does not. Repair runs the same
+          # commands as a fresh build, into whatever .venv exists, so it is
+          # idempotent; a healthy venv costs one import and no installs.
+          if .venv/bin/python -c "import uvicorn, web_ui.backend.server" 2>/dev/null; then
+            echo "Using the installer's .venv: it imports uvicorn and web_ui.backend.server."
+          else
+            echo "No USABLE .venv (missing, or it cannot import uvicorn/web_ui.backend.server); building one."
+            [ -x .venv/bin/python ] || python -m venv .venv
             .venv/bin/python -m pip install --upgrade pip
             .venv/bin/python -m pip install -r requirements.txt
             .venv/bin/python -m pip install -e .
-          else
-            echo "Using .venv created by the installer."
           fi
 
       - name: Start backend and probe health endpoints
