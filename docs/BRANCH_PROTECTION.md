@@ -1,20 +1,25 @@
 # Branch protection for `dev`
 
-Measured 2026-11-18 (C93) off the check-runs API on PR #401, not derived from
-the workflow files. Enforced by `scripts/apply_branch_protection.sh` (dry run by
-default).
+Two different mechanisms carry the name in this file, and they are kept apart on
+purpose:
 
-Read that last sentence as *intended*, not *effective*. The script targets the
-**classic** branch-protection endpoint, which answers 404 on this repo; the gate
-that actually blocks merges is a repository ruleset. So `REQUIRED_CHECKS`, and the
-eighteen-row table further down, are what the script asks for, while what is
-enforced is the eleven contexts measured in the next section.
+* **What the script asks for.** `scripts/apply_branch_protection.sh` (`REQUIRED_CHECKS`)
+  targets the **classic** branch-protection endpoint, which answers 404 on this repo.
+  On this host the script is *intended*, not *effective*.
+* **What actually blocks a merge.** A repository ruleset, `24214086`. Every membership
+  claim in this file is measured against that ruleset — never derived from
+  `REQUIRED_CHECKS`, never derived by subtracting from a count.
 
-## Enforced on `dev` today: 11 unique contexts (measured 2026-11-19)
+Dates, because these lists drift faster than the file: the ruleset readings are the
+operator's `gh api` reads of 2026-11-19 and 2026-11-21; the workflow-side mapping (which
+job reports which context, on which runner, under which trigger) was read off the tree
+at `1c4dc622` — the value `git rev-parse origin/dev` returned, not a remembered sha — on
+2026-11-23. Re-run the instrument rather than trusting the lists below.
 
-Classic protection 404s on this repo, so the only surface that answers this
-question is the repository ruleset. The instrument — run it rather than trusting
-the list below, which will drift before this file is edited again:
+## Enforced on `dev` today: 13 stored entries, 12 unique contexts
+
+Classic protection 404s on this repo, so the only surface that answers this question is
+the repository ruleset. The instrument — run it rather than trusting the list below:
 
 ```
 gh api repos/:owner/:repo/rulesets/24214086 --jq '.rules[] |
@@ -22,17 +27,12 @@ gh api repos/:owner/:repo/rulesets/24214086 --jq '.rules[] |
   .parameters.required_status_checks[].context'
 ```
 
-That returns **twelve** entries for **eleven** unique contexts. The duplicate is
-`Unit tests - Python 3.12`, stored adjacent to itself at positions 7 and 8 of the
-stored order — which is the entire reason the stored count and the enforced count
-disagree. Nothing is broken by it, but without that sentence the twelve-versus-eleven
-gap reads as a measurement error and gets "corrected" in the wrong direction. The
-order below is the order the call returns, not an order anyone chose: it is neither
-alphabetical nor grouped by workflow.
+That returns **thirteen** entries for **twelve** unique contexts. The order below is the
+order the call returns, not an order anyone chose: it is neither alphabetical nor
+grouped by workflow.
 
-**Verbatim, as the operator pasted it on 2026-11-19** — twelve entries, stored order,
-duplicate intact. This is a transcript, not a reconstruction: every name below is
-copied, and nothing in the block was inferred from a count.
+**Verbatim, stored order, duplicate intact** — the reading of 2026-11-21. Every name is
+copied; nothing in the block was inferred from a count.
 
 ```
 Ubuntu - full test suite
@@ -47,10 +47,24 @@ Unit tests - Python 3.13
 Installer version-contract assertions
 Contract gate (docs/CONTRACTS.md)
 Unit tests - Python 3.14
+web-ui-frontend-suite
 ```
 
-De-duplicated and sorted, those are the eleven unique contexts — the same eleven,
-spelled the way `scripts/apply_branch_protection.sh` spells them:
+**The duplicate, explained by measurement rather than by counting.** `Unit tests -
+Python 3.12` is stored twice, adjacent to itself at positions 7 and 8. It is not two
+jobs: the only producer of that literal string in the tree is ONE job,
+`python-version-matrix.yml:39` (`unit-tests`, `runs-on` at `:40`),
+whose `name:` interpolates `matrix.python-version` over the list at `:44` —
+`['3.11', '3.12', '3.13', '3.14']`, a single `3.12`. So the ruleset stores two entries
+that name **one** check run; the second is a duplicate of a context *string*, not a
+second required job, and GitHub matches both entries to the same run. The consequence
+for readers is the reason this paragraph exists: the ruleset page renders **twelve**
+rows because the UI de-duplicates, the API returns **thirteen** entries, and neither
+number is the membership. Only the API reading is authoritative.
+
+De-duplicated and sorted, the twelve contexts — the same twelve, spelled the way
+`scripts/apply_branch_protection.sh:75-96` spells them (the `REQUIRED_CHECKS` array
+opens at `:75` and its last entry is `:96`):
 
 ```
 Contract gate (docs/CONTRACTS.md)
@@ -64,45 +78,105 @@ Unit tests - Python 3.11
 Unit tests - Python 3.12
 Unit tests - Python 3.13
 Unit tests - Python 3.14
+web-ui-frontend-suite
 ```
 
-Seven names that `REQUIRED_CHECKS` asks for are **not** enforced:
-`Linux - auth e2e (browser)`, `web-ui-backend-suite`, `web-ui-frontend-suite`,
-`Windows - import smoke`, `Windows Python 3.14 gate proof`,
-`Windows - thin pytest slice`, `Windows venv + smoke script`. Every one of those
-is a check that runs, can go red, and stops no merge.
+### Each enforced context, mapped to the one job that reports it
 
-None of the seven appears in the transcript above. That is a stronger statement than
-the one this sentence made an hour ago: the list was then derived by subtraction from
-a total, and it is now read off by name.
+Twelve of twelve **matched**; **zero orphaned** — no stored context lacks a producer in
+this tree, so no required check here is a name no job will ever report.
 
-**Provenance, and the one paragraph of this file that evidence rewrote.** The eighteen
-declared names are byte-exact from `REQUIRED_CHECKS`
-(`scripts/apply_branch_protection.sh:78-96`). The enforced twelve are byte-exact from
-the operator's unedited paste of the instrument's output, reproduced above in the
-order it returns. An earlier version of this paragraph reconstructed the membership
-instead — eleven out of eighteen by subtraction, three exclusions re-confirmed by
-name, four carried over from a separate capture. That reconstruction landed on
-exactly these eleven names, and it is recorded here rather than tidied away, because
-the next reader should be able to tell a transcript from a good guess and should not
-conclude from this file that counting is as good as quoting. It is not: the seven
-absences above are now read off the transcript, where before they were inferred from
-a total. If the command and this file disagree, the command wins and this file is what
-gets edited.
+| check-run name (verbatim) | workflow | job id | runs-on |
+| --- | --- | --- | --- |
+| Contract gate (docs/CONTRACTS.md) | `contract-gate.yml:39` | contract-gate (`:38`) | ubuntu-latest (`:40`) |
+| Install + check-only | `first_start_ci.yml:43` | first-start (`:42`) | ubuntu-latest (`:44`), container `debian:13` (`:45`) |
+| Installer version-contract assertions | `python-version-matrix.yml:159` | installer-contract (`:158`) | ubuntu-latest (`:160`) |
+| Linux install + check-only + backend smoke | `cross-platform-smoke.yml:44` | linux-install (`:43`) | ubuntu-latest (`:45`) |
+| Linux - install/startup smoke (blocking) | `platform-matrix.yml:113` | linux-install-smoke (`:112`) | ubuntu-latest (`:114`) |
+| macOS launcher preflight (gating) | `cross-platform-smoke.yml:254` | macos-launcher (`:253`) | **macos-latest** (`:255`) |
+| Ubuntu - full test suite | `platform-matrix.yml:68` | ubuntu-suite (`:67`) | ubuntu-latest (`:69`) |
+| Unit tests - Python 3.11 | `python-version-matrix.yml:39` | unit-tests, `matrix.python-version` = 3.11 (`:44`) | ubuntu-latest (`:40`) |
+| Unit tests - Python 3.12 | same job | unit-tests, 3.12 | ubuntu-latest |
+| Unit tests - Python 3.13 | same job | unit-tests, 3.13 | ubuntu-latest |
+| Unit tests - Python 3.14 | same job | unit-tests, 3.14 | ubuntu-latest |
+| web-ui-frontend-suite | `platform-matrix.yml:501` | web-ui-frontend-suite (`:500`) | ubuntu-latest (`:502`) |
 
-**A second reading of the same ruleset — and the two views disagree.** The transcript
-above is the earlier reading of ruleset 24214086: twelve stored entries, eleven
-unique. A later reading of the same ruleset (operator, `gh api`) returns **thirteen**
-stored entries and **twelve** unique contexts — `web-ui-frontend-suite` has been
-added — while the ruleset page itself renders only **twelve** rows, because the UI
-**de-duplicates** the repeated `Unit tests - Python 3.12`. That divergence is why, on
-the operator's account, a duplicate could survive months of people reading that page:
-the two views differ by exactly one row, only the API tells the truth, and a reader
-looking at the page had no reason to suspect it. The transcript above is kept as what
-it is — a transcript of one reading, not the current set. **Open:** the seven names
-`REQUIRED_CHECKS` asks for and the ruleset did not enforce were read off that
-transcript; if `web-ui-frontend-suite` was among them, six remain. That diff has
-**not** been re-measured against the new reading.
+The four `Unit tests - Python 3.x` names are ONE job whose `name:` interpolates the
+matrix, so adding or dropping a version in `python-version-matrix.yml` changes the
+required set — and editing that matrix without editing the ruleset un-gates a version
+silently. The duplicate entry above is what a ruleset looks like when the same name is
+written twice by hand; it is not evidence of a fifth version.
+
+### Can each of them report on a PR?
+
+Measured triggers, every workflow this table touches:
+
+| workflow | `on:` | line |
+| --- | --- | --- |
+| `contract-gate.yml` | `pull_request: branches: [dev]` + `workflow_dispatch` | `:26-28` |
+| `cross-platform-smoke.yml` | `push: branches [dev, master]` + `pull_request:` | `:29-31` |
+| `first_start_ci.yml` | `push: branches [dev, master]` + `pull_request:` | `:33-35` |
+| `platform-matrix.yml` | `push: branches [dev, master]` + `pull_request:` | `:49-51` |
+| `python-version-matrix.yml` | `push: branches [dev, master]` + `pull_request:` | `:29-31` |
+
+All twelve required contexts therefore report on a pull request. One of them is
+branch-filtered: `contract-gate.yml` runs only for PRs whose **base is `dev`** (plus
+manual dispatch), so a PR opened against any other base leaves
+`Contract gate (docs/CONTRACTS.md)` at "Expected" — which only matters for the merge
+into `dev`, where it does run.
+
+## Measured absence: the nine job names the ruleset does not require
+
+The tree has 18 jobs producing 21 check-run names (`unit-tests` yields four). Twelve are
+required, above; the other nine are measured absent from the thirteen stored entries.
+The `note` column distinguishes *declared but not enforced* from *deliberately out*.
+
+| check-run name (verbatim) | workflow | job id | runs-on | note |
+| --- | --- | --- | --- | --- |
+| Linux - auth e2e (browser) | `platform-matrix.yml:180` | linux-e2e-auth (`:179`) | ubuntu-latest (`:181`) | in `REQUIRED_CHECKS`, **not** enforced |
+| web-ui-backend-suite | `platform-matrix.yml:442` | web-ui-backend-suite (`:441`) | ubuntu-latest (`:443`) | in `REQUIRED_CHECKS`, **not** enforced |
+| Windows - import smoke | `platform-matrix.yml:347` | windows-import-smoke (`:346`) | windows-latest (`:348`) | in `REQUIRED_CHECKS`, **not** enforced |
+| Windows - thin pytest slice | `platform-matrix.yml:383` | windows-thin-pytest (`:382`) | windows-latest (`:384`) | in `REQUIRED_CHECKS`, **not** enforced |
+| Windows Python 3.14 gate proof | `python-version-matrix.yml:235` | windows-python-314 (`:234`) | windows-latest (`:236`) | in `REQUIRED_CHECKS`, **not** enforced |
+| Windows venv + smoke script | `cross-platform-smoke.yml:124` | windows-smoke (`:123`) | windows-latest (`:125`) | in `REQUIRED_CHECKS`, **not** enforced |
+| macOS - full test suite (advisory) | `platform-matrix-macos.yml:75` | macos-suite (`:74`) | macos-latest (`:76`) | deliberately out |
+| macOS - install/startup smoke (advisory) | `platform-matrix-macos.yml:133` | macos-install-smoke (`:132`) | macos-latest (`:134`) | deliberately out |
+| macOS - Docker availability probe (advisory) | `platform-matrix-macos.yml:310` | macos-docker-probe (`:309`) | macos-latest (`:311`) | deliberately out |
+
+## The declared-versus-enforced gap, now by name
+
+Six of the eighteen names `REQUIRED_CHECKS` asks for are not in the ruleset:
+`Linux - auth e2e (browser)`, `web-ui-backend-suite`, `Windows - import smoke`,
+`Windows Python 3.14 gate proof`, `Windows - thin pytest slice`, and
+`Windows venv + smoke script`. Every one of those is a check that runs, can go red, and
+stops no merge.
+
+`web-ui-frontend-suite` used to be the seventh. The question this file carried after the
+second reading — *if `web-ui-frontend-suite` was among the declared-but-unenforced
+names, six remain; that diff has not been re-measured* — is now closed by name: it was,
+and it is enforced, and six remain. The measured consequence of it having been outside
+the ruleset is already recorded: `327d931f` (#424) merged with that job **red** and `dev`
+carried the failure until a human repaired it by hand (#426, `b8587e5`).
+
+## macOS: exactly one required context, and it is not from the macOS workflow
+
+Read off the thirteen stored entries: **one** macOS context is required,
+`macOS launcher preflight (gating)` (`cross-platform-smoke.yml:254`, `runs-on:
+macos-latest` at `:255`). The three names in `platform-matrix-macos.yml` are measured
+**absent** — those are the three `(advisory)` rows above.
+
+So "no macOS check is required" is false as stated, and this file does not say it. The
+measured statement is narrower and true: **the macOS-advisory workflow contributes
+nothing to the required set, while one macOS runner context does gate a merge.** The two
+facts are easy to collapse into each other, which is why both are written down.
+
+What keeps the three advisory names out is a recorded decision, not a reading of the
+workflow text. They are *not* dormant: `platform-matrix-macos.yml:52-54` says so in its
+own header — *"No job here is advisory: a red macOS job fails this workflow's run. The
+three check names are absent from REQUIRED_CHECKS, so that red does not block a merge --
+but a green run now means the jobs passed."* No job in any of the six workflows carries
+`continue-on-error`, so all 21 names gate their own workflow run and nine of them stop
+no merge.
 
 ## What a required context is
 
@@ -113,88 +187,30 @@ may reuse a job name, and renaming a job silently un-gates the branch.
 `runs-on`, `container:` and step-level `if:` do not change the name; a matrix job
 yields one check per combination.
 
+Every name in the tables above matches that rule against a real job — including
+`Install + check-only`, whose job runs inside `container: debian:13` on
+`ubuntu-latest` (`first_start_ci.yml:44-45`) and whose context is still the bare job
+name, and `Contract gate (docs/CONTRACTS.md)`, whose parenthetical is part of the job's
+`name:` (`contract-gate.yml:39`), not a workflow prefix.
+
 ## How the names were measured
+
+Every `X.yml:NN` citation in this file names `.github/workflows/X.yml`; the directory
+is dropped because each of those basenames is unique in the tree, which is also why
+`scripts/verify_doc_citations.py` can resolve them.
 
 ```
 gh api repos/use-less-vars/ThoughtMachine/commits/<PR #401 head sha>/check-runs \
   --jq '.check_runs[].name'
 ```
 
-That prints one bare name per reported check run; 21 distinct names came back.
-`gh pr checks <n>` is **not** usable for this: it prints a grouped
+That prints one bare name per reported check run. The reading of 2026-11-18 returned
+21 distinct names on PR #401; the tree at `1c4dc622` holds 18 jobs and, because
+`unit-tests` expands over four matrix values, 21 check-run names. `gh pr checks <n>`
+is **not** usable for this: it prints a grouped
 `<workflow> / <job>` display form, and contexts derived from that display name
-checks no job ever reports. Every name below is a literal string observed in
-that API response.
-
-## Declared contexts: the 18 `REQUIRED_CHECKS` asks for (21 measured on PR #401)
-
-| check-run name | workflow | job id | gating |
-| --- | --- | --- | --- |
-| Contract gate (docs/CONTRACTS.md) | contract-gate.yml | contract-gate | **required** |
-| Install + check-only | first_start_ci.yml | first-start | **required** |
-| Installer version-contract assertions | python-version-matrix.yml | installer-contract | **required** |
-| Linux - auth e2e (browser) | platform-matrix.yml | linux-e2e-auth | **required** |
-| Linux install + check-only + backend smoke | cross-platform-smoke.yml | linux-install | **required** |
-| Linux - install/startup smoke (blocking) | platform-matrix.yml | linux-install-smoke | **required** |
-| macOS launcher preflight (gating) | cross-platform-smoke.yml | macos-launcher | **required** |
-| Ubuntu - full test suite | platform-matrix.yml | ubuntu-suite | **required** |
-| Unit tests - Python 3.11 | python-version-matrix.yml | unit-tests (`matrix.python-version` = 3.11) | **required** |
-| Unit tests - Python 3.12 | python-version-matrix.yml | unit-tests (3.12) | **required** |
-| Unit tests - Python 3.13 | python-version-matrix.yml | unit-tests (3.13) | **required** |
-| Unit tests - Python 3.14 | python-version-matrix.yml | unit-tests (3.14) | **required** |
-| web-ui-backend-suite | platform-matrix.yml | web-ui-backend-suite | **required** |
-| web-ui-frontend-suite | platform-matrix.yml | web-ui-frontend-suite | **required** |
-| Windows - import smoke | platform-matrix.yml | windows-import-smoke | **required** |
-| Windows Python 3.14 gate proof | python-version-matrix.yml | windows-python-314 | **required** |
-| Windows - thin pytest slice | platform-matrix.yml | windows-thin-pytest | **required** |
-| Windows venv + smoke script | cross-platform-smoke.yml | windows-smoke | **required** |
-| macOS - full test suite (advisory) | platform-matrix-macos.yml | macos-suite | not required (gating) |
-| macOS - install/startup smoke (advisory) | platform-matrix-macos.yml | macos-install-smoke | not required (gating) |
-| macOS - Docker availability probe (advisory) | platform-matrix-macos.yml | macos-docker-probe | not required (gating) |
-
-Only eleven of those eighteen are enforced today — see *Enforced on `dev` today*
-above. The `gating` column records the script's intent, not the ruleset's state.
-
-The four `Unit tests - Python 3.x` names are ONE job in
-`python-version-matrix.yml` whose `name:` interpolates `matrix.python-version`;
-adding or dropping a version there means editing `REQUIRED_CHECKS` too.
-
-`Linux - auth e2e (browser)` is in `REQUIRED_CHECKS` but is **not** one of the
-eleven enforced contexts. It is worth knowing what it would mean if it were added:
-its steps skip when no auth-relevant file changed, the job itself has no `if:`, so
-it still reports, and a skip reports success. A required check that usually
-executes nothing is acceptable — it blocks exactly the PRs that touch auth files,
-and it fails when those break — but it must never be counted as coverage.
-
-Every name in `REQUIRED_CHECKS` belongs to a job that is merge-blocking in its own workflow
-(no `continue-on-error`) **and** triggered by `pull_request`, so the check runs
-on every PR head commit. That is a property of the workflow, not of the ruleset: a
-job can be merge-blocking there and still be absent from the required set, which
-is C105. `contract-gate.yml` triggers on `pull_request:
-branches: [dev]` plus `workflow_dispatch` — it has **no `push:` trigger**, so a
-direct push to `dev` does not run it. Branch protection needs only the
-`pull_request` trigger, which is what it has.
-
-## Correction to the previous revision
-
-The earlier version of this file listed 17 contexts and left
-`Contract gate (docs/CONTRACTS.md)` out on the grounds that its name had never
-been observed on a real PR — a derivation from `contract-gate.yml`, not a
-measurement. It has now been measured: it reports green on PR #401 in roughly
-40 s, and it is in `REQUIRED_CHECKS`. The reasoning that kept it out was sound
-(an unobserved required context parks `dev` at "Expected" forever); the
-evidence that overrode it is newer.
-
-The three macOS names stay out, and what keeps them out has changed. On PR #401,
-`macOS - full test suite (advisory)` **concluded failure** while its workflow run
-stayed green, because the job carried `continue-on-error: true`. That flag is
-gone: a red macOS job now fails the `platform-matrix-macos.yml` run, so the
-failure is visible in the run conclusion. The three names are still not
-required, and that is now a recorded decision rather than a consequence of the
-workflow text: the same job was measured red, and requiring it would block a
-merge on that runner rather than on the code. If it is ever required, do it on a
-measured green run, and note that these are the only contexts in this table
-whose job gates its own workflow while protection ignores it.
+checks no job ever reports. Every name in this file is either read from that response
+or read from the ruleset instrument at the top; nothing is derived from a display form.
 
 ## Keeping the list honest: `--verify-names FILE`
 
@@ -212,16 +228,19 @@ things:
 
 * **required but absent** → the rule can never be satisfied: every PR sits at
   "Expected — waiting for status to be reported", and with
-  `enforce_admins: true` only `--unprotect` gets past it. Exits **1**.
+  `enforce_admins: true` only `--unprotect` gets past it. Exits **1**. Measured
+  today: this direction is empty — all twelve stored contexts have a producer.
 * **present but not required** → a check runs that protection does not gate on.
-  Informational: the three macOS names are *meant* to appear here — they gate
-  their own workflow and are not required — and so does every newly added job.
-  Exits **0**.
+  Informational: the nine names above are *meant* to appear here, and so is every
+  newly added job. Exits **0**.
 
 Exit 2 is a usage error (file missing or unreadable). Run it after any job
 rename, and after any change to `REQUIRED_CHECKS`.
 
 ## Policy chosen in the payload
+
+This section is about the **classic** payload the script builds, which this host does
+not answer with — read it as intent, not as the ruleset's settings.
 
 `enforce_admins: true` — no admin bypass, which is the point, and also its
 cost: a maintainer's own direct push to `dev` is rejected like anyone else's, so
@@ -256,6 +275,23 @@ Emergency hatch: `--unprotect --apply` runs
 required check that cannot go green (renamed job, dead runner, outage) and
 re-apply afterwards — with `enforce_admins: true` nobody merges past a stuck
 check without it.
+
+## Corrections kept, so the next reader can tell a measurement from a derivation
+
+1. An earlier revision listed 17 contexts and left `Contract gate (docs/CONTRACTS.md)`
+   out on the grounds that its name had never been observed on a real PR — a derivation
+   from `contract-gate.yml`. It has since been measured green on PR #401 in ~40 s, and it
+   is in the ruleset. An unobserved required context parks `dev` at "Expected" forever,
+   which is why the conservative call was made; the ruleset reading overrode it.
+2. The previous revision's table carried a `gating` column that read **required** for
+   every name in `REQUIRED_CHECKS`. That was a restatement of the script's intent
+   dressed as enforcement, and it was wrong for six names. The column is replaced by
+   measured membership, one row per check-run name, with the job that produces it.
+3. An even earlier revision reconstructed membership by subtracting from a count. It
+   landed on the right eleven names, which is exactly why it is recorded here: a good
+   guess and a transcript are indistinguishable in the output and only the transcript
+   survives the next ruleset edit. Membership is now quoted, and the count — 13 stored,
+   12 unique — is stated next to the evidence that the two numbers differ.
 
 Unverifiable from here: per-name conclusions and trigger behaviour can only be
 confirmed against live runs, and the 422 behaviour described above depends on
