@@ -1,7 +1,7 @@
 # contract-gate.yml - the fast gate over the invariants named in docs/CONTRACTS.md.
 #
 # It runs the test files cited by the ledger, enumerated by hand (no glob, no `-m`
-# marker expression, never the whole suite), plus six gate-only additions the
+# marker expression, never the whole suite), plus seven gate-only additions the
 # ledger does not cite: tests/security/test_git_hardening.py and
 # web_ui/backend/tests/test_auth_boundary.py (both added by C91),
 # tests/test_verify_doc_citations.py, the mutation guard for the citation checker
@@ -12,8 +12,14 @@
 # tests/test_tool_import_declaration_match.py, which police "one spawn point"
 # and "one module imports subprocess unconditionally". Those two existed and ran
 # in the full-suite jobs only, so a change that broke them went green here: they
-# run in this job because a new file is exactly what trips them. The parity test
-# enforces cited <= run, so an uncited extra file cannot turn this workflow red.
+# run in this job because a new file is exactly what trips them. The seventh
+# addition, tests/test_apply_branch_protection_ruleset_refusal.py, covers
+# scripts/apply_branch_protection.sh's refusal to print "applied" about the
+# classic branch-protection layer when a repository ruleset governs `dev`: the
+# ruleset is what blocks merges here, so a PUT that changes nothing but reports
+# success is a gate that never existed.
+# The parity test enforces cited <= run, so an uncited extra file cannot turn
+# this workflow red.
 #
 # The checkout is fetch-depth: 0 (full history). That is not a luxury: the
 # ancestry check has to be able to SEE the pinned commit, and a depth-1 clone
@@ -88,7 +94,8 @@ jobs:
             tests/test_visual_grain_closure.py \
             tests/security/test_git_hardening.py \
             tests/test_onboarding_bundle_contract.py \
-            web_ui/backend/tests/test_auth_boundary.py
+            web_ui/backend/tests/test_auth_boundary.py \
+            tests/test_apply_branch_protection_ruleset_refusal.py
           status=$?
           end=$(date +%s)
           seconds=$((end - start))
