@@ -7,15 +7,11 @@ that ``docs/CONTRACTS.md`` claims will die, and the contract the claim belongs
 to.  The harness owns the mechanics (apply, run, restore, verdict); this file
 owns the claims.
 
-The registry is EMPTY in this commit on purpose
------------------------------------------------
 A gate that reports "0 mutations, 0 survived" is the same vacuous green the gate
 exists to catch, so the harness treats an empty registry as a refusal, not a
 pass: ``MUTATIONS_DECLARED=0 - a sweep of zero mutations is not a pass`` and a
-non-zero exit.  The first real subject (Contract 3's ``DEFAULT_RUNTIME_MODE``
-literal, the claim Known gap 1 says is already false) arrives in the next
-commit; this one only has to prove the harness can tell KILLED from SURVIVED
-from REFUSED before anything is pointed at production code.
+non-zero exit.  The first real subject is declared below: Contract 3's
+``DEFAULT_RUNTIME_MODE`` literal, the claim Known gap 1 said was unproven.
 
 Adding a subject
 ----------------
@@ -28,9 +24,9 @@ Append to ``MUTATIONS``; the gate runs them in declaration order::
             old="DEFAULT_RUNTIME_MODE = MODE_PROCESS",
             new="DEFAULT_RUNTIME_MODE = MODE_THREAD",
             tests=[
-                # Illustrative only: a node id that does not exist is REFUSED by
-                # the gate, never SURVIVED.  The real entry names real tests.
-                "tests/test_worker_is_a_real_process.py::test_the_default_mode",
+                # A node id that does not exist is REFUSED by the gate, never
+                # SURVIVED -- so these have to name real tests.
+                "tests/test_worker_is_a_real_process.py",
             ],
             contract="Contract 3 -- the default runtime mode is the process substrate",
         ),
@@ -50,4 +46,13 @@ What the harness enforces on every entry
 
 from mutation_gate import Mutation
 
-MUTATIONS: list[Mutation] = []
+MUTATIONS: list[Mutation] = [
+    Mutation(
+        name="contract-3-default-mode",
+        path="tools/workspace/worker_runtime.py",
+        old="DEFAULT_RUNTIME_MODE = MODE_PROCESS",
+        new="DEFAULT_RUNTIME_MODE = MODE_THREAD",
+        tests=["tests/test_worker_is_a_real_process.py"],
+        contract="Contract 3 -- the default runtime mode is the process substrate",
+    ),
+]
