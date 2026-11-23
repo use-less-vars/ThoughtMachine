@@ -119,22 +119,30 @@ fi
 #
 # `Mutation gate (contracts)` HAS a producer job in this tree, and that was
 # measured here rather than assumed: .github/workflows/contract-gate.yml
-# declares job `mutation-gate` (job id at :140) whose `name:` at :141 is exactly
-# this string, and its run step at :172 is
+# declares job `mutation-gate:` (the job KEY, line 147) whose `name:` (line 148)
+# is exactly this string, and its run step (line 179) is
 # `python3 scripts/mutation_gate.py --timeout 300`, reading the registry in
 # scripts/mutation_specs.py (both files exist on this tree). Its workflow
-# triggers on `pull_request: branches: [dev]` (:31-32), so the context is
+# triggers on `pull_request: branches: [dev]` (lines 37-38), so the context is
 # reportable on a PR to `dev`. Every context in this array therefore has a
 # producer, and `--verify-names` over a real check-run dump should list nothing
 # under REQUIRED BUT ABSENT. See docs/BRANCH_PROTECTION.md.
+#
+# Every line number in this block and in the two arrays below was re-measured
+# against THIS tree by searching the cited file for the quoted token -- not by
+# reusing an earlier reading. contract-gate.yml had grown since that reading, so
+# every anchor into it was stale: :44/:140/:141/:172/:31-32 are now
+# :50/:147/:148/:179/:37-38. Anchor on the token first and the number second, or
+# the citation rots silently; each number below points at the line carrying
+# that job's `name:` value (or the key named), which is the fact being claimed.
 # ---------------------------------------------------------------------------
 REQUIRED_CHECKS=(
-  "Contract gate (docs/CONTRACTS.md)"           # job contract-gate (contract-gate.yml:44)
+  "Contract gate (docs/CONTRACTS.md)"           # job contract-gate (contract-gate.yml:50)
   "Install + check-only"                        # job first-start (first_start_ci.yml:43)
   "Installer version-contract assertions"       # job installer-contract (python-version-matrix.yml:159)
   "Linux - install/startup smoke (blocking)"    # job linux-install-smoke (platform-matrix.yml:113)
   "Linux install + check-only + backend smoke"  # job linux-install (cross-platform-smoke.yml:44)
-  "Mutation gate (contracts)"                   # job mutation-gate (contract-gate.yml:141; see above)
+  "Mutation gate (contracts)"                   # job mutation-gate (contract-gate.yml:148; see above)
   "Ubuntu - full test suite"                    # job ubuntu-suite (platform-matrix.yml:68)
   # python-version-matrix.yml: the matrix job's name interpolates
   # matrix.python-version, so ONE job yields FOUR check-run names. Adding or
