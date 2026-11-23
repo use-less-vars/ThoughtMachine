@@ -1,5 +1,5 @@
 # tests/test_host_port_kill_switch.py
-"""CI AST kill-switch: no module under ``tools/`` may reach the host directly.
+"""CI AST kill-switch: no module in a scanned tree may reach the host directly.
 
 Every host process is supposed to funnel through ``thoughtmachine/host_port.py``
 (``host_run()`` / ``host_run_async()``), which is where the grain check, the
@@ -16,9 +16,9 @@ module explains *why* it has none) is not mistaken for the construct itself.
 Rules pinned here
 -----------------
 1. Only :data:`SANCTIONED_MODULES` -- ``tools/host_resource_policy.py`` and
-   ``tools/host_bash_tool.py`` -- may touch the host process surface inside
-   ``tools/``.  They are the policy checker and the host-run bridge; everything
-   else must call ``host_run()``.
+   ``tools/host_bash_tool.py`` -- may touch the host process surface inside the
+   :data:`SCAN_ROOTS` trees.  They are the policy checker and the host-run
+   bridge; everything else must call ``host_run()``.
 2. Every other offender must appear in :data:`ALLOWED_OFFENDERS` by its exact
    repository-relative path with the reason it still needs the surface.  The
    allowlist is a path -> reason map matched by whole string: no prefixes, no
@@ -50,7 +50,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: Directories scanned for a direct host-process surface (recursively).
 #: ``thoughtmachine/host_port.py`` -- the chokepoint itself -- is deliberately
 #: outside this root and is pinned by ``tests/test_tool_import_declaration_match.py``.
-SCAN_ROOTS = ("tools",)
+SCAN_ROOTS = ("tools", "security", "infra", "web_ui")
 
 
 # ---------------------------------------------------------------------------
@@ -69,9 +69,36 @@ SANCTIONED_MODULES = (
 
 ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
     (
+        "infra/containers/executor.py",
+        "docker image rebuild reads the committed requirements through a "
+        "`subprocess.run([\"git\", \"show\", \"HEAD:requirements.txt\"])` call "
+        "(line 1302, `cwd=` the workspace, no timeout) instead of GitReadTool / "
+        "SandboxedExecution, and never calls host_run(); that path therefore has "
+        "neither the grain check nor the kill switch. Tracked debt, not approved "
+        "design.",
+    ),
+    (
+        "infra/workspace_lifecycle_manager.py",
+        "`import subprocess` at line 38 with no call site anywhere in the module "
+        "(a dead import, kept only because the module docstring talks about "
+        "reaping subprocesses); the scan is import-level, so this entry records "
+        "the declaration rather than a spawn. Tracked debt: delete the import, "
+        "then delete this entry.",
+    ),
+    (
+        "security/sandboxed_execution.py",
+        "SandboxedExecution.run() spawns the command itself via `subprocess.run` "
+        "(line 145, with its own permission / metachar / timeout policy), so the "
+        "module is a second chokepoint that never calls host_run() and the kill "
+        "switch and cwd containment do not apply on that path. Tracked debt, not "
+        "approved design.",
+    ),
+    (
         "tools/ci_read_tool.py",
-        "spawns the `gh` CLI for CI monitoring (`subprocess.run` at line 260) "
-        "under its own `ci:read` grain; not routed through host_run yet.",
+        "resolves the repository origin with `subprocess.run([\"git\", "
+        "\"remote\", \"get-url\", \"origin\"])` (line 260) after the "
+        "`allow-host-resources` precheck at lines 250-258; the git lookup itself "
+        "is not routed through host_run() yet.",
     ),
     (
         "tools/git_info_tool.py",
@@ -98,6 +125,25 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
         "tools/workspace/worker_execution.py",
         "container teardown fallback: `docker exec <id> kill <pid>` via "
         "`subprocess.run` (line 384) in terminate_all().",
+    ),
+    (
+        "web_ui/backend/server.py",
+        "three import-time `subprocess.run` git lookups (`git rev-parse HEAD` "
+        "line 456, `git rev-parse --abbrev-ref HEAD` line 478, `git status "
+        "--porcelain` line 497, each `timeout=5.0`) feeding the /health payload, "
+        "plus the frontend build at line 6730 (`vite build`, else `npm run "
+        "build`, `timeout=120`, PATH prefixed with node_modules/.bin, "
+        "`subprocess.TimeoutExpired` handled at line 6746). None of them consults "
+        "the host permission grains and none calls host_run(). Tracked debt, not "
+        "approved design.",
+    ),
+    (
+        "web_ui/backend/tests/test_auth_boundary.py",
+        "test-only surface: `test_the_trust_flag_is_false_on_a_fresh_import` runs "
+        "`sys.executable -c ...` (line 582, `timeout=180`) because a fresh "
+        "import is the only way to read the shipped default; routing it through "
+        "host_run() would change what the test measures and it is not a "
+        "production surface. Tracked debt, not approved design.",
     ),
 )
 
@@ -279,8 +325,9 @@ def test_tools_tree_has_no_unsanctioned_host_process_surface():
         if rel_path not in sanctioned and rel_path not in allowed
     }
     assert not unlisted, (
-        "Host-process kill-switch tripped: module(s) under tools/ reach the host "
-        "directly instead of going through thoughtmachine.host_port.host_run().\n"
+        "Host-process kill-switch tripped: module(s) in the scanned trees "
+        f"{SCAN_ROOTS} reach the host directly instead of going through "
+        "thoughtmachine.host_port.host_run().\n"
         f"{_describe(unlisted)}\n"
         "Fix the module by calling host_run()/host_run_async(), or -- if the "
         "surface genuinely has to stay -- add an exact-path entry with its reason "
@@ -293,7 +340,8 @@ def test_scan_finds_the_known_offenders():
     """Positive control: the real-tree scan is not silently returning nothing."""
     offenders = scan_paths(_scanned_files())
     assert offenders, (
-        "The host-process scan found nothing anywhere under tools/. Either the "
+        f"The host-process scan found nothing anywhere under {SCAN_ROOTS}. "
+        "Either the "
         "scan is broken (it must at least see the known offenders) or the "
         "allowlist has gone stale."
     )
@@ -354,7 +402,7 @@ def test_allowlist_has_not_grown():
     added = sorted(discovered - allowlisted)
     removed = sorted(allowlisted - discovered)
     assert not added, (
-        "New unsanctioned host-process offender(s) appeared under tools/:\n  "
+        f"New unsanctioned host-process offender(s) appeared under {SCAN_ROOTS}:\n  "
         + "\n  ".join(added)
         + "\nMigrate them to host_run() or add an exact-path reason to ALLOWED_OFFENDERS."
     )

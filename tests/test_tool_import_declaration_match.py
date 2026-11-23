@@ -48,8 +48,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: Directories scanned for ``subprocess`` imports (recursively; ``__pycache__``
-#: is skipped).
-SCAN_ROOTS = ("thoughtmachine", "tools")
+#: is skipped).  Widened (F2) past the tool path: an import is a declaration of
+#: intent wherever it lives, so every tree that can spawn is scanned.
+SCAN_ROOTS = ("infra", "security", "thoughtmachine", "tools", "web_ui")
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +110,28 @@ ALLOWED_EXCEPTIONS = (
     # fallback used by terminate_all() when no container exec callable is
     # available.  Container plumbing, not host-execution tooling.
     "tools/workspace/worker_execution.py",
+    # -- WIDENED ROOTS (F2): trees outside the tool path that still spawn -----
+    # Imported function-locally inside the docker image rebuild, which reads the
+    # committed requirements with `git show HEAD:requirements.txt` (infra/
+    # containers/executor.py:1302) instead of GitReadTool/SandboxedExecution.
+    # Build plumbing that predates the chokepoint -- tracked debt, not design.
+    "infra/containers/executor.py",
+    # `import subprocess` at infra/workspace_lifecycle_manager.py:38 with no
+    # call site anywhere in the module: a dead import the reader has to check.
+    # Delete the import and this entry together.
+    "infra/workspace_lifecycle_manager.py",
+    # Second chokepoint: SandboxedExecution.run() spawns the command itself to
+    # enforce its own permission / metachar / timeout policy, so it has the
+    # import without ever calling host_run().  Tracked debt, not design.
+    "security/sandboxed_execution.py",
+    # Web backend: import-time `git rev-parse/status` probes for the /health
+    # payload (web_ui/backend/server.py:456/478/497) and the vite/npm frontend
+    # build (line 6730).  Neither consults the host grains.  Tracked debt.
+    "web_ui/backend/server.py",
+    # Test-only: `test_the_trust_flag_is_false_on_a_fresh_import` spawns
+    # `sys.executable -c ...` (web_ui/backend/tests/test_auth_boundary.py:582)
+    # to read a fresh import's default.  Not a production surface.
+    "web_ui/backend/tests/test_auth_boundary.py",
 )
 
 
@@ -151,6 +174,9 @@ DOCTOR_TOKENS = (DOCTOR_DOTTED, "thoughtmachine/doctor")
 #: ALLOWED_EXCEPTIONS) so that adding a file to the allowlist AND to the tree
 #: still fails until a human updates this tuple deliberately.
 PINNED_IMPORTERS = (
+    "infra/containers/executor.py",
+    "infra/workspace_lifecycle_manager.py",
+    "security/sandboxed_execution.py",
     "thoughtmachine/doctor.py",
     "thoughtmachine/host_port.py",
     "tools/ci_read_tool.py",
@@ -159,6 +185,8 @@ PINNED_IMPORTERS = (
     "tools/mcp_client.py",
     "tools/mcp_server_connect.py",
     "tools/workspace/worker_execution.py",
+    "web_ui/backend/server.py",
+    "web_ui/backend/tests/test_auth_boundary.py",
 )
 
 
