@@ -48,11 +48,27 @@ import pytest
 #: Repository root, derived from this file (``<root>/tests/<this file>``).
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: Directories scanned for a direct host-process surface (recursively).  Every
-#: tree that can spawn is here; ``thoughtmachine/host_port.py`` -- the chokepoint
-#: itself -- is inside ``thoughtmachine`` and is named in :data:`SANCTIONED_MODULES`
-#: rather than excused by a hole in the roots.
-SCAN_ROOTS = ("tools", "security", "infra", "web_ui", "agent", "thoughtmachine")
+#: Directories scanned for a direct host-process surface (recursively), in
+#: alphabetical order: the eight source trees that ship Python which can spawn.
+#: ``thoughtmachine/host_port.py`` -- the chokepoint itself -- is inside
+#: ``thoughtmachine`` and is named in :data:`SANCTIONED_MODULES` rather than
+#: excused by a hole in the roots.
+#:
+#: Two gaps are named rather than papered over.  ``tests/`` is the deliberate
+#: exclusion (589 ``*.py`` files): spawning is the thing under test there, so a
+#: fixture that runs a subprocess is doing its job.  The five top-level ``*.py``
+#: files at the project root (``start_windows.py`` among them, and it imports
+#: ``subprocess``) sit outside a directory-only tuple and are not scanned.
+SCAN_ROOTS = (
+    "agent",
+    "infra",
+    "mcp_examples",
+    "scripts",
+    "security",
+    "thoughtmachine",
+    "tools",
+    "web_ui",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +104,63 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
         "(grep for `subprocess` finds the import and the module docstring, and "
         "nothing else). Tracked debt: delete the import, then delete this "
         "entry.",
+    ),
+    (
+        "mcp_examples/test_client.py",
+        "hand-run example client: `subprocess.Popen([sys.executable, "
+        "\"internet_search_server.py\"], stdin/stdout/stderr=PIPE, text=True)` at "
+        "lines 68 and 126 drives the example MCP stdio server through the "
+        "handshake. Imported by nothing outside ``mcp_examples/`` and absent from "
+        "[project.scripts], so no agent tool call reaches it. Tracked debt, not "
+        "approved design.",
+    ),
+    (
+        "scripts/ci_assert_collected.py",
+        "CI anti-vacuity step: `subprocess.run([sys.executable, \"-m\", "
+        "\"pytest\", \"--collect-only\", \"-q\", <targets>], capture_output=True, "
+        "text=True)` at line 143 counts the collected tests. Invoked as `python "
+        "scripts/ci_assert_collected.py` from .github/workflows/platform-matrix.yml "
+        "and platform-matrix-macos.yml -- a CI path, not a tool path. Tracked debt, "
+        "not approved design.",
+    ),
+    (
+        "scripts/ci_doctor_poller.py",
+        "CI helper with no caller in the tree today (grep finds the filename only "
+        "inside this file): `subprocess.run([\"pkill\", \"-f\", "
+        "\"web_ui.backend.server\"])` at line 118 in cleanup(), and "
+        "`subprocess.Popen(shlex.split(args.doctor_cmd), stdout=<log file>, "
+        "stderr=STDOUT)` at line 157 -- both aimed at the doctor wrapper's own "
+        "process tree. Tracked debt, not approved design.",
+    ),
+    (
+        "scripts/doctor_checks.py",
+        "host health probes: the `_run()` helper (`subprocess.run` at line 52, "
+        "captured text, per-call timeout) runs `id -nG`, `docker info/ps/rm`, `ss "
+        "-ltn`, `lsof`, `node --version`, `python3 -c ...` and `pip install -r "
+        "requirements`. Reached from .github/workflows/cross-platform-smoke.yml, "
+        "install_thoughtmachine.sh:294 and `thoughtmachine/doctor.py:32` (`from "
+        "scripts import doctor_checks`) -- and doctor.py is the audited "
+        "off-the-tool-path launcher pinned by "
+        "test_doctor_exception_stays_off_the_tool_path. Tracked debt, not approved "
+        "design.",
+    ),
+    (
+        "scripts/gen_handoff.py",
+        "onboarding/knowledge-base generator: `subprocess.check_output(args, "
+        "text=True, encoding=\"utf-8\")` at line 86 behind `sh()`, whose only "
+        "callers are `git rev-parse --show-toplevel`, `git rev-parse --short dev` "
+        "and `git log -1/-5 dev` (lines 302-323). Run by hand and from tests; "
+        "nothing in agent/, tools/ or web_ui/ imports it. Tracked debt, not "
+        "approved design.",
+    ),
+    (
+        "scripts/verify_fix.py",
+        "red-before gate documented in scripts/verify_fix.md: `_git()` spawns `git "
+        "<args>` with a timeout (line 399) plus `git rev-parse --show-toplevel` "
+        "(line 409), and `run_pytest()` spawns `[sys.executable, \"-m\", "
+        "\"pytest\", <selector>, \"-q\"]` (line 488) in a throwaway worktree. A "
+        "human/CI verification path, not a tool path. Tracked debt, not approved "
+        "design.",
     ),
     (
         "security/sandboxed_execution.py",

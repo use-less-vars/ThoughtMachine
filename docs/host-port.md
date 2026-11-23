@@ -217,9 +217,12 @@ The scan's rules, as pinned today:
 4. `tools/host_bash_tool.py` and `tools/workspace/check_system.py` -- the two modules
    migrated in this wave -- must import no `subprocess` at all.
 
-The scan's roots are `thoughtmachine/` and `tools/`; modules in other roots are outside
-it, and `import subprocess` exists today in `tests/`, `scripts/`, `infra/`, `security/`,
-`web_ui/`, `mcp_examples/` and the project root, so the gap is named rather than implied.
+The scan's roots are the eight source trees that ship Python which can spawn --
+`agent/`, `infra/`, `mcp_examples/`, `scripts/`, `security/`, `thoughtmachine/`, `tools/`
+and `web_ui/`. Two gaps are named rather than implied: `tests/` is the deliberate
+exclusion (spawning is the thing under test there, so a fixture that runs a subprocess is
+doing its job), and the five top-level `*.py` files at the project root sit outside a
+directory-only tuple. `import subprocess` does exist in both uncovered places today.
 
 That last rule is the reason the migration is checkable rather than merely claimed: the
 scan fails if a migrated module regrows the import.
