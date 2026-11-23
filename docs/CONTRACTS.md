@@ -181,19 +181,43 @@ the calling interpreter.
         process.start()
 ```
 
-**Mutation-proof test:** `tests/test_worker_is_a_real_process.py` — `105 assert reply_pid != parent_pid`
-and `111 assert child_process_exists` for the honest handle, mirrored by `119 assert reply_pid ==
-parent_pid` / `124 assert not child_process_exists` so the branch cannot pick the vacuous side;
-`254 assert not _owns_a_real_child_process(handle)` and `265 assert "process" in str(excinfo.value)`
-reject a handle that declares `process` but answers in-process; `165 assert result.get("spawned") is
-True` dies if the production spawn path stops building a handle; `153` asserts the env flag is really
-absent, so the default is the thing under test.
+**Mutation-proof test:** `tests/test_worker_is_a_real_process.py` — `109 assert reply_pid != parent_pid`
+and `115 assert child_process_exists` for the honest handle, mirrored by `123 assert reply_pid ==
+parent_pid` / `128 assert not child_process_exists` so the branch cannot pick the vacuous side;
+`258 assert not _owns_a_real_child_process(handle)` and `269 assert "process" in str(excinfo.value)`
+reject a handle that declares `process` but answers in-process; `169 assert result.get("spawned") is
+True` dies if the production spawn path stops building a handle; `157` asserts the env flag is really
+absent, so the default is the thing under test; and `343 assert DEFAULT_RUNTIME_MODE == "process"` /
+`349 assert resolve_runtime_mode({}) == "process"` spell the default out as a literal, so a one-token
+flip of the constant is a red test rather than a green one.
 
-**Verdict:** PARTIAL — the substrate law ("the mode is a fact about where the code runs") is
-mutation-proven, but the test does NOT pin the literal default: `293 assert handle.mode ==
-DEFAULT_RUNTIME_MODE` and `300 assert resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE` compare against
-the constant itself, so flipping `DEFAULT_RUNTIME_MODE` to `MODE_THREAD` keeps every assertion in this
-file green. The literal value `MODE_PROCESS` is not asserted anywhere — see Known gaps.
+**Mutation gate:** the claim is not left to a human reading `assert` lines. The mutation is declared in
+`scripts/mutation_specs.py`, data rather than a test, and run by `scripts/mutation_gate.py`; the registry
+declares one mutation for this contract:
+`contract-3-default-mode` — the exact substring `DEFAULT_RUNTIME_MODE = MODE_PROCESS` rewritten to
+`DEFAULT_RUNTIME_MODE = MODE_THREAD` in `tools/workspace/worker_runtime.py` — with
+tests/test_worker_is_a_real_process.py as the file whose greenness the contract stands on:
+
+```text
+MUTATION contract-3-default-mode: KILLED
+GATE_SUMMARY declared=1 ran=1 killed=1 survived=0 refused=0 restore_failed=0 exit=0
+```
+
+The verdict flip is the evidence: before the literal-pinning test existed, the same declaration came
+back SURVIVED (exit 1) with all three named tests green — Known gap 1 reproduced by the gate itself —
+and KILLED afterwards (the gate also refuses an anchor that is absent or ambiguous, a node id it
+cannot collect, and a red baseline, so SURVIVED and KILLED are both earned).
+
+**Verdict:** ENFORCED — the substrate law ("the mode is a fact about where the code runs") is
+mutation-proven, and the literal default is now pinned instead of compared against itself: the two
+remaining self-comparisons at `297 assert handle.mode == DEFAULT_RUNTIME_MODE` and `304 assert
+resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE` were true and stayed true across the flip, which is
+exactly why `343` / `349` assert the value outright. Scope, stated honestly: the gate is a script
+(`python3 scripts/mutation_gate.py`) that a job runs — the `Mutation gate (contracts)` job in
+`.github/workflows/contract-gate.yml` runs it on every pull request against `dev`, so Contract 3 is
+enforced wherever that command runs and never by `pytest` alone. Running in CI is not the same as
+blocking a merge: requiredness is a property of the branch ruleset on `dev`, which the workflow file
+cannot state and this document does not verify.
 
 ## Contract 5: An unreadable permission is UNKNOWN, never assurance
 
@@ -252,12 +276,17 @@ pass:**
 
 ## Known gaps
 
-1. **Contract 3 — the literal default is unproven (GAP).** No test in the tree asserts
-   `DEFAULT_RUNTIME_MODE == "process"`. Every reference compares against the constant: in the cited
-   file at `293`/`300`, and in tests/test_worker_runtime_protocol.py at `840-842`, `864`, `1007-1008`
-   and tests/test_worker_runtime_seam.py at `242`. Flipping the constant to `MODE_THREAD` is a
-   one-token change that the entire named set would still pass. Contract 3 is cited as PARTIAL for
-   exactly this reason.
+1. **Contract 3 — the literal default is unproven (CLOSED).** No test in the tree asserted
+   `DEFAULT_RUNTIME_MODE == "process"`; every reference compared against the constant — in the cited
+   file at `297`/`304`, and in tests/test_worker_runtime_protocol.py at `840-842`, `864`, `1007-1008`
+   and tests/test_worker_runtime_seam.py at `242` — so flipping the constant to `MODE_THREAD` was a
+   one-token change the entire named set would still pass. The literal is now asserted outright at
+   `tests/test_worker_is_a_real_process.py:343` and `:349`, and the flip is a declared mutation
+   (`contract-3-default-mode`) that `scripts/mutation_gate.py` reports KILLED. The other files named
+   here are still comparisons against the constant and still would not notice the flip; what stops
+   them from mattering is that one literal, which is the file the mutation declaration names. What
+   remains open is automation, not the claim — the gate is not yet wired into CI. Contract 3 is cited
+   as ENFORCED for exactly this reason.
 2. **Contract 2 — two of the three deciders are unproven by anything named here (GAP).**
    `tests/trust/test_gate_contract.py` imports only `check_required_categories` (its line 25); neither
    `check_atomic_operation` (`security/security_gate.py::check_atomic_operation`) nor

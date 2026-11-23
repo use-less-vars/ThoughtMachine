@@ -178,6 +178,12 @@ ALLOWED_EXCEPTIONS = (
     # whose only callers are `git rev-parse` / `git log` reads (lines 302-323).
     # Run by hand and from tests; nothing in agent/, tools/ or web_ui/ imports it.
     "scripts/gen_handoff.py",
+    # Mutation gate: `subprocess.run([sys.executable, "-m", "pytest", ...])`
+    # (lines 500 and 539) in a disposable copy: spawns a fresh interpreter to
+    # import the mutated module (in-process pytest would read a cached module
+    # and prove nothing); a developer/CI script with no agent session, so the
+    # host-resource kill switch cannot apply.
+    "scripts/mutation_gate.py",
     # Red-before gate: `subprocess.run(["git", ...])` (lines 399, 409) and
     # `[sys.executable, "-m", "pytest", <selector>, "-q"]` (line 488) in a
     # throwaway worktree.  Human/CI verification path, not a tool path.
@@ -231,6 +237,7 @@ PINNED_IMPORTERS = (
     "scripts/ci_doctor_poller.py",
     "scripts/doctor_checks.py",
     "scripts/gen_handoff.py",
+    "scripts/mutation_gate.py",
     "scripts/verify_fix.py",
     "security/sandboxed_execution.py",
     "thoughtmachine/doctor.py",

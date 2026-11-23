@@ -10,8 +10,8 @@ really builds, and one that lies about its mode. A law that only ever sees the
 honest case proves nothing, so the lying handle is not a hypothetical -- it is
 the red test for the helper itself.
 
-What the three tests are
-------------------------
+What the four tests are
+-----------------------
 1. ``test_the_default_spawn_path_is_answered_by_the_substrate_it_declares`` --
    with ``WORKER_RUNTIME_MODE`` deleted from the environment, drive the REAL
    ``Worker._action_spawn`` (``tools/workspace/worker_thread.py``, the
@@ -30,6 +30,10 @@ What the three tests are
    with the flag unset, the mode the spawn path resolves must be
    ``DEFAULT_RUNTIME_MODE`` (and ``resolve_runtime_mode()`` must agree), so the
    constant is the source of truth only because the spawn path reaches it.
+4. ``test_the_default_mode_is_literally_process`` -- the one test that does NOT
+   read its expectation out of the constant: it spells the default ``"process"``
+   as a literal, so a one-token flip of ``DEFAULT_RUNTIME_MODE`` is observable
+   (Contract 3, Known gap 1).
 
 No ``skipif`` anywhere: a platform that cannot create a process cannot satisfy
 the law, and that is a red test with a message worth reading -- the same rule
@@ -305,3 +309,47 @@ def test_the_source_of_truth_constant_is_what_the_default_path_resolves(
     finally:
         handle.close(grace_ms=2000)
         worker_module._worker_registry.pop((session_id, WORKER, 1), None)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. The default's VALUE, spelled out -- the one assertion that does not
+#    compare the constant against itself
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_the_default_mode_is_literally_process():
+    """Flag absent: the default is the string ``"process"``, spelled out here.
+
+    Every other reference to the default in this file reads its expectation out
+    of ``DEFAULT_RUNTIME_MODE`` -- ``assert handle.mode == DEFAULT_RUNTIME_MODE``
+    and ``assert resolve_runtime_mode({}) == DEFAULT_RUNTIME_MODE`` -- which
+    proves the constant is *reached*, never that its VALUE is the one Contract 3
+    claims. Those two together are a comparison against itself: flipping one
+    token to ``MODE_THREAD`` keeps them green, and Contract 3's enforcement rests
+    on a literal nobody asserts. This test is that assertion.
+
+    So the literal is written out, and neither the constant nor ``MODE_PROCESS``
+    is used to produce it: importing ``MODE_PROCESS`` would put the expectation
+    back on the same one-token edit (``MODE_PROCESS = "thread"``), which is the
+    failure this test exists to make visible. Changing the default is a decision
+    about isolation, and it must be a decision that turns a sentence here red.
+
+    Env-independent by construction: ``DEFAULT_RUNTIME_MODE`` is a module
+    constant and ``resolve_runtime_mode({})`` is handed the empty mapping, so an
+    operator's ``WORKER_RUNTIME_MODE`` cannot make this measure their shell
+    instead of the shipped default.
+    """
+
+    assert DEFAULT_RUNTIME_MODE == "process", (
+        "Contract 3 says the absent flag resolves to 'process', but "
+        f"tools/workspace/worker_runtime.py:DEFAULT_RUNTIME_MODE is "
+        f"{DEFAULT_RUNTIME_MODE!r}. A worker would be served by the substrate "
+        "this names -- if that change is intended, Contract 3 changes with it"
+    )
+    assert resolve_runtime_mode({}) == "process", (
+        "the rule the spawn path applies to an absent flag -- "
+        "resolve_runtime_mode({}) -- must answer 'process' (Contract 3), got "
+        f"{resolve_runtime_mode({})!r}: the constant and the resolver disagree "
+        "about the default"
+    )
+

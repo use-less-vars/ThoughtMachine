@@ -154,6 +154,13 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
         "approved design.",
     ),
     (
+        "scripts/mutation_gate.py",
+        "spawns a fresh interpreter to import the mutated module (in-process "
+        "pytest would read a cached module and prove nothing); a developer/CI "
+        "script with no agent session, so the host-resource kill switch cannot "
+        "apply",
+    ),
+    (
         "scripts/verify_fix.py",
         "red-before gate documented in scripts/verify_fix.md: `_git()` spawns `git "
         "<args>` with a timeout (line 399) plus `git rev-parse --show-toplevel` "
