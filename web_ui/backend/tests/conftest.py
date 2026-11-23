@@ -19,6 +19,7 @@ import threading
 
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 from session.store import FileSystemSessionStore
 
 
@@ -316,6 +317,25 @@ def _webui_bus_counts():
     for event_type, callbacks in list(global_event_bus._subscribers.items()):
         counts[getattr(event_type, "value", str(event_type))] = len(callbacks)
     return counts
+
+
+@pytest.fixture
+def _webui_reaper():
+    """The reaper as a value, so that a test never has to find this module.
+
+    ``sys.modules`` cannot be used for that lookup: this file is imported under
+    the bare name ``conftest``, and so are ``<rootdir>/conftest.py`` and the
+    conftests of the other roots that are not packages
+    (``tests/security/conftest.py``, ``tests/e2e/conftest.py``).  Only the last
+    one imported keeps the ``"conftest"`` key, so scanning ``sys.modules`` for
+    this file's path misses whenever another root's conftest was loaded after
+    this one -- exactly what happens in a whole-repo run such as
+    ``pytest tests/ web_ui/backend/tests``.
+    """
+    return SimpleNamespace(
+        worker_registry=_webui_worker_registry,
+        reap_worker_threads=_webui_reap_worker_threads,
+    )
 
 
 @pytest.fixture(autouse=True)
