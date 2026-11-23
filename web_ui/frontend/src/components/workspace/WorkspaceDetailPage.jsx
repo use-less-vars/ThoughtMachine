@@ -576,9 +576,16 @@ export default function WorkspaceDetailPage({ workspaceId }) {
   const activeWorkers = summary?.active_workers?.length || 0
   const containerCount = summary?.containers_listed ?? 0
 
-  const posture = summary && summary.allow_host_resources
-    ? 'Host resources allowed. This workspace is suitable only for trusted, supervised work.'
-    : 'Host resources are forbidden. This workspace can withstand interactions with untrusted content.'
+  // Contract 5 (docs/CONTRACTS.md): `allow_host_resources` is only a claim when
+  // the summary reports a real boolean. An absent / null field means this page
+  // could not READ the permission surface -- that is UNKNOWN, and reporting it
+  // as "forbidden" would dress an unknown up as a security guarantee.
+  const hostResourcesKnown = typeof summary?.allow_host_resources === 'boolean'
+  const posture = !hostResourcesKnown
+    ? 'Workspace permissions could not be read. The security posture of this workspace is unknown; do not treat it as safe.'
+    : summary.allow_host_resources
+      ? 'Host resources allowed. This workspace is suitable only for trusted, supervised work.'
+      : 'Host resources are forbidden. This workspace can withstand interactions with untrusted content.'
 
   const handleToggle = () => {
     if (hostAllowed) {
@@ -752,7 +759,11 @@ export default function WorkspaceDetailPage({ workspaceId }) {
               <div
                 className={
                   'wdp-posture' +
-                  (summary.allow_host_resources ? ' wdp-posture-host' : ' wdp-posture-safe')
+                  (!hostResourcesKnown
+                    ? ' wdp-posture-unknown'
+                    : summary.allow_host_resources
+                      ? ' wdp-posture-host'
+                      : ' wdp-posture-safe')
                 }
               >
                 {posture}
@@ -760,10 +771,20 @@ export default function WorkspaceDetailPage({ workspaceId }) {
             </div>
             <div className="wdp-card">
               <div className="wdp-card-label">Host execution</div>
-              <div className={summary.allow_host_resources ? 'wdp-host-on' : 'wdp-host-off'}>
-                {summary.allow_host_resources
-                  ? 'Host execution enabled'
-                  : 'Host execution disabled'}
+              <div
+                className={
+                  !hostResourcesKnown
+                    ? 'wdp-host-unknown'
+                    : summary.allow_host_resources
+                      ? 'wdp-host-on'
+                      : 'wdp-host-off'
+                }
+              >
+                {!hostResourcesKnown
+                  ? 'Host execution state unknown'
+                  : summary.allow_host_resources
+                    ? 'Host execution enabled'
+                    : 'Host execution disabled'}
               </div>
             </div>
             <div className="wdp-card wdp-card-row">
