@@ -488,3 +488,9 @@ web_ui/frontend/.dist-build-stamp
 # Dated direction record (2026-11-22): ships with the repo so the README can
 # point at it and the next scoring pass can re-check its [N] tags.
 !docs/DIRECTION_2026-11-22.md
+# Its successor, filed at its own path because the record above is never edited
+# in place. Same tier and same reason as that line: `docs/*` above is a
+# catch-all, so without this negation the successor is never versioned, never
+# committed, and gone on the next clone -- while the superseded record it names
+# survives and the chain breaks at exactly the point it claims continuity.
+!docs/DIRECTION_2026-11-22_GEN67.md
