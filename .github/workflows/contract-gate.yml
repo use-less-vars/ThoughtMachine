@@ -1,14 +1,19 @@
 # contract-gate.yml - the fast gate over the invariants named in docs/CONTRACTS.md.
 #
 # It runs the test files cited by the ledger, enumerated by hand (no glob, no `-m`
-# marker expression, never the whole suite), plus four gate-only additions the
+# marker expression, never the whole suite), plus six gate-only additions the
 # ledger does not cite: tests/security/test_git_hardening.py and
 # web_ui/backend/tests/test_auth_boundary.py (both added by C91),
 # tests/test_verify_doc_citations.py, the mutation guard for the citation checker
-# wired in below, and tests/test_onboarding_bundle_contract.py, whose git
+# wired in below, tests/test_onboarding_bundle_contract.py, whose git
 # ancestry check is the only assertion in the repo that can notice the router
-# pinning a commit dev no longer contains. The parity test enforces cited <= run,
-# so an uncited extra file cannot turn this workflow red.
+# pinning a commit dev no longer contains, and the two surface guards
+# tests/test_host_port_kill_switch.py and
+# tests/test_tool_import_declaration_match.py, which police "one spawn point"
+# and "one module imports subprocess unconditionally". Those two existed and ran
+# in the full-suite jobs only, so a change that broke them went green here: they
+# run in this job because a new file is exactly what trips them. The parity test
+# enforces cited <= run, so an uncited extra file cannot turn this workflow red.
 #
 # The checkout is fetch-depth: 0 (full history). That is not a luxury: the
 # ancestry check has to be able to SEE the pinned commit, and a depth-1 clone
@@ -69,6 +74,8 @@ jobs:
             tests/test_security_gate_disk.py \
             tests/trust/test_gate_contract.py \
             tests/test_worker_is_a_real_process.py \
+            tests/test_host_port_kill_switch.py \
+            tests/test_tool_import_declaration_match.py \
             tests/test_contracts_ledger_parity.py \
             tests/test_invariants_ledger_parity.py \
             tests/test_verify_doc_citations.py \
