@@ -284,8 +284,8 @@ def _webui_reap_worker_threads(threads_before, keys_before):
         registered = {}
     candidates = [thread for key, thread in registered.items()
                   if key not in keys_before and _webui_is_worker_thread(thread)]
-    for ident, thread in threading.enumerate():
-        if ident in threads_before or any(thread is c for c in candidates):
+    for thread in threading.enumerate():
+        if id(thread) in threads_before or any(thread is c for c in candidates):
             continue
         if _webui_is_worker_thread(thread):
             candidates.append(thread)
@@ -375,7 +375,7 @@ def _webui_thread_bridge_census(request):
             keys_now = set(keys_before)
         for key in sorted(keys_now - keys_before, key=repr):
             problems.append("worker registry still holds %r" % (key,))
-        for ident, thread in threading.enumerate():
+        for thread in threading.enumerate():
             if id(thread) not in threads_before:
                 problems.append("thread still alive: %r" % (thread.name,))
         for thread in survivors:
