@@ -8,15 +8,15 @@
 # REQUIRED_CHECKS (scripts/apply_branch_protection.sh), so a red here is
 # reported and does not block a merge -- it is no longer hidden.
 #
-# The trailing "(advisory)" in this file's `name:` and in the three job `name:`
-# values is a stale label left in place so the check-run contexts do not change
-# here; the jobs themselves are gating.
+# The three job `name:` values below carry no "(advisory)" suffix: the jobs are
+# gating (no `continue-on-error`), and the suffix is gone from the check-run
+# contexts. This workflow's own `name:` still ends in "(advisory)".
 #
 # The triggers, permissions and PYTHON_VERSION value are the ones
 # platform-matrix.yml uses. The job bodies are the definitions removed from that
-# file, unchanged in behaviour since: the only later edits are comments, one log
-# string and the removal of the job-level `continue-on-error` -- no action
-# versions changed, no new secrets, no new inputs, no new conditionals.
+# file, unchanged in behaviour since: the only later edits are comments, one
+# log string, the removed `continue-on-error` and the dropped "(advisory)"
+# job-name suffix -- no action versions, secrets, inputs or conditionals changed.
 #
 # Anti-vacuity is unchanged in shape: macos-suite still runs
 # scripts/ci_assert_collected.py before the suite, with the same marker
@@ -72,7 +72,7 @@ jobs:
   # macOS: full suite (gating: a red suite fails this workflow's run).
   # -------------------------------------------------------------------------
   macos-suite:
-    name: macOS - full test suite (advisory)
+    name: macOS - full test suite
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -130,7 +130,7 @@ jobs:
   #      server that dies at import is a red step with the measurement in it.
   # -------------------------------------------------------------------------
   macos-install-smoke:
-    name: macOS - install/startup smoke (advisory)
+    name: macOS - install/startup smoke
     runs-on: macos-latest
     env:
       PORT: "8000"
@@ -307,7 +307,7 @@ jobs:
   #     host user's uid.
   # -------------------------------------------------------------------------
   macos-docker-probe:
-    name: macOS - Docker availability probe (advisory)
+    name: macOS - Docker availability probe
     runs-on: macos-latest
     steps:
       - name: Checkout

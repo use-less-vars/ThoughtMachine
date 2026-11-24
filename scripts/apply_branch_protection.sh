@@ -107,9 +107,9 @@ REQUIRED_CHECKS=(
   # run stayed green), and requiring it would block a merge on that runner
   # rather than on the code. Requiring one is a decision for a measured green
   # macOS run -- record it in docs/BRANCH_PROTECTION.md first.
-  # "macOS - full test suite (advisory)"
-  # "macOS - install/startup smoke (advisory)"
-  # "macOS - Docker availability probe (advisory)"
+  # "macOS - full test suite"
+  # "macOS - install/startup smoke"
+  # "macOS - Docker availability probe"
 )
 
 # ---------------------------------------------------------------------------
