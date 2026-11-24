@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Dict, Iterable, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from agent.core import image_store
 
@@ -36,6 +36,7 @@ __all__ = [
     "tracked_ids",
     "drop_session",
     "live_image_ids",
+    "warm_images",
     "gc_session",
     "reset",
 ]
@@ -209,6 +210,125 @@ def live_image_ids(history: Iterable[Any]) -> Set[str]:
             if image_id:
                 live.add(image_id)
     return live
+
+
+def _ordered_image_ids(history: Iterable[Any]) -> List[str]:
+    """Return the image ids *history* references, oldest first, deduplicated.
+
+    :func:`live_image_ids` answers "what is referenced" as a set; warming needs
+    the order too, because the store it fills is bounded and the newest turn is
+    the one the next request is most likely to send again.  Message order and
+    read order are identical to ``live_image_ids`` -- only the set is dropped.
+
+    Args:
+        history: Iterable of message dicts; anything that is not a mapping, or
+            whose ``images`` is not a sequence, is ignored rather than raising.
+    """
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    for message in history or ():
+        if not isinstance(message, dict):
+            continue
+        entries = message.get('images')
+        if not isinstance(entries, (list, tuple, set)):
+            continue
+        for entry in entries:
+            image_id = _image_id(entry)
+            if image_id and image_id not in seen:
+                seen.add(image_id)
+                ordered.append(image_id)
+    return ordered
+
+
+def warm_images(
+    workspace_id: Optional[str],
+    messages: Iterable[Any],
+    *,
+    budget: Optional[int] = None,
+) -> int:
+    """Restore the durable images *messages* names into the in-memory store.
+
+    ``agent.core.image_store`` lives in the process and nothing else, so a
+    restart starts it empty while the transcript -- and the UI, which reads the
+    durable files in ``agent.core.image_files`` directly -- still shows the
+    user's screenshots.  A miss then reaches the provider as
+    ``IMAGE_UNAVAILABLE_PLACEHOLDER`` text, so the model answers about an image
+    it never saw: the visible transcript and the actual request disagree.
+
+    This is the read-side repair: the bytes the transcript still names are put
+    back, so a pasted image survives the process that received it.  It only
+    ever ADDS, and only for ids the caller's own transcript mentions, which is
+    why it is not ``image_store.reconcile`` -- that one drops every id the
+    caller does not mention, and with a content-addressed store shared by all
+    sessions it would blank the image another conversation still shows.
+
+    Warming runs newest first: the store is bounded and the newest turns are
+    the ones a follow-up is most likely to resend, so they must not be the ones
+    evicted to make room for an older screenshot.
+
+    Never raises, and never turns a miss into a hit: bytes that are gone stay
+    gone and the store's own miss path reports that honestly.
+
+    Args:
+        workspace_id: Workspace holding the durable files.  Falsy means
+            "unknown", which warms nothing -- another workspace's directory is
+            never guessed at.
+        messages: Message dicts, read exactly as :func:`live_image_ids` reads
+            them.
+        budget: Maximum number of images to warm, defaulting to
+            ``image_store.MAX_ENTRIES`` -- the most the store can hold at once,
+            so a longer transcript cannot evict its own newest images while
+            warming.
+
+    Returns:
+        The number of images actually put back into the store.
+    """
+    if not workspace_id:
+        return 0
+    image_ids = _ordered_image_ids(messages)
+    if not image_ids:
+        return 0
+    limit = image_store.MAX_ENTRIES if budget is None else budget
+    if limit <= 0:
+        return 0
+    # Imported here, not at module scope: ``agent.core.image_files`` imports
+    # this module at import time, so a top-level import would be circular.
+    from agent.core import image_files
+
+    warmed = 0
+    for image_id in reversed(image_ids):
+        if warmed >= limit:
+            break
+        if image_store.get(image_id) is not None:
+            continue
+        try:
+            data = image_files.load_image(workspace_id, image_id)
+            if data is None:
+                continue
+            media_type = image_files.media_type_of(workspace_id, image_id)
+            if not media_type:
+                # ``image_files`` recovers the media type from the file name
+                # only, so an unknown one means the file cannot say what it
+                # holds.  Guessing a type here would send the provider a
+                # mislabelled payload -- an error, or garbage decoded as an
+                # image -- where an honest miss degrades to the placeholder
+                # the rest of the path already handles.  The bytes are simply
+                # dropped.
+                logger.warning(
+                    "Not warming image %s of workspace %s: its file names no "
+                    "known image media type",
+                    image_id, workspace_id,
+                )
+                continue
+            image_store.put(data, media_type, image_id=image_id)
+        except Exception:
+            logger.warning(
+                "Could not warm image %s of workspace %s into the store",
+                image_id, workspace_id, exc_info=True,
+            )
+            continue
+        warmed += 1
+    return warmed
 
 
 def gc_session(session_id: Optional[str], history: Iterable[Any]) -> int:
