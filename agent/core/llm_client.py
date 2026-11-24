@@ -391,6 +391,7 @@ class LLMClient:
             RateLimitExceeded: If rate limit is hit.
             LLMError: For provider-independent errors (authentication, timeout, etc.).
         """
+        self._warm_pasted_images(messages)
         try:
             start_time = time.time()
             response = self.provider.chat_completion(messages=messages, tools=tools, **kwargs)
@@ -422,6 +423,7 @@ class LLMClient:
         ``ToolCallComplete`` per tool call, then ``Done``. Streaming support is a
         provider capability, not a caller-side flag.
         """
+        self._warm_pasted_images(messages)
         provider = getattr(self, 'provider', None)
         if provider is not None and hasattr(provider, 'stream_completion'):
             async for event in provider.stream_completion(messages=messages, tools=tools, **kwargs):
@@ -444,6 +446,29 @@ class LLMClient:
             canonical = _to_canonical_tool_call(tool_call)
             yield ToolCallComplete(tool_call=canonical, parse_error=canonical.parse_error)
         yield Done()
+
+    def _warm_pasted_images(self, messages: List[Dict[str, Any]]) -> None:
+        """Put the pasted images *messages* names back into the image store.
+
+        The store (``agent.core.image_store``) is in-process only, so the first
+        request after a restart would send the provider
+        ``IMAGE_UNAVAILABLE_PLACEHOLDER`` text for every screenshot the
+        transcript still shows the user: the model then answers about an image
+        it never received, silently.  Re-filling from the durable copy in the
+        session's workspace is what makes a pasted image survive the process.
+
+        Best-effort and never fatal: an unnamed workspace, a message list with
+        no images, or bytes that are genuinely gone all leave the request
+        exactly as it was.
+
+        Args:
+            messages: The messages about to be sent to the provider.
+        """
+        workspace_id = getattr(getattr(self, 'session', None), 'workspace_id', None)
+        if not workspace_id:
+            return
+        from . import image_gc
+        image_gc.warm_images(workspace_id, messages)
 
     def _provider_meta(self, response) -> Dict[str, Any]:
         """Best-effort extraction of provider-specific metadata from a response.

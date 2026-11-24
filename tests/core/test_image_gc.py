@@ -469,3 +469,101 @@ def test_save_session_refuses_to_release_another_sessions_image(store):
     store.save_session(other)
 
     assert image_store.get(shared) is None
+
+
+# ---------------------------------------------------------------------------
+# restart survival: the store is in-process, the bytes are on disk
+# ---------------------------------------------------------------------------
+
+def test_warm_images_restores_bytes_a_restart_lost(vault):
+    """After a restart the transcript's image must still reach the model."""
+    image_id = image_files.save_image(WORKSPACE, 'image/png', PNG)
+    image_store.reset()  # the restart: nothing in memory, bytes still on disk
+
+    warmed = image_gc.warm_images(WORKSPACE, [_user_message(image_id)])
+
+    assert warmed == 1
+    stored = image_store.get(image_id)
+    assert stored is not None
+    assert stored[0] == PNG
+    assert stored[1] == 'image/png'
+    # Already cached now, so a second turn warms nothing.
+    assert image_gc.warm_images(WORKSPACE, [_user_message(image_id)]) == 0
+
+
+def test_warm_images_leaves_an_absent_image_a_miss(vault):
+    """Bytes that are gone stay gone: warming never invents a hit."""
+    missing = 'a' * 32
+    image_store.reset()
+
+    assert image_gc.warm_images(WORKSPACE, [_user_message(missing)]) == 0
+    assert image_store.get(missing) is None
+
+
+def test_warm_images_warms_the_newest_images_within_budget(vault):
+    """The store is bounded, so the newest turns get the budget."""
+    ids = [
+        image_files.save_image(WORKSPACE, 'image/png', PNG + bytes([index]))
+        for index in range(3)
+    ]
+    image_store.reset()
+
+    warmed = image_gc.warm_images(WORKSPACE, [_user_message(*ids)], budget=2)
+
+    assert warmed == 2
+    assert image_store.get(ids[2]) is not None
+    assert image_store.get(ids[1]) is not None
+    assert image_store.get(ids[0]) is None
+
+
+def test_warm_images_is_a_noop_without_a_workspace_or_images(vault):
+    """An unknown workspace is never guessed at, and nothing is warmed for it."""
+    image_id = image_files.save_image(WORKSPACE, 'image/png', PNG)
+    image_store.reset()
+
+    assert image_gc.warm_images(None, [_user_message(image_id)]) == 0
+    assert image_gc.warm_images('', [_user_message(image_id)]) == 0
+    assert image_gc.warm_images(WORKSPACE, []) == 0
+    assert image_gc.warm_images(WORKSPACE, [{'role': 'user', 'content': 'no images'}]) == 0
+    assert image_store.get(image_id) is None
+
+
+def test_llm_client_warming_is_a_noop_without_a_session(monkeypatch):
+    """A client that cannot name a workspace must not reach for one."""
+    from agent.core.llm_client import LLMClient
+
+    calls = []
+    monkeypatch.setattr(image_gc, 'warm_images', lambda *args, **kwargs: calls.append(args))
+
+    client = LLMClient.__new__(LLMClient)
+    client.session = None
+    client._warm_pasted_images([_user_message('a' * 32)])
+
+    assert calls == []
+
+
+def test_warm_images_leaves_an_image_of_unknown_type_a_miss(vault, monkeypatch, caplog):
+    """A file that cannot name its type is not warmed under a guessed one."""
+    image_id = image_files.save_image(WORKSPACE, 'image/png', PNG)
+    image_store.reset()  # the restart: only the durable copy is left
+    # The durable file exists and is readable; what is missing is the answer to
+    # "what does it hold?".  ``media_type_of`` recovers that from the file name
+    # alone, so ``None`` IS the unknown-extension case -- simulated here because
+    # ``image_path`` only ever resolves whitelisted extensions, which is also
+    # why warming must never invent one.
+    path = image_files.image_path(WORKSPACE, image_id)
+    assert path is not None and path.is_file()
+    monkeypatch.setattr(image_files, 'media_type_of', lambda *_: None)
+
+    with caplog.at_level(logging.WARNING, logger='agent.core.image_gc'):
+        assert image_gc.warm_images(WORKSPACE, [_user_message(image_id)]) == 0
+
+    assert image_store.get(image_id) is None
+    assert any(
+        record.levelno == logging.WARNING
+        and image_id in record.getMessage()
+        and 'media type' in record.getMessage()
+        and record.exc_info is None
+        for record in caplog.records
+    )
+
