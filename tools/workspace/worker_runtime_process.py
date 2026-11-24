@@ -133,7 +133,7 @@ class RuntimeSpecError(ValueError):
 
 
 class WorkerRuntimeLost(RuntimeError):
-    """The runtime process is gone, or answered ``ok=False`` (§4.7).
+    """The runtime process is gone, or answered ``ok=False`` for a real fault (§4.7).
 
     Carries the terminal :class:`Reply` so the supervisor can mirror the
     ``status`` it would have got in thread mode without parsing a message.
@@ -158,11 +158,18 @@ class WorkerRuntimeUnsupported(RuntimeError):
 
 
 class WorkerQueryTimeout(TimeoutError):
-    """No ``reply`` arrived inside the caller's timeout (§4.4)."""
+    """No ``reply`` arrived inside the timeout (§4.4).
+
+    Both sides bound the same query by the same number, so either can expire
+    first (§4.4): this side then synthesises the terminal ``reply``, or the
+    runtime answers its own expiry with ``status='timeout'`` and that frame is
+    carried here unchanged. The caller sees one exception either way.
+    """
 
     def __init__(self, message: str, *, reply: Reply) -> None:
         super().__init__(message)
-        #: The terminal ``reply`` this side synthesised; ``ok`` is ``False``.
+        #: The terminal ``reply`` for this query: synthesised here when this side
+        #: expired first, else the runtime's own frame; ``ok`` is ``False``.
         self.reply = reply
 
 
@@ -656,6 +663,21 @@ class ProcessWorkerRuntime:
         finally:
             self._accepted_events.pop(query_id, None)
         if not reply.ok:
+            # The child bounds its own wait by the SAME ``timeout_seconds`` it
+            # was given (``worker_runtime_main.pump_query``) and answers its own
+            # expiry with a terminal ``ok=False``/``status='timeout'`` frame.
+            # That is a query timeout, not a dead runtime: the child is alive
+            # and the next query is served by the same process. Which of the
+            # two clocks fires first is a race -- the frames are milliseconds
+            # apart, and ``future.result`` returns a reply that landed just
+            # after its own deadline instead of raising -- so both orderings
+            # must raise the same exception.
+            if reply.envelope.get("status") == "timeout":
+                raise WorkerQueryTimeout(
+                    f"query {query_id} timed out in the runtime after "
+                    f"{timeout}s (§4.4)",
+                    reply=reply,
+                )
             raise WorkerRuntimeLost(
                 f"query {query_id} failed in the runtime: "
                 f"{reply.envelope.get('status')!r} (§4.4)",
