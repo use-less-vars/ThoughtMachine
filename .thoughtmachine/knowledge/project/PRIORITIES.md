@@ -487,6 +487,34 @@ moved verbatim, only their position moved. They are still open unless the body s
 - **C14: `visual_tool.py` missing cancellation reporting.** **Open.** An interrupted render drops the `reason` and returns `"visual: the renderer exited with code None."` to the model. This looks like a renderer crash, not an operator cancel, causing the model to hallucinate a failure. Teardown runs correctly (pinned by test). Fix: detect `status == "interrupted"` and return a clear cancellation message. (Discovered during C11').
 
 - **C74** — `tools/mcp_client.py` bypasses the host-port chokepoint. (~11 other unadjudicated `import subprocess` sites).
+  **Correction (Gen 67, re-measured 2026-11-24 at `3d0be36d` — scanner executed, not inferred).**
+  The bypass is real: `tools/mcp_client.py:11` imports `subprocess`, and `:239` is a live
+  `self.process = subprocess.Popen([self.command] + self.args, ...)` — five recorded sites in all
+  (`:11,:239,:241,:242,:243`). **The second clause is false, and its count is false.** This file is
+  not an unadjudicated hit: it is a named entry in `ALLOWED_OFFENDERS`
+  (`tests/test_host_port_kill_switch.py:210`) carrying a written reason — "documented async
+  deferral: StdioMCPClient.start() needs a long-lived child (`subprocess.Popen` at line 239) and
+  host_run_async() is still a signature-only stub raising NotImplementedError." The allowlist is an
+  exact-path `tuple[tuple[str, str], ...]` of (path, reason) pairs, 19 entries, declared at `:91`;
+  `test_allowlist_is_exact_paths_with_reasons` (`:466`) rejects globs, prefixes and duplicates, and
+  `test_allowlist_has_not_grown` (`:493`) fails on a new unlisted offender file. **Census stale:**
+  running that module's own `scan_paths()` over its own `SCAN_ROOTS` (`:62`) finds 20 offending
+  files / 76 sites, every one of them either allowlisted by exact path (19 files, 70 sites) or the
+  sanctioned `thoughtmachine/host_port.py` (6 sites) — the unlisted set is empty, so there are
+  **zero** "unadjudicated" `import subprocess` sites in the tree, not ~11. (Measured by calling the
+  scanner in-container; a pytest run of that file survives only with memory raised to 2g — at the
+  default 512m the C90 reaper kills it — and passes 16/16 there.) The deferral is pinned, not
+  forgotten: `tests/test_mcp_client_uses_host_port.py` (10 tests) goes red if the note moves or the
+  spawn is half-migrated — `test_deferral_comment_sits_directly_above_the_stdio_popen_call`
+  (`:170`), `test_deferral_markers_exist_in_the_mcp_client_source` (`:193`),
+  `test_mcp_client_still_calls_subprocess_popen` (`:206`), and
+  `test_mcp_client_has_not_been_half_migrated_to_the_host_port` (`:212`). **Residual, narrow and
+  real:** stdio must spawn a long-lived child and `host_run_async` does not exist
+  (`tools/mcp_client.py:232-238` says exactly that at the call site), so the chokepoint keeps one
+  documented hole until the async primitive lands. **Evidence decay:** the census pin this rests on
+  (`PINNED_SITE_COUNTS` + `test_allowlisted_files_have_no_new_sites`) lives in `3d0be36d`, which is
+  NOT an ancestor of this branch's HEAD — on the tree read here the census is unpinned, and the
+  numbers above were re-measured rather than quoted.
 - **C75** — The AST no-tool-wrapping guard is parked, not enforced. 3 of its 4 own tests fail on an untouched checkout.
   **Correction (Gen 67, static scan — NOT executed; pytest is unreliable here, see C90).** The
   guard is genuinely parked: it lives at `.thoughtmachine/working_docs/tool_no_wrapping_guard.py`
@@ -503,6 +531,27 @@ moved verbatim, only their position moved. They are still open unless the body s
   catch it is parked in a scratch directory where nothing runs it. Pending operator ruling on
   whether the invariant is still wanted before anyone activates the guard.
 - **C77** — `web_ui/backend/tests/test_bridge_dedup.py` poisons `sys.modules` at collection, causing real-bridge tests to skip.
+  **Correction (Gen 67, re-read 2026-11-24 at `3d0be36d` — source read plus file history).** The
+  poisoning is real; the consequence in the second clause is not. `:38-70` builds a 21-key patch map
+  of `MagicMock()` attribute chains, `:72-75` binds them into `sys.modules` (`agent`,
+  `agent.config.*`, `session`, `session.*`, `tools`, `tools.workspace.*`), and the `finally` at
+  `:77-85` restores `sys.modules` — but the names `web_ui.backend.bridge` and
+  `web_ui.backend.session_manager` had already bound at import time (`Session`,
+  `FileSystemSessionStore`), and those bindings stay MagicMocks for the rest of the process.
+  **"Causing real-bridge tests to skip" is false: nothing is skipped.** The only skip mechanism in
+  `web_ui/backend/tests` is `pytest.mark.skipif(os.name == "nt", ...)` at `test_auth_token.py:33-35`
+  (POSIX permission bits); the directory's other markers are five `xfail`s, not skips
+  (`test_permission_routes.py:500`; `test_worker_stats_routes.py:64,126,154,179`). **The real damage
+  is a `TypeError`, already documented at a second call site:**
+  `web_ui/backend/tests/test_config_pipeline.py:25-58` is a helper,
+  `_restore_real_session_types`, whose own docstring (`:28-38`) records that `save_session` then
+  builds a MagicMock `Session` whose `session_id`/`metadata['name']` are not strings, so
+  `session.store._sanitize_filename` raises `TypeError: expected string or bytes-like object, got
+  'MagicMock'` and no session file is written; the helper is called at `:76`. So the residual is
+  **test-isolation fragility that has been papered over in a second file**, not a quiet loss of
+  coverage. The file is also not untouched — it moved in `fa9387dc`, `6ba1cd38` and `776677d6` —
+  so the defect has survived three edits, which is the argument for fixing it where it is created
+  rather than at each victim.
 - **C78** — Preflight diagnostics truth: two port probes, FAIL weight on advisory output.
 - **C79** — Undeclared load-bearing config key (`git_allow_worktree_commits`) and worker worktree bootstrap failure (crash loop).
   **Correction (Gen 67, measured via source read — both causal claims refuted).** The key is a
@@ -541,7 +590,25 @@ moved verbatim, only their position moved. They are still open unless the body s
   each verification as one self-contained command, and retry once if it dies without a summary
   line. `logs/5b_sigterm_finding.md` still stands as the original evidence.
 
-- **C92** — `agent/knowledge/codebase_indexer.py:38-39` installs module-level `SIGINT`/`SIGTERM` handlers on import. This is a latent defect that could hijack the server's signal handling.
+- **C92** — `agent/knowledge/codebase_indexer.py:38-39` installs module-level `SIGINT`/`SIGTERM` handlers on import. This is a latent defect that could hijack the server's signal handling. **[CLOSED — fixed by `77cb6cfc` (#400), verified 2026-11-24]**
+  **Correction (Gen 67, re-read 2026-11-24 at `3d0be36d` — source read; entry closed, never
+  deleted).** The premise was true when filed and the code no longer contains it.
+  `agent/knowledge/codebase_indexer.py` imports only `hashlib`, `os`, `pathlib.Path`, `typing`
+  names, `fnmatch`, `gc`, `time`, `AgentConfig`, `agent.knowledge.dependencies` and `atexit`
+  (`:8-18`); the word `signal` appears nowhere in the file, and the sole module-level side effect is
+  `:31 atexit.register(_cleanup_client)`, which is benign teardown and is deliberately kept. **The
+  cited lines were never the handler site:** `:35` is
+  `def split_text_with_overlap(text, chunk_size=1500, chunk_overlap=200)` and `:38-39` are docstring
+  prose (`Args:`), so the entry as filed could not have survived a check against its citation —
+  a reminder that line numbers here are dated snapshots, not addresses. Fixed by `77cb6cfc`
+  ("fix(c92): stop codebase_indexer hijacking SIGINT/SIGTERM at import", #400), which deletes
+  `import signal`, `import sys`, `_signal_handler` and both `signal.signal(...)` registrations, and
+  keeps `atexit.register(_cleanup_client)`: with the handler gone SIGINT raises `KeyboardInterrupt`,
+  the chroma teardown still runs, and the exit status becomes an honest 130 instead of a false 0.
+  The fix is pinned by
+  `tests/test_server_import_no_signal_hijack.py::test_cli_import_does_not_hijack_signal_handlers`
+  (`:86`), which imports `agent.cli.rag_commands` in a subprocess and asserts SIGINT is still
+  `signal.default_int_handler` and SIGTERM still `signal.SIG_DFL`.
 
 ## Filed Gen 70 (verification debt)
 
