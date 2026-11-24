@@ -198,10 +198,20 @@ export function driftDecision(entry) {
 //: the server just returned to update the row in place; when that state is
 //: missing or stale (the record write can land AFTER the HTTP response), the
 //: panel re-reads the list instead -- up to 3 extra reads, 500ms apart, until the
-//: row agrees with the action. There is no permanent poller: the retries stop as
-//: soon as the row matches, or when the budget is spent.
+//: row agrees with the action. The retries are BOUNDED: they stop as soon as the
+//: row matches, or when the budget is spent. (The list has its own timer -- see
+//: `LIST_POLL_MS` below.)
 const REFRESH_RETRY_DELAY_MS = 500
 const REFRESH_RETRY_ATTEMPTS = 3
+
+//: Live-list cadence (ms). The GET is live per request -- the backend handler
+//: walks the live Docker daemon through `manager.list_containers()` and caches
+//: nothing -- so re-reading the same endpoint on a timer is all "live" needs.
+//: Same approach (and the same cadence) as SessionSidebar.jsx's session-list
+//: poll: `setInterval(() => store.fetchContainers(workspaceId), 5000)`. There is
+//: deliberately no WebSocket here: this panel is mounted deep inside
+//: ConfigPanel -> SessionWorkspaceTab, which holds no socket.
+const LIST_POLL_MS = 5000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -465,6 +475,9 @@ export default function ContainerListPanel({ workspaceId }) {
   const [inflight, setInflight] = useState(null)
   const inflightRef = useRef(false)
   const inflightTimers = useRef([])
+  // One list read at a time: a slow GET must not stack up behind the poll timer
+  // (the synchronous twin of "is a read already on the wire").
+  const loadBusyRef = useRef(false)
   // Abandons an in-flight reconcile loop when the panel unmounts: the retries
   // outlive the click that started them and must not keep fetching (or write
   // state) after teardown. The busy timers are cleared here too.
@@ -516,14 +529,59 @@ export default function ContainerListPanel({ workspaceId }) {
   const refresh = useCallback(async () => {
     try {
       const all = await load()
+      // A read that settles after teardown must not write state: the poll timer
+      // and the post-action retries both outlive the effect/click that started
+      // them.
+      if (!aliveRef.current) return all
       setEntries(all)
       setError(null)
       return all
     } catch (err) {
+      if (!aliveRef.current) return null
       setError(err && err.message ? err.message : String(err))
       return null
     }
   }, [load])
+
+  // Live list: re-read the SAME endpoint on a timer (`LIST_POLL_MS`) so a
+  // container that appears, disappears or changes state -- started from another
+  // session, or reaped by a peer -- lands in the panel without an F5.
+  //
+  // The read replaces `entries` wholesale, and that is SAFE for an operator's
+  // half-typed memory limit: the draft lives in `memEdits` and `memValueFor`
+  // prefers it, so the input's `value` never comes from the freshly-read entry.
+  // Nothing re-mounts either (the row keeps its `key`), so focus and caret stay
+  // put while the rest of the list updates underneath.
+  useEffect(() => {
+    const poll = async () => {
+      // Nothing to update behind a hidden tab, and nothing to write after
+      // teardown.
+      if (!aliveRef.current || document.hidden) return
+      // No stacked reads: a poll tick that lands while one is still on the wire
+      // is dropped, not queued.
+      if (loadBusyRef.current) return
+      // Never rewrite the row whose action is in flight: `dispatch` owns it and
+      // re-reads on its own until the write settles.
+      if (inflightRef.current) return
+      loadBusyRef.current = true
+      try {
+        await refresh()
+      } finally {
+        loadBusyRef.current = false
+      }
+    }
+    const timer = setInterval(poll, LIST_POLL_MS)
+    // Coming back to the tab refetches at once instead of waiting out the rest
+    // of a tick, so the first thing the operator sees is current.
+    const onVisibilityChange = () => {
+      if (!document.hidden) poll()
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  }, [refresh])
 
   const memValueFor = (entry) => {
     if (Object.prototype.hasOwnProperty.call(memEdits, entry.id)) return memEdits[entry.id]

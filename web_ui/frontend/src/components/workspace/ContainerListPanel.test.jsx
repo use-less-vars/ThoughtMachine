@@ -1380,3 +1380,136 @@ describe('Wave — container sprint close (panel fixes)', () => {
   })
 })
 
+
+// ── Live list (5s poll) ──────────────────────────────────────────────────────
+// The panel re-reads GET /api/workspace/{workspaceId}/containers every 5000ms
+// (`LIST_POLL_MS`, the same cadence SessionSidebar uses for its session list), so
+// a container created or removed elsewhere lands on screen without an F5 -- and
+// the read must never clobber what the operator is typing.
+describe('ContainerListPanel — live list (LIST_POLL_MS poll)', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  const listGets = (fetchMock) =>
+    fetchMock.mock.calls.filter(
+      ([u, init]) => String(u).endsWith('/containers') && (!init || !init.method || init.method === 'GET')
+    )
+
+  // Let the mount read settle: `fetch`/`json` are promise-only stubs, so the
+  // microtask queue is all that has to drain.
+  const flush = async () => {
+    await act(async () => {
+      for (let i = 0; i < 12; i += 1) await Promise.resolve()
+    })
+  }
+
+  // Advance exactly one poll window, then flush what it woke.
+  const tick = async () => {
+    await act(async () => {
+      vi.advanceTimersByTime(5000)
+      for (let i = 0; i < 12; i += 1) await Promise.resolve()
+    })
+  }
+
+  it('(a) a container absent from the first read appears on a later poll, with no interaction', async () => {
+    const empty = payload({})
+    const withRow = payload({ ephemeral: [ephemeralEntry({ id: 'eph-later' })] })
+    let listCalls = 0
+    const fetchMock = vi.fn(async () => {
+      listCalls += 1
+      return { ok: true, status: 200, json: async () => (listCalls === 1 ? empty : withRow) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    vi.useFakeTimers()
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    // the mount read saw nothing
+    await flush()
+    expect(screen.getByText('No ephemeral containers.')).toBeInTheDocument()
+    expect(screen.queryByTestId('container-row-eph-later')).toBeNull()
+
+    // the interval elapses on its own: no click, no remount, no F5
+    await tick()
+    expect(screen.getByTestId('container-row-eph-later')).toBeInTheDocument()
+    expect(screen.queryByText('No ephemeral containers.')).toBeNull()
+    expect(listGets(fetchMock)).toHaveLength(2)
+  })
+
+  it('(b) a container present in the first read disappears once a poll no longer lists it', async () => {
+    const withRow = payload({ persistent: [persistentEntry({ id: 'pers-vanish' })] })
+    let listCalls = 0
+    const fetchMock = vi.fn(async () => {
+      listCalls += 1
+      return { ok: true, status: 200, json: async () => (listCalls === 1 ? withRow : payload({})) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    vi.useFakeTimers()
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    await flush()
+    expect(screen.getByTestId('container-row-pers-vanish')).toBeInTheDocument()
+
+    await tick()
+    expect(screen.queryByTestId('container-row-pers-vanish')).toBeNull()
+    expect(screen.getByText('No persistent containers.')).toBeInTheDocument()
+    expect(listGets(fetchMock)).toHaveLength(2)
+  })
+
+  it('(c) a half-typed memory limit survives a poll tick: draft and focus are not clobbered', async () => {
+    const containersBody = payload({
+      ephemeral: [ephemeralEntry({ id: 'eph-draft', intent_snapshot: { mem_limit: '512m' } })],
+    })
+    const fetchMock = stubFetch(containersBody)
+
+    vi.useFakeTimers()
+    render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    await flush()
+    const input = screen.getByTestId('container-resources-mem-eph-draft')
+    fireEvent.change(input, { target: { value: '1g' } })
+    input.focus()
+    expect(input).toHaveValue('1g')
+    expect(input).toHaveFocus()
+
+    await tick()
+
+    // the poll DID run (the list was re-read) ...
+    expect(listGets(fetchMock)).toHaveLength(2)
+    // ... and the draft is still in the box, on the same focused node
+    const after = screen.getByTestId('container-resources-mem-eph-draft')
+    expect(after).toHaveValue('1g')
+    expect(after).not.toHaveValue('512m')
+    expect(after).toHaveFocus()
+    expect(document.activeElement).toBe(after)
+  })
+
+  it('(d) unmount clears the interval: no further read and no state write afterwards', async () => {
+    const fetchMock = stubFetch(payload({ ephemeral: [ephemeralEntry({ id: 'eph-unmount' })] }))
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    vi.useFakeTimers()
+    const { unmount } = render(<ContainerListPanel workspaceId={WORKSPACE_ID} />)
+
+    await flush()
+    expect(listGets(fetchMock)).toHaveLength(1)
+
+    unmount()
+
+    // four poll windows after teardown: the timer is gone, so nothing is read
+    await act(async () => {
+      vi.advanceTimersByTime(20000)
+      for (let i = 0; i < 12; i += 1) await Promise.resolve()
+    })
+    expect(listGets(fetchMock)).toHaveLength(1)
+
+    // ... and nothing wrote state behind React's back (no act() warning)
+    const actWarnings = consoleError.mock.calls.filter((args) =>
+      String(args[0]).includes('not wrapped in act')
+    )
+    expect(actWarnings).toHaveLength(0)
+  })
+})
+
