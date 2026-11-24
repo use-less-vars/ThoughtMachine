@@ -623,6 +623,183 @@ def test_t4_kill_switch_is_truthful_when_nothing_listens(tmp_path):
     assert records[0].endswith("|pids=|cmds=")
 
 
+# ------------------------------------------------------- T5/T6: macOS fixtures
+# `fuser` is psmisc, i.e. a Linux-only package: macOS does not have it at all
+# and ships `lsof` instead.  So neither tool may be assumed, and a test that
+# only works because the HOST happens to have one of them proves nothing.
+#
+# Both tests below therefore run the switch with a PATH holding exactly the
+# external commands the switch itself needs -- and neither `fuser` nor `lsof`.
+# That is the real macOS shape, made independent of what is installed here.
+KILL_SWITCH_TOOLS = (
+    "bash", "sh", "dirname", "cat", "date", "tr", "sed", "ps",
+    "mkdir", "chmod", "sleep",
+)
+
+
+def _tool_isolated_env(scratch_dir: Path) -> dict:
+    """PATH = only the tools the switch needs, so fuser AND lsof are absent.
+
+    ``BASH_ENV`` is cleared as well: an inherited shim must not leak in, and a
+    test that wants a tool adds its own on top of the returned env.
+    """
+    bindir = scratch_dir / "bins"
+    bindir.mkdir(exist_ok=True)
+    for tool in KILL_SWITCH_TOOLS:
+        real = shutil.which(tool)
+        if real is None:
+            continue
+        link = bindir / tool
+        if not link.exists():
+            os.symlink(real, link)
+    env = dict(os.environ)
+    env["PATH"] = str(bindir)
+    env.pop("BASH_ENV", None)
+    return env
+
+
+def _which_in(env: dict, tool: str) -> str:
+    """What ``command -v`` resolves ``tool`` to under ``env`` ("" = absent).
+
+    The same probe the switch uses, so a fixture that believes a tool is absent
+    is checked against the switch's own definition of "absent" -- a shell
+    FUNCTION counts, which is how every shim here is delivered.
+    """
+    return subprocess.run(
+        [BASH, "-c", 'command -v "%s"' % tool],
+        env=env, capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+
+def _lsof_env(scratch_dir: Path, base_env: dict, match_port: int, pid: int) -> dict:
+    """A ``lsof`` shim: ``fuser`` absent, ``lsof -ti tcp:<port>`` answers a pid.
+
+    Delivered as a bash FUNCTION through ``BASH_ENV`` for the reasons spelled
+    out in ``_fuser_env`` (bash 3.2 ignores ``BASH_FUNC_*``; a PATH script needs
+    the exec bit, which noexec tmp denies).  A function also keeps the switch's
+    own ``command -v`` probe honest: the switch sees a tool, not a file.
+
+    The shim only NAMES the pid -- it never signals anything.  That is the point
+    of the test: whatever enumerated the port is not what kills it.
+    """
+    shim = scratch_dir / "lsof.sh"
+    shim.write_text((
+        "lsof() {\n"
+        "    local want=0 a\n"
+        '    for a in "$@"; do\n'
+        '        case "$a" in\n'
+        "            -t*) want=1 ;;\n"
+        '            "tcp:%(port)d") want=$((want + 1)) ;;\n'
+        "        esac\n"
+        "    done\n"
+        '    [ "$want" -ge 2 ] || return 1\n'
+        '    echo "%(pid)d"\n'
+        "    return 0\n"
+        "}\n"
+    ) % {"port": match_port, "pid": pid})
+    env = dict(base_env)
+    env["BASH_ENV"] = str(shim)
+    return env
+
+
+def _kill_switch_records(app: Path) -> list[str]:
+    return [
+        ln for ln in (app / "logs" / "backend_death.log").read_text().splitlines()
+        if ln.startswith("kill_switch|")
+    ]
+
+
+def test_t5_kill_switch_uses_lsof_when_fuser_is_absent(tmp_path):
+    """macOS shape: no psmisc, so ``lsof -ti tcp:<port>`` enumerates and bash kills."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    listener, port = _start_listener(tmp_path)
+    app = _kill_script_app(tmp_path, port)
+    try:
+        base = _tool_isolated_env(tmp_path)
+        assert _which_in(base, "fuser") == "", "fixture meant to model macOS"
+        env = _lsof_env(tmp_path, base, port, listener.pid)
+        assert _which_in(env, "lsof") != ""
+
+        # cwd is deliberately NOT the script's directory
+        proc = _run([BASH, str(app / "kill_thoughtmachine.sh")], env=env, cwd=str(elsewhere))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "All ThoughtMachine processes stopped." in proc.stdout
+        assert "nothing to stop" not in proc.stdout
+
+        records = _kill_switch_records(app)
+        assert len(records) == 1, records
+        rec = records[0]
+        assert re.match(r"^kill_switch\|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}\|pids=", rec), rec
+        assert "pids=%d" % listener.pid in rec, rec
+        assert "tm-listener" in rec.split("cmds=", 1)[1], rec
+
+        # the shim only answered; the SIGNAL came from the switch itself
+        assert listener.wait(timeout=10) == -9
+    finally:
+        if listener.poll() is None:
+            listener.kill()
+            listener.wait()
+
+
+def test_t6_kill_switch_refuses_when_it_cannot_enumerate(tmp_path):
+    """Neither tool: "I could not look" must never read as "nothing to stop"."""
+    port = _free_port()
+    app = _kill_script_app(tmp_path, port)
+    env = _tool_isolated_env(tmp_path)
+    assert _which_in(env, "fuser") == ""
+    assert _which_in(env, "lsof") == ""
+
+    proc = _run([BASH, str(app / "kill_thoughtmachine.sh")], env=env, cwd=str(tmp_path))
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 3, out
+    assert "Could not enumerate" in proc.stdout, proc.stdout
+    assert str(port) in proc.stdout, proc.stdout
+    assert "enumerate=failed" in proc.stdout, proc.stdout
+
+    # the lie this path exists to prevent
+    assert "nothing to stop" not in out, out
+    assert "No ThoughtMachine process was listening" not in out, out
+    assert "All ThoughtMachine processes stopped." not in out, out
+
+    records = _kill_switch_records(app)
+    assert len(records) == 1, records
+    assert "enumerate=failed" in records[0], records[0]
+    assert re.search(r"\bports=[^|]*\b%d\b" % port, records[0]), records[0]
+    assert "killed=no" in records[0], records[0]
+
+
+def test_t7_kill_switch_pins_the_portable_enumeration():
+    """Text pin: enumeration is ported, and the kill no longer rides on it.
+
+    ``fuser -k`` is gone because `fuser` does not exist on macOS -- a switch
+    that killed *through* the only tool that can enumerate is a no-op wherever
+    that tool is missing, and it reports success while the listener survives.
+
+    What this cannot catch: it reads text, not behaviour.  A script that names
+    both tools but picks the wrong one, or that enumerates correctly and still
+    reports success without signalling, passes here -- only T5/T6 run it.
+    """
+    text = KILL_SH.read_text()
+    # The pin is about what RUNS, so comments are stripped first: prose that
+    # explains the removal of an old call must never trip the check on it.
+    code = "\n".join(
+        ln for ln in text.splitlines() if not ln.lstrip().startswith("#")
+    )
+
+    assert "fuser -k" not in code, "the kill must not depend on fuser"
+    assert "command -v fuser" in text, text
+    assert "command -v lsof" in text, text
+    assert "lsof -ti" in text, text
+    assert re.search(r'kill -9 "\$_pid"', text), text
+
+    # the absence of a tool is a REFUSAL, reported, never a silent empty answer
+    assert "enumerate=failed" in text, text
+    assert "exit 3" in text, text
+
+
 # -------------------------------------------------------------------------- pin
 # Keywords spelled the same by BSD/macOS ps and GNU ps.  `sid`, `cmd` and
 # `args` are deliberately NOT in this set: each exists on only one of the two.
