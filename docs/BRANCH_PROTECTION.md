@@ -139,9 +139,9 @@ The `note` column distinguishes *declared but not enforced* from *deliberately o
 | Windows - thin pytest slice | `platform-matrix.yml:383` | windows-thin-pytest (`:382`) | windows-latest (`:384`) | in `REQUIRED_CHECKS`, **not** enforced |
 | Windows Python 3.14 gate proof | `python-version-matrix.yml:235` | windows-python-314 (`:234`) | windows-latest (`:236`) | in `REQUIRED_CHECKS`, **not** enforced |
 | Windows venv + smoke script | `cross-platform-smoke.yml:124` | windows-smoke (`:123`) | windows-latest (`:125`) | in `REQUIRED_CHECKS`, **not** enforced |
-| macOS - full test suite (advisory) | `platform-matrix-macos.yml:75` | macos-suite (`:74`) | macos-latest (`:76`) | deliberately out |
-| macOS - install/startup smoke (advisory) | `platform-matrix-macos.yml:133` | macos-install-smoke (`:132`) | macos-latest (`:134`) | deliberately out |
-| macOS - Docker availability probe (advisory) | `platform-matrix-macos.yml:310` | macos-docker-probe (`:309`) | macos-latest (`:311`) | deliberately out |
+| macOS - full test suite | `platform-matrix-macos.yml:75` | macos-suite (`:74`) | macos-latest (`:76`) | deliberately out |
+| macOS - install/startup smoke | `platform-matrix-macos.yml:133` | macos-install-smoke (`:132`) | macos-latest (`:134`) | deliberately out |
+| macOS - Docker availability probe | `platform-matrix-macos.yml:310` | macos-docker-probe (`:309`) | macos-latest (`:311`) | deliberately out |
 
 ## The declared-versus-enforced gap, now by name
 
@@ -163,14 +163,14 @@ carried the failure until a human repaired it by hand (#426, `b8587e5`).
 Read off the thirteen stored entries: **one** macOS context is required,
 `macOS launcher preflight (gating)` (`cross-platform-smoke.yml:254`, `runs-on:
 macos-latest` at `:255`). The three names in `platform-matrix-macos.yml` are measured
-**absent** — those are the three `(advisory)` rows above.
+**absent** — those are the three macOS rows above.
 
 So "no macOS check is required" is false as stated, and this file does not say it. The
 measured statement is narrower and true: **the macOS-advisory workflow contributes
 nothing to the required set, while one macOS runner context does gate a merge.** The two
 facts are easy to collapse into each other, which is why both are written down.
 
-What keeps the three advisory names out is a recorded decision, not a reading of the
+What keeps the three macOS names out is a recorded decision, not a reading of the
 workflow text. They are *not* dormant: `platform-matrix-macos.yml:52-54` says so in its
 own header — *"No job here is advisory: a red macOS job fails this workflow's run. The
 three check names are absent from REQUIRED_CHECKS, so that red does not block a merge --
