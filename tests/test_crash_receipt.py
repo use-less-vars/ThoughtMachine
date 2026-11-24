@@ -167,7 +167,7 @@ def test_t3_rotation_preserves_previous_log_and_keeps_five(tmp_path):
         "rotate_backend_log",
         # captured now: the later rotations prune this file away
         'first="$(ls -1 "$SCRIPT_DIR"/logs/backend_startup.*.log)"',
-        'echo "after-first=$(printf "%s\\n" "$first" | wc -l)"',
+        'echo "after-first=$(printf "%s\\n" "$first" | wc -l | tr -d " ")"',
         'echo "first-name=$(basename "$first")"',
         'echo "first-content=$(cat "$first")"',
         'echo "current-empty=$([ -s "$BACKEND_LOG" ] && echo no || echo yes)"',
@@ -177,7 +177,7 @@ def test_t3_rotation_preserves_previous_log_and_keeps_five(tmp_path):
         '    touch -t "202001010000.0$i" "$BACKEND_LOG"',
         "    rotate_backend_log",
         "done",
-        'echo "after-seven=$(ls -1 "$SCRIPT_DIR"/logs/backend_startup.*.log | wc -l)"',
+        'echo "after-seven=$(ls -1 "$SCRIPT_DIR"/logs/backend_startup.*.log | wc -l | tr -d " ")"',
         'echo "survivors=$(for f in "$SCRIPT_DIR"/logs/backend_startup.*.log; do cat "$f"; done | tr "\\n" ",")"',
     ]
     proc = _source(app, "\n".join(body) + "\n")
@@ -187,14 +187,18 @@ def test_t3_rotation_preserves_previous_log_and_keeps_five(tmp_path):
     )
 
     # (a) rotate-then-fresh: the first log survives, byte for byte, under a new name
-    assert out["after-first"] == "1"
+    #
+    # The counts are stripped of spaces in the shell ("| tr -d \" \"") and
+    # compared as NUMBERS: BSD `wc -l` right-pads to a fixed width ("       1")
+    # where GNU does not, so a string comparison passes on Linux only.
+    assert int(out["after-first"]) == 1
     assert out["first-name"].startswith("backend_startup.2")  # UTC ISO-8601 stamp
     assert out["first-content"] == "run-one-line"
     assert out["current-empty"] == "yes"
     assert out["current-exists"] == "yes"  # $BACKEND_LOG keeps its exact path
 
     # (b) the newest five survive, the two oldest are pruned
-    assert out["after-seven"] == "5"
+    assert int(out["after-seven"]) == 5
     assert out["survivors"] == "".join("run-%d," % i for i in (3, 4, 5, 6, 7))
 
 
@@ -205,15 +209,107 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_listening(port: int, timeout: float = 10.0) -> None:
+def _wait_listening(port: int, proc: subprocess.Popen, out: Path, err: Path,
+                    timeout: float = 20.0) -> None:
+    """Wait for ``proc`` to accept a TCP connection on ``port``.
+
+    The diagnostics are the point of this helper.  The listener runs in the
+    background with its output captured, and a bare "never came up" hides why:
+    the child may have died, nothing may ever have bound the port, or the port
+    may be bound but not accepting.  Each branch below says which one it was
+    and quotes the child's own stdout/stderr, so a failure on a platform this
+    machine cannot reproduce is still actionable.
+
+    20 s, not 10: a cold interpreter start on macOS CI is a few seconds, while
+    the Linux round trip is ~0.3 s, so the common path does not get slower.
+    """
+
+    def _output() -> str:
+        parts = []
+        for label, path in (("stdout", out), ("stderr", err)):
+            try:
+                text = path.read_text(errors="replace").strip()
+            except OSError:
+                text = "<unreadable>"
+            parts.append("%s=%r" % (label, text))
+        return " ".join(parts)
+
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
         except OSError:
-            time.sleep(0.05)
-    raise AssertionError("listener on port %d never came up" % port)
+            pass
+        rc = proc.poll()
+        if rc is not None:
+            raise AssertionError(
+                "listener on port %d died before accepting a connection: "
+                "exit status %d; %s" % (port, rc, _output())
+            )
+        time.sleep(0.05)
+
+    # Out of time.  Distinguish "nothing is bound" from "bound but not
+    # accepting": binding the port here raises EADDRINUSE only in the latter.
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", port))
+        bound = False
+    except OSError:
+        bound = True
+    finally:
+        probe.close()
+    if not bound:
+        raise AssertionError(
+            "listener on port %d never bound the port within %gs (it was free "
+            "the whole time; child status %r); %s"
+            % (port, timeout, proc.poll(), _output())
+        )
+    raise AssertionError(
+        "port %d is bound but nothing accepted a connection within %gs "
+        "(child status %r); %s" % (port, timeout, proc.poll(), _output())
+    )
+
+
+def _start_listener(scratch_dir: Path, attempts: int = 3):
+    """Start ``python -m http.server`` on a free port; return (proc, port).
+
+    ``_free_port()`` is a TOCTOU probe: the port is free when it is probed and
+    can be taken before the child binds it, which used to surface as an
+    unexplained "listener never came up".  Each attempt therefore takes a fresh
+    port, and the child's stdout/stderr are kept in ``scratch_dir`` so
+    ``_wait_listening`` can quote them.
+    """
+    last_error: AssertionError | None = None
+    for attempt in range(1, attempts + 1):
+        port = _free_port()
+        out = scratch_dir / ("listener-%d.out" % port)
+        err = scratch_dir / ("listener-%d.err" % port)
+        with open(out, "wb") as o, open(err, "wb") as e:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "http.server", str(port),
+                 "--bind", "127.0.0.1"],
+                cwd=str(scratch_dir),
+                stdout=o,
+                stderr=e,
+            )
+        try:
+            _wait_listening(port, proc, out, err)
+            return proc, port
+        except AssertionError as exc:
+            last_error = exc
+            print(
+                "listener attempt %d/%d on port %d failed: %s"
+                % (attempt, attempts, port, exc),
+                file=sys.stderr,
+            )
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+    raise AssertionError(
+        "could not start a listener on any of %d attempts; last failure: %s"
+        % (attempts, last_error)
+    )
 
 
 def _fuser_env(match_port, pid: int) -> dict:
@@ -283,19 +379,14 @@ def _kill_script_app(tmp_path: Path, port: int) -> Path:
 
 
 def test_t4_kill_switch_receipt_names_the_listener(tmp_path):
-    port = _free_port()
-    app = _kill_script_app(tmp_path, port)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
 
-    listener = subprocess.Popen(
-        [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
-        cwd=str(elsewhere),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # The listener comes first: the copy's port array is generated from the port
+    # it actually bound, and _start_listener retries a lost race.
+    listener, port = _start_listener(tmp_path)
+    app = _kill_script_app(tmp_path, port)
     try:
-        _wait_listening(port)
         env = dict(os.environ)
         env.update(_fuser_env(port, listener.pid))
         # cwd is deliberately NOT the script's directory
@@ -343,3 +434,62 @@ def test_t4_kill_switch_is_truthful_when_nothing_listens(tmp_path):
     ]
     assert len(records) == 1
     assert records[0].endswith("|pids=|cmds=")
+
+
+# -------------------------------------------------------------------------- pin
+# Keywords spelled the same by BSD/macOS ps and GNU ps.  `sid`, `cmd` and
+# `args` are deliberately NOT in this set: each exists on only one of the two.
+PS_PORTABLE_KEYWORDS = {"pid", "ppid", "pgid", "sess", "command"}
+PS_PROBE_KEYWORD = "tm_ps_probe_"   # deliberately bogus: used only as a probe
+PS_RAW_SITES = ("record_topology", "launcher_pgid", "launcher_sid")
+
+
+def _function_body(text: str, name: str) -> str:
+    body = re.search(r"\n%s\(\) \{\n(.*?)\n\}" % re.escape(name), text, re.S)
+    assert body, "function %s() not found in %s" % (name, START_SH.name)
+    return body.group(1)
+
+
+def test_ps_format_keywords_are_portable_by_construction():
+    """TEXT-LEVEL PIN -- not an execution proof.
+
+    BSD/macOS ``ps`` prints its ENTIRE keyword table on stdout when it does not
+    know a keyword, and still exits 0, so one GNU-only spelling (``sid=``,
+    ``cmd=``) silently turns a forensic field into a keyword dump.  This test
+    reads the launcher as text and asserts that
+
+      * every literal ``ps -o <spec>`` passes only keywords that are known to
+        be portable (or the deliberate probe keyword), and
+      * the id fields and the command line come through ``ps_id`` / ``ps_line``
+        -- ``record_topology``, ``launcher_pgid`` and ``launcher_sid`` contain
+        no raw ``ps -o`` at all.
+
+    What it cannot catch: that ``sess``/``command`` really are the right
+    spellings on the running platform (only executing there proves that), that
+    a *known* keyword returns a sane value, or any ``ps`` use outside this one
+    file -- ``kill_thoughtmachine.sh`` has its own ``cmd=`` call, which is a
+    real defect and is out of this pin's scope until it is fixed.
+    """
+    text = START_SH.read_text()
+    specs = re.findall(r"ps\s+-o\s+([A-Za-z0-9_=,]+)", text)
+    assert specs, "no `ps -o` spec found: the pin has drifted from the script"
+    for spec in specs:
+        for field in spec.split(","):
+            keyword = field.rstrip("=")
+            assert keyword in PS_PORTABLE_KEYWORDS or keyword == PS_PROBE_KEYWORD, (
+                "ps keyword %r is not known to be portable on BSD/macOS (an "
+                "unknown keyword dumps the whole keyword table onto stdout): %r"
+                % (keyword, spec)
+            )
+
+    for name in PS_RAW_SITES:
+        body = _function_body(text, name)
+        assert "ps -o" not in body, (
+            "%s() calls `ps -o` directly; go through ps_id/ps_line so the "
+            "keyword choice stays value-validated" % name
+        )
+    topology = _function_body(text, "record_topology")
+    assert "ps_id" in topology and "ps_line" in topology, (
+        "record_topology() must take its ids from ps_id and its command line "
+        "from ps_line"
+    )
