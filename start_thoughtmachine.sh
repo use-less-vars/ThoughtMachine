@@ -232,8 +232,76 @@ rotate_backend_log() {
 }
 
 # The launcher's process-group / session ids, for attributing a kill later.
-launcher_pgid() { ps -o pgid= -p "$$" 2>/dev/null | tr -d ' \n'; }
-launcher_sid()  { ps -o sid=  -p "$$" 2>/dev/null | tr -d ' \n'; }
+#
+# BSD/macOS ps and GNU ps do not agree on keyword spelling, and BSD answers an
+# UNKNOWN keyword by printing its whole keyword table on stdout with a zero
+# exit status -- which is how a forensic field once came to hold a keyword list
+# instead of a command line.  Only `sess` (session id) and `command` (command
+# line) are spelled the same way on both, while `sid` and `cmd` are GNU-only.
+# So no spelling is trusted blindly: every value is probed and validated.
+PS_MAX_ID=4194304        # above Linux's pid_max; a larger number is a pointer
+PS_KEYWORD_TABLE=""      # this platform's `ps` keyword dump (empty on GNU ps)
+PS_KEYWORD_TABLE_READ=0
+
+# Must be called directly (never inside "$( )"), so the cache survives the call.
+ps_probe_keyword_table() {
+    if [ "$PS_KEYWORD_TABLE_READ" = "1" ]; then
+        return 0
+    fi
+    PS_KEYWORD_TABLE_READ=1
+    # A deliberately bogus keyword: GNU ps fails and prints nothing, BSD answers
+    # with its keyword table -- that difference is the probe.
+    PS_KEYWORD_TABLE="$(ps -o tm_ps_probe_= -p "$$" 2>/dev/null | tr -d '\n' || true)"
+    return 0
+}
+
+# ps_id <pid> <keyword>... -> a pid-like number from the first keyword that
+# answers one; non-zero and no output when none does.
+ps_id() {
+    local pid="$1" kw val
+    shift
+    for kw in "$@"; do
+        val="$(ps -o "$kw=" -p "$pid" 2>/dev/null | tr -d ' \n' || true)"
+        case "$val" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if [ "$val" -gt 0 ] && [ "$val" -le "$PS_MAX_ID" ]; then
+            printf '%s' "$val"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ps_line <pid> <keyword>... -> the normalised line from the first keyword that
+# answers a real value; a leaked keyword dump is rejected, never recorded.
+ps_line() {
+    local pid="$1" kw line
+    shift
+    for kw in "$@"; do
+        line="$(ps -o "$kw=" -p "$pid" 2>/dev/null \
+                | tr -s ' ' ' ' | sed 's/^ //;s/ $//' || true)"
+        if [ -z "$line" ]; then
+            continue
+        fi
+        if [ -n "$PS_KEYWORD_TABLE" ] && [ "$line" = "$PS_KEYWORD_TABLE" ]; then
+            continue
+        fi
+        printf '%s' "$line"
+        return 0
+    done
+    return 1
+}
+
+launcher_pgid() {
+    ps_probe_keyword_table
+    ps_id "$$" pgid || printf 'unknown'
+}
+
+launcher_sid() {
+    ps_probe_keyword_table
+    ps_id "$$" sess sid || printf 'unknown'
+}
 
 # Once per launch: who launched whom, so a death can be attributed to a process
 # group instead of a bare number.
@@ -242,11 +310,17 @@ record_topology() {
     local ts role pid row
     ts="$(receipt_ts)"
     receipt_init
+    ps_probe_keyword_table
     for role in launcher backend; do
         if [ "$role" = "launcher" ]; then pid="$$"; else pid="$BACKEND_PID"; fi
-        row="$(ps -o pid=,ppid=,pgid=,sid=,cmd= -p "$pid" 2>/dev/null \
-               | tr -s ' ' ' ' | sed 's/^ //;s/ $//')"
-        [ -n "$row" ] || continue
+        # Every field goes through ps_id/ps_line: a platform that lacks a
+        # spelling yields "unknown" instead of a keyword dump.
+        pid="$(ps_id "$pid" pid)" || continue   # the pid anchors the row
+        row="pid=$pid"
+        row="$row ppid=$(ps_id "$pid" ppid || printf 'unknown')"
+        row="$row pgid=$(ps_id "$pid" pgid || printf 'unknown')"
+        row="$row sid=$(ps_id "$pid" sess sid || printf 'unknown')"
+        row="$row cmd=$(ps_line "$pid" command cmd || printf 'unknown')"
         printf 'topology|ts=%s|role=%s|%s\n' "$ts" "$role" "$row" >> "$DEATH_LOG"
     done
     return 0
