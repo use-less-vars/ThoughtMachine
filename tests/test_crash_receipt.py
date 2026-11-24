@@ -39,10 +39,13 @@ BASH = shutil.which("bash")
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash is required")
 
+# sid is a number OR the literal "unknown": BSD/macOS `ps -o sess=` answers a
+# session POINTER (hex, e.g. 0x7f8a3b21), not a number, so the launcher degrades the
+# field honestly -- a parser that rejects the honest record is the wrong control.
 BACKEND_EXIT_RE = re.compile(
     r"^backend_exit\|ts=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}"
     r"\|pid=\d+\|status=(\d+)\|cause=(.+)\|launcher=\d+"
-    r"\|pgid=\d+\|sid=\d+\|cwd=.*$"
+    r"\|pgid=\d+\|sid=(?:\d+|unknown)\|cwd=.*$"
 )
 
 
@@ -156,6 +159,128 @@ def test_t2_launcher_shaped_wait_records_sigkill(tmp_path):
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
 
 
+# -------------------------------------------------------------------------- T2b
+# What BSD/macOS `ps` answers: `sess` is a session POINTER (hex), and `sid` is
+# not a keyword there at all -- an unknown keyword prints the keyword table.
+PS_SHIM_SESS = "0x7f8a3b21"
+PS_SHIM_TABLE = "pid ppid pgid sess command"
+
+
+def _ps_shim_env(scratch_dir: Path) -> tuple[dict, str]:
+    """An env in which ``ps`` answers the way BSD/macOS does, delegating the rest.
+
+    Only the session field is faked: ``sess=`` answers a hex pointer and
+    ``sid=`` answers a keyword table, so BOTH of the launcher's spellings fail
+    its numeric validation -- which is why the launcher degrades ``sid`` to the
+    literal ``unknown``.  Every other argument list goes to the real ``ps``,
+    captured with ``shutil.which`` BEFORE the shim is put on ``PATH``, so
+    ``command``, ``pgid`` and the bogus-keyword probe stay real.
+
+    Two deliveries, for the same reason as ``_fuser_env``: a ``PATH`` script
+    needs the exec bit *and* an exec-capable filesystem, and pytest's
+    ``tmp_path`` is often a noexec tmpfs (measured: a non-executable shim is
+    skipped silently and the real ps answers).  So the script is offered on
+    ``PATH`` first and verified by running the probe through it; when that does
+    not take effect, the identical definition is loaded via ``BASH_ENV``
+    instead.  Returns ``(env, delivery)``, ``delivery`` naming which one won.
+    """
+    real_ps = shutil.which("ps")
+    assert real_ps, "ps is required"
+
+    definition = (
+        "ps() {\n"
+        "    case \" $* \" in\n"
+        "        *' sess='*) printf '%s\\n' '" + PS_SHIM_SESS + "'; return 0 ;;\n"
+        "        *' sid='*) printf '%s\\n' '" + PS_SHIM_TABLE + "'; return 0 ;;\n"
+        "    esac\n"
+        "    command '" + real_ps + "' \"$@\"\n"
+        "}\n"
+    )
+
+    bindir = scratch_dir / "shim-bin"
+    bindir.mkdir()
+    script = bindir / "ps"
+    script.write_text("#!/bin/sh\n" + definition + 'ps "$@"\n')
+    script.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+
+    def answers_as_bsd(candidate: dict) -> bool:
+        out = _run([BASH, "-c", "ps -o sess= -p $$"], env=candidate)
+        return out.stdout.strip() == PS_SHIM_SESS
+
+    if answers_as_bsd(env):
+        return env, "PATH"
+
+    bash_env = scratch_dir / "ps-shim.bash"
+    bash_env.write_text(definition)
+    env["BASH_ENV"] = str(bash_env)
+    assert answers_as_bsd(env), (
+        "the ps shim could be delivered neither on PATH nor via BASH_ENV"
+    )
+    return env, "BASH_ENV"
+
+
+def test_t2b_unknown_sid_is_still_a_parseable_record(tmp_path):
+    """macOS degrades ``sid`` to ``unknown``; that honest record must parse.
+
+    ``ps -o sess=`` answers a session POINTER on BSD and BSD has no ``sid``
+    keyword, so the launcher's numeric validation rejects both spellings and
+    records ``sid=unknown``.  A parser that only accepts ``sid=\\d+`` therefore
+    rejects the launcher's own record on the platform it was written for: the
+    parser is the wrong control.  Reproduced here with a ``ps`` that answers
+    like BSD, so the shape of a macOS failure is a Linux failure too.
+    """
+    app = _app_dir(tmp_path)
+    stub = app / "stub_backend.sh"
+    stub.write_text(
+        "#!/bin/bash\n"
+        'echo "stub: about to be killed"\n'
+        "sleep 1\n"
+        "kill -9 $$\n"
+    )
+    stub.chmod(0o755)
+
+    env, delivery = _ps_shim_env(tmp_path)
+    print("ps shim delivery: %s" % delivery)
+
+    # The launch/wait shape from T2, unchanged; only the record is inspected.
+    # Built by concatenation, not %-formatting: the body carries a literal "%s"
+    # of its own and must not be read as a format slot.
+    launch = '( exec "%s" "%s" ) > >(tee -a "$BACKEND_LOG") 2>&1 &' % (BASH, stub)
+    body = (
+        "\n".join(
+            [
+                "set -u",
+                'printf "shim_sess=%s\\n" "$(ps -o sess= -p $$)"',
+                launch,
+                "BACKEND_PID=$!",
+                'wait "$BACKEND_PID"',
+                "BACKEND_RC=$?",
+                'record_backend_exit "$BACKEND_RC"',
+                'exit "$BACKEND_RC"',
+            ]
+        )
+        + "\n"
+    )
+    proc = _source(app, body, extra_env=env)
+
+    assert proc.returncode == 137, proc.stdout + proc.stderr
+    # the shim really answered: without this the record below would be Linux's
+    assert ("shim_sess=%s" % PS_SHIM_SESS) in proc.stdout, proc.stdout + proc.stderr
+
+    text = _receipt(app).read_text()
+    exits = [ln for ln in text.splitlines() if ln.startswith("backend_exit|")]
+    assert len(exits) == 1, text
+    record = exits[0]
+    assert "|sid=unknown|" in record, record
+    m = BACKEND_EXIT_RE.match(record)
+    assert m, record
+    assert m.group(1) == "137"
+    assert m.group(2) == "signal 9 SIGKILL"
+
+
 # --------------------------------------------------------------------------- T3
 def test_t3_rotation_preserves_previous_log_and_keeps_five(tmp_path):
     app = _app_dir(tmp_path)
@@ -178,12 +303,18 @@ def test_t3_rotation_preserves_previous_log_and_keeps_five(tmp_path):
         "    rotate_backend_log",
         "done",
         'echo "after-seven=$(ls -1 "$SCRIPT_DIR"/logs/backend_startup.*.log | wc -l | tr -d " ")"',
-        'echo "survivors=$(for f in "$SCRIPT_DIR"/logs/backend_startup.*.log; do cat "$f"; done | tr "\\n" ",")"',
+        # name AND content per rotation: the shell's glob order is the thing
+        # under suspicion, so the ordering decision is made in Python below.
+        'for f in "$SCRIPT_DIR"/logs/backend_startup.*.log; do',
+        '    printf "rot=%s|%s\\n" "$(basename "$f")" "$(cat "$f")"',
+        "done",
     ]
     proc = _source(app, "\n".join(body) + "\n")
     assert proc.returncode == 0, proc.stderr
     out = dict(
-        line.split("=", 1) for line in proc.stdout.strip().splitlines() if "=" in line
+        line.split("=", 1)
+        for line in proc.stdout.strip().splitlines()
+        if "=" in line and not line.startswith("rot=")
     )
 
     # (a) rotate-then-fresh: the first log survives, byte for byte, under a new name
@@ -198,8 +329,26 @@ def test_t3_rotation_preserves_previous_log_and_keeps_five(tmp_path):
     assert out["current-exists"] == "yes"  # $BACKEND_LOG keeps its exact path
 
     # (b) the newest five survive, the two oldest are pruned
+    #
+    # The retained SET is compared, and it is ordered by the rotation SEQUENCE
+    # carried in the content -- not by the rotated file NAME.  Names cannot
+    # encode age here: the stamp is second resolution, collisions are
+    # disambiguated with a ".n" suffix and the bare name is REUSED once pruning
+    # frees it, so a later rotation can hold the bare name inside its own second
+    # (measured: run-7 got "<stamp>.log" while run-3 held "<stamp>.2.log").  A
+    # plain glob order is worse still: "<stamp>.1.log" sorts before
+    # "<stamp>.log" ('1' = 0x31, 'l' = 0x6c), which produced the inverted
+    # "run-4,run-5,run-6,run-7,run-3" failure.  mtime is not used either: this
+    # test deliberately fakes it (touch -t) to steer the pruner's ls -1t.
     assert int(out["after-seven"]) == 5
-    assert out["survivors"] == "".join("run-%d," % i for i in (3, 4, 5, 6, 7))
+    rotations = [
+        tuple(line[len("rot="):].split("|", 1))
+        for line in proc.stdout.splitlines()
+        if line.startswith("rot=")
+    ]
+    assert len(rotations) == 5, rotations
+    rotations.sort(key=lambda pair: int(pair[1].rsplit("-", 1)[-1]))
+    assert [content for _, content in rotations] == ["run-%d" % i for i in (3, 4, 5, 6, 7)], rotations
 
 
 # --------------------------------------------------------------------------- T4
@@ -271,8 +420,33 @@ def _wait_listening(port: int, proc: subprocess.Popen, out: Path, err: Path,
     )
 
 
+# A bare socket listener, NOT the stdlib HTTP server: that server's
+# server_bind() calls socket.getfqdn() BEFORE listen(), so a stalled reverse-DNS
+# lookup leaves the port BOUND but never LISTENING -- the child stays alive,
+# connect() times out instead of being refused, and the run looks like "listener
+# never came up" for a reason that has nothing to do with the kill switch.  This
+# test only ever needed a listening socket for the switch to enumerate, so the
+# HTTP layer is gone.  (``python -c src arg`` puts the port in sys.argv[1].)
+LISTENER_SOURCE = (
+    # The marker goes FIRST, in a comment: the receipt quotes `ps -o command=`,
+    # and BSD/macOS ps truncates the command line to the terminal width (~80
+    # columns when it is not a tty) -- a marker 197 columns into the argv
+    # (measured on GNU ps, where the full 287-column line is printed) would be
+    # cut off there and the assertion would fail for a reason that has nothing
+    # to do with the kill switch.
+    "# tm-listener\n"
+    "import socket, sys, time\n"
+    "sock = socket.socket()\n"
+    "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+    "sock.bind(('127.0.0.1', int(sys.argv[1])))\n"
+    "sock.listen(5)\n"
+    "print('listening on 127.0.0.1:%s' % sys.argv[1], flush=True)\n"
+    "time.sleep(3600)\n"
+)
+
+
 def _start_listener(scratch_dir: Path, attempts: int = 3):
-    """Start ``python -m http.server`` on a free port; return (proc, port).
+    """Start a bare socket listener on a free port; return (proc, port).
 
     ``_free_port()`` is a TOCTOU probe: the port is free when it is probed and
     can be taken before the child binds it, which used to surface as an
@@ -287,8 +461,7 @@ def _start_listener(scratch_dir: Path, attempts: int = 3):
         err = scratch_dir / ("listener-%d.err" % port)
         with open(out, "wb") as o, open(err, "wb") as e:
             proc = subprocess.Popen(
-                [sys.executable, "-m", "http.server", str(port),
-                 "--bind", "127.0.0.1"],
+                [sys.executable, "-c", LISTENER_SOURCE, str(port)],
                 cwd=str(scratch_dir),
                 stdout=o,
                 stderr=e,
@@ -418,7 +591,7 @@ def test_t4_kill_switch_receipt_names_the_listener(tmp_path):
         rec = records[0]
         assert re.match(r"^kill_switch\|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}\|pids=", rec), rec
         assert "pids=%d" % listener.pid in rec, rec
-        assert "cmds=" in rec and "http.server" in rec, rec
+        assert "cmds=" in rec and "tm-listener" in rec, rec
         assert "All ThoughtMachine processes stopped." in proc.stdout
 
         # the kill stays absolute: the named listener is really gone
