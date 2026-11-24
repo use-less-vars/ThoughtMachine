@@ -7,7 +7,7 @@ import json
 import pytest
 
 from thoughtmachine.container_record import api, migration, storage
-from thoughtmachine.container_record.models import SCHEMA_VERSION_LEGACY
+from thoughtmachine.container_record.models import SCHEMA_VERSION_CURRENT
 from thoughtmachine.container_record.snapshot import snapshot_from_attrs
 
 WS = "ws-1"
@@ -102,7 +102,8 @@ def test_synthesises_free_use_and_resource(vault):
     assert records["d2"]["lifecycle_class"] == "resource"
 
     for rec in records.values():
-        assert rec["schema_version"] == SCHEMA_VERSION_LEGACY
+        # ``migrate_records`` stamps the retention charter, which is v6.
+        assert rec["schema_version"] == SCHEMA_VERSION_CURRENT
         assert rec["inferred"] is True
         assert rec["owner"] == "workspace-owned"
         assert rec["state"] == "running"
@@ -119,7 +120,8 @@ def test_synthesises_free_use_and_resource(vault):
     assert snap["workspace_mode"] == ""
 
     # Write-ahead log holds one {docker_id, record_id, ts} line per container.
-    entries = _log_entries(WS, vault)
+    # (The trailing retention-charter summary line has no ``record_id``.)
+    entries = [e for e in _log_entries(WS, vault) if "record_id" in e]
     assert len(entries) == 2
     for entry in entries:
         assert set(entry) == {"docker_id", "record_id", "ts"}
@@ -137,7 +139,7 @@ def test_rerun_is_idempotent(vault):
     assert second["created"] == 0
     assert second["skipped"] == 1
     assert len(_records(WS, vault)) == 1
-    assert len(_log_entries(WS, vault)) == 1
+    assert len([e for e in _log_entries(WS, vault) if "record_id" in e]) == 1
 
 
 def test_rematerialises_same_id_when_record_file_missing(vault):
@@ -285,7 +287,7 @@ def test_migrated_snapshot_equals_pure_helper(vault, payload):
     )
     rec = _records(WS, vault)[0]
     assert rec["intent_snapshot"] == snapshot_from_attrs(payload)
-    assert rec["schema_version"] == SCHEMA_VERSION_LEGACY
+    assert rec["schema_version"] == SCHEMA_VERSION_CURRENT
     assert rec["inferred"] is True
 
 
@@ -298,7 +300,7 @@ def test_workspace_mount_derives_workspace_mode(vault, rw, expected):
     )
     rec = _records(WS, vault)[0]
     assert rec["intent_snapshot"]["workspace_mode"] == expected
-    assert rec["schema_version"] == SCHEMA_VERSION_LEGACY
+    assert rec["schema_version"] == SCHEMA_VERSION_CURRENT
     assert rec["inferred"] is True
 
 

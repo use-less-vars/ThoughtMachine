@@ -227,8 +227,8 @@ def test_permission_categories_match_resolver_output(caps):
 # -- 1. Schema version --------------------------------------------------------
 
 
-def test_schema_version_current_is_five():
-    assert models.SCHEMA_VERSION_CURRENT == 5
+def test_schema_version_current_is_six():
+    assert models.SCHEMA_VERSION_CURRENT == 6
 
 
 # -- 2. Record carries the permissions snapshot -------------------------------
@@ -247,8 +247,9 @@ def test_record_carries_permissions_snapshot_roundtrip():
     data = rec.to_dict()
     assert "permissions" in data
     assert data["permissions"] == STORED_PERMS
-    # New key appended LAST in the field-order list (stable key order).
-    assert list(data.keys())[-1] == "permissions"
+    # Appended to the field-order list (stable key order); the retention
+    # charter keys of schema v6 are appended after it.
+    assert list(data.keys()).index("permissions") == len(data) - 4
 
     back = models.Record.from_dict(data)
     assert back.permissions == STORED_PERMS
@@ -312,18 +313,18 @@ def test_v4_record_migrates_to_v5_with_unknown_permissions_and_is_idempotent(vau
     assert isinstance(result, dict)
 
     loaded = api.load_record(WS, record_id, vault)
-    assert loaded.schema_version == 5
+    assert loaded.schema_version == models.SCHEMA_VERSION_CURRENT
     # A migrated legacy record is UNKNOWN (None), never empty, never defaults.
     assert loaded.permissions is None
     # Migration is additive: the pre-existing fields survive untouched.
     assert loaded.docker_id == "d-legacy"
     assert loaded.lifecycle_class == "ephemeral"
 
-    # Idempotent: a second pass leaves the (now v5) record unchanged.
+    # Idempotent: a second pass leaves the (now current) record unchanged.
     second = migration.upgrade_record_schema(WS, vault_root=vault)
     assert isinstance(second, dict)
     reloaded = api.load_record(WS, record_id, vault)
-    assert reloaded.schema_version == 5
+    assert reloaded.schema_version == models.SCHEMA_VERSION_CURRENT
     assert reloaded.permissions is None
 
 

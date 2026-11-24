@@ -256,6 +256,8 @@ def record_creation(
     vault_root: str | Any | None = None,
     permissions: dict | None = None,
     created_by: str | None = None,
+    retention_mode: str | None = None,
+    retention_until: float | None = None,
 ) -> Iterator[_RecordHandle]:
     """Two-phase record context manager for a fresh container creation.
 
@@ -283,6 +285,10 @@ def record_creation(
             ``<actor>`` / ``system:<caller>``), stamped on the container as the
             :data:`CREATED_BY_LABEL` Docker label.  Ignored when *labels* is
             ``None`` -- without a label dict there is no container to stamp.
+        retention_mode: optional explicit retention charter (one of
+            ``RETENTION_MODES``); ``None`` derives the lifecycle-class default.
+        retention_until: optional explicit deadline (epoch seconds); required
+            by (and only meaningful for) ``RETENTION_RETAINED_UNTIL``.
     """
     # Fail closed: if the intent stub cannot be persisted, propagate and let the
     # caller abort *before* it calls ``containers.run``.  A container must never
@@ -296,6 +302,8 @@ def record_creation(
         name=name,
         vault_root=vault_root,
         permissions=permissions,
+        retention_mode=retention_mode,
+        retention_until=retention_until,
     )
 
     handle = _RecordHandle(record, workspace_id, vault_root)

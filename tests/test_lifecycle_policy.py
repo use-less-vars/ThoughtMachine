@@ -83,6 +83,9 @@ def test_policy_field_order_and_frozen():
         "workspace_gc_max_age_s",
         "drift_axes",
         "restart_policy",
+        # v6 retention charter defaults, appended after ``restart_policy``.
+        "default_retention_mode",
+        "default_retention_seconds",
     ]
     assert LifecyclePolicy.__dataclass_params__.frozen is True
 

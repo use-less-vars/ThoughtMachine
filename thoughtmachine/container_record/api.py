@@ -26,13 +26,14 @@ from pathlib import Path
 from typing import Any
 
 from . import storage
-from .lifecycle_policy import is_resource_like
+from .lifecycle_policy import is_resource_like, retention_for_class
 from .models import (
     ContainerRecordError,
     EVENT_ENTRY_KEYS,
     INTENT_SNAPSHOT_KEYS,
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
+    RETENTION_RETAINED_UNTIL,
     SCHEMA_FIELD_NAMES,
     SCHEMA_VERSION_CURRENT,
     STATE_CREATING,
@@ -42,6 +43,7 @@ from .models import (
     new_record_id,
     validate_lifecycle_class,
     validate_owner,
+    validate_retention_mode,
 )
 
 #: The one record-owned Docker label (§7).  Its value is the record's ``id``.
@@ -139,6 +141,41 @@ def record_label(record_id: str) -> dict[str, str]:
 # ── Create / begin / attach (two-phase) ──────────────────────────────────────
 
 
+#: ``retention_source`` values stamped by this module.
+RETENTION_SOURCE_EXPLICIT = "explicit"
+RETENTION_SOURCE_CLASS_DEFAULT = "class_default"
+
+
+def _resolve_retention(
+    lifecycle_class: str,
+    created_at: str,
+    retention_mode: str | None,
+    retention_until: float | None,
+) -> tuple[str, float | None, str]:
+    """Return the ``(mode, until, source)`` retention charter for a new record.
+
+    ``None`` for both arguments derives the lifecycle-class default
+    (:func:`~thoughtmachine.container_record.lifecycle_policy.retention_for_class`)
+    and stamps ``class_default``; anything the caller states is ``explicit`` and
+    is validated fail-closed.  ``retained_until`` without a deadline raises.
+    """
+    if retention_mode is None and retention_until is not None:
+        retention_mode = RETENTION_RETAINED_UNTIL
+    if retention_mode is None:
+        mode, until = retention_for_class(lifecycle_class, created_at)
+        return mode, until, RETENTION_SOURCE_CLASS_DEFAULT
+
+    mode = validate_retention_mode(retention_mode)
+    if mode != RETENTION_RETAINED_UNTIL:
+        # No deadline is meaningful for this mode; it is not carried over.
+        return mode, None, RETENTION_SOURCE_EXPLICIT
+    if retention_until is None:
+        raise ValueError(
+            "retention_mode 'retained_until' requires retention_until"
+        )
+    return mode, float(retention_until), RETENTION_SOURCE_EXPLICIT
+
+
 def _create(
     workspace_id: str,
     lifecycle_class: str,
@@ -150,6 +187,8 @@ def _create(
     vault_root: str | os.PathLike | None,
     name: str = "",
     permissions: dict | None = None,
+    retention_mode: str | None = None,
+    retention_until: float | None = None,
 ) -> Record:
     """Shared create path for :func:`create_record` / :func:`begin_record`."""
     validate_lifecycle_class(lifecycle_class)
@@ -164,6 +203,9 @@ def _create(
             # unchanged (§3, caller-supplied ``id``).
             return Record.from_dict(storage.read_record_file(path) or {})
         now = iso_now()
+        resolved_mode, resolved_until, retention_source = _resolve_retention(
+            lifecycle_class, now, retention_mode, retention_until
+        )
         record = Record(
             id=record_id,
             lifecycle_class=lifecycle_class,
@@ -180,6 +222,9 @@ def _create(
             updated_at=now,
             name=name,
             permissions=permissions,
+            retention_mode=resolved_mode,
+            retention_until=resolved_until,
+            retention_source=retention_source,
         )
         storage.write_record_file(path, record.to_dict())
     return record
@@ -196,15 +241,22 @@ def create_record(
     name: str = "",
     vault_root: str | os.PathLike | None = None,
     permissions: dict | None = None,
+    retention_mode: str | None = None,
+    retention_until: float | None = None,
 ) -> Record:
     """Create (or idempotently re-materialise) a record (§3, doc signature).
 
     Natively authored records carry ``schema_version=SCHEMA_VERSION_CURRENT``
-    (currently 5) / ``inferred=False``; ``docker_id`` is empty (§1 default)
+    (currently 6) / ``inferred=False``; ``docker_id`` is empty (§1 default)
     and ``state`` takes its §1 default (``""``, "last observed container
     state").  ``name`` is the workspace-scoped container identity (``""`` when
     unset).  Supplying ``id`` for an existing record returns it unchanged
     (idempotent re-materialisation, §3).
+
+    ``retention_mode`` / ``retention_until`` are the optional explicit
+    retention charter: omitting both derives the lifecycle-class default and
+    stamps ``retention_source="class_default"``; supplying either stamps
+    ``"explicit"``.  ``retained_until`` with no ``retention_until`` raises.
     """
     return _create(
         workspace_id,
@@ -217,6 +269,8 @@ def create_record(
         vault_root=vault_root,
         name=name,
         permissions=permissions,
+        retention_mode=retention_mode,
+        retention_until=retention_until,
     )
 
 
@@ -231,6 +285,8 @@ def begin_record(
     name: str = "",
     vault_root: str | os.PathLike | None = None,
     permissions: dict | None = None,
+    retention_mode: str | None = None,
+    retention_until: float | None = None,
 ) -> Record:
     """Persist a pre-run intent stub: ``state="creating"``, ``docker_id=""``.
 
@@ -238,6 +294,10 @@ def begin_record(
     ratification.  Idempotent on a caller-supplied ``id`` (returns the existing
     record unchanged).  ``name`` is the workspace-scoped container identity
     (``""`` when unset).
+
+    ``retention_mode`` / ``retention_until`` are the optional explicit
+    retention charter (same semantics as :func:`create_record`): omitting both
+    derives the lifecycle-class default and stamps ``class_default``.
     """
     return _create(
         workspace_id,
@@ -250,6 +310,8 @@ def begin_record(
         vault_root=vault_root,
         permissions=permissions,
         name=name,
+        retention_mode=retention_mode,
+        retention_until=retention_until,
     )
 
 
