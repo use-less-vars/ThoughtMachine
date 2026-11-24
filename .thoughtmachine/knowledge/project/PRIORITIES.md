@@ -488,9 +488,43 @@ moved verbatim, only their position moved. They are still open unless the body s
 
 - **C74** — `tools/mcp_client.py` bypasses the host-port chokepoint. (~11 other unadjudicated `import subprocess` sites).
 - **C75** — The AST no-tool-wrapping guard is parked, not enforced. 3 of its 4 own tests fail on an untouched checkout.
+  **Correction (Gen 67, static scan — NOT executed; pytest is unreliable here, see C90).** The
+  guard is genuinely parked: it lives at `.thoughtmachine/working_docs/tool_no_wrapping_guard.py`
+  (335 lines, tracked by a negation at `.gitignore:125-126`), is never collected
+  (`pyproject.toml:51-52 testpaths`), the repo has no `.pre-commit-config.yaml` at all, and
+  `.github/` has zero hits. Its own header (`:4-10`, `:20-25`) declares the parking and names
+  `tests/test_tool_no_wrapping.py` as the activation home — a path that has never existed on
+  `dev`. **Census stale:** there are five tests, not four (`:280,:286,:292,:298,:314`), with zero
+  `skip`/`xfail`; the "3 of 4" figure matches an older four-test version whose node ids are still
+  in `.pytest_cache`. Today a static scan finds rule (a) 12 violations, rule (b) 0, rule (c) 1, so
+  the live shape is ~2 of 5 failing. Exact pass/fail is UNVERIFIABLE without execution.
+  **Substantive finding, independent of the census:** a real invariant ("no `tools/**` module
+  imports another tool") is violated 12 times in shipped code, and the only instrument that would
+  catch it is parked in a scratch directory where nothing runs it. Pending operator ruling on
+  whether the invariant is still wanted before anyone activates the guard.
 - **C77** — `web_ui/backend/tests/test_bridge_dedup.py` poisons `sys.modules` at collection, causing real-bridge tests to skip.
 - **C78** — Preflight diagnostics truth: two port probes, FAIL weight on advisory output.
 - **C79** — Undeclared load-bearing config key (`git_allow_worktree_commits`) and worker worktree bootstrap failure (crash loop).
+  **Correction (Gen 67, measured via source read — both causal claims refuted).** The key is a
+  *retired* legacy name, not a live gate: it survives only as `values.pop(...)` inside two
+  `model_validator(mode='before')` migration shims (`agent/config/models.py:333`,
+  `agent/config/session_config.py:110`) and one cleanup script
+  (`scripts/vault_permission_cleanup_dryrun.py:150,273`). There is **no behavioural read**; commit
+  authority is the `git` grain (`tools/git_write_tool.py:1010-1013,1014-1039,1051-1065`), and
+  `:112,253,276,330` explicitly disclaim the legacy `agent_config` path. So it is not load-bearing.
+  **The real defect is the inverse:** absent or `False` is dropped (fail-closed, correct), but
+  present and `True` silently escalates `session_permissions['git'] = 'write'`
+  (`models.py:334-341`, `session_config.py:110-117`) — an invisible grant from a key the schema
+  manifest explicitly "will not be validated or repaired" (`logs/backend_startup.log:8`).
+  Declaring it would not remove the escalation; only removal does. **The "crash loop" does not
+  exist.** The resolver fails open by design (`tools/workspace/worktree_defaults.py:9,154-249`,
+  nine `return None` sites); the caller treats a falsy `worktree_root` as normal
+  (`tools/workspace/worker_thread.py:4112,4122`); and `self._worker_max_retries`
+  (`worker_thread.py:2223`) is written and never read repo-wide, so there is no retry machinery
+  to loop. The property is pinned green by `tests/test_worktree_failopen_does_not_block_spawn.py`.
+  **Evidence decay:** cited hash `724dcc89` does not exist (real commit `c3781927`), and every
+  cited `worktree_defaults.py` line is stale (`worktree add --detach` is now `-b <branch>` at
+  `:223`). Pending operator ruling on the escalation channel.
 - **C80** — `terminate_all` skips subprocesses with no pid during shutdown.
 
 - **C86** — Process-Mode Observability (State Seam). Event seam is fixed, but state seam is leaking. Enforced deadline != reported deadline (10s requested, 70s blocked). No exit-code reader exists. Cache `_last_event` is never read. See audit doc for 12 proposals.
