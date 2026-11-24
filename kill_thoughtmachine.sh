@@ -13,6 +13,9 @@
 # from THIS script's own directory, never from $PWD:
 #   kill_switch|<iso8601 local ts>|pids=<pid,pid>|cmds=<cmdline;cmdline>
 # The kill itself stays absolute: every listener on these ports is killed.
+# Exit codes: 0 = the ports were enumerated (any listener was signalled);
+#             3 = no enumeration tool at all (neither fuser nor lsof) -- the
+#                 script refuses, signals nothing, and says so in the receipt.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DEATH_LOG="$SCRIPT_DIR/logs/backend_death.log"
 
@@ -69,14 +72,64 @@ ps_line() {
     return 1
 }
 
-# --- receipt: enumerate WITHOUT -k, then resolve each pid to its command line --
+# --- portable listener enumeration --------------------------------------------
+# `fuser` is psmisc, i.e. a Linux package; macOS does not have it at all and
+# ships `lsof` instead.  So the ENUMERATION is what gets ported, and the kill
+# no longer goes through any external tool: the pids resolved here are signalled
+# by the shell itself (invariant: signalling must not depend on the tool that
+# enumerated -- on macOS that dependency is what made this switch a no-op).
+#
+# Presence is probed ONCE per tool with `command -v`: it is a property of the
+# machine, not of a port.  `command -v` also finds a shell FUNCTION, which is
+# how the tests inject fakes -- a fake tool is a present tool.
+HAVE_FUSER=0
+HAVE_LSOF=0
+command -v fuser >/dev/null 2>&1 && HAVE_FUSER=1
+command -v lsof >/dev/null 2>&1 && HAVE_LSOF=1
+
+# enumerate_port_pids <port> -> pids on stdout, one per line.
+#   0 = the enumeration RAN; EMPTY stdout is a real answer: "I looked, there is
+#       nothing here" (both tools exit non-zero when they match nothing, so the
+#       exit status cannot be used for this -- the tool's existence is).
+#   1 = NO tool could look.  That is NOT an empty result and must never be
+#       reported as one.
+# Per-call stderr is discarded: an ABSENT tool is detected up front by
+# `command -v`, so suppressing it here cannot hide a missing dependency.
+enumerate_port_pids() {
+    # PORTS holds "<port>/tcp" specs.  fuser wants the spec ("5173/tcp"), lsof
+    # wants the bare number ("tcp:5173"): passing one to the other matches
+    # nothing, which would read as "no listener" -- the exact lie this guards.
+    local spec="$1" port="${1%/tcp}" raw tok
+    if [ "$HAVE_FUSER" = "1" ]; then
+        raw="$(fuser "$spec" 2>/dev/null)"
+    elif [ "$HAVE_LSOF" = "1" ]; then
+        raw="$(lsof -ti "tcp:$port" 2>/dev/null)"
+    else
+        return 1
+    fi
+    # fuser prefixes its pid list with the port ("35507/tcp:  5800") and lsof -t
+    # prefixes nothing, so only purely numeric tokens are pids.
+    for tok in $raw; do
+        case "$tok" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        printf '%s\n' "$tok"
+    done
+    return 0
+}
+
+# --- receipt: enumerate WITHOUT killing, then resolve each pid to its command line
 KILL_PIDS=""
 KILL_CMDS=""
+ENUM_UNKNOWN_PORTS=""
 # read once, up front: inside "$( )" the cached value would not survive
 ps_probe_keyword_table
 for _port in "${PORTS[@]}"; do
-    # No 2>/dev/null here on purpose: a failing enumeration must stay visible.
-    for _pid in $(fuser "$_port"); do
+    if ! _port_pids="$(enumerate_port_pids "$_port")"; then
+        ENUM_UNKNOWN_PORTS="$ENUM_UNKNOWN_PORTS ${_port%/tcp}"
+        continue
+    fi
+    for _pid in $_port_pids; do
         case " $KILL_PIDS " in
             *" $_pid "*) continue ;;
         esac
@@ -93,11 +146,29 @@ KILL_PIDS_CSV="$(printf '%s' "$KILL_PIDS" | tr ' ' ',')"
 mkdir -p "$SCRIPT_DIR/logs" 2>/dev/null
 ( umask 077; : >> "$DEATH_LOG" ) 2>/dev/null
 chmod 600 "$DEATH_LOG" 2>/dev/null
+
+# --- refusal: 'I could not look' is not 'there is nothing there' ----------------
+# Signals NOTHING: a partial kill announced as success is the same lie this
+# receipt exists to stop.  The record names what was visible, and says it was
+# not signalled.
+if [ -n "$ENUM_UNKNOWN_PORTS" ]; then
+    printf 'kill_switch|%s|pids=%s|cmds=%s|enumerate=failed|ports=%s|killed=no|reason=neither fuser nor lsof is available\n' \
+        "$(date +%Y-%m-%dT%H:%M:%S%z)" "$KILL_PIDS_CSV" "$KILL_CMDS" \
+        "${ENUM_UNKNOWN_PORTS# }" >> "$DEATH_LOG"
+    echo "Could not enumerate listening processes on port(s):${ENUM_UNKNOWN_PORTS} - neither 'fuser' nor 'lsof' is available on this machine, so this script cannot see or kill anything on them. Refusing to report success."
+    echo "  Receipt: $DEATH_LOG (kill_switch enumerate=failed ports=${ENUM_UNKNOWN_PORTS# })"
+    exit 3
+fi
+
 printf 'kill_switch|%s|pids=%s|cmds=%s\n' \
     "$(date +%Y-%m-%dT%H:%M:%S%z)" "$KILL_PIDS_CSV" "$KILL_CMDS" >> "$DEATH_LOG"
 
-# --- kill: absolute, exactly as before -----------------------------------------
-fuser -k "${PORTS[@]}" 2>/dev/null
+# --- kill: the pids this script itself enumerated -----------------------------
+# The signal is the shell's own `kill`, not the tool that enumerated.
+# Receipt first, kill second -- unchanged: the witness must not be the victim.
+for _pid in $KILL_PIDS; do
+    kill -9 "$_pid" 2>/dev/null
+done
 sleep 1
 
 if [ -n "$KILL_PIDS" ]; then
