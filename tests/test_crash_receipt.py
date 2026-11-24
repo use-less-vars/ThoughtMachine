@@ -312,18 +312,32 @@ def _start_listener(scratch_dir: Path, attempts: int = 3):
     )
 
 
-def _fuser_env(match_port, pid: int) -> dict:
+def _fuser_env(scratch_dir: Path, match_port, pid: int) -> dict:
     """A ``fuser`` shim needing neither psmisc nor an executable file.
 
-    Some sandboxes ship no psmisc and mount tmp noexec, so a PATH script could
-    not run there; bash imports this function from the environment instead.  It
-    emulates exactly what kill_thoughtmachine.sh uses: "<port>/tcp" -> the
-    listening pid, and "-k <port>/tcp" -> the same pid plus the kill.
+    Three deliveries were tried; only the last one is portable:
+
+    * a PATH script -- needs the exec bit, and tmp is often mounted noexec
+      (measured here: ``PermissionError: [Errno 13]``), so it fails on Linux in
+      that sandbox for a reason that has nothing to do with the switch;
+    * exporting the function as ``BASH_FUNC_fuser%%`` -- honoured by bash >= 4.2
+      only, and macOS ships 3.2.57, where the variable is silently ignored, the
+      real ``fuser`` (absent there) runs, and T4 fails for the wrong reason;
+    * ``BASH_ENV`` -- bash reads that file when it starts a NON-interactive
+      shell (which is how these tests run the script) on every version,
+      including 3.2, and the file only has to be readable, never executable.
+
+    The function emulates exactly what kill_thoughtmachine.sh uses: "<port>/tcp"
+    -> the listening pid, and "-k <port>/tcp" -> the same pid plus the kill.
     """
+    shim = scratch_dir / "fuser.sh"
     if match_port is None:
-        return {"BASH_FUNC_fuser%%": "() { return 0; }"}
-    body = (
-        "() {\n"
+        shim.write_text("fuser() { return 0; }\n")
+        env = dict(os.environ)
+        env["BASH_ENV"] = str(shim)
+        return env
+    shim.write_text((
+        "fuser() {\n"
         "    local kill_mode=0 matched= a\n"
         '    for a in "$@"; do\n'
         '        case "$a" in\n'
@@ -335,9 +349,11 @@ def _fuser_env(match_port, pid: int) -> dict:
         '    echo " %(pid)d"\n'
         '    if [ "$kill_mode" = "1" ]; then kill -9 %(pid)d 2>/dev/null; fi\n'
         "    return 0\n"
-        "}"
-    ) % {"port": match_port, "pid": pid}
-    return {"BASH_FUNC_fuser%%": body}
+        "}\n"
+    ) % {"port": match_port, "pid": pid})
+    env = dict(os.environ)
+    env["BASH_ENV"] = str(shim)
+    return env
 
 
 # The shipped kill switch must stay absolute: six real ports, no override.
@@ -387,8 +403,7 @@ def test_t4_kill_switch_receipt_names_the_listener(tmp_path):
     listener, port = _start_listener(tmp_path)
     app = _kill_script_app(tmp_path, port)
     try:
-        env = dict(os.environ)
-        env.update(_fuser_env(port, listener.pid))
+        env = _fuser_env(tmp_path, port, listener.pid)
         # cwd is deliberately NOT the script's directory
         proc = _run([BASH, str(app / "kill_thoughtmachine.sh")], env=env, cwd=str(elsewhere))
         assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -418,8 +433,7 @@ def test_t4_kill_switch_is_truthful_when_nothing_listens(tmp_path):
     port = _free_port()
     app = _kill_script_app(tmp_path, port)
 
-    env = dict(os.environ)
-    env.update(_fuser_env(None, 999999))
+    env = _fuser_env(tmp_path, None, 999999)
     proc = _run([BASH, str(app / "kill_thoughtmachine.sh")], env=env, cwd=str(tmp_path))
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
@@ -441,13 +455,24 @@ def test_t4_kill_switch_is_truthful_when_nothing_listens(tmp_path):
 # `args` are deliberately NOT in this set: each exists on only one of the two.
 PS_PORTABLE_KEYWORDS = {"pid", "ppid", "pgid", "sess", "command"}
 PS_PROBE_KEYWORD = "tm_ps_probe_"   # deliberately bogus: used only as a probe
-PS_RAW_SITES = ("record_topology", "launcher_pgid", "launcher_sid")
+PS_HELPERS = ("ps_probe_keyword_table", "ps_line", "ps_id")
+# Duplicated verbatim in BOTH shipped scripts (each ships as a standalone file),
+# so this drift check is the only thing holding the copies together: a fix in
+# one place otherwise leaves the other with the bug it just fixed.
+PS_SHARED_HELPERS = ("ps_probe_keyword_table", "ps_line")
+PS_SCRIPTS = (START_SH, KILL_SH)
 
 
 def _function_body(text: str, name: str) -> str:
-    body = re.search(r"\n%s\(\) \{\n(.*?)\n\}" % re.escape(name), text, re.S)
-    assert body, "function %s() not found in %s" % (name, START_SH.name)
-    return body.group(1)
+    body = _maybe_function_body(text, name)
+    assert body is not None, "function %s() not found" % name
+    return body
+
+
+def _maybe_function_body(text: str, name: str):
+    """The body of ``name()``, or None -- some helpers only one script needs."""
+    match = re.search(r"\n%s\(\) \{\n(.*?)\n\}" % re.escape(name), text, re.S)
+    return match.group(1) if match else None
 
 
 def test_ps_format_keywords_are_portable_by_construction():
@@ -456,40 +481,82 @@ def test_ps_format_keywords_are_portable_by_construction():
     BSD/macOS ``ps`` prints its ENTIRE keyword table on stdout when it does not
     know a keyword, and still exits 0, so one GNU-only spelling (``sid=``,
     ``cmd=``) silently turns a forensic field into a keyword dump.  This test
-    reads the launcher as text and asserts that
+    reads BOTH shipped scripts -- the launcher and the kill switch -- as text
+    and asserts that
 
       * every literal ``ps -o <spec>`` passes only keywords that are known to
-        be portable (or the deliberate probe keyword), and
-      * the id fields and the command line come through ``ps_id`` / ``ps_line``
-        -- ``record_topology``, ``launcher_pgid`` and ``launcher_sid`` contain
-        no raw ``ps -o`` at all.
+        be portable (or the deliberate probe keyword),
+      * every ``ps -o`` in either script lives inside ``ps_id``/``ps_line``:
+        with the helper bodies removed, no ``ps -o`` remains, so the validated
+        path cannot be bypassed by a future call site in either file,
+      * ``ps_probe_keyword_table`` is actually CALLED in each script -- an
+        uncalled probe leaves the dump rejection above silently disabled,
+      * ``record_topology`` still takes its ids from ``ps_id`` and its command
+        line from ``ps_line``, and the kill switch resolves each pid's command
+        line through ``ps_line`` while keeping its ``(gone)`` fallback
+        reachable (that fallback is what the keyword dump made unreachable),
+      * the helper bodies duplicated into both files are BYTE-IDENTICAL: the
+        scripts ship as standalone files next to their ``.bat`` twins, so this
+        assertion is the only thing keeping the copies from drifting apart.
 
     What it cannot catch: that ``sess``/``command`` really are the right
     spellings on the running platform (only executing there proves that), that
-    a *known* keyword returns a sane value, or any ``ps`` use outside this one
-    file -- ``kill_thoughtmachine.sh`` has its own ``cmd=`` call, which is a
-    real defect and is out of this pin's scope until it is fixed.
+    a *known* keyword returns a sane value, or any ``ps`` use outside these two
+    files.
     """
-    text = START_SH.read_text()
-    specs = re.findall(r"ps\s+-o\s+([A-Za-z0-9_=,]+)", text)
-    assert specs, "no `ps -o` spec found: the pin has drifted from the script"
-    for spec in specs:
-        for field in spec.split(","):
-            keyword = field.rstrip("=")
-            assert keyword in PS_PORTABLE_KEYWORDS or keyword == PS_PROBE_KEYWORD, (
-                "ps keyword %r is not known to be portable on BSD/macOS (an "
-                "unknown keyword dumps the whole keyword table onto stdout): %r"
-                % (keyword, spec)
-            )
+    bodies: dict[str, dict[str, str]] = {}
+    for path in PS_SCRIPTS:
+        text = path.read_text()
+        specs = re.findall(r"ps\s+-o\s+([A-Za-z0-9_=,]+)", text)
+        assert specs, "no `ps -o` spec found in %s: the pin has drifted" % path.name
+        for spec in specs:
+            for field in spec.split(","):
+                keyword = field.rstrip("=")
+                assert keyword in PS_PORTABLE_KEYWORDS or keyword == PS_PROBE_KEYWORD, (
+                    "ps keyword %r in %s is not known to be portable on BSD/macOS "
+                    "(an unknown keyword dumps the whole keyword table onto "
+                    "stdout): %r" % (keyword, path.name, spec)
+                )
 
-    for name in PS_RAW_SITES:
-        body = _function_body(text, name)
-        assert "ps -o" not in body, (
-            "%s() calls `ps -o` directly; go through ps_id/ps_line so the "
-            "keyword choice stays value-validated" % name
+        # every `ps -o` that survives must live inside the validated path
+        remaining = text
+        for name in PS_HELPERS:
+            body = _maybe_function_body(text, name)
+            if body is not None:
+                remaining = remaining.replace(body, "")
+        assert "ps -o" not in remaining, (
+            "%s calls `ps -o` outside ps_id/ps_line; the keyword choice must "
+            "stay value-validated" % path.name
         )
-    topology = _function_body(text, "record_topology")
+        assert re.search(r"^\s*ps_probe_keyword_table\s*$", text, re.M), (
+            "%s never calls ps_probe_keyword_table, so a leaked keyword dump "
+            "would be recorded as a value" % path.name
+        )
+        for name in PS_SHARED_HELPERS:
+            body = _maybe_function_body(text, name)
+            assert body is not None, "%s() is missing from %s" % (name, path.name)
+            bodies.setdefault(name, {})[path.name] = body
+
+    for name, per_file in bodies.items():
+        assert len(per_file) == len(PS_SCRIPTS) and len(set(per_file.values())) == 1, (
+            "the copies of %s() in %s have drifted apart; they must stay "
+            "byte-identical (or be extracted into a single shared file)"
+            % (name, " and ".join(sorted(per_file)))
+        )
+
+    # launcher-specific structure
+    topology = _function_body(START_SH.read_text(), "record_topology")
     assert "ps_id" in topology and "ps_line" in topology, (
         "record_topology() must take its ids from ps_id and its command line "
         "from ps_line"
+    )
+
+    # kill-switch-specific structure
+    kill = KILL_SH.read_text()
+    assert 'ps_line "$_pid"' in kill, (
+        "the kill switch must resolve each pid's command line through ps_line"
+    )
+    assert '"$_pid (gone)"' in kill, (
+        "the kill switch must keep its (gone) fallback for a pid that vanished "
+        "between enumeration and lookup"
     )
