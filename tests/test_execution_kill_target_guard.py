@@ -45,6 +45,10 @@ SUCCESS (``gone``).
    code already uses, TOGETHER WITH the three POSIX steps that run before it
    (``os.getpgid``, ``os.killpg``, ``os.kill(pid, 0)``), so the arm is really
    exercised on Linux AND on Darwin.
+13. A ``subprocess`` execution that carries NO pid cannot be signalled: the
+    refusal is REPORTED at ERROR, naming the worker and the execution, and
+    says the child may outlive shutdown.  It used to be a WARNING "skipping"
+    line, which leaked a live child with no failure record.
 
 Run with::
 
@@ -189,6 +193,9 @@ class _Logs:
     def warnings(self):
         return [m for level, _component, m in self.entries if level == "WARNING"]
 
+    def errors(self):
+        return [m for level, _component, m in self.entries if level == "ERROR"]
+
     def install(self, monkeypatch) -> "_Logs":
         monkeypatch.setattr(worker_execution_module, "_log", self)
         return self
@@ -239,7 +246,7 @@ def test_nested_arguments_pid_is_not_registered_as_kill_target(tmp_path, monkeyp
     assert signals.kill == [], (
         f"teardown signalled a tool argument as a pid: {signals.kill!r}"
     )
-    assert any("has no pid" in m for m in logs.warnings()), logs.warnings()
+    assert any("has no pid" in m for m in logs.errors()), logs.errors()
 
 
 # ---------------------------------------------------------------------------
@@ -1459,3 +1466,45 @@ def test_unreadable_proc_state_degrades_toward_alive(monkeypatch, error):
         assert tracker.active_count() == 0
     finally:
         _reap(proc)
+
+
+# ---------------------------------------------------------------------------
+# 13. a subprocess record with NO pid: the refusal is REPORTED, not skipped
+# ---------------------------------------------------------------------------
+
+def test_subprocess_without_pid_reports_unterminated_child(monkeypatch):
+    """A ``subprocess`` record with NO pid must not be a silent skip.
+
+    Nothing in the record names the child, so no signal channel can be PROVEN
+    to reach it -- the teardown genuinely cannot kill it.  That failure used to
+    be logged at WARNING as "skipping", which reads as "nothing to do" and
+    leaked a live child with no failure record.  It must be an ERROR naming
+    BOTH the worker and the execution and saying the child may outlive
+    shutdown, and nothing may be signalled in its place.
+    """
+    signals = _Signals().install(monkeypatch)
+    logs = _Logs().install(monkeypatch)
+    tracker = ExecutionTracker()
+    tracker.add("w1:live-child", {"type": "subprocess", "pid": None})
+
+    tracker.terminate_all("w1", None, None)
+
+    assert signals.kill == [], (
+        f"a no-pid record was signalled as a pid: {signals.kill!r}"
+    )
+    assert signals.killpg == [], (
+        f"a no-pid record was signalled as a process group: {signals.killpg!r}"
+    )
+    reported = [m for m in logs.errors() if "worker=w1" in m and "w1:live-child" in m]
+    assert reported, (
+        "the un-killable child was not reported at ERROR naming the worker and "
+        f"the execution; got errors {logs.errors()!r}"
+    )
+    assert any("has no pid" in m for m in reported), reported
+    assert any("may outlive" in m for m in reported), (
+        f"the refusal did not say the child may outlive shutdown: {reported!r}"
+    )
+    assert logs.warnings() == [], (
+        f"the un-killable child was reported as a mere warning: {logs.warnings()!r}"
+    )
+    assert tracker.active_count() == 0
