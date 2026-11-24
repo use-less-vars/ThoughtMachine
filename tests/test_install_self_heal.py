@@ -296,6 +296,11 @@ def test_doctor_reports_docker_daemon_fail_with_fix(monkeypatch, capsys):
 
 
 def test_doctor_all_pass_prints_table(monkeypatch, capsys):
+    # The port rows come from TM_BACKEND_PORT / TM_FRONTEND_PORT, so the
+    # ambient environment must not decide what this test asserts.
+    monkeypatch.delenv("TM_BACKEND_PORT", raising=False)
+    monkeypatch.delenv("TM_FRONTEND_PORT", raising=False)
+
     def pass_result(check):
         return {"check": check, "status": "PASS", "fix": ""}
 
@@ -328,3 +333,102 @@ def test_doctor_all_pass_prints_table(monkeypatch, capsys):
         "Vault writable",
     ):
         assert token in out
+
+
+# ---------------------------------------------------------------------------
+# thoughtmachine.doctor -- which ports the table probes
+#
+# The port rows are sourced from TM_BACKEND_PORT / TM_FRONTEND_PORT, the same
+# names start_thoughtmachine.sh and web_ui/backend/origin_policy.py use. These
+# tests observe the ports actually handed to _check_port, so they pin the
+# behaviour rather than the source text.
+# ---------------------------------------------------------------------------
+
+
+def _neutralise_non_port_checks(monkeypatch):
+    """Mock every non-port check so run_checks() executes nothing real."""
+
+    def pass_result(*args, **kwargs):
+        return {"check": "ok", "status": "PASS", "fix": ""}
+
+    for helper in (
+        "_check_python",
+        "_check_node",
+        "_check_docker_daemon",
+        "_check_docker_group",
+        "_check_venv",
+        "_check_vault",
+        "_check_vault_repair",
+    ):
+        monkeypatch.setattr(tm_doctor, helper, pass_result)
+
+
+def _record_probed_ports(monkeypatch):
+    """Replace _check_port with a recorder; return the list it appends to."""
+    probed = []
+
+    def fake_check_port(port):
+        probed.append(port)
+        return {"check": "Port %d free" % port, "status": "PASS", "fix": ""}
+
+    monkeypatch.setattr(tm_doctor, "_check_port", fake_check_port)
+    return probed
+
+
+def test_doctor_probes_ports_from_env(monkeypatch):
+    """TM_BACKEND_PORT / TM_FRONTEND_PORT decide which ports are probed."""
+    _neutralise_non_port_checks(monkeypatch)
+    probed = _record_probed_ports(monkeypatch)
+    monkeypatch.setenv("TM_BACKEND_PORT", "9100")
+    monkeypatch.setenv("TM_FRONTEND_PORT", "5100")
+
+    tm_doctor.run_checks()
+
+    assert probed == [9100, 5100]
+
+
+def test_doctor_port_defaults_when_env_unset(monkeypatch):
+    """An unset environment keeps the historical 8000 / 5173 exactly."""
+    _neutralise_non_port_checks(monkeypatch)
+    probed = _record_probed_ports(monkeypatch)
+    monkeypatch.delenv("TM_BACKEND_PORT", raising=False)
+    monkeypatch.delenv("TM_FRONTEND_PORT", raising=False)
+
+    tm_doctor.run_checks()
+
+    assert probed == [8000, 5173]
+
+
+def test_doctor_invalid_port_env_fails_by_name_without_crashing(monkeypatch, capsys):
+    """A malformed port is a FAIL naming the variable - never a silent default.
+
+    Non-numeric, zero, negative and out-of-range values must each report the
+    offending variable and value, must not be probed or defaulted, must leave
+    the other port check intact, and must leave the table printable (exit 1,
+    no traceback).
+    """
+    _neutralise_non_port_checks(monkeypatch)
+    monkeypatch.delenv("TM_FRONTEND_PORT", raising=False)
+
+    for bad in ("abc", "0", "-1", "70000", "80 0"):
+        probed = _record_probed_ports(monkeypatch)
+        monkeypatch.setenv("TM_BACKEND_PORT", bad)
+
+        results = tm_doctor.run_checks()
+
+        # the malformed port is neither probed nor silently defaulted
+        assert probed == [5173], bad
+        port_rows = [r for r in results if r["check"].startswith("Port ")]
+        assert len(port_rows) == 2, bad
+        assert port_rows[0]["check"] == "Port TM_BACKEND_PORT", bad
+        assert port_rows[0]["status"] == "FAIL", bad
+        assert port_rows[0]["fix"] == (
+            "TM_BACKEND_PORT='%s' is not a port (expected 1-65535)" % bad
+        ), bad
+        assert port_rows[1]["check"] == "Port 5173 free", bad
+
+    rc = tm_doctor.main([])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "TM_BACKEND_PORT='80 0' is not a port (expected 1-65535)" in out
+
