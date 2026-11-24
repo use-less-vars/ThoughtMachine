@@ -494,3 +494,8 @@ web_ui/frontend/.dist-build-stamp
 # committed, and gone on the next clone -- while the superseded record it names
 # survives and the chain breaks at exactly the point it claims continuity.
 !docs/DIRECTION_2026-11-22_GEN67.md
+
+# Engineer rulings 2026-11-24 (Gen 67): the tracked instruction channel for the
+# agent branches in flight. Public-tier docs need one negation line each under
+# the `docs/*` rule above; this is that line.
+!docs/DIRECTION_2026-11-24_GEN67_RULINGS.md
