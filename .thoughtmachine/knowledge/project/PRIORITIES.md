@@ -487,10 +487,93 @@ moved verbatim, only their position moved. They are still open unless the body s
 - **C14: `visual_tool.py` missing cancellation reporting.** **Open.** An interrupted render drops the `reason` and returns `"visual: the renderer exited with code None."` to the model. This looks like a renderer crash, not an operator cancel, causing the model to hallucinate a failure. Teardown runs correctly (pinned by test). Fix: detect `status == "interrupted"` and return a clear cancellation message. (Discovered during C11').
 
 - **C74** — `tools/mcp_client.py` bypasses the host-port chokepoint. (~11 other unadjudicated `import subprocess` sites).
+  **Correction (Gen 67, re-measured 2026-11-24 at `3d0be36d` — scanner executed, not inferred).**
+  The bypass is real: `tools/mcp_client.py:11` imports `subprocess`, and `:239` is a live
+  `self.process = subprocess.Popen([self.command] + self.args, ...)` — five recorded sites in all
+  (`:11,:239,:241,:242,:243`). **The second clause is false, and its count is false.** This file is
+  not an unadjudicated hit: it is a named entry in `ALLOWED_OFFENDERS`
+  (`tests/test_host_port_kill_switch.py:210`) carrying a written reason — "documented async
+  deferral: StdioMCPClient.start() needs a long-lived child (`subprocess.Popen` at line 239) and
+  host_run_async() is still a signature-only stub raising NotImplementedError." The allowlist is an
+  exact-path `tuple[tuple[str, str], ...]` of (path, reason) pairs, 19 entries, declared at `:91`;
+  `test_allowlist_is_exact_paths_with_reasons` (`:466`) rejects globs, prefixes and duplicates, and
+  `test_allowlist_has_not_grown` (`:493`) fails on a new unlisted offender file. **Census stale:**
+  running that module's own `scan_paths()` over its own `SCAN_ROOTS` (`:62`) finds 20 offending
+  files / 76 sites, every one of them either allowlisted by exact path (19 files, 70 sites) or the
+  sanctioned `thoughtmachine/host_port.py` (6 sites) — the unlisted set is empty, so there are
+  **zero** "unadjudicated" `import subprocess` sites in the tree, not ~11. (Measured by calling the
+  scanner in-container; a pytest run of that file survives only with memory raised to 2g — at the
+  default 512m the C90 reaper kills it — and passes 16/16 there.) The deferral is pinned, not
+  forgotten: `tests/test_mcp_client_uses_host_port.py` (10 tests) goes red if the note moves or the
+  spawn is half-migrated — `test_deferral_comment_sits_directly_above_the_stdio_popen_call`
+  (`:170`), `test_deferral_markers_exist_in_the_mcp_client_source` (`:193`),
+  `test_mcp_client_still_calls_subprocess_popen` (`:206`), and
+  `test_mcp_client_has_not_been_half_migrated_to_the_host_port` (`:212`). **Residual, narrow and
+  real:** stdio must spawn a long-lived child and `host_run_async` does not exist
+  (`tools/mcp_client.py:232-238` says exactly that at the call site), so the chokepoint keeps one
+  documented hole until the async primitive lands. **Evidence decay:** the census pin this rests on
+  (`PINNED_SITE_COUNTS` + `test_allowlisted_files_have_no_new_sites`) lives in `3d0be36d`, which is
+  NOT an ancestor of this branch's HEAD — on the tree read here the census is unpinned, and the
+  numbers above were re-measured rather than quoted.
 - **C75** — The AST no-tool-wrapping guard is parked, not enforced. 3 of its 4 own tests fail on an untouched checkout.
+  **Correction (Gen 67, static scan — NOT executed; pytest is unreliable here, see C90).** The
+  guard is genuinely parked: it lives at `.thoughtmachine/working_docs/tool_no_wrapping_guard.py`
+  (335 lines, tracked by a negation at `.gitignore:125-126`), is never collected
+  (`pyproject.toml:51-52 testpaths`), the repo has no `.pre-commit-config.yaml` at all, and
+  `.github/` has zero hits. Its own header (`:4-10`, `:20-25`) declares the parking and names
+  `tests/test_tool_no_wrapping.py` as the activation home — a path that has never existed on
+  `dev`. **Census stale:** there are five tests, not four (`:280,:286,:292,:298,:314`), with zero
+  `skip`/`xfail`; the "3 of 4" figure matches an older four-test version whose node ids are still
+  in `.pytest_cache`. Today a static scan finds rule (a) 12 violations, rule (b) 0, rule (c) 1, so
+  the live shape is ~2 of 5 failing. Exact pass/fail is UNVERIFIABLE without execution.
+  **Substantive finding, independent of the census:** a real invariant ("no `tools/**` module
+  imports another tool") is violated 12 times in shipped code, and the only instrument that would
+  catch it is parked in a scratch directory where nothing runs it. Pending operator ruling on
+  whether the invariant is still wanted before anyone activates the guard.
 - **C77** — `web_ui/backend/tests/test_bridge_dedup.py` poisons `sys.modules` at collection, causing real-bridge tests to skip.
+  **Correction (Gen 67, re-read 2026-11-24 at `3d0be36d` — source read plus file history).** The
+  poisoning is real; the consequence in the second clause is not. `:38-70` builds a 21-key patch map
+  of `MagicMock()` attribute chains, `:72-75` binds them into `sys.modules` (`agent`,
+  `agent.config.*`, `session`, `session.*`, `tools`, `tools.workspace.*`), and the `finally` at
+  `:77-85` restores `sys.modules` — but the names `web_ui.backend.bridge` and
+  `web_ui.backend.session_manager` had already bound at import time (`Session`,
+  `FileSystemSessionStore`), and those bindings stay MagicMocks for the rest of the process.
+  **"Causing real-bridge tests to skip" is false: nothing is skipped.** The only skip mechanism in
+  `web_ui/backend/tests` is `pytest.mark.skipif(os.name == "nt", ...)` at `test_auth_token.py:33-35`
+  (POSIX permission bits); the directory's other markers are five `xfail`s, not skips
+  (`test_permission_routes.py:500`; `test_worker_stats_routes.py:64,126,154,179`). **The real damage
+  is a `TypeError`, already documented at a second call site:**
+  `web_ui/backend/tests/test_config_pipeline.py:25-58` is a helper,
+  `_restore_real_session_types`, whose own docstring (`:28-38`) records that `save_session` then
+  builds a MagicMock `Session` whose `session_id`/`metadata['name']` are not strings, so
+  `session.store._sanitize_filename` raises `TypeError: expected string or bytes-like object, got
+  'MagicMock'` and no session file is written; the helper is called at `:76`. So the residual is
+  **test-isolation fragility that has been papered over in a second file**, not a quiet loss of
+  coverage. The file is also not untouched — it moved in `fa9387dc`, `6ba1cd38` and `776677d6` —
+  so the defect has survived three edits, which is the argument for fixing it where it is created
+  rather than at each victim.
 - **C78** — Preflight diagnostics truth: two port probes, FAIL weight on advisory output.
 - **C79** — Undeclared load-bearing config key (`git_allow_worktree_commits`) and worker worktree bootstrap failure (crash loop).
+  **Correction (Gen 67, measured via source read — both causal claims refuted).** The key is a
+  *retired* legacy name, not a live gate: it survives only as `values.pop(...)` inside two
+  `model_validator(mode='before')` migration shims (`agent/config/models.py:333`,
+  `agent/config/session_config.py:110`) and one cleanup script
+  (`scripts/vault_permission_cleanup_dryrun.py:150,273`). There is **no behavioural read**; commit
+  authority is the `git` grain (`tools/git_write_tool.py:1010-1013,1014-1039,1051-1065`), and
+  `:112,253,276,330` explicitly disclaim the legacy `agent_config` path. So it is not load-bearing.
+  **The real defect is the inverse:** absent or `False` is dropped (fail-closed, correct), but
+  present and `True` silently escalates `session_permissions['git'] = 'write'`
+  (`models.py:334-341`, `session_config.py:110-117`) — an invisible grant from a key the schema
+  manifest explicitly "will not be validated or repaired" (`logs/backend_startup.log:8`).
+  Declaring it would not remove the escalation; only removal does. **The "crash loop" does not
+  exist.** The resolver fails open by design (`tools/workspace/worktree_defaults.py:9,154-249`,
+  nine `return None` sites); the caller treats a falsy `worktree_root` as normal
+  (`tools/workspace/worker_thread.py:4112,4122`); and `self._worker_max_retries`
+  (`worker_thread.py:2223`) is written and never read repo-wide, so there is no retry machinery
+  to loop. The property is pinned green by `tests/test_worktree_failopen_does_not_block_spawn.py`.
+  **Evidence decay:** cited hash `724dcc89` does not exist (real commit `c3781927`), and every
+  cited `worktree_defaults.py` line is stale (`worktree add --detach` is now `-b <branch>` at
+  `:223`). Pending operator ruling on the escalation channel.
 - **C80** — `terminate_all` skips subprocesses with no pid during shutdown.
 
 - **C86** — Process-Mode Observability (State Seam). Event seam is fixed, but state seam is leaking. Enforced deadline != reported deadline (10s requested, 70s blocked). No exit-code reader exists. Cache `_last_event` is never read. See audit doc for 12 proposals.
@@ -507,7 +590,25 @@ moved verbatim, only their position moved. They are still open unless the body s
   each verification as one self-contained command, and retry once if it dies without a summary
   line. `logs/5b_sigterm_finding.md` still stands as the original evidence.
 
-- **C92** — `agent/knowledge/codebase_indexer.py:38-39` installs module-level `SIGINT`/`SIGTERM` handlers on import. This is a latent defect that could hijack the server's signal handling.
+- **C92** — `agent/knowledge/codebase_indexer.py:38-39` installs module-level `SIGINT`/`SIGTERM` handlers on import. This is a latent defect that could hijack the server's signal handling. **[CLOSED — fixed by `77cb6cfc` (#400), verified 2026-11-24]**
+  **Correction (Gen 67, re-read 2026-11-24 at `3d0be36d` — source read; entry closed, never
+  deleted).** The premise was true when filed and the code no longer contains it.
+  `agent/knowledge/codebase_indexer.py` imports only `hashlib`, `os`, `pathlib.Path`, `typing`
+  names, `fnmatch`, `gc`, `time`, `AgentConfig`, `agent.knowledge.dependencies` and `atexit`
+  (`:8-18`); the word `signal` appears nowhere in the file, and the sole module-level side effect is
+  `:31 atexit.register(_cleanup_client)`, which is benign teardown and is deliberately kept. **The
+  cited lines were never the handler site:** `:35` is
+  `def split_text_with_overlap(text, chunk_size=1500, chunk_overlap=200)` and `:38-39` are docstring
+  prose (`Args:`), so the entry as filed could not have survived a check against its citation —
+  a reminder that line numbers here are dated snapshots, not addresses. Fixed by `77cb6cfc`
+  ("fix(c92): stop codebase_indexer hijacking SIGINT/SIGTERM at import", #400), which deletes
+  `import signal`, `import sys`, `_signal_handler` and both `signal.signal(...)` registrations, and
+  keeps `atexit.register(_cleanup_client)`: with the handler gone SIGINT raises `KeyboardInterrupt`,
+  the chroma teardown still runs, and the exit status becomes an honest 130 instead of a false 0.
+  The fix is pinned by
+  `tests/test_server_import_no_signal_hijack.py::test_cli_import_does_not_hijack_signal_handlers`
+  (`:86`), which imports `agent.cli.rag_commands` in a subprocess and asserts SIGINT is still
+  `signal.default_int_handler` and SIGTERM still `signal.SIG_DFL`.
 
 ## Filed Gen 70 (verification debt)
 
@@ -608,6 +709,29 @@ below was read at `c89cb56b`; anything not read there is marked **UNVERIFIED**.
   - Observed: a container named `git-runner-alpine`, requested with `alpine/git:latest`, came up as **Debian trixie with no `git` in it**, while the record kept the requested name. A record that misstates its own image is worse than a refusal: a refusal is visible at the call, while a misstatement is read back as fact later.
   - Same class, adjacent: container drift is **detected but not remediable**. The remedy text is "recreate the container to restore the desired isolation", and for `persistent` containers recreation is itself out of the agent's hands, because removal is an operator-grain permission. Detection whose only available action is unavailable is a report nobody can act on.
   - Verification: observed live by the operator; not reproduced here.
+
+**Numbering correction, second pass (measured 2026-11-25).** The two runtime tickets below were filed against the worker-runtime process path, after C108. Measured in this file at `95de754c`: the highest allocated id is **C108** (`:708`), and **C109/C110 have no row** — zero hits for either id over the whole file before this block, no renumbering of any existing entry, and the C93/C94 gap is still a gap: it is **not** back-filled here. Every citation below was read at `95de754c`; nothing in this block is inherited from the C99–C105 pass, whose readings were taken at `c89cb56b`.
+
+- **C109**: The runtime supervisor's query clock starts at *dispatch*, not at *acceptance* — `query_accepted` is plumbed end to end and then never awaited, so a slow accept is charged to the query's own timeout. **Open.**
+  - Design says accept-first: `docs/design-worker-runtime-process.md:199` gives the message's whole rationale in one table cell — `query_accepted`, keyed by `query_id`, "lets the supervisor start its wait clock before any reply" — and `:227` lists it among the never-droppable: "**Never drop:** `reply`, `query_accepted`, `cancel_ack`, `control_ack`, `fatal`."
+  - The wire type exists: `tools/workspace/worker_runtime_protocol.py:522-528` declares `class QueryAccepted(Message):` with `KIND: ClassVar[str] = "query_accepted"` and a docstring that states the contract outright: "query_accepted -- lets the supervisor start its wait clock (§4.4)."
+  - The child does signal it: `tools/workspace/worker_runtime_main.py:408` `outbox.put(QueryAccepted(query_id=message.query_id))`, one statement after the triple is queued at `:405-407` and before `pump_query` is started at `:409-414`.
+  - The supervisor does receive it: `tools/workspace/worker_runtime_process.py:1109` `accepted = self._accepted_events.get(message.query_id)`, `:1111` `accepted.set()`. The Event is created at `:635` `acceptance = threading.Event()`, registered at `:637` `self._accepted_events[query_id] = acceptance`, and popped on both exits — `:651` on the `TimeoutError` branch and `:657` in the `finally`.
+  - **Nothing ever waits on it.** The clock is `:646` `reply = future.result(timeout=timeout)`, which runs after the `DispatchQuery` is queued at `:639-645` and therefore before any accept could possibly be observed. The file's only three `.wait(` calls are `:517` `if not self._hello_event.wait(HELLO_TIMEOUT_SECONDS):`, `:919` `woken = slot.event.wait(timeout)` and `:987` `if not slot.event.wait(timeout):` — the hello and the ping/ack slots. There is no `acceptance.wait(` in the tree.
+  - The `accepted` property at `:1061-1063` (a frozenset over the same map) has no reader either: `git grep '\.accepted\b'` over `tools/` returns zero matches, so both halves of the mechanism — the Event and the correlation set — are write-only.
+  - Not the same finding as `e352805f` ("fix(runtime): a query that timed out is not a runtime that died"): that commit reclassifies the timeout, it does not move the clock, and it is not an ancestor of `95de754c`, so it is absent from this tree.
+  - Done means: `dispatch_query` waits on the acceptance Event for its own bounded interval and only then arms `future.result(timeout=...)`, or `QueryAccepted` is removed from the protocol and the design doc stops claiming a pre-reply clock.
+
+- **C110**: A worker-internal turn timeout travels the runtime channel as an **accepted** reply — `ok=True` with `status: "timeout"` inside the envelope — and every consumer treats `ok` as the whole verdict, so a timed-out turn is journalled as completed. **Open.** The claim is **partial**: it holds for the worker's own turn envelope and does **not** hold for the pump-level timeout (see the second-last bullet).
+  - The flag is status-blind by construction: `tools/workspace/worker_runtime_main.py:753` `ok = not (isinstance(envelope, dict) and envelope.get("status") == "error")`. `"timeout"` is not `"error"`, so a turn envelope carrying it reaches the supervisor with `ok=True` (`:754-761` puts the `Reply`, immediately after `:752` `envelope = _envelope_from_reply(raw)`).
+  - That status is the worker's own soft-timeout verdict: `tools/workspace/worker_thread.py:5494-5496` `status = self._respond_metadata.get("status")` / `if self._timeout_triggered: status = "timeout"`, carried into the envelope at `:5499-5501` and defaulted again at `:5530` `envelope["status"] = envelope["status"] or ("timeout" if self._timeout_triggered else "error")`.
+  - The supervisor never reads it: `tools/workspace/worker_runtime_process.py:658-663` `if not reply.ok: raise WorkerRuntimeLost(...)`, then `:664-670` takes `envelope.get("response")` — present on the pump-level envelope, absent on a turn envelope, whose text is under `content` — and falls through to `return json.dumps(envelope)`. A soft-timeout turn is therefore handed back as a JSON blob, indistinguishable in kind from any ordinary reply.
+  - Downstream, four consumers, none inspecting status: `tools/workspace/worker_thread.py:7638` `response = deliver_query_to_worker(reuse_thread, query, timeout=wait)` and `:8783` `response = deliver_query_to_worker(thread, delivered_query, timeout=wait)` place the string under a `"response"` key (`:8787-8792`); `:7745` and `:8324` `final_result = handle.dispatch_query(...)` reach `:7787-7794` / `:8375-8382` `parsed = json.loads(final_result)` followed by setdefaults only.
+  - The one place that does inspect it is unreachable for this case: `worker_thread.py:1998` `if error is None and bool(getattr(reply, "ok", False)): registry.complete(...)` runs first, and the `status = envelope.get("status")` / `if status == "timeout": registry.terminalize(... status="timeout")` branch that follows it is only reached when `ok` is false. So an `ok=True` / `status="timeout"` reply is recorded **completed**.
+  - Severity is therefore **latent**, not live: no happy-path branch keys on `status`, so today's damage is a misleading journal record plus a JSON blob returned where a timeout verdict was meant. It becomes live the moment any consumer starts trusting the envelope.
+  - **Partial, and the correction matters.** The *pump-level* timeout does not arrive `ok=True`: `worker_runtime_main.py:741-751` sets `ok=False` with `envelope={"status": "timeout", "response": None}`, which the supervisor's `if not reply.ok` turns into `WorkerRuntimeLost` — a lost-runtime verdict, which is exactly the misclassification `e352805f` addresses, and that commit is not an ancestor of `95de754c`.
+  - Thread mode already has the strict contract this path lacks: `tools/workspace/worker_query.py:427` `if reply.get("status") == "timeout": return _resolve_terminal(...)`, backed by `is_timeout_envelope` at `:114` — status `"timeout"` **and** a non-empty note **and** a numeric `elapsed_seconds`. The runtime path has no equivalent.
+  - Done means: `ok` is derived from the terminal statuses enumerated at `worker_thread.py:5536` (`stopped`, `paused`, `error`, `timeout`, `max_turns`, `max_turns_reached`) rather than from `"error"` alone, and a timed-out turn reaches the registry as `timeout` instead of `completed`.
 
 ## Archived (pre-Gen 42 brain dump — do not read as current work)
 
