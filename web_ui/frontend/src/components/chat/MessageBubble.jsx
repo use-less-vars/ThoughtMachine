@@ -394,7 +394,29 @@ function MessageImages({ msg, sessionId }) {
    * different source (a preview for a durable url that 404'd, or a new message
    * re-using this bubble instance) is not poisoned by an older failure. */
   const [failedSrc, setFailedSrc] = useState({})
-  if (images.length === 0) return null
+  if (images.length === 0) {
+    /* Tombstoned images (session.image_retention): the retention pass empties
+     * ``images`` and leaves an ``images_tombstoned`` count on the message, so a
+     * bare ``return null`` here would hide an attachment the transcript still
+     * talks about.  Say so in the SAME sentence the provider adapters send the
+     * model (``agent/core/image_store.py``: ``IMAGE_UNAVAILABLE_PLACEHOLDER``).
+     * JSX cannot import a Python constant, so
+     * ``tests/test_image_tombstone_placeholder_parity.py`` holds the two
+     * literals equal; change both or neither. */
+    if ((Number(msg.images_tombstoned) || 0) > 0) {
+      return (
+        <div className="message-images">
+          <span
+            className="message-image-tombstoned"
+            data-testid="message-image-tombstoned"
+          >
+            [screenshot — no longer available]
+          </span>
+        </div>
+      )
+    }
+    return null
+  }
   const markFailed = (src) =>
     setFailedSrc((prev) => (prev[src] ? prev : { ...prev, [src]: true }))
   return (

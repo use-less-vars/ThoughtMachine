@@ -395,6 +395,20 @@ body {
   opacity: 0.8;
 }
 
+/* The retention pass emptied ``images`` and left an ``images_tombstoned`` count:
+ * the screenshot is gone, the message says so in the adapters' own sentence.
+ * Same colours/weight as the placeholder above, sized for a line of text. */
+.message-image-tombstoned {
+  display: inline-block;
+  padding: 0.2rem 0.4rem;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  font-family: var(--font-sans);
+  opacity: 0.8;
+}
+
 .reasoning-summary {
   display: flex;
   align-items: center;

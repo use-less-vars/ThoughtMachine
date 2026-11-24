@@ -57,6 +57,13 @@ _warned_missing_images = set()
 # than being suppressed by the first.
 _warned_unsupported_images = set()
 
+# Canonical audit marker set by the save-time retention pass
+# (``session/image_retention.py``): the ids were released from the durable
+# transcript and the message ``content`` was left exactly as the user typed it.
+# Like every other adapter, this one only ever tests it for truthiness -- the
+# value records why the ids went, not something to interpret here.
+_TOMBSTONE_KEY = 'images_tombstoned'
+
 
 def _resolve_image_id(entry: Any) -> Optional[str]:
     """Return the image id carried by one ``images`` entry.
@@ -121,6 +128,11 @@ def build_wire_messages(
       transcript replayed in a fresh process) is replaced by
       ``IMAGE_UNAVAILABLE_PLACEHOLDER`` text and logged once, so the model is
       told it cannot see the screenshot instead of the turn failing.
+    * A message tombstoned at save time (``images_tombstoned`` with its ids
+      released and ``content`` left as the user typed it) becomes
+      ``content = [{'type': 'text', ...}, {'type': 'text', ...}]`` with a
+      single ``IMAGE_UNAVAILABLE_PLACEHOLDER``; the bytes are gone for every
+      model, so the capability branch is not consulted.
     * An image the target model cannot receive is replaced by
       ``IMAGE_UNSUPPORTED_PLACEHOLDER`` text and logged once per image per
       model; its bytes are left in the store.  Refusing the conversation
@@ -152,12 +164,15 @@ def build_wire_messages(
 
     wire_messages: List[Dict[str, Any]] = []
     for message in messages:
-        if not isinstance(message, dict) or 'images' not in message:
+        if not isinstance(message, dict) or (
+            'images' not in message and not message.get(_TOMBSTONE_KEY)
+        ):
             wire_messages.append(dict(message) if isinstance(message, dict) else message)
             continue
         wire_message = dict(message)
-        image_ids = wire_message.pop('images') or []
-        if not image_ids:
+        image_ids = wire_message.pop('images', None) or []
+        tombstoned = wire_message.pop(_TOMBSTONE_KEY, None)
+        if not image_ids and not tombstoned:
             wire_messages.append(wire_message)
             continue
         content = wire_message.get('content')
@@ -165,6 +180,15 @@ def build_wire_messages(
         parts: List[Dict[str, Any]] = []
         if text.strip():
             parts.append({'type': 'text', 'text': text})
+        if not image_ids:
+            # Tombstoned at save time: the ids were released from the transcript
+            # while ``content`` was left byte-identical, so the placeholder is
+            # derived here, at render time.  Exactly one, and it does not matter
+            # which model is asking -- the bytes are gone for every adapter.
+            parts.append({'type': 'text', 'text': IMAGE_UNAVAILABLE_PLACEHOLDER})
+            wire_message['content'] = parts
+            wire_messages.append(wire_message)
+            continue
         if not accepts_images:
             # The bytes are deliberately not read: they are not being sent, and
             # leaving them in the store is what makes a later vision-capable

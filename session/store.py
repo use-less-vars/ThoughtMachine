@@ -400,6 +400,19 @@ class FileSystemSessionStore(SessionStore):
         if 'metadata' in data and 'external_file_path' in data['metadata']:
             del data['metadata']['external_file_path']
 
+        # Image retention (main-agent sessions only, and only when the owning
+        # workspace is known -- the byte policy cannot measure anything without
+        # it).  Older image-bearing messages are tombstoned: their `images`
+        # list is emptied while the message itself stays.  This must happen
+        # BEFORE the single atomic write below, so the file that lands is the
+        # rewritten one, and it never deletes a byte -- reclaiming the file is
+        # agent.core.image_files' job (see session/image_retention.py).
+        if isinstance(data.get('metadata'), dict) and (data.get('metadata') or {}).get('agent_type') in (None, 'main') and workspace_id:
+            from session.image_retention import apply_image_retention
+            data['user_history'] = apply_image_retention(
+                workspace_id, data.get('user_history') or []
+            )
+
         # Session history bounding: applies to main-agent sessions
         # (metadata['agent_type'] == 'main') AND legacy sessions whose metadata
         # lacks agent_type or has it explicitly set to None — those files are
