@@ -634,6 +634,9 @@ export default function ContainerListPanel({ workspaceId }) {
         // reload clears `error` (re-setting it afterwards keeps the message
         // visible exactly as before).
         await refresh()
+        // The panel can be gone by now: a write that lands after teardown must
+        // not reach state.
+        if (!aliveRef.current) return
         setError(message)
         return
       }
@@ -645,6 +648,7 @@ export default function ContainerListPanel({ workspaceId }) {
       const body = await res.json().catch(() => null)
       const posted = postActionEntry(body)
       if (posted) {
+        if (!aliveRef.current) return
         setEntries((prev) =>
           prev.map((e) => (e.id === posted.id ? mergePostActionEntry(e, posted) : e))
         )
@@ -670,6 +674,9 @@ export default function ContainerListPanel({ workspaceId }) {
     inflightTimers.current.forEach((timer) => clearTimeout(timer))
     inflightTimers.current = []
     inflightRef.current = false
+    // The dispatch promise outlives the click that started it (and the panel):
+    // a settle that lands after teardown must not write state.
+    if (!aliveRef.current) return
     setInflight(null)
   }, [])
 

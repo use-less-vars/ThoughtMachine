@@ -12,6 +12,7 @@ Covers:
 
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from agent.core.llm_client import LLMClient, LLMError
@@ -146,6 +147,12 @@ def test_factory_passes_timeout_and_max_retries_into_provider_config(monkeypatch
 # ---------------------------------------------------------------------------
 # Provider classification: SDK APITimeoutError -> ProviderTimeoutError
 # ---------------------------------------------------------------------------
+#
+# Both SDKs type the ``request`` argument as a real ``httpx.Request``; a
+# ``SimpleNamespace`` stand-in is not the shape the SDK actually raises.
+_OPENAI_REQUEST = httpx.Request('POST', 'https://api.openai.com/v1/chat/completions')
+_ANTHROPIC_REQUEST = httpx.Request('POST', 'https://api.anthropic.com/v1/messages')
+
 
 def test_openai_apitimeout_error_maps_to_provider_timeout():
     openai = pytest.importorskip('openai')
@@ -155,7 +162,7 @@ def test_openai_apitimeout_error_maps_to_provider_timeout():
 
     class FakeCompletions:
         def create(self, **kwargs):
-            raise openai.APITimeoutError(request=SimpleNamespace())
+            raise openai.APITimeoutError(request=_OPENAI_REQUEST)
 
     class FakeClient:
         base_url = 'https://api.openai.com/v1'
@@ -177,7 +184,7 @@ def test_anthropic_apitimeout_error_maps_to_provider_timeout():
 
     class FakeMessages:
         def create(self, **kwargs):
-            raise anthropic.APITimeoutError(request=SimpleNamespace())
+            raise anthropic.APITimeoutError(request=_ANTHROPIC_REQUEST)
 
     class FakeClient:
         def __init__(self):

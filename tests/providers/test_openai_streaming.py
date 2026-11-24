@@ -19,6 +19,7 @@ import inspect
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from openai import APITimeoutError
@@ -456,7 +457,9 @@ def _no_backoff(monkeypatch):
 
 def _timeout():
     """``APITimeoutError`` exactly as the SDK raises it mid-iteration."""
-    return APITimeoutError(request=SimpleNamespace())
+    return APITimeoutError(
+        request=httpx.Request('POST', 'https://api.openai.com/v1/chat/completions')
+    )
 
 
 def test_timeout_before_first_token_is_retried(monkeypatch):
