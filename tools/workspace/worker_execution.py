@@ -496,8 +496,15 @@ class ExecutionTracker:
     def _terminate_subprocess(self, worker_id, execution_id, details) -> None:
         pid = details.get("pid", details.get("process_id"))
         if pid is None:
-            _log("WARNING", "workspace.lifecycle",
-                 f"terminate_all: subprocess {execution_id} has no pid — skipping")
+            # No pid: nothing here names the child, so no signal channel can be
+            # PROVEN to reach it.  A control that cannot do its job must
+            # REFUSE -- a skip reads as "nothing to do" while the child keeps
+            # running, and a weaker proxy (a container stop, a process group)
+            # would be a guess dressed up as a kill.
+            _log("ERROR", "workspace.lifecycle",
+                 f"terminate_all(worker={worker_id}): subprocess {execution_id} "
+                 f"has no pid — cannot terminate the child; it may outlive "
+                 f"shutdown")
             return
         mode, reason = self._kill_decision(pid)
         if mode == "refuse":

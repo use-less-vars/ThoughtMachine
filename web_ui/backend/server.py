@@ -147,7 +147,7 @@ from fastapi import (
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from agent.logging import log
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from session.store import FileSystemSessionStore
 from session.session_registry import SessionRegistry
 from agent.config.presets import get_tools_for_mode
@@ -1097,6 +1097,93 @@ async def _periodic_container_sweep_loop(
             log('WARNING', 'server', f'Periodic container sweep error: {exc}')
 
 
+# ── Periodic session autosave (C89) ─────────────────────────────────────────
+# Nothing in this backend writes a session after a turn: _run_loop ends by
+# emitting session_stop, not by saving, so a completed turn reaches disk only on
+# an explicit save, a session switch/create/close, or the atexit hook.  A SIGKILL
+# between those points loses every turn since the last explicit save; an interval
+# flush bounds that without putting a disk write on the turn path.  Same write
+# path as the shutdown hook, same atomic store helper, no fsync (a power-loss
+# weakness, not a SIGKILL one, out of scope).  30s = agent heartbeat interval.
+_SESSION_FLUSH_INTERVAL_S = 30.0
+
+# Last conversation version this flusher wrote, keyed by session id: nothing in
+# the repo tracks "changed since last write" and the on-disk schema must not grow
+# a dirty flag.  ``conversation_version`` increments on every history mutation, so
+# an unchanged value means no new checkpoint -- skipping it stops an idle session
+# being rewritten every tick.  Another path's save leaves it stale: one redundant
+# write, not churn.
+_session_flush_versions: Dict[str, int] = {}
+
+
+def _flush_one_session(session_id: str, bridge: Any) -> bool:
+    """Flush one live session; True when a write happened.  Runs in a thread."""
+    # MANDATORY: with ``_session`` None, bridge.save_session() does not fail -- it
+    # rebuilds from ``_loaded_session`` (bridge.py:2630-2640) and would write a
+    # STALE history over newer content.  Real window: a bridge is cached before
+    # its load_session() runs, so a refused/failed load leaves exactly this state.
+    session = getattr(bridge, '_session', None)
+    if session is None or getattr(bridge, '_cleanly_closed', False):
+        return False
+    # Marker read, compare and save share the lock the save takes, so the counter
+    # cannot move between "unchanged?" and the snapshot written.  Re-entrant
+    # (bridge.py:626), so save_session() re-taking it cannot deadlock.
+    lock = getattr(bridge, '_session_state_lock', None)
+    with (lock if lock is not None else nullcontext()):
+        version = getattr(session, 'conversation_version', None)
+        if version is not None and _session_flush_versions.get(session_id) == version:
+            return False
+        bridge.save_session()
+        if version is not None:
+            _session_flush_versions[session_id] = version
+    return True
+
+
+async def _flush_sessions_once() -> List[str]:
+    """One flush tick; returns the session ids actually written."""
+    # Concurrency invariant: _session_flush_versions is a plain dict written from
+    # a worker thread and read/pruned here, and is safe ONLY because ticks are
+    # strictly sequential -- one task owns the loop, it awaits this coroutine to
+    # completion before the next tick, and the to_thread calls below are awaited
+    # in turn, so two flush threads can never overlap.  Parallelising this loop
+    # (gather / several tasks / a second caller) requires a lock on the dict.
+    # Drop markers whose bridge is gone (close_session removes the entry); without
+    # this the map grows for the life of the process.
+    for stale_id in [s for s in _session_flush_versions if s not in _session_bridges]:
+        _session_flush_versions.pop(stale_id, None)
+    flushed: List[str] = []
+    for session_id, bridge in list(_session_bridges.items()):
+        try:
+            if await asyncio.to_thread(_flush_one_session, session_id, bridge):
+                flushed.append(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Per-session isolation: one bad session must never stop the tick --
+            # the flush is worth nothing if it dies before the crash arrives.
+            log('WARNING', 'server',
+                f'Session flush failed for {session_id}: {exc}')
+    return flushed
+
+
+async def _periodic_session_flush_loop(
+    interval_s: float = _SESSION_FLUSH_INTERVAL_S,
+) -> None:
+    """Flush every changed live session every ``interval_s`` seconds (C89).
+
+    Same shape as ``_periodic_container_sweep_loop``: the body is guarded so the
+    task cannot die of an unhandled exception; cancellation propagates.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await _flush_sessions_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log('WARNING', 'server', f'Periodic session flush error: {exc}')
+
+
 # ── Boot container drift scan ──────────────────────────────────────────────
 # Hard cap on how many container records the boot-time drift scan inspects in
 # a single pass.  Bounds startup work on hosts with many records; when the cap
@@ -1434,6 +1521,17 @@ async def lifespan(app: FastAPI):
         f'Periodic container sweep scheduled every '
         f'{_CONTAINER_SWEEP_INTERVAL_S:.0f}s')
 
+    # ── Background periodic session autosave (C89) ─────────────────────────────
+    # Bounds crash loss to one interval.  Additive: the atexit shutdown save runs.
+    flush_task = asyncio.create_task(
+        _periodic_session_flush_loop(),
+        name='session-flush',
+    )
+    app.state.session_flush_task = flush_task
+    log('INFO', 'server',
+        f'Periodic session flush scheduled every '
+        f'{_SESSION_FLUSH_INTERVAL_S:.0f}s')
+
     # ── Stale watchdog (S7c, ANNOUNCE-ONLY) ──────────────────────────────────
     # The stale machinery existed and never ran: ``start_stale_check`` had no
     # production caller, so nothing ever scanned for a worker that had gone
@@ -1471,6 +1569,15 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log('WARNING', 'server',
             f'Container sweep task shutdown error: {exc}')
+
+    # Stop the periodic session flush task (mirror of the startup above).
+    try:
+        flush_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await flush_task
+    except Exception as exc:
+        log('WARNING', 'server',
+            f'Session flush task shutdown error: {exc}')
 
     # Stop EventLogger
     try:

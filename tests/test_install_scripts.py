@@ -134,9 +134,11 @@ def exec_tmp():
 
 DOCTOR_SHIM_TEMPLATE = """\
 import json
+import os
 import sys
 
 REASON = "__REASON__"
+PORT_REASON = "__PORT_REASON__"
 
 
 def _emit(payload):
@@ -168,6 +170,15 @@ if args and args[0].endswith("doctor_checks.py"):
     elif flag == "--check-docker":
         _emit({"ok": False, "reason": REASON, "detail": "Cannot connect to the Docker daemon"})
     elif flag == "--check-port":
+        port = args[2]
+        # Record the probed port so a test can assert WHICH ports the launcher
+        # asked about, not merely what it printed.
+        with open(os.path.join(os.environ.get("HOME", "."), "port_calls.log"), "a") as fh:
+            fh.write("%s\\n" % port)
+        if PORT_REASON == "in_use":
+            _emit({"ok": False, "reason": "in_use", "detail": "%s is in use by some-process" % port})
+        if PORT_REASON:
+            _emit({"ok": False, "reason": PORT_REASON, "detail": "cannot verify port %s" % port})
         _emit({"ok": True})
     elif flag == "--check-node":
         _emit({"ok": True, "reason": "", "detail": "", "version": "20.0.0"})
@@ -203,22 +214,27 @@ def _make_repo(base):
     return repo
 
 
-def _write_shim(base, reason):
+def _write_shim(base, reason, port_reason=""):
     shim_dir = base / "bin"
     shim_dir.mkdir()
     shim = shim_dir / "python3"
     shim.write_text(
-        f"#!{sys.executable}\n" + DOCTOR_SHIM_TEMPLATE.replace("__REASON__", reason)
+        f"#!{sys.executable}\n"
+        + DOCTOR_SHIM_TEMPLATE.replace("__REASON__", reason).replace(
+            "__PORT_REASON__", port_reason
+        )
     )
     shim.chmod(0o755)
     return shim_dir
 
 
-def _run_script(repo, base, reason, extra_args=("--check-only",)):
-    shim_dir = _write_shim(base, reason)
+def _run_script(repo, base, reason, extra_args=("--check-only",), port_reason="", extra_env=None):
+    shim_dir = _write_shim(base, reason, port_reason)
     env = dict(os.environ)
     env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
     env["HOME"] = str(base)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         ["bash", str(repo / "start_thoughtmachine.sh")] + list(extra_args),
         capture_output=True,
@@ -283,6 +299,84 @@ def test_script_prepends_system_paths_for_docker_detection():
     source = (REPO_ROOT / "start_thoughtmachine.sh").read_text()
     assert 'export PATH="/usr/bin:$PATH"' in source
     assert 'export PATH="/usr/sbin:$PATH"' in source
+
+
+# ---------------------------------------------------------------------------
+# start_thoughtmachine.sh [4/8] port preflight
+#
+# These EXECUTE the real script against the fake python3 shim: the shim logs
+# every --check-port port it is asked about ("$HOME/port_calls.log") and can
+# answer with a chosen reason, so both the weight of a non-zero exit and the
+# set of probed ports are observed behaviour, not source text.
+# ---------------------------------------------------------------------------
+
+
+def _probed_ports(base):
+    return (base / "port_calls.log").read_text().split()
+
+
+def test_port_check_is_fatal_when_reason_is_in_use(exec_tmp):
+    repo = _make_repo(exec_tmp)
+    result = _run_script(repo, exec_tmp, "daemon_down", port_reason="in_use")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "FAILED: 8000 is in use by some-process." in result.stdout
+    assert "Stop the other process, then re-run this script." in result.stdout
+
+
+def test_port_check_warns_and_continues_when_it_cannot_verify(exec_tmp):
+    # reason="other" is doctor_checks.py's "neither ss nor lsof" answer: the
+    # port is UNKNOWN, so the launcher must not tell the operator it is in use.
+    repo = _make_repo(exec_tmp)
+    result = _run_script(repo, exec_tmp, "daemon_down", port_reason="other")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "WARNING: could not verify that port 8000 is free (reason: other)." in result.stdout
+    assert "cannot verify port 8000" in result.stdout
+    assert "is in use" not in result.stdout
+    assert "FAILED" not in result.stdout
+    # it really continued: the next preflight step ran and --check-only finished
+    assert "[5/8]" in result.stdout
+    assert "(--check-only: preflight done, nothing was started)" in result.stdout
+
+
+def test_port_check_warns_and_continues_on_an_unknown_reason(exec_tmp):
+    repo = _make_repo(exec_tmp)
+    result = _run_script(repo, exec_tmp, "daemon_down", port_reason="something_new")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "could not verify that port 8000 is free (reason: something_new)." in result.stdout
+    assert "is in use" not in result.stdout
+    assert "[5/8]" in result.stdout
+
+
+def test_prod_mode_probes_only_the_backend_port(exec_tmp):
+    # Prod is a single process (backend serves the built frontend), so 5173 is
+    # never bound and must not be probed - let alone be fatal.
+    repo = _make_repo(exec_tmp)
+    result = _run_script(repo, exec_tmp, "daemon_down")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _probed_ports(exec_tmp) == ["8000"]
+    assert "[4/8] Port 8000 (backend) ..." in result.stdout
+
+
+def test_dev_mode_probes_both_ports(exec_tmp):
+    repo = _make_repo(exec_tmp)
+    result = _run_script(
+        repo, exec_tmp, "daemon_down", extra_args=("--dev", "--check-only")
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _probed_ports(exec_tmp) == ["8000", "5173"]
+
+
+def test_dev_mode_probes_the_configured_frontend_port(exec_tmp):
+    repo = _make_repo(exec_tmp)
+    result = _run_script(
+        repo,
+        exec_tmp,
+        "daemon_down",
+        extra_args=("--dev", "--check-only"),
+        extra_env={"TM_FRONTEND_PORT": "5174"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _probed_ports(exec_tmp) == ["8000", "5174"]
 
 
 # ---------------------------------------------------------------------------

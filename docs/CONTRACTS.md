@@ -352,10 +352,10 @@ open item below.
 | `.github/workflows/python-version-matrix.yml` — "Python Version Matrix" | `unit-tests` (matrix over `python-version`), `installer-contract`, `windows-python-314` | 3 of 3 | — |
 
 The advisory column is empty as of this revision: no job in any of the six files carries
-`continue-on-error`. The three macOS jobs did until their job-level mask was removed, which is why the
-file is still named "(macOS, advisory)" and why each of its job `name:` values still ends in
-"(advisory)" — stale text retained so the check-run contexts did not change, not a claim that the
-jobs can be ignored.
+`continue-on-error`. The three macOS jobs did until their job-level mask was removed; the workflow
+file still carries "(macOS, advisory)" as its own display name, but the three job `name:` values no
+longer end in "(advisory)" — that suffix went with the mask, so the check-run contexts are plain
+job names, not a claim that the jobs can be ignored.
 
 What the trigger blocks and job names add to that table:
 
@@ -379,7 +379,7 @@ What the trigger blocks and job names add to that table:
   was the last one: all three of its jobs carried `continue-on-error: true`, so those three of the
   eighteen could not fail their run. The mask is gone — no job in any of the six files carries
   `continue-on-error` — so all eighteen fail their own workflow run on a red result. What remains is
-  naming and protection, not masking: none of the three macOS check names is in `REQUIRED_CHECKS`, so
+  protection, not masking: none of the three macOS check names is in `REQUIRED_CHECKS`, so
   a red macOS job fails the `platform-matrix-macos.yml` run without blocking a merge.
   `.github/workflows/platform-matrix.yml`'s `web-ui-backend-suite` job was the fourth advisory job
   until C91 made it BLOCKING (no `continue-on-error`, and its name no longer carries the

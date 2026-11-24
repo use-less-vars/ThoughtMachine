@@ -245,6 +245,42 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
 
 
 # ---------------------------------------------------------------------------
+# the census: how many sites each exempted file is allowed to carry
+# ---------------------------------------------------------------------------
+
+#: ``ALLOWED_OFFENDERS`` path -> the number of :class:`Site` objects
+#: :func:`scan_source` records for that file.  The allowlist above excuses a file;
+#: this pins how much host-process surface that excusal covers, so a second,
+#: third or tenth ``subprocess.run`` added to an already-exempted file is a
+#: failure and not a silent ride on the old entry.  It is deliberately exact in
+#: BOTH directions: one site more is red, and one site fewer is red too -- the
+#: pin may only ever be tightened deliberately, never drift.  Measured by running
+#: this module's own scanner over the real tree on 2026-11-24 (19 files, 70
+#: sites).
+PINNED_SITE_COUNTS: dict[str, int] = {
+    "infra/containers/executor.py": 2,
+    "infra/workspace_lifecycle_manager.py": 1,
+    "mcp_examples/test_client.py": 9,
+    "scripts/ci_assert_collected.py": 2,
+    "scripts/ci_doctor_poller.py": 7,
+    "scripts/doctor_checks.py": 3,
+    "scripts/gen_handoff.py": 2,
+    "scripts/mutation_gate.py": 5,
+    "scripts/verify_fix.py": 8,
+    "security/sandboxed_execution.py": 3,
+    "thoughtmachine/doctor.py": 3,
+    "tools/ci_read_tool.py": 3,
+    "tools/git_info_tool.py": 3,
+    "tools/git_write_tool.py": 2,
+    "tools/mcp_client.py": 5,
+    "tools/mcp_server_connect.py": 2,
+    "tools/workspace/worker_execution.py": 2,
+    "web_ui/backend/server.py": 6,
+    "web_ui/backend/tests/test_auth_boundary.py": 2,
+}
+
+
+# ---------------------------------------------------------------------------
 # the dangerous surface, as AST names
 # ---------------------------------------------------------------------------
 
@@ -491,7 +527,8 @@ def test_allowlist_is_exact_paths_with_reasons():
 
 
 def test_allowlist_has_not_grown():
-    """New offenders fail here even if someone quietly appends to the allowlist."""
+    """New offender FILES fail here, even if the allowlist is quietly appended to;
+    new *sites* in an already-exempted file fail in the census test below."""
     discovered = set(scan_paths(_scanned_files())) - set(SANCTIONED_MODULES)
     allowlisted = set(_allowlisted())
 
@@ -506,6 +543,70 @@ def test_allowlist_has_not_grown():
         "ALLOWED_OFFENDERS lists file(s) that produce no hit any more (the "
         "allowlist must shrink when the last offender is migrated):\n  "
         + "\n  ".join(removed)
+    )
+
+
+def test_allowlisted_files_have_no_new_sites():
+    """Per-file census: an exempted file may not gain a site -- nor lose one."""
+    offenders = scan_paths(_scanned_files())
+    allowlisted = _allowlisted()
+    pins = dict(PINNED_SITE_COUNTS)
+
+    total = sum(len(sites) for sites in offenders.values())
+    census = (
+        f"site census: {total} site(s) in {len(offenders)} file(s) under "
+        f"{SCAN_ROOTS}, {sum(len(offenders.get(p, [])) for p in pins)} of them in "
+        "the exempted files"
+    )
+
+    # The census and the allowlist must name the same files: one constant
+    # without the other is already a mistake, and it would make the counts
+    # below silently vacuous.
+    unpinned = sorted(set(allowlisted) - set(pins))
+    unallowed = sorted(set(pins) - set(allowlisted))
+    assert not unpinned and not unallowed, (
+        "PINNED_SITE_COUNTS and ALLOWED_OFFENDERS disagree about which files are "
+        "exempt; they must be kept in step.\n"
+        f"  allowlisted but not pinned (add its measured count): {unpinned}\n"
+        f"  pinned but not allowlisted (drop the pin or admit the file): "
+        f"{unallowed}\n{census}"
+    )
+
+    grown = []
+    shrunk = []
+    for rel_path in sorted(pins):
+        sites = offenders.get(rel_path, [])
+        pinned = pins[rel_path]
+        if len(sites) > pinned:
+            grown.append(
+                f"  {rel_path}: pinned {pinned}, found {len(sites)} "
+                f"(+{len(sites) - pinned} new site(s))\n"
+                "    sites now: "
+                + "; ".join(f"line {s.lineno}: {s.construct}" for s in sites)
+            )
+        elif len(sites) < pinned:
+            shrunk.append(
+                f"  {rel_path}: pinned {pinned}, found {len(sites)} "
+                f"({len(sites) - pinned})"
+            )
+
+    assert not grown, (
+        "An already-exempted file grew a new host-process site. The exemption "
+        "covers the census pinned below, not the file forever:\n"
+        + "\n".join(grown)
+        + "\n"
+        + census
+        + "\nMigrate the new site to host_run()/host_run_async(), or raise that "
+        "file's count in PINNED_SITE_COUNTS deliberately -- the old "
+        "ALLOWED_OFFENDERS reason does not cover a site it never saw."
+    )
+    assert not shrunk, (
+        "An exempted file now has fewer host-process sites than pinned: tighten "
+        "the pin (lower that file's count in PINNED_SITE_COUNTS) so the "
+        "exemption cannot quietly widen again later:\n"
+        + "\n".join(shrunk)
+        + "\n"
+        + census
     )
 
 
