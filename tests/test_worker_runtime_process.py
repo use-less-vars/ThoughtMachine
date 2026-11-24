@@ -452,6 +452,100 @@ def test_a_late_reply_never_satisfies_the_next_query():
         runtime.close(grace_ms=50)
 
 
+class _DelayedDispatchOutbox:
+    """Outbox that lets the child's answer land BEFORE the caller's clock starts.
+
+    Only the ``DispatchQuery`` frame is held up, and the hold happens *after* it
+    has been queued: the child receives it at the normal time, spends its own
+    ``timeout_seconds`` waiting for a reply that cannot come (the fake worker
+    sleeps far longer), answers ``status='timeout'``, and only then does the
+    caller reach ``future.result`` -- which finds the future already finished
+    and returns the reply instead of raising.
+    """
+
+    def __init__(self, inner, delay: float) -> None:
+        self._inner = inner
+        self._delay = delay
+
+    def put(self, message) -> None:
+        self._inner.put(message)
+        if isinstance(message, DispatchQuery):
+            time.sleep(self._delay)
+
+
+class _DroppingDispatchOutbox:
+    """Outbox that swallows ``DispatchQuery`` frames: no reply can ever arrive.
+
+    This removes the second clock entirely, so the caller's own expiry is the
+    only thing that can end the query -- the pure "this side gave up first"
+    ordering, with no dependence on process scheduling.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.dropped: list = []
+
+    def put(self, message) -> None:
+        if isinstance(message, DispatchQuery):
+            self.dropped.append(message.query_id)
+            return
+        self._inner.put(message)
+
+
+def test_a_runtime_reported_timeout_is_not_a_lost_runtime(monkeypatch):
+    """§4.4: the child's own ``status='timeout'`` frame is a TIMEOUT, not a death.
+
+    Both sides bound the same query by the same ``timeout_seconds``
+    (``worker_runtime_main.pump_query``), so which clock expires first is a race
+    a few milliseconds wide. This forces the ordering that loses on a loaded
+    machine: the child's timeout frame is already in the pending future when
+    ``future.result`` is called, so the reply path -- not the local
+    ``TimeoutError`` path -- decides the exception. A healthy child must not be
+    reported as gone, and the next query must still be served by it (§4.8).
+    """
+    runtime = ProcessWorkerRuntime(_spec(delay=0.15))
+    try:
+        runtime.start()
+        monkeypatch.setattr(
+            runtime, "_outbox", _DelayedDispatchOutbox(runtime._outbox, 0.2)
+        )
+        with pytest.raises(WorkerQueryTimeout) as caught:
+            runtime.dispatch_query("first", timeout=0.05)
+        assert caught.value.reply.envelope["status"] == "timeout"
+        # The runtime's own frame, not one this side synthesised: the local
+        # synthesiser stamps ``elapsed_seconds=0.0`` (``_terminal_reply``).
+        assert caught.value.reply.elapsed_seconds > 0.0
+        assert caught.value.reply.ok is False
+        assert runtime.lost is False
+        assert runtime.dispatch_query("second", timeout=30) == "ok:second"
+    finally:
+        runtime.close(grace_ms=50)
+
+
+def test_a_local_timeout_is_the_same_timeout_as_a_reported_one(monkeypatch):
+    """§4.4: when no frame arrives, this side's expiry raises the SAME exception.
+
+    The other half of the race: the caller's clock expires with an empty future,
+    so ``dispatch_query`` synthesises the terminal reply. Both orderings must be
+    indistinguishable to the caller -- same type, same envelope status -- because
+    the caller cannot know which side was scheduled first.
+    """
+    runtime = ProcessWorkerRuntime(_spec())
+    try:
+        runtime.start()
+        outbox = _DroppingDispatchOutbox(runtime._outbox)
+        monkeypatch.setattr(runtime, "_outbox", outbox)
+        with pytest.raises(WorkerQueryTimeout) as caught:
+            runtime.dispatch_query("first", timeout=0.05)
+        assert outbox.dropped, "the frame was not actually swallowed"
+        assert caught.value.reply.envelope["status"] == "timeout"
+        assert caught.value.reply.elapsed_seconds == 0.0  # synthesised here
+        assert caught.value.reply.ok is False
+        assert runtime.lost is False
+    finally:
+        runtime.close(grace_ms=50)
+
+
 class _SpecStub:
     """A worker stand-in carrying only the attributes ``spec_from_worker`` reads."""
 
