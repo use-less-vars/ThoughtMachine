@@ -143,6 +143,33 @@ def _check_port(port: int) -> Dict[str, Any]:
     return {"check": name, "status": "FAIL", "fix": "free port %d (stop the process using it)" % port}
 
 
+def _check_port_env(name: str, default: int) -> Dict[str, Any]:
+    """Port check for the port named by env var ``name`` (default ``default``).
+
+    The launcher (start_thoughtmachine.sh) and origin_policy.py already treat
+    TM_BACKEND_PORT / TM_FRONTEND_PORT as the source of truth, so the table
+    reports on the same ports. A value that is not a port FAILs by name: the
+    default is NOT substituted silently, because a misconfigured port is
+    exactly what this table exists to surface.
+    """
+    raw = os.environ.get(name, "")
+    port: Optional[int] = default
+    if raw.strip():
+        try:
+            port = int(raw.strip(), 10)
+        except ValueError:
+            port = None
+        if port is not None and not 1 <= port <= 65535:
+            port = None
+    if port is None:
+        return {
+            "check": "Port %s" % name,
+            "status": "FAIL",
+            "fix": "%s='%s' is not a port (expected 1-65535)" % (name, raw),
+        }
+    return _check_port(port)
+
+
 def _check_venv() -> Dict[str, Any]:
     name = "Venv healthy"
     result = doctor_checks.check_venv(".venv")
@@ -198,8 +225,8 @@ def run_checks() -> List[Dict[str, Any]]:
         _check_node(),
         _check_docker_daemon(),
         _check_docker_group(),
-        _check_port(8000),
-        _check_port(5173),
+        _check_port_env("TM_BACKEND_PORT", 8000),
+        _check_port_env("TM_FRONTEND_PORT", 5173),
         _check_venv(),
         _check_vault(),
         _check_vault_repair(),

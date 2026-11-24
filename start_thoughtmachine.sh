@@ -347,18 +347,46 @@ fi
 echo ""
 
 # ---------------------------------------------- [4/8] Ports (backend API) / (Vite frontend)
-echo "[4/8] Ports $TM_BACKEND_PORT (backend) and $TM_FRONTEND_PORT (frontend) ..."
-for port in "$TM_BACKEND_PORT" "$TM_FRONTEND_PORT"; do
+# Prod binds one port only (the backend serves the built frontend from
+# web_ui/frontend/dist), so TM_FRONTEND_PORT is probed in dev mode only.
+if $DEV_MODE; then
+    PROBE_PORTS="$TM_BACKEND_PORT $TM_FRONTEND_PORT"
+    echo "[4/8] Ports $TM_BACKEND_PORT (backend) and $TM_FRONTEND_PORT (frontend) ..."
+else
+    PROBE_PORTS="$TM_BACKEND_PORT"
+    echo "[4/8] Port $TM_BACKEND_PORT (backend) ..."
+fi
+PORT_WARNED=false
+for port in $PROBE_PORTS; do
     PORT_OUT="$(doctor --check-port "$port" 2>&1)"
     PORT_RC=$?
     if [ "$PORT_RC" -ne 0 ]; then
+        PORT_REASON="$(printf '%s' "$PORT_OUT" | json_get reason)"
         PORT_DETAIL="$(printf '%s' "$PORT_OUT" | json_get detail)"
-        echo "      FAILED: ${PORT_DETAIL:-port $port is in use}."
-        echo "      Stop the other process, then re-run this script."
-        exit 1
+        # Only reason=in_use is a definite conflict. Anything else - including
+        # "other" (neither ss nor lsof available) and an absent reason - means
+        # the port could not be verified, and must not be reported as another
+        # process holding it.
+        case "$PORT_REASON" in
+            in_use)
+                echo "      FAILED: ${PORT_DETAIL:-port $port is in use}."
+                echo "      Stop the other process, then re-run this script."
+                exit 1
+                ;;
+            *)
+                echo "      WARNING: could not verify that port $port is free (reason: ${PORT_REASON:-unknown})."
+                [ -n "$PORT_DETAIL" ] && echo "      $PORT_DETAIL"
+                echo "      Continuing; the port may still be unusable."
+                PORT_WARNED=true
+                ;;
+        esac
     fi
 done
-echo "      ok."
+if $PORT_WARNED; then
+    echo "      ok (unverified ports above)."
+else
+    echo "      ok."
+fi
 
 # -------------------------------------------------------------- [5/8] Node.js
 echo "[5/8] Node.js >= 18 ..."
