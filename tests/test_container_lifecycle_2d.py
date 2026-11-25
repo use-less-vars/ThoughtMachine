@@ -318,6 +318,8 @@ def _shortcircuit_create(monkeypatch):
 
     dummy = types.SimpleNamespace(mounts=[], tmpfs={})
     monkeypatch.setattr(de, "git_shadow_for_workspace", lambda *a, **k: dummy)
+    # Never seed the REAL vault from a unit test.
+    monkeypatch.setattr(de, "ensure_git_shadow_mask", lambda *a, **k: None)
     monkeypatch.setattr(de, "_host_ids", lambda: (1000, 1000))
     monkeypatch.setattr(de, "_load_admission_capabilities", lambda *a, **k: None)
     monkeypatch.setattr(ag, "admit", lambda *a, **k: MagicMock())

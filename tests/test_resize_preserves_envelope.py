@@ -378,7 +378,7 @@ def _fresh_start_capture(monkeypatch, *, restored_envelope,
     monkeypatch.setattr(
         cm, "git_shadow_for_workspace",
         lambda *a, **k: types.SimpleNamespace(tmpfs={}, mounts=[]))
-    monkeypatch.setattr(cm, "git_shadow_mask_path", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "ensure_git_shadow_mask", lambda *a, **k: None)
     monkeypatch.setattr(
         cm, "admit",
         lambda request, probes=None: cm.Transform(

@@ -41,7 +41,10 @@ from infra.container_create import (
     create_hardened_container,
     git_shadow_for_workspace,
 )
-from thoughtmachine.workspace_capabilities import git_shadow_mask_path
+from thoughtmachine.workspace_capabilities import (
+    ensure_git_shadow_mask,
+    git_shadow_mask_path,
+)
 import docker
 import docker.types
 import hashlib
@@ -932,7 +935,12 @@ class DockerExecutor:
         }
         shadow = git_shadow_for_workspace(
             self.workspace_path,
-            git_shadow_mask_path(self.workspace_id) if self.workspace_id else None,
+            # Seeded HERE, on the create path itself: the mask source must exist
+            # before the bind is handed to the daemon, which would otherwise
+            # materialise a missing single-file source as a DIRECTORY.  Keyed on
+            # the workspace DIRECTORY, so a pre-existing workspace (provisioned
+            # before this file existed) is healed at create time.
+            ensure_git_shadow_mask(self.workspace_id) if self.workspace_id else None,
         )
         tmpfs.update(shadow.tmpfs)
 

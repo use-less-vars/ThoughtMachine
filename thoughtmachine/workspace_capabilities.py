@@ -178,6 +178,42 @@ def git_shadow_mask_path(workspace_id: str) -> Path:
     return _workspace_dir(workspace_id) / GIT_SHADOW_MASK_FILENAME
 
 
+def ensure_git_shadow_mask(workspace_id: str) -> Path:
+    """Ensure the per-workspace ``.git`` shadow mask exists and return its path.
+
+    The mask is a ZERO-BYTE REGULAR FILE.  ``git_shadow_for_workspace`` binds it
+    read-only over ``/workspace/.git`` whenever the workspace's ``.git`` is a
+    FILE (a git worktree / submodule pointer); a missing source is refused there
+    because the docker daemon would silently materialise it as a DIRECTORY,
+    attaching the wrong shape inside the container.
+
+    Seeding is keyed on the DIRECTORY, not on a "newly created" flag: a
+    workspace config directory that ALREADY exists (provisioned before this file
+    existed) is seeded exactly like a fresh one, and the parent directory is
+    created when absent.  Idempotent by construction:
+
+    * an existing REGULAR file is never opened for writing, so it is never
+      truncated;
+    * a missing file is created as an empty regular file;
+    * a DIRECTORY sitting at the mask path (the daemon's silent materialisation
+      of a previously missing bind source) is removed and replaced by the
+      required regular file.
+
+    Returns the mask path.
+    """
+    path = git_shadow_mask_path(workspace_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_dir():
+        logging.getLogger(__name__).warning(
+            "Replacing directory at .git shadow mask path %s with a zero-byte "
+            "regular file (a single-file bind source must be a file)", path
+        )
+        shutil.rmtree(str(path))
+    if not path.is_file():
+        path.write_text("", encoding="utf-8")
+    return path
+
+
 def _validate_workspace_id(workspace_id: str) -> str:
     """Return *workspace_id* unchanged, or raise ``ValueError`` if unusable.
 
@@ -401,9 +437,14 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
         created.append(str(domain_allowlist_path))
 
     # ── .git shadow mask (zero-byte regular file) ──────────────────────────
-    git_shadow_mask = base / GIT_SHADOW_MASK_FILENAME
-    if not git_shadow_mask.exists():
-        git_shadow_mask.write_text("", encoding="utf-8")
+    # One authority (``ensure_git_shadow_mask``) owns the shape, so a workspace
+    # directory that ALREADY exists -- provisioned before this file existed --
+    # is seeded exactly like a fresh one, instead of only the fresh path being
+    # covered.  Listed as "created" only when the mask was not already a regular
+    # file, preserving the returned-list contract.
+    git_shadow_mask = git_shadow_mask_path(workspace_id)
+    if not git_shadow_mask.is_file():
+        ensure_git_shadow_mask(workspace_id)
         created.append(str(git_shadow_mask))
 
     # ── workers.json (template workers) ────────────────────────────
