@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import pytest
 
@@ -410,6 +411,54 @@ def test_rotation_by_size_keeps_every_record_and_prunes_archives(tmp_path):
 SLEEP_SOURCE = "import time\ntime.sleep(120)\n"
 
 
+def _queued_signal_probe(ledger_path):
+    """Fork-side half of block (c): block SIGTERM, queue one at *this* process,
+    then prove the waiter sees it and forwards it to the child.
+
+    This may only ever run in a forked child -- the pending SIGTERM is aimed at
+    getpid(), and the pytest process must never be that pid.  Success is a
+    normal return; every failure raises, for the child to report and then leave
+    through os._exit().
+    """
+    queue = tm_witness.Ledger(ledger_path)
+    dummy = None
+    mask = {int(signal.SIGTERM)}
+    try:
+        # Spawn the dummy BEFORE installing the mask: an exec'd child inherits
+        # the blocking mask, so a dummy forked after the block would ignore the
+        # very SIGTERM this probe proves is forwarded.
+        dummy = subprocess.Popen([sys.executable, "-c", SLEEP_SOURCE])
+        signal.pthread_sigmask(signal.SIG_BLOCK, mask)
+        os.kill(os.getpid(), signal.SIGTERM)  # blocked -> only queued
+        assert signal.SIGTERM in signal.sigpending(), "signal was not queued"
+        state = {"lock": threading.Lock(), "child_pid": dummy.pid, "pending": []}
+        threading.Thread(
+            target=tm_witness._signal_waiter,
+            args=(queue, "queued-run", mask, state),
+            name="tm-witness-sigwait-test",
+            daemon=True,
+        ).start()
+        recorded = _wait_for(lambda: _events(_records(ledger_path), "signal"))
+        assert recorded, "the waiter never saw the queued SIGTERM"
+        assert recorded[0]["signo"] == int(signal.SIGTERM), recorded[0]
+        assert recorded[0]["si_pid"] == os.getpid(), recorded[0]
+        assert _wait_for(lambda: dummy.poll() is not None, timeout=15), (
+            "the queued SIGTERM was recorded but never forwarded to the child"
+        )
+        assert dummy.returncode == -int(signal.SIGTERM), dummy.returncode
+    finally:
+        # Drain before unblocking: a still-pending SIGTERM kills whoever
+        # unblocks the mask.  Here that is a throwaway child, and an empty
+        # sigpending() also proves the waiter CONSUMED the queued signal.
+        while signal.SIGTERM in signal.sigpending():
+            signal.sigtimedwait(mask, 0.1)
+        signal.pthread_sigmask(signal.SIG_SETMASK, [])
+        if dummy is not None and dummy.poll() is None:
+            dummy.kill()
+            dummy.wait(timeout=10)
+        queue.close()
+
+
 @LINUX_ONLY
 def test_fork_happens_before_the_waiter_thread_starts(tmp_path):
     # --- (a) a normal run must not fork from a multi-threaded process -------
@@ -462,44 +511,65 @@ def test_fork_happens_before_the_waiter_thread_starts(tmp_path):
     assert proc.returncode == 128 + int(signal.SIGTERM)
 
     # --- (c) deterministic proof that a QUEUED signal is still delivered ----
-    # The signal is blocked in the main thread and sent to ourselves while the
-    # process is single-threaded and NO waiter exists yet, so it can only sit
-    # pending in the kernel.  The waiter, started afterwards, must see it and
-    # forward it -- exactly the case the old ordering dropped on the floor.
+    # The signal is blocked in the main thread and sent to ourselves while NO
+    # waiter exists yet, so it can only sit pending in the kernel.  The waiter,
+    # started afterwards, must see it and forward it -- exactly the case the old
+    # ordering dropped on the floor.
+    #
+    # It runs in a fork()ed CHILD, never in the pytest process.  A still-pending
+    # SIGTERM is a live grenade: the in-process version killed the whole run
+    # with exit 143 as soon as the block unwound with the signal still queued,
+    # so a broken waiter looked like a crashed CI job instead of a failed test.
+    # The child is the only getpid() that signal can reach, it always leaves
+    # through os._exit(), and the parent re-derives the verdict from the wait
+    # status and then from the ledger.
     queue_ledger = tmp_path / "queued.jsonl"
-    queue = tm_witness.Ledger(queue_ledger)
-    mask = {int(signal.SIGTERM)}
-    state = {"lock": threading.Lock(), "child_pid": None, "pending": []}
-    dummy = subprocess.Popen([sys.executable, "-c", SLEEP_SOURCE])
-    try:
-        signal.pthread_sigmask(signal.SIG_BLOCK, mask)
-        os.kill(os.getpid(), signal.SIGTERM)  # blocked -> only queued
-        assert signal.SIGTERM in signal.sigpending(), "signal was not queued"
-        with state["lock"]:
-            state["child_pid"] = dummy.pid
-        threading.Thread(
-            target=tm_witness._signal_waiter,
-            args=(queue, "queued-run", mask, state),
-            name="tm-witness-sigwait-test",
-            daemon=True,
-        ).start()
-        recorded = _wait_for(lambda: _events(_records(queue_ledger), "signal"))
-        assert recorded, "the waiter never saw the queued SIGTERM"
-        assert recorded[0]["signo"] == int(signal.SIGTERM)
-        assert recorded[0]["si_pid"] == os.getpid()
-        assert _wait_for(lambda: dummy.poll() is not None, timeout=15), (
-            "the queued SIGTERM was recorded but never forwarded to the child"
-        )
-        assert dummy.returncode == -int(signal.SIGTERM)
-    finally:
-        # drain before unblocking: a still-pending SIGTERM would kill pytest
-        while signal.SIGTERM in signal.sigpending():
-            signal.sigtimedwait(mask, 0.1)
-        signal.pthread_sigmask(signal.SIG_SETMASK, [])
-        if dummy.poll() is None:
-            dummy.kill()
-            dummy.wait(timeout=10)
-        queue.close()
+    report = tmp_path / "queued-child-report.txt"
+    queued_pid = os.fork()
+    if queued_pid == 0:
+        # ---- child: the ONLY target of the self-directed SIGTERM -----------
+        rc = 1
+        try:
+            _queued_signal_probe(queue_ledger)
+            rc = 0
+        except BaseException:  # noqa: BLE001 -- report, then leave for good
+            try:
+                report.write_text("forked probe failed:\n" + traceback.format_exc())
+            except BaseException:  # noqa: BLE001 -- the exit code says it anyway
+                pass
+        finally:
+            os._exit(rc)  # never unwind into the parent's stack
+    # ---- parent: no signal was ever sent to THIS process -------------------
+    deadline = time.time() + 30
+    status = None
+    while time.time() < deadline:
+        reaped, raw_status = os.waitpid(queued_pid, os.WNOHANG)
+        if reaped == queued_pid:
+            status = raw_status
+            break
+        time.sleep(0.02)
+    if status is None:
+        os.kill(queued_pid, signal.SIGKILL)
+        os.waitpid(queued_pid, 0)
+    assert status is not None, "the forked queued-signal probe never finished"
+    detail = report.read_text() if report.exists() else "<no report written>"
+    assert os.WIFEXITED(status), (
+        "the forked probe died on a signal (wait status %r) instead of exiting: "
+        "the queued SIGTERM was not consumed by the waiter.\n%s" % (status, detail)
+    )
+    assert os.WEXITSTATUS(status) == 0, (
+        "the forked probe failed (exit %d).\n%s" % (os.WEXITSTATUS(status), detail)
+    )
+    queued_records = _records(queue_ledger)
+    queued_signals = _events(queued_records, "signal")
+    assert queued_signals, (
+        "the waiter never saw the queued SIGTERM: %r" % (queued_records,)
+    )
+    assert queued_signals[0]["signo"] == int(signal.SIGTERM)
+    assert queued_signals[0]["si_pid"] == queued_pid, (
+        "sender provenance lost: the queued SIGTERM came from the forked probe "
+        "(pid %d), not from %r" % (queued_pid, queued_signals[0]["si_pid"])
+    )
 
 
 

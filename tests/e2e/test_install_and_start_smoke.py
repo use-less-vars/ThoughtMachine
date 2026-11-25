@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -167,6 +168,46 @@ _SCRATCH_SKIP = {
 }
 
 
+# The launcher is the single source of truth for which ``scripts/`` files must
+# exist in the scratch mirror; ``scripts/<path>`` is how it spells them.
+_LAUNCHER = "start_thoughtmachine.sh"
+_LAUNCHER_SCRIPT_REF = re.compile(r"scripts/[A-Za-z0-9_./-]+")
+_REF_TRAILING = ".,;:)]}\"'"
+
+
+def _launcher_scripts() -> "list[str]":
+    """``scripts/<path>`` files ``start_thoughtmachine.sh`` will actually run.
+
+    Derived from the launcher rather than hard-coded, so a new script reference
+    cannot silently fall out of the scratch mirror.  A *comment* that merely
+    mentions a path which is not a real file in ``REPO_ROOT`` is ignored, so a
+    stale or optional mention cannot break the test; a path the launcher really
+    runs is required even if the source tree has lost it.  Returned paths are
+    relative to ``REPO_ROOT``.
+    """
+    refs = set()
+    for line in (REPO_ROOT / _LAUNCHER).read_text(errors="replace").splitlines():
+        mention_only = line.lstrip().startswith("#")
+        for ref in _LAUNCHER_SCRIPT_REF.findall(line):
+            ref = ref.rstrip(_REF_TRAILING)
+            if mention_only and not (REPO_ROOT / ref).is_file():
+                continue
+            refs.add(ref)
+    return sorted(refs)
+
+
+def _assert_launcher_scripts_mirrored(scratch_repo: Path) -> None:
+    """Every script ``start_thoughtmachine.sh`` runs must exist in the mirror."""
+    missing = [ref for ref in _launcher_scripts() if not (scratch_repo / ref).is_file()]
+    assert not missing, (
+        "scratch repo is missing "
+        + ", ".join(missing)
+        + ": path(s) referenced by "
+        + _LAUNCHER
+        + " (requirement derived from that file, not from a hard-coded list)"
+    )
+
+
 def _mirror_repo_into(scratch_repo: Path) -> None:
     """Populate the scratch repo with copies + symlinks of the real repo.
 
@@ -201,11 +242,20 @@ def _mirror_repo_into(scratch_repo: Path) -> None:
             continue
         (scratch_repo / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
 
-    (scratch_repo / "scripts").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(REPO_ROOT / "scripts" / "doctor_checks.py", scratch_repo / "scripts" / "doctor_checks.py")
+    # ``scripts/`` is copied WHOLE and for real (never symlinked): the launcher
+    # runs ``scripts/tm_witness.py`` out of it and ``install.sh`` runs
+    # ``scripts/doctor_checks.py``, so a partial mirror silently breaks the boot.
+    shutil.copytree(
+        REPO_ROOT / "scripts",
+        scratch_repo / "scripts",
+        symlinks=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        dirs_exist_ok=True,
+    )
     shutil.copy2(REPO_ROOT / "install.sh", scratch_repo / "install.sh")
     shutil.copy2(REPO_ROOT / "start_thoughtmachine.sh", scratch_repo / "start_thoughtmachine.sh")
     shutil.copy2(REPO_ROOT / "requirements.txt", scratch_repo / "requirements.txt")
+    _assert_launcher_scripts_mirrored(scratch_repo)
 
 
 def _snapshot_tree(root: Path):
