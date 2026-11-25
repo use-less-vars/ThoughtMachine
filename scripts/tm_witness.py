@@ -18,6 +18,15 @@ Non-negotiable properties
 * Signal provenance: SIGTERM/SIGINT/SIGHUP are blocked in the main thread
   *before* the sigwaitinfo worker thread is created (so the worker inherits the
   block).  The signal record is on disk before the signal is forwarded.
+* Refusal, not a half-witness: the capabilities this supervisor needs are
+  probed, not inferred from a platform name -- `signal.sigwaitinfo` (without it
+  there is no sender provenance) and a readable
+  `/proc/sys/kernel/random/boot_id` (without it boot identity is unavailable).
+  When either is missing the witness REFUSES before the fork and before the
+  ledger is opened: stderr names the missing capability, nothing is spawned and
+  no ledger is created, and the exit code is 78 (EX_CONFIG).  A witness that
+  cannot attribute a death would file its own kills as unattributable signals,
+  which is worse than no witness at all.
 * fork() happens while the process is still SINGLE-THREADED (the waiter thread
   is started afterwards, with the child pid already published): forking from a
   multi-threaded process raises a DeprecationWarning on 3.12 and can deadlock
@@ -118,6 +127,36 @@ def read_boot_id():
             return fh.read().strip() or None
     except OSError:
         return None
+
+
+#: Exit code for "this host cannot be supervised at all".  78 is EX_CONFIG from
+#: sysexits.h: the machine is misconfigured for this program, the command is
+#: not.  The other non-zero codes in this module are runtime outcomes (127 fork
+#: failure, the child's own status, 128+signo for a signalled death), so this is
+#: deliberately outside them.
+EX_UNSUPPORTED = 78
+
+
+def unsupported_reason():
+    """Why this host cannot be supervised, or None when it can.
+
+    Probed by capability, never by a ``sys.platform`` string: what matters is
+    that the kernel can report WHO sent a signal (``signal.sigwaitinfo``) and
+    that boot identity is readable.  WSL, containers and the BSD/kqueue world
+    all sit between the extremes a platform name implies, and a wrong guess here
+    is a witness that silently records nothing worth reading.
+    """
+    if not hasattr(signal, "sigwaitinfo"):
+        return (
+            "signal.sigwaitinfo is missing, so the kernel cannot report the "
+            "sender of a signal"
+        )
+    if read_boot_id() is None:
+        return (
+            "/proc/sys/kernel/random/boot_id is unreadable, so boot identity "
+            "is unavailable"
+        )
+    return None
 
 
 def read_uptime_s():
@@ -707,15 +746,48 @@ def classify_shutdown(status, forwarded, exited_at, grace_s=None):
     return ("unknown", True)
 
 
+def _fatal_waiter_failure(detail):
+    """A stopped waiter is fatal, never a silent ``return``.
+
+    SIGTERM/SIGINT/SIGHUP are blocked in every thread here and the waiter is the
+    only consumer of that mask: a waiter that stops leaves the block installed
+    with nobody to read it, so this process can neither forward a signal to the
+    child nor be stopped by one, while the ledger goes on looking healthy.  A
+    thread cannot return an exit status, so this exits the way the pre-fork
+    refusal does -- loud, on stderr, with EX_CONFIG.  PDEATHSIG then takes the
+    child down with us instead of leaving an unsupervised backend behind.
+    """
+    sys.stderr.write(
+        "tm_witness: fatal: the sigwaitinfo waiter stopped (%s).  A signal "
+        "could only be parked, never attributed and never forwarded, so this "
+        "witness refuses to keep supervising; exit %d (EX_CONFIG).\n"
+        % (detail, EX_UNSUPPORTED)
+    )
+    sys.stderr.flush()
+    os._exit(EX_UNSUPPORTED)
+
+
 def _signal_waiter(ledger, run_id, mask, state):
-    """Blocking sigwaitinfo loop.  Record first, forward second."""
+    """Blocking sigwaitinfo loop.  Record first, forward second.
+
+    Every escape is fatal (see :func:`_fatal_waiter_failure`) -- including the
+    capability itself being absent, which the pre-fork refusal is supposed to
+    have caught already.
+    """
+    try:
+        _signal_waiter_loop(ledger, run_id, mask, state)
+    except BaseException as exc:  # noqa: BLE001 -- deliberate, see above
+        _fatal_waiter_failure(repr(exc))
+
+
+def _signal_waiter_loop(ledger, run_id, mask, state):
     while True:
         try:
             info = signal.sigwaitinfo(mask)
         except InterruptedError:
             continue
-        except (OSError, ValueError):
-            return
+        except (OSError, ValueError) as exc:
+            _fatal_waiter_failure(repr(exc))
         # struct_siginfo IS a tuple subclass (fields: si_signo, si_code, si_errno,
         # si_pid, si_uid, ...), so attributes must be preferred over indexing.
         si_signo = getattr(info, "si_signo", None)
@@ -811,6 +883,21 @@ def main(argv=None):
     if not command:
         parser.error("no command given; usage: tm_witness.py --ledger PATH -- <command> [args...]")
 
+    # Refuse BEFORE the fork and BEFORE the ledger exists: a host that cannot
+    # attribute a signal must leave no half-written run behind for the next boot
+    # to read as evidence.
+    unsupported = unsupported_reason()
+    if unsupported is not None:
+        sys.stderr.write(
+            "tm_witness: refusing to supervise: %s.  Sender provenance is "
+            "impossible without it, so a death this witness caused could not be "
+            "told apart from one it merely observed.  Nothing was forked and no "
+            "ledger was opened.  Exit %d (EX_CONFIG).\n"
+            % (unsupported, EX_UNSUPPORTED)
+        )
+        sys.stderr.flush()
+        return EX_UNSUPPORTED
+
     ledger = Ledger(args.ledger, args.rotate_bytes, args.keep_archives)
     run_id = new_run_id()
     boot_id = read_boot_id()
@@ -880,7 +967,18 @@ def main(argv=None):
         target=_signal_waiter, args=(ledger, run_id, mask, state),
         name="tm-witness-sigwait", daemon=True,
     )
-    waiter.start()
+    # Belt and braces: the pre-fork refusal already covers a host without the
+    # capability, so this only fires if it vanished mid-run.  Neither starting a
+    # waiter that cannot attribute a sender nor carrying on without one is
+    # acceptable.
+    if not hasattr(signal, "sigwaitinfo"):
+        _fatal_waiter_failure(
+            "signal.sigwaitinfo disappeared after the pre-fork capability check"
+        )
+    try:
+        waiter.start()
+    except BaseException as exc:  # noqa: BLE001 -- a waiter that will not start is fatal
+        _fatal_waiter_failure(repr(exc))
     for signo in pending:
         _record_forward(state, child_pid, signo)
 

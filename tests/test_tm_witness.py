@@ -30,6 +30,21 @@ import tm_witness  # noqa: E402  (needs scripts/ on sys.path)
 
 pytestmark = pytest.mark.timeout(60)
 
+#: Why THIS host cannot supervise, or None when it can -- the module's own probe,
+#: the same one the witness refuses on, so the skip verdict and the runtime
+#: verdict can never disagree.  Probed by capability, not by a platform name.
+UNSUPPORTED = tm_witness.unsupported_reason()
+
+#: Every test that drives the real witness needs the real capability: without
+#: signal.sigwaitinfo there is no sender provenance to assert on, and without a
+#: readable /proc/sys/kernel/random/boot_id there is no boot identity to compare.
+#: The refusal test below must run everywhere (a green skip would prove nothing),
+#: so it is the one test that does not carry this mark.
+LINUX_ONLY = pytest.mark.skipif(
+    UNSUPPORTED is not None,
+    reason="tm_witness needs signal.sigwaitinfo and /proc (Linux); %s" % (UNSUPPORTED,),
+)
+
 CHILD_SOURCE = '''
 import pathlib
 import signal
@@ -124,6 +139,7 @@ def _term_scenario(tmp_path):
     return proc, ledger, marker, _records(ledger)
 
 
+@LINUX_ONLY
 def test_signal_record_captures_sender_provenance(tmp_path):
     proc, ledger, marker, records = _term_scenario(tmp_path)
     signals = _events(records, "signal")
@@ -138,6 +154,7 @@ def test_signal_record_captures_sender_provenance(tmp_path):
     assert isinstance(record["ts"], str) and record["ts"].endswith("+00:00")
 
 
+@LINUX_ONLY
 def test_child_received_forwarded_signal_and_exited_gracefully(tmp_path):
     proc, ledger, marker, records = _term_scenario(tmp_path)
     assert marker.exists(), "child never ran its SIGTERM handler (signal was not delivered)"
@@ -148,6 +165,7 @@ def test_child_received_forwarded_signal_and_exited_gracefully(tmp_path):
     assert proc.returncode == 0
 
 
+@LINUX_ONLY
 def test_exit_record_has_correct_returncode(tmp_path):
     proc, ledger, marker, records = _term_scenario(tmp_path)
     exits = _events(records, "exit")
@@ -163,6 +181,7 @@ def test_exit_record_has_correct_returncode(tmp_path):
     assert "backend_startup_log" in snapshots[0]
 
 
+@LINUX_ONLY
 def test_sigkilled_child_yields_hard_kill_verdict(tmp_path):
     ledger = tmp_path / "killed.jsonl"
     proc, _ledger, _marker = _start(tmp_path, ledger=ledger)
@@ -197,6 +216,7 @@ def test_sigkilled_child_yields_hard_kill_verdict(tmp_path):
     assert verdicts[-1]["prior_run_id"] == birth[0]["run_id"]
 
 
+@LINUX_ONLY
 def test_boot_id_comparison_classifies_reboot_without_rebooting(tmp_path):
     current_boot_id = tm_witness.read_boot_id()
     assert current_boot_id, "/proc/sys/kernel/random/boot_id unreadable"
@@ -227,6 +247,7 @@ def test_boot_id_comparison_classifies_reboot_without_rebooting(tmp_path):
     assert tm_witness.evaluate_previous_run(tm_witness.load_records(ledger), current_boot_id, "new-run") is None
 
 
+@LINUX_ONLY
 def test_ledger_is_append_only_across_runs(tmp_path):
     quick = _write_script(tmp_path, "quick.py", QUICK_SOURCE)
     ledger = tmp_path / "append.jsonl"
@@ -271,6 +292,7 @@ def _pid_gone(pid):
     return False
 
 
+@LINUX_ONLY
 def test_child_dies_with_the_witness_even_on_sigkill(tmp_path):
     """If kill_thoughtmachine.sh SIGKILLs the witness, the backend must not be
     left behind holding the port.  Remove the prctl() call and this fails."""
@@ -309,6 +331,7 @@ def test_child_dies_with_the_witness_even_on_sigkill(tmp_path):
 # --------------------------------------------------------------------------- #
 # TASK B: size rotation must not lose or reorder a single record
 # --------------------------------------------------------------------------- #
+@LINUX_ONLY
 def test_rotation_by_size_keeps_every_record_and_prunes_archives(tmp_path):
     path = tmp_path / "ledger.jsonl"
     ledger = tm_witness.Ledger(str(path))
@@ -387,6 +410,7 @@ def test_rotation_by_size_keeps_every_record_and_prunes_archives(tmp_path):
 SLEEP_SOURCE = "import time\ntime.sleep(120)\n"
 
 
+@LINUX_ONLY
 def test_fork_happens_before_the_waiter_thread_starts(tmp_path):
     # --- (a) a normal run must not fork from a multi-threaded process -------
     ledger = tmp_path / "single_threaded.jsonl"
@@ -508,6 +532,7 @@ def _send_and_wait(tmp_path, ledger_name, target, signo, to_child=False):
     return proc, records, exits[-1]
 
 
+@LINUX_ONLY
 def test_forwarded_sigterm_is_an_orderly_shutdown(tmp_path):
     """A SIGTERM WE forwarded, answered by a clean exit: orderly, not dirty."""
     proc, ledger, marker, records = _term_scenario(tmp_path)
@@ -519,6 +544,7 @@ def test_forwarded_sigterm_is_an_orderly_shutdown(tmp_path):
     assert exit_record["dirty_shutdown"] is False
 
 
+@LINUX_ONLY
 def test_forwarded_sighup_is_unhandled_signal(tmp_path):
     """uvicorn's HANDLED_SIGNALS is (SIGINT, SIGTERM): it installs NO SIGHUP
     handler, so a HUP we forward kills the backend.  That is not orderly."""
@@ -533,6 +559,7 @@ def test_forwarded_sighup_is_unhandled_signal(tmp_path):
     assert proc.returncode == 128 + int(signal.SIGHUP)
 
 
+@LINUX_ONLY
 def test_sigterm_we_never_forwarded_is_unattributed(tmp_path):
     """Somebody killed the child behind our back: that must not be reported as
     the orderly stop we perform, and it must be dirty."""
@@ -548,6 +575,7 @@ def test_sigterm_we_never_forwarded_is_unattributed(tmp_path):
     assert exit_record["dirty_shutdown"] is True
 
 
+@LINUX_ONLY
 def test_direct_sigkill_is_reported_as_killed(tmp_path):
     """SIGKILL can never be forwarded, so it is always somebody else's doing."""
     sleepy = _write_script(tmp_path, "sleepy.py", SLEEP_SOURCE)
@@ -560,6 +588,7 @@ def test_direct_sigkill_is_reported_as_killed(tmp_path):
     assert proc.returncode == 128 + int(signal.SIGKILL)
 
 
+@LINUX_ONLY
 def test_nonzero_exit_is_a_crash_not_a_clean_exit(tmp_path):
     """The child chose to fail: exit code 3 is a crash, and dirty."""
     crash = _write_script(tmp_path, "crash.py", "raise SystemExit(3)\n")
@@ -610,6 +639,7 @@ def _start_under_bash(tmp_path, survivor):
     return proc, ledger
 
 
+@LINUX_ONLY
 def test_live_child_is_reported_in_the_death_snapshot(tmp_path):
     """A process still running when the backend dies is a real leftover."""
     proc, ledger = _start_under_bash(tmp_path, "/bin/sleep 60")
@@ -639,6 +669,7 @@ def test_live_child_is_reported_in_the_death_snapshot(tmp_path):
                 pass
 
 
+@LINUX_ONLY
 def test_exited_child_is_not_reported_as_a_leftover(tmp_path):
     """A child that already exited is a zombie, not a leftover: reporting the
     pids of processes we merely have not reaped yet is exactly the old bug."""
@@ -658,6 +689,7 @@ def test_exited_child_is_not_reported_as_a_leftover(tmp_path):
     )
 
 
+@LINUX_ONLY
 def test_read_git_head_matches_git_rev_parse():
     """read_git_head() parses git's own files instead of spawning git, so it
     must still agree with the answer git itself gives for this checkout."""
@@ -676,3 +708,78 @@ def test_read_git_head_matches_git_rev_parse():
     if git.returncode != 0:
         pytest.skip("git cannot resolve HEAD here: %s" % git.stderr.strip()[:200])
     assert tm_witness.read_git_head() == git.stdout.strip()
+
+
+def test_unsupported_host_is_refused_before_anything_is_forked(tmp_path, capsys):
+    """A host that cannot attribute a signal must be REFUSED, not half-started.
+
+    Runs on every platform and is deliberately NOT marked LINUX_ONLY: the
+    interesting case is precisely the host that cannot supervise, and a skipped
+    test would make that case unobservable.  Both capabilities are simulated in
+    turn -- deleting ``signal.sigwaitinfo`` is the real absence, and stubbing the
+    boot-id read covers the other probe without needing a fake /proc.
+    """
+    marker = tmp_path / "child-ran"
+    command = [sys.executable, "-c", "open(%r, 'w').write('ran')" % str(marker)]
+
+    cases = [
+        (
+            "sigwaitinfo",
+            tmp_path / "no-sigwaitinfo.jsonl",
+            # raising=False: on a host where the capability is ALREADY absent this
+            # test must still run (that is the host it exists for), so deleting it
+            # must be a no-op rather than an AttributeError.
+            lambda mp: mp.delattr(signal, "sigwaitinfo", raising=False),
+        ),
+        (
+            "boot_id",
+            tmp_path / "no-boot-id.jsonl",
+            lambda mp: mp.setattr(tm_witness, "read_boot_id", lambda: None),
+        ),
+    ]
+
+    for capability, ledger, break_capability in cases:
+        # The capability must stay broken for the whole run, not merely while it is
+        # asserted on: the detector and ``main`` are both read inside this block.
+        # (Collecting the cases first and running them afterwards would silently
+        # restore the capability and turn this into a test of a working host.)
+        with pytest.MonkeyPatch.context() as mp:
+            break_capability(mp)
+            assert tm_witness.unsupported_reason() is not None, (
+                "the detector did not notice that %s is unusable" % (capability,)
+            )
+            rc = tm_witness.main(["--ledger", str(ledger), "--"] + command)
+            err = capsys.readouterr().err
+
+            assert rc == tm_witness.EX_UNSUPPORTED, (
+                "refusal used exit %r, not the documented %r (EX_CONFIG)"
+                % (rc, tm_witness.EX_UNSUPPORTED)
+            )
+            # The refusal must name the capability that is really missing.  On a
+            # host where signal.sigwaitinfo is genuinely absent the boot-id case
+            # can never be reached -- the first probe refuses -- so sigwaitinfo is
+            # then the only honest name, and demanding the exact sentence keeps
+            # that escape hatch from swallowing a real misattribution.
+            named = capability in err or (
+                capability == "boot_id"
+                and "signal.sigwaitinfo is missing" in err
+                and not hasattr(signal, "sigwaitinfo")
+            )
+            assert named, (
+                "stderr does not name the missing capability %r: %r" % (capability, err)
+            )
+            assert "provenance" in err, (
+                "stderr does not say what is impossible: %r" % (err,)
+            )
+
+            # (c) nothing was forked: no ledger at all, therefore no birth record,
+            # and the command never ran.
+            assert not ledger.exists(), (
+                "the ledger was created although the witness refused to supervise: %r"
+                % (ledger,)
+            )
+            births = _events(_records(ledger), "birth") if ledger.exists() else []
+            assert births == [], "a birth record was written: %r" % (births,)
+            assert not marker.exists(), (
+                "the command ran although the witness cannot supervise: %r" % (marker,)
+            )
