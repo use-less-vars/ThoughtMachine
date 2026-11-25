@@ -414,6 +414,9 @@ class TestCpuQuotaReachesCreateSpec:
         monkeypatch.setattr(cm_mod, "record_creation", _record_creation)
         monkeypatch.setattr(cm_mod, "_local_image_present", lambda client, image: True)
         monkeypatch.setattr(cm_mod, "git_shadow_for_workspace", lambda *a, **k: _Shadow())
+        # Never seed the REAL vault from a unit test.
+        monkeypatch.setattr(
+            cm_mod, "ensure_git_shadow_mask", lambda *a, **k: None)
         monkeypatch.setattr(cm_mod, "_reobserve_effective_intent", lambda *a, **k: None)
         monkeypatch.setattr(cm_mod, "log_container_event", lambda *a, **k: None)
         monkeypatch.setattr(cm_mod, "audit_event", lambda *a, **k: None)

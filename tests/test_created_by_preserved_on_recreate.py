@@ -299,7 +299,7 @@ def _fresh_start_labels(monkeypatch, *, created_by, session_id="sess-9"):
     monkeypatch.setattr(
         cm, "git_shadow_for_workspace",
         lambda *a, **k: types.SimpleNamespace(tmpfs={}, mounts=[]))
-    monkeypatch.setattr(cm, "git_shadow_mask_path", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "ensure_git_shadow_mask", lambda *a, **k: None)
     monkeypatch.setattr(
         cm, "admit", lambda request, probes=None: Allow(spec=request.spec))
     monkeypatch.setattr(cm, "_audit", lambda event, data="": None)
