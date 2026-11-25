@@ -195,16 +195,24 @@ def _reset_module_memos():
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_current_is_5():
-    assert SCHEMA_VERSION_CURRENT == 5
+def test_schema_version_current_is_6():
+    assert SCHEMA_VERSION_CURRENT == 6
 
 
-def test_name_is_a_schema_field_and_permissions_is_last():
+def test_name_is_a_schema_field_and_permissions_precedes_the_v6_charter():
     assert "name" in SCHEMA_FIELD_NAMES
     assert "user" in SCHEMA_FIELD_NAMES
     assert "permissions" in SCHEMA_FIELD_NAMES
-    assert SCHEMA_FIELD_NAMES[-2] == "user"
-    assert SCHEMA_FIELD_NAMES[-1] == "permissions"
+    # v6 appends the retention charter, so ``permissions`` is no longer last;
+    # the historic ``user`` -> ``permissions`` order is still pinned.
+    assert SCHEMA_FIELD_NAMES.index("permissions") == (
+        SCHEMA_FIELD_NAMES.index("user") + 1
+    )
+    assert SCHEMA_FIELD_NAMES[-3:] == (
+        "retention_mode",
+        "retention_until",
+        "retention_source",
+    )
 
 
 def test_record_round_trip_name_present(tmp_path):

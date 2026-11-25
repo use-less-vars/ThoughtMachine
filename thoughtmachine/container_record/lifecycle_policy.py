@@ -26,8 +26,10 @@ guard for the hand-maintained axis names above.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from .models import (
@@ -35,6 +37,9 @@ from .models import (
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
     LIFECYCLE_SERVICE,
+    RETENTION_EPHEMERAL_UNTIL_EXIT,
+    RETENTION_PINNED,
+    RETENTION_RETAINED_UNTIL,
 )
 
 # ── Resource-container identity literals ────────────────────────────────────
@@ -126,6 +131,13 @@ class LifecyclePolicy:
         restart_policy: the Docker restart policy applied when a container of
             this class is created (``None`` = unset, i.e. Docker's default
             ``no``).
+        default_retention_mode: the retention charter stamped on a record of
+            this class when the caller supplies none (one of
+            :data:`thoughtmachine.container_record.models.RETENTION_MODES`).
+        default_retention_seconds: the deadline, in seconds, for a class whose
+            default mode is ``retained_until`` (``None`` = no class opinion —
+            :func:`retention_for_class` falls back to
+            :data:`DEFAULT_RETENTION_SECONDS`).
     """
 
     class_name: str
@@ -134,6 +146,8 @@ class LifecyclePolicy:
     workspace_gc_max_age_s: int | None
     drift_axes: frozenset[str]
     restart_policy: str | None = None
+    default_retention_mode: str = RETENTION_PINNED
+    default_retention_seconds: float | None = None
 
 
 #: The policy table, keyed by lifecycle class.
@@ -161,6 +175,8 @@ POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
         workspace_gc_max_age_s=86400,
         drift_axes=_ALL_DRIFT_AXES,
         restart_policy="unless-stopped",
+        default_retention_mode=RETENTION_RETAINED_UNTIL,
+        default_retention_seconds=86400.0,
     ),
     LIFECYCLE_EPHEMERAL: LifecyclePolicy(
         class_name=LIFECYCLE_EPHEMERAL,
@@ -169,6 +185,8 @@ POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
         workspace_gc_max_age_s=86400,
         drift_axes=_IMAGE_AXIS,
         restart_policy="no",
+        default_retention_mode=RETENTION_EPHEMERAL_UNTIL_EXIT,
+        default_retention_seconds=None,
     ),
     LIFECYCLE_RESOURCE: LifecyclePolicy(
         class_name=LIFECYCLE_RESOURCE,
@@ -177,6 +195,8 @@ POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
         workspace_gc_max_age_s=None,
         drift_axes=_IMAGE_AXIS,
         restart_policy="unless-stopped",
+        default_retention_mode=RETENTION_EPHEMERAL_UNTIL_EXIT,
+        default_retention_seconds=None,
     ),
     LIFECYCLE_SERVICE: LifecyclePolicy(
         class_name=LIFECYCLE_SERVICE,
@@ -185,6 +205,11 @@ POLICY_BY_CLASS: dict[str, LifecyclePolicy] = {
         workspace_gc_max_age_s=None,
         drift_axes=_IMAGE_AXIS,
         restart_policy="unless-stopped",
+        default_retention_mode=RETENTION_RETAINED_UNTIL,
+        # SERVICE owns its lifecycle, so the class table carries no workspace
+        # GC window; the charter still needs a deadline, supplied by
+        # ``DEFAULT_RETENTION_SECONDS`` in :func:`retention_for_class`.
+        default_retention_seconds=None,
     ),
 }
 
@@ -205,6 +230,71 @@ def policy_for(lifecycle_class: str) -> LifecyclePolicy:
         raise UnknownLifecycleClass(
             f"unknown lifecycle class: {lifecycle_class!r}"
         ) from exc
+
+
+# ── Retention charter defaults (v6) ────────────────────────────────────────
+
+#: Deadline, in seconds, for a class that asks for the ``retained_until``
+#: charter but carries no opinion of its own (``workspace_gc_max_age_s`` and
+#: ``default_retention_seconds`` both ``None``).  24 h mirrors the existing
+#: ``workspace_gc_max_age_s`` opinion of the workspace-GC'd classes.
+DEFAULT_RETENTION_SECONDS: float = 86400.0
+
+
+def _epoch_seconds(value: Any) -> float | None:
+    """Return *value* as epoch seconds, or ``None`` when it is not a time.
+
+    Accepts an epoch number or an ISO-8601 string (as written by
+    ``models.iso_now``); never raises.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def retention_for_class(
+    lifecycle_class: str, created_at: Any = None
+) -> tuple[str, float | None]:
+    """Return the ``(retention_mode, retention_until)`` charter for a class.
+
+    The class default is the *starting point* of a record's retention charter:
+    a caller may override it explicitly, but a record created without one is
+    never charter-less.
+
+    ``retention_until`` is epoch seconds derived from ``created_at`` (an
+    ISO-8601 string or epoch number; ``None``/unparseable falls back to "now")
+    plus the class deadline, and is ``None`` for every mode that carries no
+    deadline.
+
+    Fail-closed: an unknown lifecycle class raises through
+    :func:`policy_for` rather than defaulting to a permissive charter.
+    """
+    policy = policy_for(lifecycle_class)
+    mode = policy.default_retention_mode
+    if mode != RETENTION_RETAINED_UNTIL:
+        return mode, None
+
+    seconds = policy.default_retention_seconds
+    if seconds is None:
+        seconds = policy.workspace_gc_max_age_s
+    if seconds is None:
+        seconds = DEFAULT_RETENTION_SECONDS
+
+    anchor = _epoch_seconds(created_at)
+    if anchor is None:
+        anchor = time.time()
+    return mode, anchor + float(seconds)
 
 
 # ── Restart-policy plumbing ──────────────────────────────────────────────────

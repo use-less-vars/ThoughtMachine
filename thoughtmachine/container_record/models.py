@@ -48,7 +48,10 @@ SCHEMA_VERSION_LEGACY = 0
 #: v4 adds the ``retention_days`` lifecycle field (absent in v1-v3 records).
 #: v5 adds the ``permissions`` resolved-grant field (absent in v1-v4 records;
 #: ``None`` = the record predates the field, i.e. no recorded grant to diff).
-SCHEMA_VERSION_CURRENT = 5
+#: v6 adds the *retention charter*: ``retention_mode`` / ``retention_until`` /
+#: ``retention_source`` (absent in v1-v5 records; the 5->6 step maps every
+#: such record to :data:`RETENTION_PINNED`).
+SCHEMA_VERSION_CURRENT = 6
 
 LIFECYCLE_EPHEMERAL = "ephemeral"
 LIFECYCLE_PERSISTENT = "persistent"
@@ -74,6 +77,35 @@ STATE_CREATING = "creating"
 #: record advances ``creating`` -> ``running`` in the same ``attach`` call that
 #: binds the docker container (the five fresh-create sites).
 STATE_RUNNING = "running"
+
+# ── Retention charter (v6) ──────────────────────────────────────────────────
+#
+# ``retention_mode`` is the ONLY machine-readable retention authority on a
+# record: every automatic deletion decision (workspace GC, sweeper, operator
+# purge) reads it.  Free-text prose is display-only and is never parsed by
+# policy code -- a human sentence such as "do not remove this" carries no
+# authority whatsoever.
+
+#: Never deleted by any automatic policy; only an explicit operator delete
+#: (or a workspace purge) removes it.
+RETENTION_PINNED = "pinned"
+
+#: Deleted automatically once the wall-clock deadline in ``retention_until``
+#: (epoch seconds, UTC) has passed.
+RETENTION_RETAINED_UNTIL = "retained_until"
+
+#: Deleted when the container exits -- exit is the ONLY trigger; the record
+#: carries no deadline and its execution authority expires with the container.
+RETENTION_EPHEMERAL_UNTIL_EXIT = "ephemeral_until_exit"
+
+#: The closed set of retention modes.  Anything else is rejected fail-closed.
+RETENTION_MODES: frozenset[str] = frozenset(
+    {
+        RETENTION_PINNED,
+        RETENTION_RETAINED_UNTIL,
+        RETENTION_EPHEMERAL_UNTIL_EXIT,
+    }
+)
 
 #: Field order of §1 (also the on-disk JSON key order).
 SCHEMA_FIELD_NAMES: tuple[str, ...] = (
@@ -111,6 +143,17 @@ SCHEMA_FIELD_NAMES: tuple[str, ...] = (
     # grant is available to diff against). Appended last to keep the on-disk
     # key order of v1-v5 records stable.
     "permissions",
+    # ``retention_mode`` is the record's retention charter -- the ONLY
+    # machine-readable retention authority (see ``RETENTION_MODES``).  Appended
+    # last to keep the on-disk key order of v1-v6 records stable.
+    "retention_mode",
+    # ``retention_until`` is the epoch-seconds deadline implied by
+    # ``retention_mode == RETENTION_RETAINED_UNTIL`` (``None`` otherwise).
+    "retention_until",
+    # ``retention_source`` records *why* the mode holds: ``"explicit"``
+    # (caller-supplied), ``"class_default"`` (derived from the lifecycle
+    # class) or ``"migration_default"`` (stamped by the 5->6 step).
+    "retention_source",
 )
 
 #: Nested ``intent_snapshot`` field order (§1.1).
@@ -175,6 +218,20 @@ def validate_owner(value: str) -> str:
     return value
 
 
+def validate_retention_mode(value: str) -> str:
+    """Return *value* if it is a valid retention mode, else raise.
+
+    Fail-closed: an unknown mode (including an empty string) is rejected rather
+    than defaulted, so no caller can silently acquire a retention guarantee.
+    """
+    if value not in RETENTION_MODES:
+        raise ValueError(
+            f"invalid retention_mode {value!r}; expected one of "
+            f"{', '.join(sorted(RETENTION_MODES))}"
+        )
+    return value
+
+
 # ── Record ──────────────────────────────────────────────────────────────────
 
 
@@ -216,6 +273,25 @@ class Record:
     #: The resolved six-category grant captured at create time
     #: (``None`` = the record predates the field, i.e. no recorded grant).
     permissions: dict | None = None
+    #: The retention charter -- the ONLY machine-readable retention authority
+    #: (one of :data:`RETENTION_MODES`).  A record whose charter is
+    #: ``RETENTION_PINNED`` is never removed by an automatic policy, whatever
+    #: its free-text prose field says.
+    retention_mode: str = RETENTION_PINNED
+    #: Epoch-seconds UTC deadline; required by (and only meaningful for)
+    #: ``RETENTION_RETAINED_UNTIL``.
+    retention_until: float | None = None
+    #: Provenance of ``retention_mode``: ``"explicit"`` / ``"class_default"``
+    #: / ``"migration_default"`` ("" = unset).
+    retention_source: str = ""
+
+    def __post_init__(self) -> None:
+        """Validate the retention charter fail-closed (v6)."""
+        mode = validate_retention_mode(self.retention_mode)
+        if mode == RETENTION_RETAINED_UNTIL and self.retention_until is None:
+            raise ValueError(
+                "retention_mode 'retained_until' requires retention_until"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Return the record as a plain dict in §1 field order."""
@@ -238,6 +314,9 @@ class Record:
             "retention_days": self.retention_days,
             "user": self.user,
             "permissions": self.permissions,
+            "retention_mode": self.retention_mode,
+            "retention_until": self.retention_until,
+            "retention_source": self.retention_source,
         }
 
     @classmethod
@@ -285,6 +364,29 @@ class Record:
         else:
             permissions = dict(permissions)
 
+        # ``retention_mode`` is lenient on READ (absent / unknown -> ``pinned``,
+        # the most conservative mode) but fail-closed on explicit construction
+        # (``__post_init__``).  Reading can never widen a retention guarantee.
+        retention_mode = data.get("retention_mode")
+        if retention_mode not in RETENTION_MODES:
+            retention_mode = RETENTION_PINNED
+
+        retention_until = data.get("retention_until")
+        if isinstance(retention_until, bool) or not isinstance(
+            retention_until, (int, float)
+        ):
+            retention_until = None
+        else:
+            retention_until = float(retention_until)
+        if retention_mode != RETENTION_RETAINED_UNTIL:
+            retention_until = None
+        if retention_mode == RETENTION_RETAINED_UNTIL and retention_until is None:
+            # A dangling deadline (absent / non-numeric) would be rejected by
+            # ``__post_init__`` and so poison every read of the workspace;
+            # downgrade to the conservative mode instead of raising -- a read
+            # must never widen retention and must never raise.
+            retention_mode = RETENTION_PINNED
+
         return cls(
             id=str(data.get("id", "")),
             lifecycle_class=str(data.get("lifecycle_class", "")),
@@ -304,4 +406,7 @@ class Record:
             retention_days=retention_days,
             user=str(data.get("user", "") or ""),
             permissions=permissions,
+            retention_mode=retention_mode,
+            retention_until=retention_until,
+            retention_source=str(data.get("retention_source", "") or ""),
         )

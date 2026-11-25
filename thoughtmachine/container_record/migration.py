@@ -31,6 +31,8 @@ from .models import (
     LIFECYCLE_PERSISTENT,
     LIFECYCLE_RESOURCE,
     OWNER_WORKSPACE,
+    RETENTION_MODES,
+    RETENTION_PINNED,
     SCHEMA_VERSION_CURRENT,
     SCHEMA_VERSION_LEGACY,
     Record,
@@ -352,8 +354,120 @@ def migrate_records(
                 "container record migration skipped one container: %s", exc
             )
 
+    # The schema-v6 retention charter is stamped by ``migrate_retention_charter``,
+    # which ``migrate_records`` predates: without this pass the records synthesised
+    # above would keep the legacy schema version and never carry a charter.  One
+    # call per workspace this pass touched; idempotent (an already-current record
+    # is not rewritten) and best-effort -- a charter failure must never abort the
+    # migration or change its counters.
+    for ws in sorted(logs):
+        try:
+            migrate_retention_charter(ws, vault_root=vault_root)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "retention charter migration skipped workspace %s: %s", ws, exc
+            )
+
     return summary
 
+
+
+# ── Retention charter (schema v6) ────────────────────────────────────────────
+
+RETENTION_MIGRATION_SOURCE = "migration_default"
+
+
+def _apply_retention_charter(data: dict) -> bool:
+    """Ensure *data* carries a retention charter; return whether it changed.
+
+    The charter is a **machine field**: it is derived from
+    ``retention_mode`` / ``schema_version`` alone and never from any prose.
+    Only a record that already carries a valid mode *and* the current schema
+    version is left untouched (so a re-run is byte-identical); everything else
+    is given :data:`RETENTION_PINNED` — the conservative, never-collectable
+    default — plus the migration provenance stamp.
+    """
+    mode = data.get("retention_mode")
+    try:
+        version_no = int(data.get("schema_version"))
+    except (TypeError, ValueError):
+        version_no = SCHEMA_VERSION_LEGACY
+
+    if mode in RETENTION_MODES and version_no >= SCHEMA_VERSION_CURRENT:
+        return False
+
+    if mode not in RETENTION_MODES:
+        data["retention_mode"] = RETENTION_PINNED
+        data["retention_until"] = None
+        data["retention_source"] = RETENTION_MIGRATION_SOURCE
+    data["schema_version"] = SCHEMA_VERSION_CURRENT
+    return True
+
+
+def migrate_retention_charter(
+    workspace_id: str,
+    *,
+    vault_root: Any = None,
+) -> dict:
+    """Stamp the retention charter onto every record of *workspace_id*.
+
+    Additive and idempotent: a record that already carries a valid
+    ``retention_mode`` at the current schema version is not rewritten at all
+    (its bytes stay identical).  Records that predate the charter are pinned
+    with :data:`RETENTION_MIGRATION_SOURCE` as provenance — no prose (a note,
+    a purpose, an event payload) is ever inspected to decide a retention.
+
+    Args:
+        workspace_id: the workspace whose records are stamped.
+        vault_root: explicit vault root override (defaults to ``vault_root()``).
+
+    Returns:
+        A summary dict with ``workspace_id``, ``scanned`` / ``upgraded`` /
+        ``skipped`` / ``failed`` counts and ``errors``.
+    """
+    summary: dict[str, Any] = {
+        "workspace_id": workspace_id,
+        "scanned": 0,
+        "upgraded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "errors": [],
+    }
+
+    containers = storage.containers_dir(workspace_id, vault_root)
+    for path in storage.iter_record_files(containers):
+        summary["scanned"] += 1
+        try:
+            data = storage.read_record_file(path)
+            if data is None:
+                summary["skipped"] += 1
+                continue
+            if not _apply_retention_charter(data):
+                summary["skipped"] += 1
+                continue
+            storage.write_record_file(path, data)
+            summary["upgraded"] += 1
+        except Exception as exc:  # per-record best-effort
+            summary["failed"] += 1
+            summary["errors"].append(str(exc))
+            logger.warning("retention charter migration skipped one record: %s", exc)
+
+    try:
+        storage.append_migration_line(
+            storage.migrations_log_path(workspace_id, vault_root),
+            {
+                "event": "retention_charter",
+                "timestamp": iso_now(),
+                "scanned": summary["scanned"],
+                "upgraded": summary["upgraded"],
+                "skipped": summary["skipped"],
+                "failed": summary["failed"],
+            },
+        )
+    except OSError as exc:  # pragma: no cover - defensive
+        logger.warning("could not record retention migration summary: %s", exc)
+
+    return summary
 
 
 def upgrade_record_schema(
@@ -364,11 +478,12 @@ def upgrade_record_schema(
     """Bring every record's ``schema_version`` up to the current schema (§4).
 
     A focused, record-file-only upgrade pass: it walks the workspace's record
-    files and rewrites ``schema_version`` to :data:`SCHEMA_VERSION_CURRENT`.
-    It never stops, restarts, mutates or relabels a container and never adds or
-    removes any other record field — the on-disk key order (and the position of
-    ``schema_version``) is preserved.  The pass is idempotent: a re-run simply
-    rewrites the same value.
+    files, rewrites ``schema_version`` to :data:`SCHEMA_VERSION_CURRENT` and
+    stamps the retention charter (:func:`_apply_retention_charter`) so a
+    current-version record is never charter-less.  It never stops, restarts,
+    mutates or relabels a container and never removes a record field — the
+    on-disk key order (and the position of ``schema_version``) is preserved.
+    The pass is idempotent: a re-run rewrites the same values.
 
     Args:
         workspace_id: the workspace whose records are upgraded.
@@ -397,6 +512,7 @@ def upgrade_record_schema(
                 continue
             # assigning an existing key preserves its on-disk position.
             data["schema_version"] = SCHEMA_VERSION_CURRENT
+            _apply_retention_charter(data)
             storage.write_record_file(path, data)
             summary["upgraded"] += 1
         except Exception as exc:  # per-record best-effort

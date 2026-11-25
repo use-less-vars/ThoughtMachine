@@ -40,6 +40,10 @@ from .models import (
     OWNER_SYSTEM,
     OWNER_VALUES,
     OWNER_WORKSPACE,
+    RETENTION_EPHEMERAL_UNTIL_EXIT,
+    RETENTION_MODES,
+    RETENTION_PINNED,
+    RETENTION_RETAINED_UNTIL,
     SCHEMA_FIELD_NAMES,
     SCHEMA_VERSION_CURRENT,
     SCHEMA_VERSION_LEGACY,
@@ -50,6 +54,7 @@ from .models import (
     RecordCorrupt,
     RecordLocked,
     RecordNotFound,
+    validate_retention_mode,
 )
 from .lifecycle_policy import (
     POLICY_BY_CLASS,
@@ -64,6 +69,7 @@ from .lifecycle_policy import (
     docker_restart_policy,
     normalise_restart_policy,
     policy_for,
+    retention_for_class,
 )
 from .snapshot import (
     HARDENING_KEYS,
@@ -97,6 +103,11 @@ __all__ = [
     "OWNER_SYSTEM",
     "STATE_CREATING",
     "STATE_RUNNING",
+    "RETENTION_PINNED",
+    "RETENTION_RETAINED_UNTIL",
+    "RETENTION_EPHEMERAL_UNTIL_EXIT",
+    "RETENTION_MODES",
+    "validate_retention_mode",
     # snapshot extraction (§1.1 / §4)
     "snapshot_from_attrs",
     "snapshot_has_evidence",
@@ -124,6 +135,7 @@ __all__ = [
     "LifecyclePolicy",
     "POLICY_BY_CLASS",
     "policy_for",
+    "retention_for_class",
     "UnknownLifecycleClass",
     "is_resource_like",
     "docker_restart_policy",
