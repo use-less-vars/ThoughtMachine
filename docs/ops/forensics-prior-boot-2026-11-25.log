@@ -1,0 +1,419 @@
+=== FORENSICS: journald boot 49372fc6 (prior boot, -1) ===
+
+WHAT THIS FILE IS
+  A dated, read-only post-mortem of ONE machine boot, pinned to a tracked file
+  because journald keeps only about three boots: the next reboot destroys the
+  evidence captured here.
+
+WHICH BOOT
+  boot id      : 49372fc6-cf96-4002-8973-e25df6342aa0   (journalctl -b -1)
+  span         : 2026-11-13 14:20:56 .. 2026-11-25 02:52:15  (11 d 12 h 31 min)
+  housekeeping : the machine rebooted at 2026-11-25 02:52:04 CET (01:52:04 UTC;
+                 witness ledger exit, returncode=-1, signaled_by=1,
+                 dirty_shutdown=true). Once three more boots accumulate, boot
+                 49372fc6 falls out of the journal and is gone permanently.
+  captured at  : 2026-11-25T18:12:00Z  (all times in the extracts are the journal
+                 own local zone, CET/CEST: short-iso with +01:00)
+
+HOW TO READ THIS FILE
+  Section 1 is the project script own report (default 6 h window) -- that run
+  IS a real measurement. Section 2 is a second, independent instrument: direct
+  journalctl counts. Sections 3 and 4 are raw journal extracts, filtered.
+
+CAVEAT (the reason section 2 exists):
+  Any count in the script section below that shows 0 or an empty block may be a
+  BUDGET=30 timeout rather than a true zero; the independent counts in the next
+  section are the authority.
+  Journal-count helper in scripts/forensics_after_reboot.sh:
+      out=$(timeout -k 5 30 bash -c "$1") || out=""   then  grep -c
+  A query that exceeds BUDGET=30 s yields an empty string and is reported as 0.
+  A 0 from that helper therefore means UNMEASURED, not none happened.
+  A second, independent fault in that helper was found while pinning this boot:
+  journalctl -g matches the MESSAGE text only, and earlyoom messages never
+  contain the string earlyoom (the word lives in SYSLOG_IDENTIFIER, selectable
+  with -t earlyoom). So the script earlyoom counts are structurally 0. See
+  DISAGREEMENT lines at the end of this file.
+
+SECTION 1a -- the 300 h run: attempted, NOT published as measurements
+  The 300 h run was attempted; its summary counts are BUDGET-limited and are
+  NOT measurements - see the independent counts below.
+  Only its header is kept (the header is fact, not a count):
+
+  === TM WITNESS FORENSICS (read-only) ===
+  generated : 2026-11-25T18:04:00Z
+  repo      : /home/jojo/PycharmProjects/ThoughtMachine-dev
+  ledger    : /home/jojo/PycharmProjects/ThoughtMachine-dev/logs/witness/ledger.jsonl
+  boot_id   : 349fef68-2d8d-4a0b-9d41-115f27a93a50
+  uptime_s  : 58293.82
+  boot -1   : 2026-11-13 14:20:56 .. 2026-11-25 02:52:15 (span 11d 12h)
+  window    : last 300 h of boot -1: 2026-11-12 14:52:15 .. 2026-11-25 02:52:15
+  
+  ----- boots (last 3) -----
+   -2 ebc28b367a204a26b1ddfe6f452aadbe Tue 2026-11-10 19:05:56 CET Fri 2026-11-13 14:20:35 CET
+   -1 49372fc6cf9640028973e25df6342aa0 Fri 2026-11-13 14:20:56 CET Wed 2026-11-25 02:52:15 CET
+    0 349fef682d8d4a0b9d41115f27a93a50 Wed 2026-11-25 02:52:30 CET Wed 2026-11-25 19:00:02 CET
+  
+
+  TRUNCATED: the 300 h run was stopped after its header/summary stage; only
+  its first 14 header lines are reproduced above, by design (CORRECTION 1).
+
+SECTION 1 -- script report, default 6 h window (this one IS a real measurement)
+  command: bash scripts/forensics_after_reboot.sh --full   (rc=0, 124 lines)
+
+  === TM WITNESS FORENSICS (read-only) ===
+  generated : 2026-11-25T18:10:47Z
+  repo      : /home/jojo/PycharmProjects/ThoughtMachine-dev
+  ledger    : /home/jojo/PycharmProjects/ThoughtMachine-dev/logs/witness/ledger.jsonl
+  boot_id   : 349fef68-2d8d-4a0b-9d41-115f27a93a50
+  uptime_s  : 58700.71
+  boot -1   : 2026-11-13 14:20:56 .. 2026-11-25 02:52:15 (span 11d 12h)
+  window    : last 6 h of boot -1: 2026-11-24 20:52:15 .. 2026-11-25 02:52:15
+  WARNING   : boot -1 lasted 11d 12h but only its last 6 h were scanned -- this report is NOT the whole boot
+  
+  ----- boots (last 3) -----
+   -2 ebc28b367a204a26b1ddfe6f452aadbe Tue 2026-11-10 19:05:56 CET Fri 2026-11-13 14:20:35 CET
+   -1 49372fc6cf9640028973e25df6342aa0 Fri 2026-11-13 14:20:56 CET Wed 2026-11-25 02:52:15 CET
+    0 349fef682d8d4a0b9d41115f27a93a50 Wed 2026-11-25 02:52:30 CET Wed 2026-11-25 19:10:03 CET
+
+  ----- summary -----
+  scope     : prior boot (-1), last 6 h only (the boot lasted 11d 12h) -- earlier evidence is NOT in this report
+  prior boot ended orderly?: yes -- Nov 25 02:52:15 jojo-Swift-SFG16-71 systemd[1]: Reached target reboot.target - System Reboot.
+  kernel oom kills in prior boot: 0
+  cgroup memcg kills in prior boot: 0
+  segfaults/traps in prior boot: 0
+  earlyoom kills in prior boot: 0
+  systemd-oomd kills in prior boot: 0
+  witness verdicts (from ledger): 0
+  
+
+SECTION 2 -- INDEPENDENT COUNTS (second instrument; authority per the caveat)
+  1) journalctl -b -1 --since 2026-11-25 01:20:00 --until 2026-11-25 01:22:00 -g earlyoom --no-pager | grep -c .
+     -> 1, and that single line is the literal string "-- No entries --".
+     -> CORRECTED count of real earlyoom entries: 0  (the -g filter finds nothing;
+        earlyoom text never contains the token earlyoom)
+  1b) same window, correct selector: journalctl -b -1 -t earlyoom --since ... --no-pager | grep -c .
+     -> 58 earlyoom entries in those two minutes
+  2) journalctl -b -1 --since 2026-11-25 01:20:00 --until 2026-11-25 01:22:00 -g "sending SIGTERM to process 1071477" --no-pager | wc -l
+     -> 1   (2026-11-25T01:20:33+01:00 earlyoom: sending SIGTERM to process 1071477 uid 1000 "python": badness 819, VmRSS 673 MiB;
+        followed at 01:20:41 by "process exited after 7.9 seconds")
+  3) journalctl -b -1 --since 2026-11-25 02:52:00 --until 2026-11-25 02:53:00 -g "Reached target.*(Power-Off|Reboot)" --no-pager | wc -l
+     -> 1   (orderly reboot: the boot was NOT killed, it was shut down)
+  4) journalctl -b -1 -k --since 2026-11-25 00:00:00 --until 2026-11-25 02:52:15 -g "Out of memory: Killed process|oom-kill:" --no-pager | grep -c .
+     -> 0   (scan COMPLETED, output was the single line "-- No entries --"; this 0 is a true 0:
+        the kernel OOM killer did not fire in the 2 h 52 min before the reboot)
+  5) whole-boot earlyoom counts, selector -t earlyoom (all scans completed):
+     journalctl -b -1 -t earlyoom -o short-iso --no-pager | grep -c .        -> 42973 lines
+     ... | grep -c "sending SIGTERM"                                        -> 9482
+     ... | grep -c "sending SIGKILL"                                        -> 1046
+     ... | cut -c1-10 | sort -u | wc -l   (distinct days earlyoom fired)     -> 13
+     (13 distinct dates for an 11 d 12 h boot = earlyoom fired on every single day:
+      2026-11-13 14, 11-14 2945, 11-15 1066, 11-16 4733, 11-17 3270, 11-18 3702,
+      11-19 8181, 11-20 513, 11-21 876, 11-22 2243, 11-23 9138, 11-24 2876, 11-25 3416)
+     whole-boot count of the exact process named above:
+     ... | grep -c "sending SIGTERM to process 1071477"                     -> 1
+  6) NOT MEASURED (scan did not complete before capture): none -- every count
+     above was obtained. The 300 h script run is deliberately not counted as an
+     instrument (see SECTION 1a).
+
+SECTION 3 -- DEATH WINDOW 2026-11-25 01:00:00..01:35:00 (boot -1, short-iso, filtered)
+  source: /tmp/death.log  total lines 1190  matching filter 642
+  2026-11-25T01:00:05+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:00:05+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1097 of 15673 MiB ( 7.01%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:00:05+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:00:05+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2026036 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:00:15+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:00:15+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1467 of 15673 MiB ( 9.36%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:00:15+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:00:15+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2026036 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:00:25+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:00:25+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1475 of 15673 MiB ( 9.41%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:00:25+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:00:25+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2026036 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: escalating to SIGKILL after 8.4 seconds
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 8.5 seconds
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   659 of 15673 MiB ( 4.21%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2021480 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   899 of 15673 MiB ( 5.74%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027225 uid 1000 "runc:[2:INIT]": badness 1333, VmRSS 12 MiB
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   877 of 15673 MiB ( 5.60%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027293 uid 1000 "runc:[2:INIT]": badness 1333, VmRSS 12 MiB
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   884 of 15673 MiB ( 5.64%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:00:34+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027357 uid 1000 "runc:[2:INIT]": badness 1333, VmRSS 11 MiB
+  2026-11-25T01:00:35+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:00:35+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   879 of 15673 MiB ( 5.61%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:00:35+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:00:35+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027159 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:00:45+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:00:45+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1079 of 15673 MiB ( 6.89%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:00:45+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:00:45+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027159 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:00:55+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:00:55+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1492 of 15673 MiB ( 9.52%), swap free:    2 of 12287 MiB ( 0.02%)
+  2026-11-25T01:00:55+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:00:55+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027159 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:01:05+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:01:05+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1400 of 15673 MiB ( 8.93%), swap free:    2 of 12287 MiB ( 0.02%)
+  2026-11-25T01:01:05+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:01:05+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027159 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:01:15+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:01:15+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1297 of 15673 MiB ( 8.28%), swap free:    2 of 12287 MiB ( 0.02%)
+  2026-11-25T01:01:15+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:01:15+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027159 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:01:25+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:01:27+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1452 of 15673 MiB ( 9.27%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:01:27+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:01:27+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027159 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:01:37+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:01:37+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1498 of 15673 MiB ( 9.56%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:01:37+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:01:37+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027159 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:01:38+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.4 seconds
+  2026-11-25T01:01:38+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1487 of 15673 MiB ( 9.49%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:01:38+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:01:38+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027420 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:01:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:01:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1453 of 15673 MiB ( 9.27%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:01:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:01:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027420 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:01:58+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:01:58+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1452 of 15673 MiB ( 9.27%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:01:58+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:01:58+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2028412 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:02:06+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 7.9 seconds
+  2026-11-25T01:02:06+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1387 of 15673 MiB ( 8.85%), swap free:    3 of 12287 MiB ( 0.03%)
+  2026-11-25T01:02:06+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:02:06+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027420 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:02:16+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:02:16+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1305 of 15673 MiB ( 8.33%), swap free:    3 of 12287 MiB ( 0.03%)
+  2026-11-25T01:02:16+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:02:16+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027420 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:02:26+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:02:26+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1378 of 15673 MiB ( 8.80%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:02:26+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:02:26+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027420 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:02:36+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:02:36+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1149 of 15673 MiB ( 7.33%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:02:36+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:02:36+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027420 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:02:46+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:02:47+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1040 of 15673 MiB ( 6.64%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:02:47+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:02:47+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2027420 uid 1000 "tail": badness 1333, VmRSS 1 MiB
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: escalating to SIGKILL after 7.5 seconds
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 7.6 seconds
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   801 of 15673 MiB ( 5.11%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2029345 uid 1000 "runc:[2:INIT]": badness 1333, VmRSS 11 MiB
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: escalating to SIGKILL after 0.1 seconds
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Inappropriate ioctl for device
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   817 of 15673 MiB ( 5.22%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:02:54+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2029410 uid 0 "runc:[2:INIT]": badness 1333, VmRSS 10 MiB
+  2026-11-25T01:02:55+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  TRUNCATED: showing first 100 and last 100 of 642 matching lines (head -n 100 / tail -n 100); the full extract is /tmp/death.log
+  2026-11-25T01:18:47+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:18:47+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2040379 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:18:47+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   629 of 15673 MiB ( 4.02%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 1774757 uid 1000 "tail": badness 999, VmRSS 0 MiB
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   762 of 15673 MiB ( 4.87%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2040464 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   647 of 15673 MiB ( 4.13%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2040510 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   801 of 15673 MiB ( 5.11%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:18:48+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 1953006 uid 1000 "tail": badness 999, VmRSS 0 MiB
+  2026-11-25T01:18:58+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:18:59+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1554 of 15673 MiB ( 9.92%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:18:59+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:18:59+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:19:09+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:19:10+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1175 of 15673 MiB ( 7.50%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:19:10+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:19:10+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:19:20+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:19:20+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1240 of 15673 MiB ( 7.91%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:19:20+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:19:20+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:19:30+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:19:30+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1168 of 15673 MiB ( 7.45%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:19:30+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:19:30+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:19:40+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:19:40+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1269 of 15673 MiB ( 8.10%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:19:40+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:19:40+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:19:50+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:19:50+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1213 of 15673 MiB ( 7.74%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:19:50+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:19:50+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:20:00+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:20:00+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1024 of 15673 MiB ( 6.53%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:00+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:20:00+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:20:10+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:20:10+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1365 of 15673 MiB ( 8.71%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:10+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:20:10+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:20:20+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:20:20+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1176 of 15673 MiB ( 7.50%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:20+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:20:21+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: kill failed: Timer expired
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1145 of 15673 MiB ( 7.31%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 2040623 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: escalating to SIGKILL after 0.4 seconds
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.5 seconds
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   691 of 15673 MiB ( 4.41%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2040630 uid 1000 "tail": badness 999, VmRSS 0 MiB
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   680 of 15673 MiB ( 4.34%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:20:31+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2041675 uid 1000 "runc:[2:INIT]": badness 1000, VmRSS 12 MiB
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   677 of 15673 MiB ( 4.32%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2041740 uid 0 "runc:[2:INIT]": badness 1000, VmRSS 11 MiB
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   682 of 15673 MiB ( 4.35%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2041616 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   680 of 15673 MiB ( 4.34%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 1953006 uid 1000 "tail": badness 999, VmRSS 0 MiB
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   698 of 15673 MiB ( 4.46%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2041877 uid 1000 "runc:[2:INIT]": badness 1000, VmRSS 11 MiB
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   688 of 15673 MiB ( 4.39%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:20:32+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2041943 uid 0 "runc:[2:INIT]": badness 1000, VmRSS 10 MiB
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   688 of 15673 MiB ( 4.39%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 2041832 uid 1000 "tail": badness 1000, VmRSS 1 MiB
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.1 seconds
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:   690 of 15673 MiB ( 4.40%), swap free:    0 of 12287 MiB ( 0.00%)
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGKILL limits: mem  5.00%, swap  5.00%
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGKILL to process 1771792 uid 1000 "Isolated Web Co": badness 827, VmRSS 1050 MiB
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 0.0 seconds
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: mem avail:  1395 of 15673 MiB ( 8.90%), swap free:    8 of 12287 MiB ( 0.07%)
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: low memory! at or below SIGTERM limits: mem 10.00%, swap 10.00%
+  2026-11-25T01:20:33+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: sending SIGTERM to process 1071477 uid 1000 "python": badness 819, VmRSS 673 MiB
+  2026-11-25T01:20:41+01:00 jojo-Swift-SFG16-71 earlyoom[1154]: process exited after 7.9 seconds
+
+SECTION 4 -- REBOOT WINDOW 2026-11-25 02:40:00..03:00:00 (boot -1, short-iso, filtered)
+  source: /tmp/reboot.log  total lines 1211  matching filter 74
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target bluetooth.target - Bluetooth Support.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target getty-pre.target - Preparation for Logins.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target graphical.target - Graphical Interface.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target multi-user.target - Multi-User System.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target getty.target - Login Prompts.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target sound.target - Sound Card.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target timers.target - Timer Units.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session-wayland@ubuntu.target - GNOME Wayland Session (session: ubuntu).
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target graphical-session.target - Current graphical user session.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session.target - GNOME Session.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session-wayland.target - GNOME Wayland Session.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session-x11-services-ready.target - GNOME session X11 services.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session@ubuntu.target - GNOME Session (session: ubuntu).
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.A11ySettings.target - GNOME accessibility target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Color.target - GNOME color management target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Datetime.target - GNOME date & time target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Housekeeping.target - GNOME maintenance of expirable data target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Keyboard.target - GNOME keyboard configuration target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.MediaKeys.target - GNOME keyboard shortcuts target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Power.target - GNOME power management target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.PrintNotifications.target - GNOME printer notifications target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Rfkill.target - GNOME RFKill support target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.ScreensaverProxy.target - GNOME FreeDesktop screensaver target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Sharing.target - GNOME file sharing target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Smartcard.target - GNOME smartcard target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Sound.target - GNOME sound sample caching target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.Wacom.target - GNOME Wacom tablet support target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.SettingsDaemon.XSettings.target - GNOME XSettings target.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target nss-lookup.target - Host and Network Name Lookups.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[1]: Starting plymouth-reboot.service - Show Plymouth Reboot Screen...
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session-x11-services.target - GNOME session X11 services.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session-initialized.target - GNOME Session is initialized.
+  2026-11-25T02:52:04+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target org.gnome.Shell.target - GNOME Shell.
+  2026-11-25T02:52:05+01:00 jojo-Swift-SFG16-71 systemd[1]: Started plymouth-reboot.service - Show Plymouth Reboot Screen.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session-manager.target - GNOME Session Manager is ready.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session-pre.target - Tasks to be run before GNOME Session starts.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target graphical-session-pre.target - Session services which should run early before the graphical session is brought up.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Reached target gnome-session-shutdown.target - Shutdown running GNOME Session.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target gnome-session-shutdown.target - Shutdown running GNOME Session.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target bluetooth.target - Bluetooth.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target default.target - Main User Target.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target sound.target - Sound Card.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target basic.target - Basic System.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target paths.target - Paths.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target sockets.target - Sockets.
+  2026-11-25T02:52:06+01:00 jojo-Swift-SFG16-71 systemd[2149]: Stopped target timers.target - Timers.
+  2026-11-25T02:52:07+01:00 jojo-Swift-SFG16-71 systemd[2149]: Reached target shutdown.target - Shutdown.
+  2026-11-25T02:52:07+01:00 jojo-Swift-SFG16-71 systemd[2149]: Reached target exit.target - Exit the Session.
+  2026-11-25T02:52:07+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target nss-user-lookup.target - User and Group Name Lookups.
+  2026-11-25T02:52:07+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target remote-fs.target - Remote File Systems.
+  2026-11-25T02:52:09+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target time-set.target - System Time Set.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target network-online.target - Network is Online.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target network.target - Network.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target basic.target - Basic System.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target network-pre.target - Preparation for Network.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target paths.target - Path Units.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target slices.target - Slice Units.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target sockets.target - Socket Units.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target sysinit.target - System Initialization.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target cryptsetup.target - Local Encrypted Volumes.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target integritysetup.target - Local Integrity Protected Volumes.
+  2026-11-25T02:52:14+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target veritysetup.target - Local Verity Protected Volumes.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target local-fs.target - Local File Systems.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target snapd.mounts.target - Mounted snaps.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target snapd.mounts-pre.target - Mounting snaps.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target local-fs-pre.target - Preparation for Local File Systems.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Stopped target swap.target - Swaps.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Reached target umount.target - Unmount All Filesystems.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Reached target shutdown.target - System Shutdown.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Reached target final.target - Late Shutdown Services.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Finished systemd-reboot.service - System Reboot.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd[1]: Reached target reboot.target - System Reboot.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd-shutdown[1]: Syncing filesystems and block devices.
+  2026-11-25T02:52:15+01:00 jojo-Swift-SFG16-71 systemd-shutdown[1]: Sending SIGTERM to remaining processes...
+
+SECTION 5 -- DISAGREEMENTS
+  DISAGREEMENT: script summary says earlyoom kills in prior boot: 0 (and the 300 h
+    run the same). Independent instrument says 9482 sending SIGTERM / 1046 sending
+    SIGKILL / 42973 earlyoom log lines over the boot, and 58 earlyoom entries in a
+    single two-minute window. I believe the independent counts, and the proof is
+    reproducible in one command pair over one window: -g earlyoom returns exactly
+    "-- No entries --" for 01:20:00..01:22:00 while -t earlyoom returns 58 lines
+    for the same window. Cause: journalctl -g matches the MESSAGE field only, and
+    earlyoom message bodies never contain the token earlyoom; the identifier must
+    be selected with -t earlyoom (SYSLOG_IDENTIFIER). The script 0 is therefore a
+    filter artefact, not evidence of an idle OOM daemon.
+  DISAGREEMENT (instrument trap, recorded so nobody repeats it): journalctl prints
+    "-- No entries --" to STDOUT when nothing matches, so `| wc -l` or
+    `| grep -c .` reports 1 for a window with no matches, not 0. Counts 1) and 2)
+    above had to be corrected for this; count 4) was inspected by eye for it.
+  AGREEMENT: kernel OOM kill count is 0 on both instruments (script summary and
+    the direct 00:00..02:52:15 kernel scan). Both agree the reboot was orderly:
+    script reports "Reached target (Power-Off|Reboot)" yes, and the direct
+    02:52:00..02:53:00 query returns exactly 1 such line. So the backend death was
+    NOT a kernel OOM kill and NOT a hard power loss.
+
