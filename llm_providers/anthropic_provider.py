@@ -18,7 +18,10 @@ from .base import LLMProvider, ProviderConfig, LLMResponse
 from agent.config.secret import reveal_secret
 from .tool_converter import ToolFormatConverter
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
-from agent.core.image_store import IMAGE_UNSUPPORTED_PLACEHOLDER
+from agent.core.image_store import (
+    IMAGE_UNAVAILABLE_PLACEHOLDER,
+    IMAGE_UNSUPPORTED_PLACEHOLDER,
+)
 from agent.core.ir import UnsupportedContentError
 from agent.logging import log
 
@@ -159,22 +162,37 @@ class AnthropicProvider(LLMProvider):
             A new list; the caller's transcript is never mutated and the image
             bytes are left untouched in the image store.
         """
-        if not any(isinstance(msg, dict) and msg.get('images') for msg in messages):
+        if not any(
+            isinstance(msg, dict)
+            and (msg.get('images') or msg.get('images_tombstoned'))
+            for msg in messages
+        ):
             return messages
         degraded: List[Dict[str, Any]] = []
         for msg in messages:
-            if not isinstance(msg, dict) or not msg.get('images'):
+            if not isinstance(msg, dict) or not (
+                msg.get('images') or msg.get('images_tombstoned')
+            ):
                 degraded.append(msg)
                 continue
             rewritten = dict(msg)
-            image_ids = rewritten.pop('images') or []
+            image_ids = rewritten.pop('images', None) or []
+            # The save-time audit marker never reaches the wire.
+            rewritten.pop('images_tombstoned', None)
             content = rewritten.get('content')
             text = content if isinstance(content, str) else (
                 '' if content is None else str(content)
             )
-            placeholders = '\n\n'.join(
-                IMAGE_UNSUPPORTED_PLACEHOLDER for _ in image_ids
-            )
+            if image_ids:
+                placeholders = '\n\n'.join(
+                    IMAGE_UNSUPPORTED_PLACEHOLDER for _ in image_ids
+                )
+            else:
+                # Tombstoned at save time (``session/image_retention.py``): the
+                # ids were released from the durable transcript, whose
+                # ``content`` stays exactly what the user typed, so the
+                # placeholder is derived here, at render time.  Exactly one.
+                placeholders = IMAGE_UNAVAILABLE_PLACEHOLDER
             rewritten['content'] = (
                 f'{text}\n\n{placeholders}' if text.strip() else placeholders
             )
