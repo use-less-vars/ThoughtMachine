@@ -761,7 +761,7 @@ if ! $DEV_MODE; then
     echo "============================================"
     echo ""
     export TM_NPM_CMD="$(command -v npm 2>/dev/null || true)"
-    start_backend ".venv/bin/python -m web_ui.backend.server --serve-frontend --port $TM_BACKEND_PORT"
+    start_backend ".venv/bin/python scripts/tm_witness.py --ledger logs/witness/ledger.jsonl -- .venv/bin/python -m web_ui.backend.server --serve-frontend --port $TM_BACKEND_PORT"
     echo ""
     echo "  Backend is running (PID $BACKEND_PID); serving the frontend on http://localhost:$TM_BACKEND_PORT."
     echo "  Stop it with Ctrl-C."
