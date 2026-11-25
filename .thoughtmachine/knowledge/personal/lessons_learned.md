@@ -1337,3 +1337,153 @@ Continuity written under token pressure is written badly or not at all. Append a
 (5) `MANDATORY_STOP.md:9` records §9.3's two named exceptions: **git and container-git are OUTSIDE `host_port`'s coverage.** Do not claim the host chokepoint covers git — that surface is unaudited (the operator's "git hooks surface" class of attack).
 
 (6) `contract-gate.yml` runs a HAND-ENUMERATED 18-file list, no `paths` filter, on every PR to `dev`, but NOT on push to dev. The ledger→gate coupling is one-way (`cited ⊆ run`): it catches a deleted check, never an absent one. A new contract citing no test passes.
+
+## 2026-11-21 — Worker reliability: reliable at refusing, unreliable at facts (recorded, not fixed)
+
+Operator asked whether the worker is malfunctioning. Measured answer: **not broken, but its output must be split before use.** Its refusals and self-checks are trustworthy; its counts, paths and mechanisms are not.
+
+**Reliable (adopt as-is):** refusing to record a mechanism it could not measure rather than writing a plausible one (I9, and it was right to refuse even though I overruled it with CI evidence); refusing to cite `D1`/`D2` because no such entry exists in any DIRECTION record — those labels live only in conversation; flagging "broken reaper" → "broken lookup" as imprecise; flagging that an entry naming a MODULE inherits every defect that module ever had; reporting four stale citations it had been told to leave untouched instead of silently fixing them; validating its own YAML with `yaml.safe_load` and its `run:` blocks with `sh -n`.
+
+**Unreliable (re-derive every time):** every self-reported figure and location. Measured instances this session — `"100s"` for a computed 60s; `"fifteen entries"` for 18 (16 with a live call site, 15 tests passed); `attempts > 0 on Darwin` (wrong function inspected in isolation; real mechanism is `os.getpgid` raising `ESRCH` before any poll); `platform-matrix.yml` for `.github/workflows/platform-matrix-macos.yml`; `worker_runtime_process.py:14-21` described as the `fast_json_repair` import block when those lines are a docstring (the real block is `agent/core/tool_executor.py:14-21`).
+
+**Cost signal:** 300–373 tool calls per single-task turn. That is consistent with locating files by guessing their names rather than reading the tree, and it is the likely origin of the wrong paths.
+
+**Rule.** Split the envelope: `meta.struggles`, `meta.needs_direction` and explicit refusals arrive correct. `content`'s numbers, paths, line references and mechanism claims are drafts. Never publish one, and never brief another worker with one, without re-deriving it from a tool. Corollary learned twice: a worker's claim inside MY brief is still a rumour — verify before handing it on.
+
+**My own instance, same day:** I wrote `# expect 2` for a `grep -c` in a command handed to the operator, without running it. Actual 4, because the phrase also appears in the prose the worker added. Predicting a count I could have measured is the same defect as citing one I could not. Prefer structural checks with known shape (`grep -c '^      - name: Set up Python'`) over prose greps.
+
+## 2026-11-21 (late) — Chokepoint ruling, and the two measurements it corrected
+
+**The F2 note I carried all session was wrong.** I had recorded `security/sandboxed_execution.py` as having "no credential-env stripping". Measured at source (`origin/dev` 12a52a46 era): it has `_STRIPPED_ENV = {HOME: /dev/null, PATH: fixed}`, `_GIT_ENV = {GIT_CONFIG_NOSYSTEM: 1, GIT_CONFIG_GLOBAL: /dev/null}`, applied by default via `strip_env=True`. `thoughtmachine/host_port.py` (`host_run`) instead refuses/strips credential-shaped env *keys* (check 7) and audits their names.
+
+**The real asymmetry, which is sharper:** door A has kill switch, cwd containment, cross-workspace session check, and a credential-key **denylist**. Door B has a hermetic env **allowlist**, shell-metachar reject, category gate, audit. **Neither has the union.** A denylist loses to a name it does not know; an allowlist does not. They are not substitutes, so "which door is ungoverned" is the wrong question.
+
+**Ruling (design brief `docs/design-second-chokepoint.md`, branch `docs/second-chokepoint` @ f501655a):** collapse the *spawn* to one door (`host_run`), and demote door B's policy to parameters applied to that spawn. Not "collapse = call host_run", which would silently delete the hermetic env and be a security regression published as a fix. Not federation, whose only guarantee is the discipline that produced two doors with complementary holes.
+
+**No call cycle** — measured by AST BFS both ways (94 modules each, neither reachable from the other) plus runtime `sys.modules` check. So a single spawn point is achievable; the two-door split was sequencing, not architecture.
+
+**Reusable decision rule:** one spawn point per capability; a second door is permitted only if it needs a different governance *shape*, not merely a different call site.
+
+## Two open contradictions (do not resolve by reading)
+
+1. **Same test file, same platform, two verdicts.** `test_unreadable_proc_state_degrades_toward_alive` was GREEN on macOS run #199 (tree 9de79d42 + 228df0e7) and RED on macOS run #204 (same test file merged into dev 12a52a46), failing `assert attempts > 0` at :984. The fix injects three seams; with a working injection `attempts == 0` is impossible. Either the injection is incomplete or the test is racy on Darwin. Instrumented instead of guessed: branch `test/proc-seam-trace` @ 7a4e9dec1650809a3604a8144591cd89d2c8405f prints `PROC_SEAM_TRACE summary: ... read=yes|no first=...` on **pass and fail**, so the two runs can be compared. My hypothesis (ESRCH from `os.getpgid` on a Darwin zombie) is unconfirmed and must not put a fix in a file.
+2. **The timeout test has three behaviours because "timeout" has three encodings.** Observed across runs: `WorkerRuntimeLost: ... 'timeout' (§4.4)`, then `DID NOT RAISE WorkerQueryTimeout`. Encodings: (a) client `future.result(timeout=)` → `WorkerQueryTimeout`; (b) child `reply_q.get(timeout=)` → `Reply(status="timeout", ok=False)` → `if not reply.ok` → `WorkerRuntimeLost` (a timeout relabelled as a lost runtime); (c) worker-internal timeout → `status="timeout"` with `ok=True` → returns normally, raises nothing. Both timers carry the same number, started milliseconds apart by IPC latency, so the racing one wins.
+
+## Mutation gate (band closed, three stacked PRs)
+
+`test/mutation-gate-harness` @ 9416be6e → `test/contract-3-gate` @ f8831940 → `test/gate-in-ci` @ 1169d07b. It produced its first real result immediately: **Contract 3's "mutation-proven" claim was false** (`MUTATION contract-3-default-mode: SURVIVED`), and one test asserting the literal `"process"` turned it to `KILLED`. The harness refuses rather than passes on an absent/ambiguous anchor, an uncollectable node id, a timed-out run, or a **red baseline** — the last one because KILLED is a delta, not a property: without it a pre-existing failure would be scored as proof a control works.
+
+**Still not a required check.** Requiredness is a property of ruleset `24214086`; no file in the repo can verify it, and `docs/BRANCH_PROTECTION.md` still names only the old job. Correct sentence: "the mutation gate runs in CI", never "contracts are gate-enforced".
+
+## 2026-11-23 — 2026-11-21 — THREE INSTRUMENT LESSONS from the mutation-gate...
+
+2026-11-21 — THREE INSTRUMENT LESSONS from the mutation-gate band (all mine, all self-inflicted).
+
+1. GREEN ON THE WRONG TREE, concretely. I added `scripts/mutation_gate.py` (imports `subprocess`) and verified the tests I had touched (parity, citations, harness, the gate itself) — all green — then shipped. The operator's full-suite run found FIVE failures: `tests/test_host_port_kill_switch.py` x2 and `tests/test_tool_import_declaration_match.py` x2. A new module under a scanned root trips the repo-wide meta-guards. Root cause of the miss: this container CANNOT run the full suite (`exit 137, OOM-killed at 47%` after 275s), so full-suite green is never available to me; verification is always by name, and I named the wrong set. Standing rule: when a NEW FILE lands, run by name — kill-switch drift (`test_host_port_kill_switch.py`), importer pin (`test_tool_import_declaration_match.py`), citation/ledger parity (`test_contracts_ledger_parity.py`, `test_invariants_ledger_parity.py`, `test_verify_doc_citations.py`), and the `docs/*` gitignore negation.
+
+2. A DATA MODULE IS NOT A TEST. Putting `tests/mutation_gate/specs.py` under `tests/` and citing it in `docs/CONTRACTS.md` failed `test_every_cited_test_runs_in_the_contract_gate` (cited subset of run). The checker was right. Fix: registry lives beside its consumer (`scripts/mutation_specs.py`). Do not "fix" this class of failure by adding a data file to a workflow (running pytest on data) or by un-backticking the citation (hiding it).
+
+3. BOUND-METHOD IDENTITY CANNOT PROVE A MONKEYPATCH. I dictated a diagnostic asserting `os.getpgid is no_procfs.getpgid` — ALWAYS False, because attribute access rebuilds a bound method each time. Correct form: `getattr(seam, "__self__", None) is fake` (or `==`). The worker caught it; left unfixed it would have reported "injection absent" on a host where it was installed — a fresh rumour manufactured by the very block meant to stop rumours.
+
+4. `host_run` IS UNREACHABLE FROM ANY CI SCRIPT (measured, `thoughtmachine/host_port.py:557`). It refuses on: unknown grain, empty workspace_id/session_id, `_check_identity` against the session registry, `allow_host_resources is not True` (`:657-666`, fails CLOSED on a missing workspace config), vault-resolved permissions, mcp/client_type pairing. `host_run_async` raises `NotImplementedError` (`:854`). Consequence: every `scripts/` entry in the two spawn allowlists is admitted on the same ground — "human/CI verification path, not a tool path" — and no CI script can ever be migrated to the chokepoint. A mutation gate needs a FRESH interpreter (in-process pytest would read a cached module and prove nothing), so its `subprocess` use is legitimate and exact-path allowlisted in BOTH pinned lists.
+
+5. GIT ARCHAEOLOGY KILLED MY OWN HYPOTHESIS CHEAPLY. `git blame`/`git log <file>` established that `tests/test_execution_kill_target_guard.py` has only two commits (`336cd697` #441, `2d540347` #449) and that `worker_execution.py`'s `_kill_decision`/`_pid_is_alive` block is ALSO `336cd697` — so the "three-seam proc fix" (#456) touched neither, and the green/red macOS pair executed IDENTICAL code with IDENTICAL (deterministic, no pytest-randomly) ordering. Blame before theorising: it costs one call and it deletes whole families of explanation.
+
+## Live problems observed while working (agent-side, container retention task)
+
+**1. Worker fabricates verification when there is no shell.** The workspace container was `stopped` (CheckSystem twice) yet the worker reported "207 passed / 1 skipped", "604 passed", "full test run green", and later "54 passed", "314 passed, 4 skipped" plus a `python -m py_compile ... exit=0`. None of it is measurable by me. Its *file edits* were real (git status confirms). Rule adopted: a worker's code edits are evidence, a worker's test output is not. Ask workers for file:line + quoted text instead of test counts; when they volunteer counts, discount them and never repeat them as fact.
+
+**2. A git-tool-created worktree is invisible to worker file tools.** `worktree_add` (via the containerized git backend) created `.worktrees/retention-charter`, and `git_read` inside it worked, but the worker's file tools reported "there is NO `.worktrees/retention-charter` directory" and its writes silently landed in the MAIN tree. Probable cause: the git backend and the worker file tools mount different filesystem views, so a directory created only through git is not visible to the file-tool sandbox (and vice versa). Workaround used: do branch work in the main tree (`checkout(branch=...)`), no worktrees. Fix idea: have `worktree_add` create the directory through the same FS layer the file tools see, or make file tools fall back to the git backend's view; at minimum return the absolute path the file tools will resolve.
+
+**3. `git_read ls_tree` ignores the `prefix` parameter** and dumps the whole tree (~35k tokens, truncated). Use `treeish="HEAD:<dir>"` instead. Same class of problem for `show_file`: it requires `path=`, not `file_path=` (silently errors "path is required").
+
+**4. Migration entry-point gap found by wiring review (reusable lesson).** A new migration step (`migrate_retention_charter`) can pass its own unit tests and still never run in production: `migrate_records` did not call it and `upgrade_record_schema` had zero production callers. Whenever a migration is added, trace the caller chain from the actual startup path (here `web_ui/backend/server.py:1204`) before declaring it wired.
+
+## 2026-11-24 — A pin with no verifier is a hope, not a guarantee (measured, with a version number)
+
+Agent 2's container holds **`openai 3.40.0`**. `requirements.txt:5` now reads `openai>=1.0.0,<3`. So our own substrate runs a version the declared constraint forbids CI from ever installing. Consequences, both real:
+
+1. **Every Python number a delegated agent reports is from a dependency resolution CI cannot reproduce.** Agent 2's `57 passed` on `tests/providers` was true and worthless: it verified the OLD `request=SimpleNamespace()` fake against an SDK (3.40.0) that tolerates `SimpleNamespace`. Agent 2 demonstrated this directly — on 3.40.0 the pre-repair fake constructs fine (`constructed_ok`, no raise). CI resolves 2.x and raises inside `openai/_exceptions.py:49`. Same tree, same test, opposite result, entirely because of an unmeasured version.
+2. **The constraint itself had nothing checking it.** `<3` is prose in a file. Nothing asserts that the running interpreter satisfies it, so a sandbox can violate it indefinitely and produce plausible greens. **This is the general pattern: a declared constraint with no verifier is indistinguishable from no constraint.** The fix is cheap and general — resolve every pin in `requirements.txt` against `importlib.metadata.version()` in one test, so a substrate that violates its own pins fails loudly at the gate instead of manufacturing confident greens. That single test would have caught the entire baseline red at build time rather than as six mystery failures in site-packages.
+
+Same disease as `continue-on-error: true`, as `git_read log` ignoring `commit=`, and as the `own_lifecycle` reap guard: **a control that reports success without doing its job.**
+
+## 2026-11-24 — When the host has no swap, CI is the only instrument
+
+`free -m` on the operator's machine: `Swap: 12287 / 12287 used`, `available 1323 MB`. Agent 2's bisect over `tests/`: **424 of 444 files returned rc=143 with empty summaries**; only 3 finished clean, all ≤0.75 s. The cgroup did NOT account for the kills (`memory.peak 414 MB < memory.max 512 MB`, `oom_kill 0`, `oom_group_kill 0`), so it is system-wide memory pressure reaching the exec harness, not the container limit.
+
+The dangerous property: **a run that dies with an empty summary looks like a run that has not finished, not like a failure.** Two of Agent 2's wide runs froze mid-progress with no living pytest process. `exit 0` with no summary is a masked kill. Rule that follows: when local execution is degraded, do not spend the operator's machine on full-suite runs — **open the PR and let the required checks be the transcript**, because a check run carries the head sha, runs on the merge ref, and cannot be silently SIGTERM'd. A green on CI is a stronger receipt than a green on a laptop, and when swap is exhausted it is the only receipt.
+
+## Standing instructions from the operator (2026-11-24) — measurement honesty
+Applies to every future session in this workspace. Issued after the image-tombstone delivery; rule 1 was **extended by the operator** to the whole pinned set ("one measured lie is enough").
+
+1. **Quote the version of every pinned dependency the result depends on, in the same breath as the result — not just `openai`.** Measured pinned set (`requirements.txt`, 26 lines): `openai>=1.0.0,<3` (:5), `anthropic>=0.30.0` (:6), `httpx>=0.25.0`, `pytest>=8.0.0`, … Installed in the worker container: `openai 3.40.0`, `anthropic 2.3.0`, `httpx 0.28.1`, `pytest 9.2.0`.
+   - **`requirements.txt` contains exactly ONE ceiling in 26 lines: openai's `<3` — and that is the one constraint the container violates.** Filed by the operator as a substrate defect. Every provider number produced here is **advisory at best**.
+   - The other 25 lines are floors only (`>=`), i.e. "whatever pip resolves today" with no upper bound — so version drift is unconstrained for anthropic/httpx/pytest too. A floor-only pin cannot be *violated*, only *satisfied*, which is why extending the rule to the full set is cheap: the failure mode is silent for all of them and loud for exactly the one that has a ceiling.
+2. **Never present a provider result as evidence about CI.** CI installs from `requirements.txt` (e.g. `.github/workflows/contract-gate.yml:64`), so it resolves a different SDK than this container holds. Green here ≠ green there. Show the mechanism (e.g. a fake that is inert on the installed version), don't assert it.
+3. **Do not run wide `-k` sweeps in this container.** Bisect proved the kills are systemic (424/444 files `rc=143` with empty summaries; every survivor finished in <0.75 s; `oom_kill 0` while host swap was 12287/12287 used). Narrow per-file runs or nothing. The PR's CI lanes are the receipt.
+4. **Never claim the frontend hint renders.** There is no `web_ui/frontend/node_modules`, so Vitest cannot run. JSX/CSS changes are **unexecuted**; say so. The PR's frontend lane (e.g. `web-ui-frontend-suite`) is the operator's to read; if it goes red he supplies the exact assertion, not a paraphrase.
+5. **`show_ref` before declaring a sha unreachable.** Doctrine; skipping it cost a round trip on `3680f567`. A read that echoes its own argument (D1–D4 PR) is welcome but is **not** a precondition — use `show_ref` unconditionally.
+6. **A skip is never a pass; a run with no summary line is NO RESULT; a green measured on the wrong tree is not a pass.**
+
+### Verifier status (honest)
+- Rule 1's only verifier today is a reviewer's eye. **Proposed, not built:** a CI step that prints the pinned-set versions at lane start, so the version is in the log by construction. Same primitive as the D1–D4 argument-echo line — a read/run that states its own inputs.
+- The two operator entries of 2026-11-24 — "A pin with no verifier is a hope, not a guarantee" and "When the host has no swap, CI is the only instrument" — **have no verifier yet**. That is not a joke that resolves itself: the verifier for an unverifiable pin can only be CI, which is what the second entry says is the only instrument. Do not cite either as settled.
+
+### Reusable technique that settled the reconciliation
+To test whether a test *fake* is version-portable, execute the fake directly and print it (`openai.APITimeoutError(request=SimpleNamespace())` → constructs, `str` → `"Request timed out."` on 3.40.0), rather than reasoning about the SDK signature. That single command turned an unprovable assertion into a receipt.
+
+### Evidence classification for the tombstone work (post-advisory rule, operator-accepted)
+- **SDK-free ⇒ non-advisory, 51 tests:** `tests/test_image_retention.py` (11), `tests/core/test_image_gc.py` (36, docstring: "no provider, no network"), `tests/test_image_tombstone_placeholder_parity.py` (4 — imports only `os`, `re`, `agent.core.image_store`; reads `MessageBubble.jsx` **as text**).
+- **Advisory, 57 tests:** all of `tests/providers`, including `tests/providers/test_tombstoned_image_placeholders.py` (imports `anthropic_provider` and `openai_compatible`; clients constructed, never called).
+- **Official phrasing:** the adapters' base behaviours are *pinned statically* by the parity test and *exercised at runtime only inside the advisory directory*. The parity pin is a text-level check — it keeps the JSX literal honest and **cannot stand in for the Vitest lane**; the JSX hint has never been executed.
+
+### Housekeeping
+KB churn (this file) and `.thoughtmachine/pr/` stay **uncommitted** and must never be committed onto a delivery branch. Archive this domain after #477 closes — it was ~56.5k tokens at 2026-11-24 and is past the size where a session reads it whole.
+
+### 2026-11-25 - The fallback class is not the runtime path
+
+I reported "workers are threads" from `worker_thread.py:2071`
+(`class WorkerThread(threading.Thread)`) and published it as runtime behaviour.
+It was false. Measured with host_bash, at last:
+
+    backend    2042672  python -m web_ui.backend.server --serve-frontend --port 8000
+      child    2042673  tee -a logs/backend_startup.log
+      child    2044315  python -c from multiprocessing.resource_tracker import main
+      child    2044316  python -c from multiprocessing.spawn import spawn_main ... --multiprocessing-fork
+                        RSS 255,188 kB, 5 threads, spawned 01:23:47
+      grandchild 2077230  /bin/sh -c ...     <- that worker's own host_bash tool call
+
+`worker_thread.py:3332` - `start()` returns early for any worker whose mode is
+not MODE_THREAD and which is not `is_runtime_child`: "the body lives in the
+child interpreter". `:2071` is the fallback class, 1,261 lines above the branch
+that decides behaviour. It certifies the class hierarchy and nothing about the
+runtime.
+
+Second, independent error in the same report: I called the process substrate
+"unmerged" (branch `fix/gen67-worker-runtime-default-process`) when
+`worker_runtime.py`, `worker_runtime_main.py`, `worker_runtime_process.py` and
+`worker_runtime_protocol.py` are all committed blobs on `origin/dev` at
+`339034e6`. Wrong premise, wrong inference, published as a finding.
+
+Third, why I never measured: `host_bash` was granted (`permission_level:
+"allow"`) and refused every command including `echo hi`, because
+`~/.thoughtmachine/workspaces/fierce-owl-43/config.json` had no top-level
+`root`. I knew that one-key unblock for hours and filed it as a footnote in a
+status block instead of surfacing it as the thing blocking every measurement.
+The dead instrument was the story.
+
+RULES (permanent):
+1. If the empirical test is cheap, take it before the code read. A line of code
+   certifies its line, not its behaviour.
+2. A blocked measurement is a headline, not a footnote. When the instrument is
+   dead, say so first and name the one-line fix.
+3. A declaration is not a verdict: check whether the path you are reading is on
+   the runtime route or merely inherited alongside it.
+
+TRAP worth remembering: `multiprocessing.Process(name=...)` sets a Python
+name, not an OS process title. `pgrep -af worker_runtime_main` and
+`ps | grep worker-runtime-` both returned NOTHING while a worker process was
+live and serving. Those greps are false negatives that look like proof of
+absence. Identify runtime children by `--multiprocessing-fork` / `spawn_main`,
+or by `ppid == backend_pid`.
