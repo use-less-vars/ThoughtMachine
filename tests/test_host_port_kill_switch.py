@@ -161,6 +161,14 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
         "apply",
     ),
     (
+        "scripts/tm_witness.py",
+        "the witness is the launch gate itself: after fork() it arms "
+        "PR_SET_PDEATHSIG, clears the inherited mask and `os.execv`s the "
+        "backend, then must keep a supervised live child (sigwaitinfo + "
+        "waitpid) that has to survive as a running process -- host_run() "
+        "cannot express that because it returns a finished result.",
+    ),
+    (
         "scripts/verify_fix.py",
         "red-before gate documented in scripts/verify_fix.md: `_git()` spawns `git "
         "<args>` with a timeout (line 399) plus `git rev-parse --show-toplevel` "
@@ -256,7 +264,7 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
 #: BOTH directions: one site more is red, and one site fewer is red too -- the
 #: pin may only ever be tightened deliberately, never drift.  Measured by running
 #: this module's own scanner over the real tree on 2026-11-24 (19 files, 70
-#: sites).
+#: sites; scripts/tm_witness.py was added later, on its own line below).
 PINNED_SITE_COUNTS: dict[str, int] = {
     "infra/containers/executor.py": 2,
     "infra/workspace_lifecycle_manager.py": 1,
@@ -266,6 +274,7 @@ PINNED_SITE_COUNTS: dict[str, int] = {
     "scripts/doctor_checks.py": 3,
     "scripts/gen_handoff.py": 2,
     "scripts/mutation_gate.py": 5,
+    "scripts/tm_witness.py": 1,
     "scripts/verify_fix.py": 8,
     "security/sandboxed_execution.py": 3,
     "thoughtmachine/doctor.py": 3,

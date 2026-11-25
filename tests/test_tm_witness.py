@@ -656,3 +656,23 @@ def test_exited_child_is_not_reported_as_a_leftover(tmp_path):
         "an already-exited child was reported as a leftover: %r"
         % (snapshots[0]["live_children"],)
     )
+
+
+def test_read_git_head_matches_git_rev_parse():
+    """read_git_head() parses git's own files instead of spawning git, so it
+    must still agree with the answer git itself gives for this checkout."""
+    if not (REPO_ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    try:
+        git = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # no git installed
+        pytest.skip("git is unavailable: %r" % (exc,))
+    if git.returncode != 0:
+        pytest.skip("git cannot resolve HEAD here: %s" % git.stderr.strip()[:200])
+    assert tm_witness.read_git_head() == git.stdout.strip()

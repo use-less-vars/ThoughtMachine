@@ -76,7 +76,6 @@ import json
 import os
 import shutil
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -129,20 +128,119 @@ def read_uptime_s():
         return None
 
 
-def read_git_head():
+def _slurp(path):
+    """Whole file as text, or None when it cannot be read."""
     try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-        )
-    except (OSError, subprocess.SubprocessError):
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
         return None
-    if proc.returncode != 0:
+
+
+def _is_sha(value):
+    """True for a full 40-hex object name and nothing else.
+
+    Deliberately strict: a 7-character abbreviation, a ref name or a truncated
+    read must never be recorded as the commit this process was born at.
+    """
+    return len(value) == 40 and all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+
+def _resolve_gitdirs(repo_root):
+    """(gitdir, commondir) for `repo_root`, or (None, None) if it is not a checkout.
+
+    `.git` is a DIRECTORY in a normal checkout.  In a worktree it is a FILE
+    whose first line is `gitdir: <path>`, and that path may be relative to the
+    repo root.  A worktree's gitdir then usually names its own `commondir`
+    (relative to the gitdir): the per-worktree gitdir holds HEAD and index,
+    while refs/ and packed-refs live in the COMMON dir.
+    """
+    dot_git = os.path.join(repo_root, ".git")
+    gitdir = None
+    if os.path.isdir(dot_git):
+        gitdir = dot_git
+    elif os.path.isfile(dot_git):
+        text = _slurp(dot_git)
+        if text is None:
+            return None, None
+        lines = text.splitlines()
+        first = lines[0].strip() if lines else ""
+        if not first.startswith("gitdir:"):
+            return None, None
+        target = first[len("gitdir:"):].strip()
+        if not target:
+            return None, None
+        gitdir = target if os.path.isabs(target) else os.path.join(repo_root, target)
+    if gitdir is None:
+        return None, None
+
+    commondir = gitdir
+    common_file = os.path.join(gitdir, "commondir")
+    if os.path.isfile(common_file):
+        text = _slurp(common_file)
+        if text is None:
+            return None, None
+        target = text.strip()
+        if not target:
+            return None, None
+        commondir = target if os.path.isabs(target) else os.path.join(gitdir, target)
+    return gitdir, commondir
+
+
+def _packed_ref(commondir, ref):
+    """The sha `ref` is pinned to in <commondir>/packed-refs, or None.
+
+    Peeled tags (`^<sha>`) and comments start with '^' and '#', and are not
+    ref records, so they are skipped rather than parsed.
+    """
+    text = _slurp(os.path.join(commondir, "packed-refs"))
+    if text is None:
         return None
-    return proc.stdout.strip() or None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped[0] in "#^":
+            continue
+        parts = stripped.split()
+        if len(parts) == 2 and parts[1] == ref and _is_sha(parts[0]):
+            return parts[0]
+    return None
+
+
+def read_git_head():
+    """The commit sha at HEAD, read from git's own files -- no subprocess.
+
+    Read instead of spawned because this module is the launch gate: the only
+    process it may create is the supervised child, and asking git for the sha
+    would mean one more host process outside host_run()'s chokepoint.
+
+    Handles: `.git` a directory (plain checkout) or a file (`gitdir:` worktree
+    pointer, relative or absolute); a worktree gitdir with a `commondir` (refs
+    and packed-refs live there); HEAD as `ref: refs/heads/x` with the loose ref
+    present, or absent and therefore read out of `packed-refs`; HEAD as a bare
+    40-hex sha (detached).  Anything unreadable or unparseable returns None --
+    never a guessed or partial sha.
+    """
+    gitdir, commondir = _resolve_gitdirs(REPO_ROOT)
+    if gitdir is None or commondir is None:
+        return None
+    head = _slurp(os.path.join(gitdir, "HEAD"))
+    if head is None:
+        return None
+    head = head.strip()
+
+    if _is_sha(head):
+        return head
+    if not head.startswith("ref:"):
+        return None
+    ref = head[len("ref:"):].strip()
+    if not ref:
+        return None
+
+    loose = _slurp(os.path.join(commondir, ref))
+    if loose is not None:
+        value = loose.strip()
+        return value if _is_sha(value) else None
+    return _packed_ref(commondir, ref)
 
 
 def new_run_id():
