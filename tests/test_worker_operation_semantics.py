@@ -2095,6 +2095,115 @@ def test_a_correctly_fenced_command_is_still_obeyed(tmp_path):
     assert _rejected(thread) == []
 
 
+def _record_worker_log(monkeypatch):
+    """Capture every line the poller logs through ``tools.worker_thread.log``.
+
+    ``worker_thread`` binds ``log`` at import time (``from agent.logging import
+    log``), so the module attribute is the only place a poller message can be
+    intercepted without touching the real logging stack.
+    """
+    import tools.workspace.worker_thread as worker_thread_module
+
+    records = []
+
+    def _log(level, tag, message, *args, **kwargs):
+        records.append((level, tag, message))
+
+    monkeypatch.setattr(worker_thread_module, "log", _log)
+    return records
+
+
+def _refusal_warnings(records):
+    return [r for r in records if r[0] == "WARNING" and r[1] == "tools.worker"]
+
+
+def test_a_fence_rejection_names_the_supported_way_out(tmp_path, monkeypatch):
+    """D9: the refusal WARNING must carry the recovery path, not just the facts.
+
+    A command addressed to a DIFFERENT incarnation of this worker is quarantined
+    and never obeyed -- correct, and completely invisible to the operator, to
+    whom a worker that ignores a stop looks identical to a broken worker.  The
+    WARNING is the only signal, so it has to say both what happened (which
+    worker, which incarnation, which fence axes disagree) and what to do about
+    it: respawning with ``force=True`` is the supported way out, because it
+    replaces this session's instances and the stale one can no longer be
+    addressed by a command written for it.
+    """
+    thread = _unstarted_thread(tmp_path, "w1", "sess-cmd-recovery-hint")
+    records = _record_worker_log(monkeypatch)
+    mine = thread._fence()
+    foreign = dataclasses.replace(mine, instance_id=mine.instance_id + 1)
+    cmd = _write_raw_command(
+        thread, dict({"action": "kill"}, **foreign.to_payload())
+    )
+
+    thread._poll_command()
+
+    warnings = _refusal_warnings(records)
+    assert len(warnings) == 1, warnings
+    message = warnings[0][2]
+    # The FACTS: who was addressed, which incarnation refused it, and which
+    # axes of the fence disagree -- the two numbers are the diagnosis.
+    assert thread.worker_name in message, message
+    assert "instance_id=%d" % (thread.instance_id,) in message, message
+    assert (
+        "instance_id %r != %r" % (foreign.instance_id, mine.instance_id)
+    ) in message, message
+    # The RECOVERY HINT (D9): the operator's way out, named verbatim.
+    assert "force=True on spawn" in message, message
+    assert "replaces this session's instances" in message, message
+    assert "is the supported way out" in message, message
+    # Enforcement is UNTOUCHED: still claimed, still quarantined, still not
+    # obeyed -- a longer message must not have become a softer fence.
+    _assert_quarantined(thread, cmd, "kill")
+    assert thread._stop_event.is_set() is False
+    assert thread.status == "ready"
+
+
+@pytest.mark.parametrize("payload,reason", [
+    ({"action": "stop"}, "no fence in payload"),
+    (
+        {
+            "action": "stop",
+            "session_id": "sess-cmd-recovery-hint",
+            "worker_name": "w1",
+            "instance_id": "one",
+            "epoch": 1,
+        },
+        "malformed fence in payload",
+    ),
+])
+def test_the_hint_is_appended_to_the_message_not_to_the_evidence(
+    tmp_path, monkeypatch, payload, reason
+):
+    """Every refusal shape gets the hint; the EVIDENCE keeps its own vocabulary.
+
+    The reason string is not just prose: ``quarantine`` slugifies it into the
+    quarantined filename, so lengthening the reason would truncate the
+    post-mortem evidence.  The hint therefore belongs to the message only, and
+    the quarantined file must still be named by the reason alone.
+    """
+    thread = _unstarted_thread(tmp_path, "w1", "sess-cmd-recovery-hint")
+    records = _record_worker_log(monkeypatch)
+    cmd = _write_raw_command(thread, payload)
+
+    thread._poll_command()
+
+    warnings = _refusal_warnings(records)
+    assert len(warnings) == 1, warnings
+    message = warnings[0][2]
+    assert reason in message, message
+    assert "force=True on spawn" in message, message
+    assert "is the supported way out" in message, message
+    quarantined = _rejected(thread)
+    assert len(quarantined) == 1, quarantined
+    assert "force" not in quarantined[0].name, quarantined[0].name
+    assert "supported" not in quarantined[0].name, quarantined[0].name
+    _assert_quarantined(thread, cmd, "stop")
+    assert thread._detach_requested is False
+    assert thread._stop_event.is_set() is False
+
+
 if __name__ == "__main__":
     unittest.main()
 

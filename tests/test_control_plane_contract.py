@@ -416,7 +416,7 @@ class TestTimeoutRestrictionGrantsOnlyWriteEscape:
         summary it is about to write (rationale:
         thoughtmachine/timeout_constants.py). SummarizeTool stays so compaction
         still works. Enforcement and display must agree, because the rejection
-        prose (``Available tools:``) is rendered from ``get_allowed_tools()``.
+        prose (``Allowed:``) is rendered from ``get_allowed_tools()``.
         """
         agent = _make_agent()
         agent.state.restrict("timeout")

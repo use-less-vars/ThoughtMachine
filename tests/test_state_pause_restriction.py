@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent.core.state import WRITE_ESCAPE_TOOLS, AgentState
+from agent.core.state import RESTRICTION_RULES, WRITE_ESCAPE_TOOLS, AgentState
 from thoughtmachine.timeout_constants import TIMEOUT_WRITE_ESCAPE_TOOLS
 
 
@@ -28,6 +28,40 @@ def _assert_unrestricted(state: AgentState) -> None:
     assert state.restrictions_active is False
     assert state.restrictions_pending is False
     assert state.restriction_reason is None
+
+
+#: A fixed probe list of REAL tool names (plus one that must never be granted
+#: and the empty string) for round-tripping the display allow-list through the
+#: gate in both directions. Names, never a hard-coded expectation: widening the
+#: escape set cannot make these tests pass silently.
+_GATE_PROBES = (
+    'Respond', 'SummarizeTool', 'WorkingDocument',
+    'ReadFile', 'ReadFileTool', 'FileSearchTool', 'FilePreviewTool',
+    'FileSummaryTool', 'GlobTool', 'DirectoryTreeTool', 'CheckSystem',
+    'git_read', 'git_write', 'ApplyEdits', 'FileEditor', 'FileMover',
+    'CodeModifier', 'DockerCodeRunner', 'ContainerExecTool',
+    'ContainerStartTool', 'ProgressReport', 'Worker',
+    'NonexistentToolOnPurpose', '',
+)
+
+
+def _state_restricted_on(reason) -> AgentState:
+    """A state whose restriction_reason is ``reason`` -- including the ones
+    ``restrict()`` refuses (unknown, '', None): those are exactly the values
+    both readers must fail safe on, so they are written straight onto the
+    attributes."""
+    state = _state()
+    if isinstance(reason, str) and reason.strip():
+        state.restrict(reason)
+    else:
+        state.restrictions_active = True
+        state.restriction_reason = reason
+    return state
+
+
+def _permitted_by_gate(state: AgentState) -> set:
+    """The probe names ``is_tool_allowed()`` actually permits."""
+    return {name for name in _GATE_PROBES if state.is_tool_allowed(name)}
 
 
 # a) entering restricted mode, and idempotence for the same reason
@@ -88,7 +122,7 @@ def test_clear_restriction_without_reason_on_idle_state_returns_false():
 # ('timeout' is deliberately NOT here: it is the widened axis, pinned below.)
 @pytest.mark.parametrize(
     'reason',
-    ['turn', 'pause', 'something-unknown', None],
+    ['turn', 'pause', 'something-unknown', '', None],
 )
 def test_allowed_tools_respond_only_for_non_token_reasons(reason):
     state = _state()
@@ -138,6 +172,57 @@ def test_allowed_tools_token_reason_allows_summarize():
         assert state.is_tool_allowed(name) is True, name
     for refused in ('ReadFile', 'FileSearchTool', 'git_read', 'DockerCodeRunner'):
         assert state.is_tool_allowed(refused) is False, refused
+
+
+# f3) D4: ONE restriction table -- the display allow-list and the gate are the
+# same decision for EVERY declared reason, not just the two widened ones.
+@pytest.mark.parametrize('reason', sorted(RESTRICTION_RULES))
+def test_display_and_gate_agree_for_every_declared_reason(reason):
+    """get_allowed_tools() == exactly what is_tool_allowed() permits.
+
+    Both directions over a fixed probe list: the display must not advertise a
+    tool the gate refuses, and must not hide one it permits. Parametrized off
+    ``RESTRICTION_RULES`` so a new row is covered the day it is declared.
+    """
+    state = _state_restricted_on(reason)
+    allowed = state.get_allowed_tools()
+    permitted = _permitted_by_gate(state)
+    assert permitted == set(allowed), (
+        f'[{reason}] gate and display disagree: only-in-gate '
+        f'{sorted(permitted - set(allowed))}, only-in-display '
+        f'{sorted(set(allowed) - permitted)}'
+    )
+    # Every advertised name really passes the gate (not just set equality).
+    for name in allowed:
+        assert state.is_tool_allowed(name) is True, (reason, name)
+    # The probe list must be able to SEE the whole allow-list, otherwise the
+    # bidirectional check above is vacuous for the tools it is missing.
+    assert set(allowed) <= set(_GATE_PROBES), (
+        f'[{reason}] allow-list names a tool _GATE_PROBES does not probe: '
+        f'{sorted(set(allowed) - set(_GATE_PROBES))}'
+    )
+    # One name, one line: a duplicate would be advertised twice.
+    assert len(allowed) == len(set(allowed)), allowed
+
+
+@pytest.mark.parametrize(
+    'reason',
+    ['something-unknown', '', None, 42],
+    ids=['unknown-string', 'empty-string', 'none', 'non-string'],
+)
+def test_unattributable_reason_permits_exactly_respond(reason):
+    """A reason no rule declares fails safe to Respond and NOTHING else.
+
+    'Some misspelled or future reason' must never inherit the token allow-list
+    -- that would silently re-enable tool access.
+    """
+    state = _state_restricted_on(reason)
+    assert state.get_allowed_tools() == ['Respond'], state.get_allowed_tools()
+    assert _permitted_by_gate(state) == {'Respond'}
+    assert state.is_tool_allowed('SummarizeTool') is False
+    assert state.is_tool_allowed('WorkingDocument') is False
+    assert state.is_tool_allowed('ReadFile') is False
+    assert state.is_tool_allowed('ContainerExecTool') is False
 
 
 def test_allowed_tools_empty_only_when_unrestricted():
