@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent.core.state import AgentState
+from agent.core.state import WRITE_ESCAPE_TOOLS, AgentState
 from thoughtmachine.timeout_constants import TIMEOUT_WRITE_ESCAPE_TOOLS
 
 
@@ -122,9 +122,22 @@ def test_allowed_tools_timeout_reason_allows_respond_summarize_and_write_escape(
 
 
 def test_allowed_tools_token_reason_allows_summarize():
+    """'token' allows Respond, SummarizeTool and the WRITE escape hatch.
+
+    Same escape set as 'timeout': the ceiling protects the context window, not
+    the ability to land an already-prepared write. Reads/searches stay out.
+    """
     state = _state()
     state.restrict('token')
-    assert state.get_allowed_tools() == ['Respond', 'SummarizeTool']
+    # Derived from the token axis' own escape set (not a hard-coded list, not the
+    # timeout constant) so a future widening cannot pass here silently: reads and
+    # searches stay refused, writes are allowed, exactly as on 'timeout'.
+    expected = ['Respond', 'SummarizeTool'] + list(WRITE_ESCAPE_TOOLS)
+    assert state.get_allowed_tools() == expected
+    for name in expected:
+        assert state.is_tool_allowed(name) is True, name
+    for refused in ('ReadFile', 'FileSearchTool', 'git_read', 'DockerCodeRunner'):
+        assert state.is_tool_allowed(refused) is False, refused
 
 
 def test_allowed_tools_empty_only_when_unrestricted():

@@ -833,6 +833,34 @@ class WorkerSessionLifecycle:
 
 logger = logging.getLogger("tools.workspace.worker")
 
+
+def _join_would_raise(thread: Any, *, worker_label: Any, context: str) -> bool:
+    """Whether ``thread.join()`` would raise ``RuntimeError`` on *thread*.
+
+    In the default ``process`` runtime mode the worker body lives in a child
+    process and ``start()`` deliberately returns early, so the supervisor
+    ``Thread`` is never started and carries ``ident is None``.  CPython then
+    raises ``RuntimeError("cannot join thread before it is started")`` -- which
+    must never escape a teardown or timeout path: there the caller owes the
+    agent a degraded envelope, not a traceback.
+
+    A skip proves NOTHING about liveness -- it only avoids the raise -- so the
+    caller must still decide liveness with ``is_alive()`` (or, for a
+    process-mode worker, the runtime probe).  The skip is always logged (DEBUG,
+    naming the worker and *context*) so a skipped wait can never be mistaken
+    for a completed one.
+    """
+    if getattr(thread, "ident", None) is not None:
+        return False
+    logger.debug(
+        "%s: worker '%s' was never started in this process (no thread ident); "
+        "skipping join -- a skip proves nothing about liveness, is_alive() decides",
+        context,
+        worker_label,
+    )
+    return True
+
+
 # Hard blocklist: tools that workers must NEVER use, regardless of permissions.
 # NOTE: container tools (DockerCodeRunner, ContainerStartTool, ContainerExecTool,
 # etc.) ARE allowed for workers — they are permission-gated like any other tool,
@@ -8547,9 +8575,17 @@ class Worker(ToolBase):
         if not isinstance(_timeout_seconds, (int, float)):
             _timeout_seconds = WORKER_TIMEOUT_SECONDS
         _join_budget = max(30, int(_timeout_seconds or WORKER_TIMEOUT_SECONDS))
+        # Process runtime mode: the body is in the child process and the
+        # supervisor Thread was never started, so there is nothing to join and
+        # Thread.join() would raise.  Skipping the wait is NOT a liveness verdict
+        # -- the is_alive() probes below still decide -- and the return contract
+        # (True = gone, False = still alive) is unchanged.
+        _can_join = not _join_would_raise(
+            thread, worker_label=self.worker_name, context="query-timeout-wait"
+        )
         _join_elapsed = 0.0
         _join_step = 2.0
-        while _join_elapsed < _join_budget:
+        while _can_join and _join_elapsed < _join_budget:
             thread.join(timeout=_join_step)
             _join_elapsed += _join_step
             if not thread.is_alive():
@@ -9510,8 +9546,15 @@ class Worker(ToolBase):
                 # termination path): the worker may be blocked inside a slow
                 # LLM call.
                 _budget = max(30, t._timeout_seconds)
+                # Never join a Thread that was never started (process runtime
+                # mode never starts it): join() would raise and turn a reset into
+                # an error result.  A skip says nothing about liveness -- the
+                # is_alive() probe below still decides.
+                _can_join = not _join_would_raise(
+                    t, worker_label=self.worker_name, context="reset"
+                )
                 _elapsed = 0.0
-                while _elapsed < _budget:
+                while _can_join and _elapsed < _budget:
                     t.join(timeout=2.0)
                     _elapsed += 2.0
                     if not t.is_alive():

@@ -49,6 +49,7 @@ from agent.config.models import AgentConfig
 from agent.controller import AgentController
 from agent.core.agent import Agent
 from agent.core.state import (
+    WRITE_ESCAPE_TOOLS,
     AgentState,
     ExecutionState,
     SessionState,
@@ -364,7 +365,13 @@ class TestImplicitUnpauseOnNewQuery:
         assert thread.send_query("hello") == "ok"
 
         assert agent.state.restriction_reason == "token"
-        assert agent.state.get_allowed_tools() == ["Respond", "SummarizeTool"]
+        # Derived from the single source of truth rather than hard-coded, so a
+        # future widening of the escape set cannot pass here silently. The token
+        # axis refuses reads/searches (they grow the context) but allows the
+        # write-only escape hatch, mirroring 'timeout'.
+        assert agent.state.get_allowed_tools() == [
+            "Respond", "SummarizeTool", *WRITE_ESCAPE_TOOLS
+        ]
 
     def test_send_query_unpauses_a_pause_restricted_worker(self, tmp_path, monkeypatch):  # PIN
         """A new query returns a paused worker to RUNNING.

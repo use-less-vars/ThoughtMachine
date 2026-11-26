@@ -127,12 +127,86 @@ class TestGetAllowedTools:
         assert state.is_tool_allowed('ApplyEdits') is False
         assert state.is_tool_allowed('ContainerExecTool') is False
 
-    def test_get_allowed_tools_token_critical_returns_respond_and_summarize(self, state: AgentState):
-        """When restriction_reason is 'token', both Respond and SummarizeTool should be allowed."""
+    def test_get_allowed_tools_token_critical_mirrors_the_write_escape(self, state: AgentState):
+        """On 'token': Respond + SummarizeTool + the SAME write escape hatch as 'timeout'.
+
+        The ceiling protects the CONTEXT WINDOW, not the ability to finish
+        already-prepared work: a worker holding a finished patch was refused
+        ``ApplyEdits`` (``Reason: token. Available tools: Respond,
+        SummarizeTool``) and could only paste the patch into chat. A write is
+        bounded input, so it must still reach disk; reads and searches stay
+        refused because they are what grows the context.
+        """
         state.restrictions_active = True
         state.restriction_reason = 'token'
         allowed = state.get_allowed_tools()
-        assert allowed == ['Respond', 'SummarizeTool'], f"Expected ['Respond', 'SummarizeTool'], got {allowed}"
+        expected = {'Respond', 'SummarizeTool'} | set(TIMEOUT_WRITE_ESCAPE_TOOLS)
+        assert set(allowed) == expected, f"Expected {sorted(expected)}, got {allowed}"
+        assert len(allowed) == len(set(allowed)), f'Duplicates in {allowed}'
+        # Identical to the timeout allow-list: one escape set, not two.
+        state.restriction_reason = 'timeout'
+        assert set(state.get_allowed_tools()) == set(allowed), (
+            "'token' and 'timeout' must share ONE write escape set"
+        )
+
+    def test_get_allowed_tools_token_critical_allows_write_escape_refuses_read(self, state: AgentState):
+        """The token axis grants every escape-set tool and refuses reads/searches."""
+        state.restrictions_active = True
+        state.restriction_reason = 'token'
+        for name in sorted(TIMEOUT_WRITE_ESCAPE_TOOLS):
+            assert state.is_tool_allowed(name) is True, (
+                f'{name} is in the escape set and must be allowed under token'
+            )
+        assert state.is_tool_allowed('Respond') is True
+        assert state.is_tool_allowed('SummarizeTool') is True
+        # The ceiling's whole point: no context growth.
+        for read_tool in ('ReadFile', 'ReadFileTool', 'FileSearchTool',
+                          'FilePreviewTool', 'FileSummaryTool', 'GlobTool',
+                          'DirectoryTreeTool', 'CheckSystem', 'git_read'):
+            assert state.is_tool_allowed(read_tool) is False, (
+                f'{read_tool} is read-scoped and must stay refused under token'
+            )
+        assert state.is_tool_allowed('DockerCodeRunner') is False
+        assert state.is_tool_allowed('ContainerExecTool') is False
+
+    @pytest.mark.parametrize('reason', ['token', 'timeout'])
+    def test_get_allowed_tools_matches_is_tool_allowed_both_directions(
+        self, state: AgentState, reason: str
+    ):
+        """Display list and gate must agree EXACTLY, as sets, in both directions.
+
+        The rejection prose renders ``Available tools:`` from
+        get_allowed_tools(), so any asymmetry advertises a tool the gate then
+        refuses (or hides one it permits).
+        """
+        state.restrictions_active = True
+        state.restriction_reason = reason
+        allowed = set(state.get_allowed_tools())
+        probes = allowed | {
+            'ApplyEdits', 'FileEditor', 'FileMover', 'CodeModifier',
+            'DockerCodeRunner', 'ContainerExecTool', 'ContainerStartTool',
+            'ReadFile', 'ReadFileTool', 'FileSearchTool', 'FilePreviewTool',
+            'GlobTool', 'DirectoryTreeTool', 'CheckSystem', 'git_read',
+            'WorkingDocument', 'ProgressReport', 'Worker',
+            'NonexistentToolOnPurpose', '',
+        }
+        permitted = {name for name in probes if state.is_tool_allowed(name)}
+        assert permitted == allowed, (
+            f'[{reason}] gate and display disagree: only-in-gate '
+            f'{sorted(permitted - allowed)}, only-in-display '
+            f'{sorted(allowed - permitted)}'
+        )
+
+    def test_get_allowed_tools_timeout_behaviour_is_unchanged(self, state: AgentState):
+        """The pre-existing 'timeout' contract still holds after sharing the set."""
+        state.restrictions_active = True
+        state.restriction_reason = 'timeout'
+        allowed = state.get_allowed_tools()
+        assert allowed[:2] == ['Respond', 'SummarizeTool'], allowed
+        assert set(allowed[2:]) == set(TIMEOUT_WRITE_ESCAPE_TOOLS), allowed
+        assert state.is_tool_allowed('WorkingDocument') is True
+        assert state.is_tool_allowed('ReadFile') is False
+        assert state.is_tool_allowed('ApplyEdits') is False
 
     def test_get_allowed_tools_turn_critical_returns_only_respond(self, state: AgentState):
         """When restriction_reason is 'turn', only Respond should be allowed."""

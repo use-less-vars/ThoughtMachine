@@ -10,6 +10,21 @@ from thoughtmachine.timeout_constants import (
     TIMEOUT_WRITE_ESCAPE_TOOLS,
 )
 
+# The ONE write escape hatch set, shared by every restriction reason that grants
+# one. A restriction exists to protect a RESOURCE -- time, or the context window
+# -- and never to strand work that is already finished: a write is bounded
+# input, so letting a prepared edit reach disk costs almost nothing, while
+# refusing it loses an entire turn (the agent can only paste the patch into
+# chat). Reads and searches stay refused under every restriction reason: they
+# are exactly what grows the context and what a yielding agent keeps doing
+# instead of stopping.
+#
+# ``TIMEOUT_WRITE_ESCAPE_TOOLS`` (the constant this is derived from) keeps
+# working untouched: it is imported above, named in the docs, and pinned by
+# tests/test_state_timeout.py. This is the sorted tuple both allow-list
+# branches must agree on.
+WRITE_ESCAPE_TOOLS: tuple[str, ...] = tuple(sorted(TIMEOUT_WRITE_ESCAPE_TOOLS))
+
 
 def describe_allowed_tools(allowed: List[str]) -> str:
     """Render an allow-list as the sentence shown to the model.
@@ -148,7 +163,12 @@ class AgentState:
                     )
                 else:
                     formatted = self._format_tokens(total_tokens)
-                    warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only Respond and SummarizeTool are available.'
+                    # Rendered from the SAME tuple the allow-list uses, so the
+                    # sentence cannot drift from what is actually permitted.
+                    _token_allowed = ', '.join(
+                        ('Respond', 'SummarizeTool') + WRITE_ESCAPE_TOOLS
+                    )
+                    warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only {_token_allowed} are available; reads and searches stay disabled.'
                 self.last_token_warning = warning
                 self.last_token_warning_count = total_tokens
                 self.last_token_warning_state = new_state
@@ -490,15 +510,18 @@ class AgentState:
         is True the allow-list is chosen strictly by restriction_reason:
 
         - 'turn': Only Respond is allowed (agent must finish immediately).
-        - 'timeout': Respond + SummarizeTool + TIMEOUT_WRITE_ESCAPE_TOOLS.
+        - 'timeout': Respond + SummarizeTool + WRITE_ESCAPE_TOOLS.
           The timeout restriction is RESOURCE MANAGEMENT, not salvage: the
           agent must yield and compact, so no read tool is granted (read
-          access would let it keep investigating). The single WRITE-only
-          escape hatch lets it dump verbatim working memory to disk first, so
-          the detail survives the summary.
+          access would let it keep investigating). The WRITE-only escape hatch
+          lets it dump verbatim working memory to disk first, so the detail
+          survives the summary.
         - 'pause': Only Respond is allowed (externally paused; wait it out).
-        - 'token': Respond + SummarizeTool allowed (SummarizeTool needed to
-          reduce context).
+        - 'token': Respond + SummarizeTool + WRITE_ESCAPE_TOOLS (SummarizeTool
+          needed to reduce context). The ceiling protects the CONTEXT WINDOW,
+          so reads and searches stay refused -- they are what grows it -- but a
+          prepared write must still reach disk: refusing it strands a finished
+          turn. Same escape set as 'timeout', deliberately.
         - anything else (unknown, None, empty string): Only Respond.
 
         Display-only: enforcement happens in ``is_tool_allowed()``, which
@@ -515,11 +538,15 @@ class AgentState:
             return []
         reason = getattr(self, 'restriction_reason', None)
         if reason == 'token':
-            return ['Respond', 'SummarizeTool']
+            # Mirrors 'timeout' for WRITES only: the ceiling exists to protect
+            # the context window, not to strand uncommitted work, so a prepared
+            # edit can always reach disk. Reads and searches stay refused --
+            # they are exactly what grows the context.
+            return ['Respond', 'SummarizeTool'] + list(WRITE_ESCAPE_TOOLS)
         if reason == 'timeout':
             # Write-only escape hatch: dump the detail, then yield. Nothing
             # here can be used to continue the investigation.
-            return ['Respond', 'SummarizeTool'] + sorted(TIMEOUT_WRITE_ESCAPE_TOOLS)
+            return ['Respond', 'SummarizeTool'] + list(WRITE_ESCAPE_TOOLS)
         # 'turn', 'pause' and every unrecognised reason: fail safe to
         # Respond-only rather than assuming the token allow-list.
         return ['Respond']
@@ -543,13 +570,17 @@ class AgentState:
             return True
         reason = getattr(self, 'restriction_reason', None)
         if reason == 'token':
-            return tool_name in ('Respond', 'SummarizeTool')
+            # Must agree EXACTLY with get_allowed_tools() for 'token' -- same
+            # literal, same WRITE_ESCAPE_TOOLS tuple, same order. A prepared
+            # write is allowed (bounded input); reads and searches are not.
+            return tool_name in (
+                ('Respond', 'SummarizeTool') + WRITE_ESCAPE_TOOLS
+            )
         if reason == 'timeout':
             # Must agree EXACTLY with get_allowed_tools() for 'timeout' --
             # same literal, same escape-hatch constant, same order.
             return tool_name in (
-                ('Respond', 'SummarizeTool')
-                + tuple(sorted(TIMEOUT_WRITE_ESCAPE_TOOLS))
+                ('Respond', 'SummarizeTool') + WRITE_ESCAPE_TOOLS
             )
         # 'turn', 'pause' and every unrecognised reason (including a missing
         # `restriction_reason`): fail safe to Respond-only rather than assuming

@@ -16,7 +16,7 @@ import json
 from agent.config.models import AgentConfig
 from agent.core.agent import Agent
 from agent.core.llm_client import _to_canonical_tool_call
-from agent.core.state import TokenState
+from agent.core.state import WRITE_ESCAPE_TOOLS, TokenState
 from agent.core.stream_events import Done, TextDelta, ToolCallComplete, UsageUpdate
 
 
@@ -102,7 +102,12 @@ class TestProviderTokenTruthMidTurn:
         assert agent.state.restrictions_active is True
         assert agent.state.restriction_reason == "token"
         assert agent.state.is_tool_allowed("ReadFile") is False
-        assert agent.state.get_allowed_tools() == ["Respond", "SummarizeTool"]
+        # Derived from the single source of truth, not hard-coded: the token axis
+        # refuses reads/searches but allows the write escape hatch (mirrors
+        # 'timeout', so prepared work can still reach disk).
+        assert agent.state.get_allowed_tools() == [
+            "Respond", "SummarizeTool", *WRITE_ESCAPE_TOOLS
+        ]
 
         # The turn still terminates normally.
         assert "agent_responded" in types

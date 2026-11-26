@@ -200,5 +200,88 @@ class TestForceSpawnOnNeverStartedThread(unittest.TestCase):
         )
 
 
+class _NeverStartedAliveInstance(_NeverStartedInstance):
+    """A never-started thread that nevertheless claims to be alive.
+
+    The guard must not read "cannot join" as "is gone": liveness is decided by
+    ``is_alive()`` alone, so this fixture still has to produce the degraded
+    outcome. ``join()`` is overridden to fail loudly: the whole point is that it
+    is never reached.
+    """
+
+    def is_alive(self) -> bool:  # narrow override, deliberately ignoring real state
+        return True
+
+    def join(self, timeout: float | None = None) -> None:
+        raise AssertionError(
+            "join() must never be called on a thread that was never started"
+        )
+
+
+class TestWaitForWorkerExitOnNeverStartedThread(unittest.TestCase):
+    """``_wait_for_worker_exit`` (sync-query timeout path) must not raise.
+
+    Field report: after a query timeout the tool answered ``cannot join thread
+    before it is started`` instead of the degraded envelope the helper's own
+    docstring promises. Same root shape as the force-spawn test above, different
+    call site -- the guard had been applied to only one of the module's joins.
+
+    Contract pinned here:
+
+      * a never-started thread (``ident is None``) does NOT make the wait raise;
+      * the skip is reported once at DEBUG, naming the worker and the call site;
+      * the return contract is unchanged -- ``True`` when the thread is gone,
+        ``False`` when it is still alive and left to terminate on its own.
+    """
+
+    def _tool(self) -> Worker:
+        return Worker(
+            action="query",
+            worker_name=WORKER,
+            session_id=SESSION,
+            agent_config={"provider": "openai", "model": "gpt-4"},
+        )
+
+    def test_never_started_thread_returns_without_raising(self) -> None:
+        thread = _NeverStartedInstance()
+        self.assertIsNone(
+            thread.ident, "fixture must be a never-started thread (ident is None)"
+        )
+
+        with self.assertLogs("tools.workspace.worker", level="DEBUG") as captured:
+            result = self._tool()._wait_for_worker_exit(thread)
+
+        self.assertTrue(
+            result, "a never-started, not-alive thread must be reported as exited"
+        )
+        messages = [record.getMessage() for record in captured.records]
+        skipped = [m for m in messages if "no thread ident" in m]
+        self.assertEqual(
+            len(skipped), 1, f"the skipped join was not reported once: {messages}"
+        )
+        self.assertIn(WORKER, skipped[0])
+        self.assertIn("query-timeout-wait", skipped[0])
+        self.assertFalse(
+            any("cannot join thread before it is started" in m for m in messages),
+            f"the join traceback still surfaced: {messages}",
+        )
+
+    def test_never_started_but_alive_thread_reports_still_running(self) -> None:
+        thread = _NeverStartedAliveInstance()
+
+        with self.assertLogs("tools.workspace.worker", level="DEBUG") as captured:
+            result = self._tool()._wait_for_worker_exit(thread)
+
+        self.assertFalse(
+            result, "a skipped join must not masquerade as a completed exit"
+        )
+        messages = [record.getMessage() for record in captured.records]
+        self.assertTrue(
+            any("did not stop within" in m or "still running" in m for m in messages),
+            f"the degraded outcome was not reported: {messages}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+

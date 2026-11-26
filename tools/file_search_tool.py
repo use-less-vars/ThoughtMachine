@@ -23,6 +23,23 @@ class FileSearchTool(ToolBase):
     MAX_RESULTS: ClassVar[int] = 200
     MAX_FILES_TO_SEARCH: ClassVar[int] = 1000
 
+    # Per-file cap on printed match blocks. Matches beyond the cap are NOT
+    # silently dropped: one notice line names the count and their line numbers.
+    MAX_MATCHES_PER_FILE: ClassVar[int] = 5
+    # How many omitted line numbers the notice lists before eliding with '...'.
+    MAX_OMITTED_LINES_SHOWN: ClassVar[int] = 20
+    MORE_MATCHES_NOTICE: ClassVar[str] = "[+{count} more matches in this file at lines {lines}]"
+    CHAR_BUDGET_WARNING: ClassVar[str] = (
+        "[Output truncated by the {budget} character budget: {dropped} further "
+        "matches dropped. Narrow the pattern/scope or paginate to see them.]"
+    )
+    CONTEXT_DROPPED_WARNING: ClassVar[str] = (
+        "[Context lines dropped to fit the {budget} character budget; matches are "
+        "kept, shown without surrounding context.]"
+    )
+    # Room reserved for the budget marker so appending it never busts the cap.
+    CHAR_BUDGET_RESERVE: ClassVar[int] = 400
+
     pattern: str = Field(description="Search pattern. If use_regex=True, this is a regex pattern; otherwise plain text.")
     file_pattern: Optional[str] = Field(None, description="Glob pattern to limit which files are searched (e.g., '**/*.py'). If None, use filenames or directory.")
     filenames: Optional[List[str]] = Field(default=None, description="List of file paths to search in. If not provided, use directory or file_pattern.")
@@ -52,6 +69,119 @@ class FileSearchTool(ToolBase):
             if self._should_exclude_dir(parent.name):
                 return True
         return False
+
+    @staticmethod
+    def _highlight_span(match: dict, line_idx: int, line_offsets: List[int]):
+        """Column span (start, end) of ``match`` on 0-based line ``line_idx``."""
+        if line_idx < 0 or line_idx + 1 >= len(line_offsets):
+            return None
+        line_start_pos = line_offsets[line_idx]
+        line_end_pos = line_offsets[line_idx + 1]
+        seg_start = max(match['start'], line_start_pos)
+        seg_end = min(match['end'], line_end_pos)
+        if seg_start >= seg_end:
+            return None
+        return (seg_start - line_start_pos, seg_end - line_start_pos)
+
+    def _format_source_line(self, file_lines: List[str], line_num: int,
+                            spans, is_match: bool) -> str:
+        """Render one source line, highlighting every span on it exactly once."""
+        highlighted = file_lines[line_num - 1]
+        if spans:
+            # Right-to-left so earlier column offsets stay valid.
+            for col_start, col_end in sorted(set(spans), reverse=True):
+                highlighted = (highlighted[:col_start] + '**'
+                               + highlighted[col_start:col_end] + '**'
+                               + highlighted[col_end:])
+        line_content = highlighted.rstrip('\n')
+        prefix = "> " if is_match else "  "
+        if self.show_line_numbers:
+            return f"{prefix}{line_num:4d}: {line_content}"
+        return f"{prefix}{line_content}"
+
+    @staticmethod
+    def _rendered_chars(rendered) -> int:
+        return sum(len(text) + 1 for text, _ in rendered)
+
+    def _render_matches_grouped(self, matches_by_file, file_lines_cache,
+                                file_line_offsets_cache, context_lines):
+        """Render matches grouped per file.
+
+        One ``rel_path:`` header per file; context windows of nearby matches are
+        merged so no source line is printed twice; at most
+        ``MAX_MATCHES_PER_FILE`` blocks are printed per file and the rest are
+        announced explicitly (count + line numbers).
+
+        Returns ``[(text, matches_represented), ...]`` where the second element
+        is how many matches that line stands for (0 for context, headers and
+        notices), so the caller can account for what a budget drop loses.
+        """
+        rendered = []
+        for file_path, file_matches in matches_by_file.items():
+            file_lines = file_lines_cache.get(file_path)
+            line_offsets = file_line_offsets_cache.get(file_path)
+            if file_lines is None or line_offsets is None:
+                continue
+            try:
+                rel_path = os.path.relpath(file_path)
+            except ValueError:
+                rel_path = file_path
+
+            windows = []
+            for match in file_matches:
+                ctx_start = max(1, match['line_start'] - context_lines)
+                ctx_end = min(len(file_lines), match['line_end'] + context_lines)
+                windows.append((ctx_start, ctx_end, match))
+            windows.sort(key=lambda w: (w[0], w[1]))
+
+            merged = []  # [ctx_start, ctx_end, [matches]]
+            for ctx_start, ctx_end, match in windows:
+                if merged and ctx_start <= merged[-1][1] + 1:
+                    merged[-1][1] = max(merged[-1][1], ctx_end)
+                    merged[-1][2].append(match)
+                else:
+                    merged.append([ctx_start, ctx_end, [match]])
+
+            printed = merged[:self.MAX_MATCHES_PER_FILE]
+            omitted = merged[self.MAX_MATCHES_PER_FILE:]
+
+            rendered.append((f"{rel_path}:", 0))
+            for ctx_start, ctx_end, group in printed:
+                spans_by_line = {}
+                matched_lines = set()
+                for match in group:
+                    for line_num in range(match['line_start'], match['line_end'] + 1):
+                        matched_lines.add(line_num)
+                        span = self._highlight_span(match, line_num - 1, line_offsets)
+                        if span is not None:
+                            spans_by_line.setdefault(line_num, []).append(span)
+                # Charge this block's match count to one line only.
+                charge_line = min(m['line_start'] for m in group)
+                for line_num in range(ctx_start, ctx_end + 1):
+                    rendered.append((
+                        self._format_source_line(
+                            file_lines, line_num,
+                            spans_by_line.get(line_num),
+                            line_num in matched_lines,
+                        ),
+                        len(group) if line_num == charge_line else 0,
+                    ))
+                rendered.append(("", 0))
+
+            if omitted:
+                omitted_lines = sorted(
+                    m['line_start'] for group in omitted for m in group[2]
+                )
+                shown = omitted_lines[:self.MAX_OMITTED_LINES_SHOWN]
+                listed = ", ".join(str(n) for n in shown)
+                if len(omitted_lines) > len(shown):
+                    listed += ", ..."
+                rendered.append((
+                    self.MORE_MATCHES_NOTICE.format(
+                        count=len(omitted_lines), lines=listed
+                    ), 0,
+                ))
+        return rendered
 
     def execute(self) -> str:
         try:
@@ -249,74 +379,18 @@ class FileSearchTool(ToolBase):
 
                 return msg
             
-            # Now build output with context lines and highlighting
-            output_lines = []
+            # Group matches by file, preserving first-seen file order, so each
+            # file's path is printed exactly once.
+            matches_by_file = {}
             for match in matches:
-                file_path = match['file']
-                # Retrieve cached lines and offsets
-                file_lines = file_lines_cache.get(file_path)
-                line_offsets = file_line_offsets_cache.get(file_path)
-                if file_lines is None or line_offsets is None:
-                    continue
-                
-                line_start = match['line_start']
-                line_end = match['line_end']
-                start = match['start']
-                end = match['end']
-                
-                context_before = max(1, line_start - context_lines)
-                context_after = min(len(file_lines), line_end + context_lines)
-                
-                # Determine relative path
-                try:
-                    rel_path = os.path.relpath(file_path)
-                except ValueError:
-                    rel_path = file_path
-                
-                output_lines.append(f"{rel_path}:")
-                # Context lines before match
-                for i in range(context_before, line_start):
-                    line_num = i
-                    line_content = file_lines[i-1].rstrip('\n')
-                    if self.show_line_numbers:
-                        output_lines.append(f"  {line_num:4d}: {line_content}")
-                    else:
-                        output_lines.append(f"  {line_content}")
-                # Matched lines with highlighting
-                for i in range(line_start, line_end + 1):
-                    line_num = i
-                    line_idx = i - 1
-                    raw_line = file_lines[line_idx]
-                    # Compute highlight segment within this line
-                    line_start_pos = line_offsets[line_idx]
-                    line_end_pos = line_offsets[line_idx + 1]
-                    seg_start = max(start, line_start_pos)
-                    seg_end = min(end, line_end_pos)
-                    if seg_start < seg_end:
-                        # Convert to column positions within line (including newline)
-                        col_start = seg_start - line_start_pos
-                        col_end = seg_end - line_start_pos
-                        # Apply highlighting to raw_line
-                        highlighted = raw_line[:col_start] + '**' + raw_line[col_start:col_end] + '**' + raw_line[col_end:]
-                        line_content = highlighted.rstrip('\n')
-                    else:
-                        line_content = raw_line.rstrip('\n')
-                    if self.show_line_numbers:
-                        output_lines.append(f"> {line_num:4d}: {line_content}")
-                    else:
-                        output_lines.append(f"> {line_content}")
-                # Context lines after match
-                for i in range(line_end + 1, context_after + 1):
-                    line_num = i
-                    line_content = file_lines[i-1].rstrip('\n')
-                    if self.show_line_numbers:
-                        output_lines.append(f"  {line_num:4d}: {line_content}")
-                    else:
-                        output_lines.append(f"  {line_content}")
-                output_lines.append("")
-            
-            header = f"Found {len(matches)} matches for pattern '{self.pattern}'"
+                matches_by_file.setdefault(match['file'], []).append(match)
 
+            rendered = self._render_matches_grouped(
+                matches_by_file, file_lines_cache, file_line_offsets_cache,
+                context_lines,
+            )
+
+            header = f"Found {len(matches)} matches for pattern '{self.pattern}'"
             if self.max_results != max_results:
                 header += f" (clamped from {self.max_results} to {max_results})"
             if self.use_regex:
@@ -326,9 +400,20 @@ class FileSearchTool(ToolBase):
             if self.directory:
                 header += f" in directory '{self.directory}'"
             header += f" (case_sensitive={self.case_sensitive}, max_results={self.max_results}):"
-            output = header + "\n" + "\n".join(output_lines)
 
-            # Add truncation warnings
+            # Prefer many DISTINCT matches over one match's context: if the
+            # full-context rendering blows the character budget, re-render with
+            # no context lines before any match is dropped.
+            if (context_lines > 0
+                    and self._rendered_chars(rendered) + len(header) + 1
+                    > self.MAX_OUTPUT_CHARS):
+                rendered = self._render_matches_grouped(
+                    matches_by_file, file_lines_cache, file_line_offsets_cache, 0
+                )
+                truncation_warnings.append(
+                    self.CONTEXT_DROPPED_WARNING.format(budget=self.MAX_OUTPUT_CHARS)
+                )
+
             if line_truncated_files:
                 truncation_warnings.append(
                     "[Output truncated at {} lines per file. Use more specific parameters or pagination to read further.]".format(self.MAX_LINES_PER_FILE)
@@ -337,8 +422,45 @@ class FileSearchTool(ToolBase):
                 truncation_warnings.append(
                     "[Output truncated at {} results. Use more specific parameters or pagination to read further.]".format(max_results)
                 )
-            if truncation_warnings:
-                output += "\n" + "\n".join(truncation_warnings)
+
+            trailer = ("\n" + "\n".join(truncation_warnings)) if truncation_warnings else ""
+            fixed_chars = len(header) + 1 + len(trailer)
+
+            # Enforce the character budget: stop adding blocks that no longer
+            # fit and count the matches they stood for, so the marker can say
+            # exactly how much was dropped.
+            kept = []
+            used = fixed_chars
+            dropped_matches = 0
+            budget_hit = False
+            for text, n_matches in rendered:
+                if budget_hit or (used + len(text) + 1 + self.CHAR_BUDGET_RESERVE
+                                  > self.MAX_OUTPUT_CHARS):
+                    budget_hit = True
+                    dropped_matches += n_matches
+                    continue
+                kept.append((text, n_matches))
+                used += len(text) + 1
+
+            def _compose():
+                body = "\n".join(text for text, _ in kept)
+                out = (header + "\n" + body) if body else header
+                if budget_hit:
+                    out += "\n" + self.CHAR_BUDGET_WARNING.format(
+                        budget=self.MAX_OUTPUT_CHARS, dropped=dropped_matches
+                    )
+                if trailer:
+                    out += trailer
+                return out
+
+            output = _compose()
+            # Hard guarantee: never exceed MAX_OUTPUT_CHARS, even with the
+            # warnings/marker appended.
+            while len(output) > self.MAX_OUTPUT_CHARS and kept:
+                _, n_matches = kept.pop()
+                dropped_matches += n_matches
+                budget_hit = True
+                output = _compose()
 
             return self._truncate_output(output)
             
