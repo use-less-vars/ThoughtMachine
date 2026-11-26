@@ -512,3 +512,7 @@ web_ui/frontend/.dist-build-stamp
 # with the repo -- `docs/*` above is a catch-all, so the negation is required or
 # the file is never versioned and vanishes on the next clone.
 !docs/DESIGN_RESOURCES.md
+# Credentials design doc (branch docs/design-credentials): public tier, ships with
+# the repo -- `docs/*` above is a catch-all, so the negation is required or the
+# file is never versioned and vanishes on the next clone.
+!docs/DESIGN_CREDENTIALS.md
