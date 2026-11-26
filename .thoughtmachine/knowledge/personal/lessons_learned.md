@@ -1514,3 +1514,16 @@ Related, and unfixed (all F1 shape — a tool answering confidently and wrongly)
 - Worker timeout is granted-but-not-honoured: **480 s requested (clamp reported `false`, `timeout_source: worker_thread.spawn`), cut at 187.8 s** with `timeout_triggered: true`. Earlier in the same session: 420 granted, cut at 140 s and 163 s. The cut never names its layer. Mitigation that works: order the brief "edit code first, tests second, report third" so a cut still leaves work on disk, and never put the report before the work.
 
 Ticket candidate: one PR "tools answer truthfully" covering the four tool defects above.
+
+## SESSION NOTES — gen67/68 turn-lifecycle band (2026-11-26)
+
+**Two self-corrections, recorded because the pattern is the point.** (1) "Workers are threads" — refuted by measurement: process mode starts no thread, the child PID is real. (2) "Merging #486 will let a token-restricted agent use FileEditor" — refuted one turn later by reading `thoughtmachine/timeout_constants.py`: the escape hatch is `{'WorkingDocument'}` exactly, by design (a restriction makes an overrunning turn yield and compact, not keep investigating). Both were claims made before measurement and corrected before they cost anything. Write the claim, measure it, retract it in the same breath — that is the discipline, not an embarrassment.
+
+**Worker-runtime seams measured this session** (all now fixed or scoped):
+- `_wait_for_worker_exit` joined an unstarted Thread (`ident is None` in process mode) → `cannot join thread before it is started` replaced the degraded envelope. Guard now at all three `.join(` sites; a skip is logged, liveness still from `is_alive()`.
+- Worker timeout granting is honest only at the top level: asking for 900 s is REFUSED with the owner named (`agent.config.defaults.HARD_TIMEOUT`), but a *turn* was cut at 77–188 s while the envelope reported 600 s requested / `clamped: false` / `source: worker_thread.spawn`. The reported number is ceiling arithmetic, not the cutting clock. Decisions D1/D2 remain open.
+- Worker token ceiling at ~85k refuses `ApplyEdits` mid-edit; the patch survived only because the worker pasted it into its report. Mitigation that works: order briefs "edit first, tests second, report third", and keep one objective per turn.
+- `DockerCodeRunner` caps a single exec at ~300 s and, for a PIPED command, reports `exit_code: 0, success: true` for a SIGKILLed run — only `stderr: "Killed"` and the duration reveal it. Run long suites detached to a log and poll.
+- `docs/*` is gitignored with per-file negations; a new deliverable doc is invisible to `git add` until a negation is added AFTER the `docs/*` line.
+
+**Live-runtime observation (unexplained, worth chasing):** after this branch's D11 code landed on disk (uncommitted, unmerged), the Worker envelope's telemetry began carrying the new `restriction_reason` / `cut` keys. Either the app auto-reloads from the working tree, or something re-imports. If the running agent executes uncommitted working-tree code, that is both a convenience and an F2 question: file writes reach the runtime without a named gate.
