@@ -390,6 +390,40 @@ def _match_blocked_workspace_path(rel_path: str) -> Optional[str]:
     return None
 
 
+def _vault_contains(path: str) -> bool:
+    """Return True when *path* is the vault root or lives BENEATH it.
+
+    Component-aware, not a bare ``str.startswith``: the target is compared with
+    ``os.path.relpath`` against both the raw and the resolved ``VAULT_ROOT``,
+    exactly as the workspace boundary in :func:`validate_path` is.  A sibling
+    directory that merely shares the vault's string prefix
+    (``~/.thoughtmachine-evil``) is therefore NOT vault material, while every
+    path inside ``~/.thoughtmachine`` still is.
+    """
+    candidates: List[str] = []
+    for candidate in (VAULT_ROOT, ):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    try:
+        vault_root_resolved = os.path.realpath(VAULT_ROOT)
+    except Exception:
+        vault_root_resolved = None
+    if vault_root_resolved and vault_root_resolved not in candidates:
+        candidates.append(vault_root_resolved)
+
+    for root in candidates:
+        try:
+            rel = os.path.relpath(path, root)
+        except ValueError:
+            # Different drives (Windows): cannot be beneath this root.
+            continue
+        if rel == os.curdir:
+            return True
+        if not rel.startswith("..") and not os.path.isabs(rel):
+            return True
+    return False
+
+
 def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] = None) -> str:
     """
     Validate that a given path is within the allowed workspace.
@@ -438,13 +472,9 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
 
     # ── BLOCK VAULT COMPARTMENTS ──────────────────────────────────────────
     # Never allow file tools to access ~/.thoughtmachine/ or its subdirectories
-    try:
-        vault_root_resolved = os.path.realpath(VAULT_ROOT)
-    except Exception:
-        vault_root_resolved = VAULT_ROOT  # Fallback if realpath fails
-
-    # If the path itself is directly under ~/.thoughtmachine/, block it
-    if requested_abs.startswith(vault_root_resolved) or requested_abs.startswith(VAULT_ROOT):
+    # If the path itself is directly under ~/.thoughtmachine/, block it.
+    # Component-aware: a sibling of the vault is not the vault.
+    if _vault_contains(requested_abs):
         # Check each blocked subdirectory
         blocked_reason = None
         for subdir in VAULT_BLOCKED_SUBDIRS:
@@ -471,12 +501,53 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
         )
         raise PathOutsideWorkspaceError(f"Access to vault compartment '{blocked_reason}' is blocked: '{original_path}'")
 
-    # If no workspace restriction, return canonical path if possible
+    # If no workspace restriction, return canonical path if possible.
+    #
+    # NOTE: this branch used to return here, BEFORE the post-resolution vault
+    # re-check further down -- so a caller that cannot name a workspace root
+    # (``ToolBase._validate_path`` with ``resolved_ws=None``) got a symlink's
+    # resolved vault target back unexamined.  EVERY return path now runs the
+    # vault re-check, and a target that cannot be resolved is REFUSED (fail
+    # closed) rather than handed back unverified.
     if not workspace_path:
         try:
-            return os.path.realpath(target_abs)
-        except Exception:
-            return target_abs
+            resolved_no_ws = os.path.realpath(target_abs)
+        except Exception as e:
+            _log_security_event(
+                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+                message=f"Refused unresolvable path: '{original_path}' ({e})",
+                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+                data={
+                    "path": original_path,
+                    "resolved_path": target_abs,
+                    "reason": "vault_recheck_unresolved"
+                }
+            )
+            raise PathOutsideWorkspaceError(
+                f"Access denied: '{original_path}' could not be resolved, so the "
+                f"vault barrier cannot be applied"
+            )
+
+        # ── RE-CHECK VAULT AFTER SYMLINK RESOLUTION (no-workspace branch) ──
+        # Same rule as the workspace branch below: the resolved target may be
+        # a vault file reached through a workspace symlink.
+        if _vault_contains(resolved_no_ws):
+            _log_security_event(
+                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+                message=f"Blocked vault access via symlink: '{original_path}' resolves to '{resolved_no_ws}'",
+                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+                data={
+                    "path": original_path,
+                    "resolved_path": resolved_no_ws,
+                    "symlink_target": target_abs,
+                    "reason": "vault_blocked_via_symlink"
+                }
+            )
+            raise PathOutsideWorkspaceError(
+                f"Access to vault via symlink is blocked: '{original_path}' -> '{resolved_no_ws}'"
+            )
+
+        return resolved_no_ws
 
     workspace_abs = os.path.abspath(workspace_path)
     workspace_abs = os.path.realpath(workspace_abs)
@@ -558,17 +629,13 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
     # A symlink inside the workspace may point to a vault file. Even though
     # the symlink itself passed the vault check, the resolved target must not
     # be in the vault.
-    try:
-        vault_root_resolved = os.path.realpath(VAULT_ROOT)
-    except Exception:
-        vault_root_resolved = VAULT_ROOT
     if canonical_abs != target_abs:
         # Symlink was resolved — check if target is in vault
         try:
             canonical_resolved = os.path.realpath(canonical_abs)
         except Exception:
             canonical_resolved = canonical_abs
-        if canonical_resolved.startswith(vault_root_resolved) or canonical_resolved.startswith(VAULT_ROOT):
+        if _vault_contains(canonical_resolved):
             _log_security_event(
                 event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
                 message=f"Blocked vault access via symlink: '{original_path}' resolves to '{canonical_resolved}'",
