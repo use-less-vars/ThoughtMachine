@@ -7387,6 +7387,63 @@ class Worker(ToolBase):
             "parent_pid": parent_pid,
         }
 
+    def _spawn_context_payload(self) -> dict:
+        """Build the initial-context payload for THIS spawn.
+
+        ONE briefing channel: the fresh path stores this on the thread and
+        ``run()`` renders it via ``initial_context_message``; the
+        continue-existing and paused-resume paths (which have no fresh thread
+        to hand it to) render the very same payload and prepend it to the
+        query.  Anything added to the briefing must be added HERE, or the two
+        routings diverge again.
+        """
+        if self.context is not None and isinstance(self.context, dict):
+            # A COPY, not an alias: the caller may reuse one context dict
+            # across several spawns.
+            payload = dict(self.context)
+        elif isinstance(self.context, str) and self.context:
+            # A plain-string context means "the task" per the tool schema; it
+            # must become the query, not be silently dropped.
+            payload = {"query": self.context}
+        else:
+            payload = {}
+        if self.purpose is not None:
+            payload["purpose"] = self.purpose
+        if self.style is not None:
+            payload["style"] = self.style
+        if self.meta is not None:
+            payload["meta"] = self.meta
+        return payload
+
+    def _reuse_dispatch_context(self, query: str) -> tuple:
+        """Compose the text delivered to an ALREADY-EXISTING instance.
+
+        Returns ``(text, context_keys, error)``.  ``error`` is a reason string
+        when a supplied briefing cannot be rendered (an unserializable or
+        self-referencing context): the caller must then REFUSE the dispatch
+        instead of dropping the briefing, which is what used to happen here.
+        """
+        extras = self._spawn_context_payload()
+        # The query travels as the message body itself, so it is not repeated
+        # inside the payload.
+        extras.pop("query", None)
+        if "style" not in (self.model_fields_set or set()):
+            # ``style`` has a MODEL default ("precise"): a default is not a
+            # supplied briefing, so it must neither appear as a phantom context
+            # block nor turn a context-less spawn into a dispatch.
+            extras.pop("style", None)
+        context_keys = list(extras)
+        if not extras:
+            return query, context_keys, None
+        try:
+            rendered = initial_context_message(extras)["content"]
+        except (TypeError, ValueError) as exc:
+            return "", context_keys, (
+                f"supplied initial context ({', '.join(context_keys)}) cannot "
+                f"be rendered: {type(exc).__name__}: {exc}"
+            )
+        return (f"{rendered}\n\n{query}" if query else rendered), context_keys, None
+
     def _action_spawn(self, workers: list, ws_id: Optional[str]) -> dict:
         """Spawn a worker thread from its definition in workers.json."""
         # ── Commit 8: dispatcher-side duration instrumentation ──
@@ -7635,9 +7692,41 @@ class Worker(ToolBase):
                 if isinstance(self.context, dict)
                 else str(self.context or "")
             )
-            if not query:
-                # No query to deliver — nothing was dropped; keep the legacy
-                # reuse message.
+            # ── D2 (reuse): the briefing rides WITH the query ──
+            # This instance already exists, so there is no run() to hand an
+            # ``_initial_context`` to.  The payload the fresh path renders is
+            # composed here and PREPENDED to the query, in the same
+            # ``initial_context_message`` channel.  A briefing that cannot be
+            # rendered REFUSES the dispatch: dropping it is exactly the silent
+            # loss this branch used to cause.
+            dispatch_text, context_keys, context_error = self._reuse_dispatch_context(
+                query
+            )
+            if context_error is not None:
+                return {
+                    "error": (
+                        f"Worker '{self.worker_name}' instance {reuse_iid} was "
+                        f"NOT dispatched: {context_error}. Nothing was sent to "
+                        "the existing instance; re-send the spawn with a "
+                        "serializable context."
+                    ),
+                    "note": (
+                        "The existing instance is untouched and can still be "
+                        "queried via action='query'."
+                    ),
+                    "worker_name": self.worker_name,
+                    "instance_id": reuse_iid,
+                    "instance_label": getattr(reuse_thread, "instance_label", None),
+                    "spawned": False,
+                    "status": reuse_thread.status,
+                    "**context_ignored**": (
+                        "context was NOT delivered: "
+                        f"{', '.join(context_keys) or 'context'}"
+                    ),
+                }
+            if not dispatch_text:
+                # No query AND no supplied context — nothing was dropped; keep
+                # the legacy reuse message.
                 return {
                     "worker_name": self.worker_name,
                     "instance_id": reuse_iid,
@@ -7658,7 +7747,7 @@ class Worker(ToolBase):
                 # direct send_query would be dropped on the floor and answered
                 # by nothing.
                 response = deliver_query_to_worker(
-                    reuse_thread, query, timeout=wait
+                    reuse_thread, dispatch_text, timeout=wait
                 )
             except TimeoutError as exc:
                 return {
@@ -7679,7 +7768,7 @@ class Worker(ToolBase):
                 # WorkerQueryTransportMissing / WorkerRuntimeLost: no transport,
                 # or the child died under the query. Both are answers about this
                 # instance, and neither may escape a spawn call as a raise.
-                return {
+                transport_envelope = {
                     "error": f"{type(exc).__name__}: {exc}",
                     "note": (
                         f"Worker '{self.worker_name}' instance {reuse_iid} "
@@ -7693,6 +7782,14 @@ class Worker(ToolBase):
                     "spawned": False,
                     "status": reuse_thread.status,
                 }
+                if context_keys:
+                    # Nothing reached the instance, so the briefing went with
+                    # the query: say so instead of dropping it quietly.
+                    transport_envelope["**context_ignored**"] = (
+                        "context was NOT delivered with the query: "
+                        f"{', '.join(context_keys)}"
+                    )
+                return transport_envelope
             elapsed = reuse_thread._last_elapsed()
             # ── Commit 8: dispatch window closes — envelope about to return ──
             dispatch_finished_at = time.time()
@@ -7746,6 +7843,34 @@ class Worker(ToolBase):
                 if isinstance(self.context, dict)
                 else str(self.context or "")
             )
+            # ── D2 (paused resume): the briefing rides WITH the query ──
+            # Same routing class as continue-existing — an ALREADY-EXISTING
+            # instance, with no run() to hand ``_initial_context`` to — so it
+            # gets the very same composed text, and refuses for the very same
+            # reason when the briefing cannot be rendered.
+            dispatch_text, context_keys, context_error = self._reuse_dispatch_context(
+                query
+            )
+            if context_error is not None:
+                return {
+                    "error": (
+                        f"Worker '{self.worker_name}' instance "
+                        f"{resume_paused_worker.instance_id} was NOT "
+                        f"dispatched: {context_error}. The paused instance was "
+                        "left untouched; resume it explicitly with the "
+                        "'resume' action and re-send a serializable context."
+                    ),
+                    "worker_name": self.worker_name,
+                    "instance_id": resume_paused_worker.instance_id,
+                    "instance_label": resume_paused_worker.instance_label,
+                    "spawned": False,
+                    "status": resume_paused_worker.status,
+                    "**context_ignored**": (
+                        "context was NOT delivered: "
+                        f"{', '.join(context_keys) or 'context'}"
+                    ),
+                }
+            query = dispatch_text
             # Drain stale park markers / None signals left by pause() in the
             # input queue.  If a real query was queued by someone else, keep it — but the
             # NEW spawn query runs FIRST (F4 FIFO): it is enqueued before the
@@ -8117,22 +8242,11 @@ class Worker(ToolBase):
         # COPY, not an alias: the caller may reuse one context dict across
         # several spawns, so aliasing it and then mutating it in place would
         # cross-contaminate workers and mutate caller-owned state.
-        if self.context is not None and isinstance(self.context, dict):
-            thread._initial_context = dict(self.context)
-        elif isinstance(self.context, str) and self.context:
-            # A plain-string context means "the task" per the tool schema; it
-            # must become the query, not be silently dropped.
-            thread._initial_context = {"query": self.context}
-        else:
-            thread._initial_context = {}
-
-        # Merge purpose, style, meta into the COPY (never into self.context)
-        if self.purpose is not None:
-            thread._initial_context["purpose"] = self.purpose
-        if self.style is not None:
-            thread._initial_context["style"] = self.style
-        if self.meta is not None:
-            thread._initial_context["meta"] = self.meta
+        # ONE briefing channel: the payload (copy of the caller's context plus
+        # purpose/style/meta) is built by ``_spawn_context_payload``, which the
+        # continue-existing and paused-resume paths reuse so a briefing reaches
+        # an EXISTING instance in the same shape.
+        thread._initial_context = self._spawn_context_payload()
 
         # Context persistence on spawn is now conditional:
         #   * NON-forced spawn — context.json is preserved. If it exists from a
