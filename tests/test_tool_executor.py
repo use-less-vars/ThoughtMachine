@@ -8,13 +8,18 @@ Covers:
 """
 
 import json
+import logging
 import os
+from datetime import datetime, timedelta
 from typing import ClassVar, List
+from unittest.mock import MagicMock
 
 import pytest
 
+from agent.core.state import AgentState
 from agent.core.tool_executor import (
     DEFAULT_SESSION_PERMISSIONS,
+    TOOL_REFUSAL_LOGGER_NAME,
     ToolExecutor,
 )
 from tools.base import ToolBase
@@ -778,3 +783,153 @@ class TestWorkspaceIdResolutionPrecedence:
         assert result["result"] == "Container OK", result["result"]
         assert spy.resolved_workspace_id == "ws-A", spy.calls
 
+
+# ---------------------------------------------------------------------------
+# D5b: the refusal the model reads, and the ONE structured record of it
+# ---------------------------------------------------------------------------
+
+#: Names used to round-trip the advertised allow-list through the GATE. The
+#: assertions compare the prose against ``is_tool_allowed()``, never against a
+#: hard-coded list, so a state change cannot silently desynchronise the two.
+_TOOL_NAME_PROBES = frozenset({
+    'Respond', 'SummarizeTool', 'WorkingDocument',
+    'ReadFile', 'ReadFileTool', 'FileSearchTool', 'FilePreviewTool',
+    'FileSummaryTool', 'GlobTool', 'DirectoryTreeTool', 'CheckSystem',
+    'git_read', 'ApplyEdits', 'FileEditor', 'FileMover', 'CodeModifier',
+    'DockerCodeRunner', 'ContainerExecTool', 'ContainerStartTool',
+    'ProgressReport', 'Worker', 'NonexistentToolOnPurpose', '',
+})
+
+
+def _restricted_state(reason: str) -> AgentState:
+    """A REAL AgentState restricted on ``reason``.
+
+    Real rather than a stub: D5b's whole point is that the advertised
+    allow-list is derived from the SAME state the gate refuses through, and a
+    stub would let the refusal prose and the gate drift apart unobserved.
+    """
+    config = MagicMock()
+    config.turn_monitor_enabled = True
+    config.max_turns = 100
+    config.token_monitor_warning_threshold = 500
+    config.token_monitor_critical_threshold = 1000
+    config.time_monitor_enabled = True
+    config.timeout_seconds = 300
+    config.time_warning_threshold = 240
+    state = AgentState(config=config, logger=MagicMock())
+    state.reset()
+    state.restrict(reason)
+    return state
+
+
+def _refusal_executor(state) -> ToolExecutor:
+    return ToolExecutor(
+        tool_classes=[],
+        config=FakeConfig(None),
+        state=state,
+        logger=None,
+        security_available=False,
+        agent=None,
+    )
+
+
+def _refusal_records(caplog):
+    """Only the D5b records -- nothing else the logger tree emitted."""
+    return [r for r in caplog.records if r.name == TOOL_REFUSAL_LOGGER_NAME]
+
+
+class TestToolRefusalMessage:
+    """D5b: three lines -- what/why, the ENFORCED allow-list, what to do next."""
+
+    def test_token_refusal_is_three_lines_reasoning_from_state(self):
+        state = _restricted_state('token')
+        message = _refusal_executor(state)._create_tool_rejection_message('ReadFile')
+        lines = message.split('\n')
+        assert len(lines) == 3, message
+        assert lines[0] == "Tool 'ReadFile' not allowed. Reason: token.", message
+        # Derived, not hard-coded: the line must be the state's own list.
+        assert lines[1] == 'Allowed: %s.' % ', '.join(state.get_allowed_tools()), message
+        assert lines[2] == (
+            'Save your working memory with WorkingDocument, then yield.'
+        ), message
+        # The old one-line prose is gone.
+        assert 'Available tools:' not in message, message
+
+    @pytest.mark.parametrize('reason', ['token', 'timeout', 'turn'])
+    def test_allowed_line_is_exactly_what_the_gate_permits(self, reason):
+        state = _restricted_state(reason)
+        message = _refusal_executor(state)._create_tool_rejection_message(
+            'DockerCodeRunner'
+        )
+        allowed_line = message.split('\n')[1]
+        assert allowed_line.startswith('Allowed: '), message
+        assert allowed_line.endswith('.'), message
+        advertised = allowed_line[len('Allowed: '):-1].split(', ')
+        permitted = {name for name in _TOOL_NAME_PROBES if state.is_tool_allowed(name)}
+        assert set(advertised) == permitted, (
+            f'[{reason}] advertised {sorted(advertised)} != gate {sorted(permitted)}'
+        )
+        for name in advertised:
+            assert state.is_tool_allowed(name) is True, (
+                f'[{reason}] advertised {name} that the gate refuses'
+            )
+
+    def test_each_refusal_emits_exactly_one_record(self, caplog):
+        state = _restricted_state('token')
+        executor = _refusal_executor(state)
+        with caplog.at_level(logging.WARNING, logger=TOOL_REFUSAL_LOGGER_NAME):
+            executor._create_tool_rejection_message('ReadFile')
+            assert len(_refusal_records(caplog)) == 1, (
+                f'expected exactly one record per refusal: '
+                f'{[r.getMessage() for r in _refusal_records(caplog)]}'
+            )
+            executor._create_tool_rejection_message('ReadFile')
+        assert len(_refusal_records(caplog)) == 2, caplog.records
+
+    def test_record_parses_as_json_with_exactly_the_five_keys(self, caplog):
+        state = _restricted_state('token')
+        executor = _refusal_executor(state)
+        with caplog.at_level(logging.WARNING, logger=TOOL_REFUSAL_LOGGER_NAME):
+            executor._create_tool_rejection_message('ReadFile')
+        record = json.loads(_refusal_records(caplog)[0].getMessage())
+        assert set(record) == {
+            'tool', 'reason', 'allowed_set', 'requested_at', 'turn_id',
+        }, record
+        assert record['tool'] == 'ReadFile', record
+        assert record['reason'] == 'token', record
+        # Sorted on purpose: two refusals under the same gate compare equal.
+        assert record['allowed_set'] == sorted(state.get_allowed_tools()), record
+
+    def test_requested_at_is_utc_iso8601(self, caplog):
+        state = _restricted_state('token')
+        executor = _refusal_executor(state)
+        with caplog.at_level(logging.WARNING, logger=TOOL_REFUSAL_LOGGER_NAME):
+            executor._create_tool_rejection_message('ReadFile')
+        record = json.loads(_refusal_records(caplog)[0].getMessage())
+        stamp = record['requested_at']
+        assert isinstance(stamp, str), record
+        assert stamp.endswith('+00:00'), record
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.utcoffset() == timedelta(0), record
+
+    def test_turn_id_is_none(self, caplog):
+        """Nothing in ``agent/`` owns a turn identifier, so it must not be faked."""
+        state = _restricted_state('token')
+        executor = _refusal_executor(state)
+        with caplog.at_level(logging.WARNING, logger=TOOL_REFUSAL_LOGGER_NAME):
+            executor._create_tool_rejection_message('ReadFile')
+        record = json.loads(_refusal_records(caplog)[0].getMessage())
+        assert record['turn_id'] is None, record
+
+    def test_advice_differs_between_token_and_turn(self):
+        token_message = _refusal_executor(
+            _restricted_state('token')
+        )._create_tool_rejection_message('ReadFile')
+        turn_message = _refusal_executor(
+            _restricted_state('turn')
+        )._create_tool_rejection_message('ReadFile')
+        token_advice = token_message.split('\n')[2]
+        turn_advice = turn_message.split('\n')[2]
+        assert token_advice != turn_advice, (token_advice, turn_advice)
+        assert 'WorkingDocument' in token_advice, token_advice
+        assert turn_advice == 'Finish your turn with Respond.', turn_advice

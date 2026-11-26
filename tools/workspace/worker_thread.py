@@ -3797,9 +3797,18 @@ class WorkerThread(threading.Thread):
             # Unaddressed or wrongly-addressed payload. Obeying it is exactly
             # the cross-talk bug this fence exists to prevent.
             quarantine(claimed, reason)
+            # D9: the reason keeps the fence's own vocabulary (which axes
+            # disagree -- observed != expected), because that same string
+            # names the quarantined file (``quarantine``'s ``_slugify`` +
+            # ``_MAX_SLUG_LEN``) and is re-used verbatim by the journal.
+            # Lengthening it would truncate the evidence, so the recovery
+            # hint is appended to the MESSAGE instead. Enforcement is
+            # untouched: the command is still quarantined, never obeyed.
             log("WARNING", "tools.worker",
                 f"Rejected command for worker '{self.worker_name}' "
-                f"(instance_id={self.instance_id}): {reason}")
+                f"(instance_id={self.instance_id}): {reason}. "
+                f"Recovery: force=True on spawn replaces this session's "
+                f"instances and is the supported way out.")
             return
 
         # ── REVALIDATE, THEN DISPATCH ─────────────────────────────────
@@ -5500,12 +5509,59 @@ class WorkerThread(threading.Thread):
 
                 # Send the response back to the waiting tool call
 
-                # Build telemetry
+                # Build telemetry (D11). Two additions, each NULL when the fact
+                # is not knowable -- a defaulted value would read as evidence:
+                #   * ``restriction_reason``: the agent-state reason this turn
+                #     ended restricted under (None when the turn was free);
+                #   * ``cut``: the cut this turn suffered, if any. D3: a
+                #     recorded cut always NAMES its owner, 'unknown' when the
+                #     owner cannot be determined -- never a guess.
+                # ``restriction_reason`` is cleared by run()'s per-query reset,
+                # so a value here IS this turn's restriction -- no extra
+                # "was it active?" guess is needed (and a duck-typed state that
+                # only carries the reason still reports it).
+                _turn_state = getattr(getattr(self, "_agent", None), "state", None)
+                _restriction_reason = getattr(_turn_state, "restriction_reason", None)
+                _cut = None
+                if self._timeout_triggered or _restriction_reason is not None:
+                    # The ONE clock: the budget resolved at dispatch and stored
+                    # on this thread (``_time_budget``). Absent it (a bare
+                    # thread, a duck-typed double) the requested/clamped facts
+                    # are unknown -> None, while the effective bound the loop
+                    # actually ran against is still ``_timeout_seconds``.
+                    _budget = getattr(self, "_time_budget", None)
+                    if not isinstance(_budget, TimeBudget):
+                        _budget = None
+                    _cut = {
+                        "requested_seconds": (
+                            _budget.requested if _budget is not None else None
+                        ),
+                        "effective_seconds": (
+                            _budget.effective
+                            if _budget is not None
+                            else getattr(self, "_timeout_seconds", None)
+                        ),
+                        "clamped": _budget.clamped if _budget is not None else None,
+                        "clamped_by": (
+                            _budget.clamped_by if _budget is not None else None
+                        ),
+                        # An agent-state restriction IS the agent's own turn
+                        # limit: the loop stops issuing tool calls. It is never
+                        # the spawner, which only sets bounds and never cuts a
+                        # running turn.
+                        "cut_by": (
+                            "agent_turn_restriction"
+                            if _restriction_reason is not None
+                            else "unknown"
+                        ),
+                    }
                 telemetry = {
                     "elapsed_seconds": round(self._last_elapsed_val, 1) if self._last_elapsed_val else None,
                     "tool_call_count": self._tool_call_count,
                     "timeout_triggered": self._timeout_triggered,
                     "token_usage": self._final_token_usage,
+                    "restriction_reason": _restriction_reason,
+                    "cut": _cut,
                 }
 
                 # Determine status for force-stop cases. A soft timeout is

@@ -94,7 +94,7 @@ class TestGetAllowedTools:
     def test_get_allowed_tools_timeout_matches_is_tool_allowed(self, state: AgentState):
         """get_allowed_tools() is display-only but must agree with the gate.
 
-        The tool-rejection prose renders ``Available tools:`` from
+        The tool-rejection prose renders ``Allowed:`` from
         get_allowed_tools(), so a disagreement would advertise tools the gate
         then refuses (or hide tools that are permitted).
         """
@@ -132,9 +132,9 @@ class TestGetAllowedTools:
 
         The ceiling protects the CONTEXT WINDOW, not the ability to finish
         already-prepared work: a worker holding a finished patch was refused
-        ``ApplyEdits`` (``Reason: token. Available tools: Respond,
-        SummarizeTool``) and could only paste the patch into chat. A write is
-        bounded input, so it must still reach disk; reads and searches stay
+        ``ApplyEdits`` (``Reason: token. Allowed: Respond, SummarizeTool``)
+        and could only paste the patch into chat. A write is bounded input,
+        so it must still reach disk; reads and searches stay
         refused because they are what grows the context.
         """
         state.restrictions_active = True
@@ -175,7 +175,7 @@ class TestGetAllowedTools:
     ):
         """Display list and gate must agree EXACTLY, as sets, in both directions.
 
-        The rejection prose renders ``Available tools:`` from
+        The rejection prose renders ``Allowed:`` from
         get_allowed_tools(), so any asymmetry advertises a tool the gate then
         refuses (or hides one it permits).
         """

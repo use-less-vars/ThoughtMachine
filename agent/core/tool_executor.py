@@ -6,6 +6,7 @@ Extracted from agent.py to separate tool execution concerns.
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
 from pydantic import ValidationError
@@ -25,6 +26,28 @@ from tools.summarize_tool import SummarizeTool
 
 # Module logger used for the fail-closed id-less entry observation below.
 logger = logging.getLogger(__name__)
+
+# D5b: a control-plane refusal is emitted as ONE structured, machine-readable
+# record on its own logger, so a refusal can be counted/grepped without parsing
+# the ``[CONTROL_PLANE_GATE]`` diagnostics or the prose the model reads.
+TOOL_REFUSAL_LOGGER_NAME = 'thoughtmachine.control_plane.tool_refusal'
+refusal_logger = logging.getLogger(TOOL_REFUSAL_LOGGER_NAME)
+
+# D5b: the last line of a refusal tells the model what to do NEXT, keyed by the
+# restriction that refused it. 'token' and 'timeout' are the two ceilings whose
+# escape hatch is a WRITE (WorkingDocument, see WRITE_ESCAPE_TOOLS in
+# agent/core/state.py) -- the model's remaining useful act is to dump its
+# working memory and yield. A per-turn limit ('turn') or an operator pause ends
+# the turn with the only tool that is left: Respond.
+_REFUSAL_ADVICE = {
+    'token': 'Save your working memory with WorkingDocument, then yield.',
+    'timeout': 'Save what you have with WorkingDocument, then yield.',
+    'turn': 'Finish your turn with Respond.',
+    'pause': 'Finish your turn with Respond.',
+}
+#: Unknown/absent reason: the allow-list is already advertised above, so the
+#: safe instruction is the one that always applies to a restricted turn.
+_REFUSAL_ADVICE_DEFAULT = 'Finish your turn with Respond.'
 
 # Try to import event system for security prompts
 try:
@@ -1123,18 +1146,59 @@ class ToolExecutor:
             return len(str(text)) // 4
 
     def _create_tool_rejection_message(self, tool_name: str) -> str:
-        """Create concise rejection message for disallowed tool calls.
-        
-        Includes the restriction reason so the LLM understands why the tool
-        was blocked (e.g., 'timeout', 'token', 'turn') rather than retrying
-        the same call blindly.
+        """Create the refusal the model reads for one disallowed tool call.
+
+        Three lines, in this order (D5b):
+
+        * what was refused and WHY -- ``Tool 'X' not allowed. Reason: token.``;
+        * the allow-list the gate actually enforces, rendered from
+          ``get_allowed_tools()`` so the advertisement can never contradict
+          the gate that just refused the call;
+        * what to do NEXT, keyed by the reason (see ``_REFUSAL_ADVICE``).
+
+        The previous wording (``Available tools: ...``) was prose inside one
+        line: a model reading it could retry the same blocked call without ever
+        learning the one action it still had.
         """
-        allowed_tools = self.state.get_allowed_tools()
+        allowed_tools = list(self.state.get_allowed_tools() or [])
         restriction_reason = getattr(self.state, 'restriction_reason', None)
-        if allowed_tools:
-            allowed_list = ', '.join(allowed_tools)
-            if restriction_reason:
-                return f"Tool '{tool_name}' not allowed. Reason: {restriction_reason}. Available tools: {allowed_list}"
-            return f"Tool not allowed. Available tools: {allowed_list}"
+        self._record_tool_refusal(tool_name, restriction_reason, allowed_tools)
+        if restriction_reason:
+            headline = f"Tool '{tool_name}' not allowed. Reason: {restriction_reason}."
         else:
-            return f"Tool not allowed. Available tools: none"
+            headline = f"Tool '{tool_name}' not allowed."
+        allowed_line = 'Allowed: %s.' % (
+            ', '.join(allowed_tools) if allowed_tools else 'none'
+        )
+        advice = _REFUSAL_ADVICE.get(restriction_reason, _REFUSAL_ADVICE_DEFAULT)
+        return '\n'.join((headline, allowed_line, advice))
+
+    def _record_tool_refusal(
+        self, tool_name: str, reason: Optional[str], allowed_tools: List[str]
+    ) -> None:
+        """Emit ONE structured record for a refusal (D5b).
+
+        Shape (one JSON object in the message, on its own logger
+        ``TOOL_REFUSAL_LOGGER_NAME``): ``tool``, ``reason``, ``allowed_set``
+        (sorted, so two refusals under the same gate compare equal),
+        ``requested_at`` (ISO-8601, UTC) and ``turn_id``.
+
+        ``turn_id`` is ``None``: nothing in the executor identifies a turn.
+        ``state.current_turn`` is a per-query COUNTER, not an identifier, and
+        inventing one here would make two turns of two workers indistinguishable
+        while looking correlated. A real turn id has to be threaded down from
+        the caller that owns it.
+
+        Never raises: a broken log record must not turn a refusal into a crash.
+        """
+        try:
+            record = {
+                'tool': tool_name,
+                'reason': reason,
+                'allowed_set': sorted(allowed_tools),
+                'requested_at': datetime.now(timezone.utc).isoformat(),
+                'turn_id': None,
+            }
+            refusal_logger.warning('%s', json.dumps(record, sort_keys=True))
+        except Exception:  # pragma: no cover - defensive only
+            pass

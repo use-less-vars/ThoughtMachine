@@ -526,9 +526,9 @@ class AgentState:
 
         Display-only: enforcement happens in ``is_tool_allowed()``, which
         computes the same decision inline. The two MUST agree -- the
-        tool-rejection prose in ``agent/core/tool_executor.py`` renders the
-        ``Available tools:`` list directly from this method, so it has to name
-        the read-only set now that those tools are actually permitted.
+        tool-rejection prose in ``agent/core/tool_executor.py`` renders its
+        ``Allowed:`` line directly from this method, so it has to name the
+        read-only set now that those tools are actually permitted.
 
         The final branch is a fail-safe: an unattributable reason must never
         grant a broader allow-list than the narrowest one, otherwise a

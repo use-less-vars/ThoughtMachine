@@ -65,6 +65,10 @@ from tools.workspace.worker import (  # noqa: E402
     _registry_lock,
 )
 from agent.core.worker_context import WorkerContext  # noqa: E402
+from thoughtmachine.timebudget import (  # noqa: E402
+    CEILING_OWNER,
+    TimeBudget,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1116,6 +1120,109 @@ class TestBriefingSurvivesRealSystemPromptSanitizer(_InitialContextHelpers):
             [msg for msg in history if msg.get("role") == "system"],
             [{"role": "system", "content": SYS_PROMPT}],
         )
+
+
+class TestTurnCutTelemetry(_RunSafetyPatches):
+    """D11: telemetry names the restriction the turn ran under AND the cut.
+
+    Both are NULL when the fact is not knowable: a defaulted value would read
+    as evidence. ``cut_by`` is 'agent_turn_restriction' when an agent-state
+    restriction stopped the turn and the literal 'unknown' for a plain soft
+    timeout -- no distinct owner exists for that, and inventing one would be a
+    guess dressed as a fact.
+    """
+
+    def _run_once(self, thread, *, restriction_reason, timeout_triggered,
+                  budget=None):
+        """Run one query and return the envelope's telemetry.
+
+        ``budget`` is installed the way the dispatch hop installs it
+        (``tools/workspace/worker_timeout.py`` sets ``thread._time_budget``).
+        """
+        if budget is not None:
+            thread._time_budget = budget
+        thread._agent = make_fake_agent(
+            "CRITICAL" if timeout_triggered else "LOW", None
+        )
+        thread._input_queue.put("query-1")
+        thread._input_queue.put(None)
+
+        def fake_run_tool_loop(self, query):
+            # run()'s per-query reset cleared the reason; re-apply what the
+            # agent's own monitors would have set during this turn.
+            self._agent.state.restriction_reason = restriction_reason
+            self._agent.state.restrictions_active = restriction_reason is not None
+            self._timeout_triggered = timeout_triggered
+            self._last_elapsed_val = 12.3
+            self._final_token_usage = self.get_current_context_tokens()
+            return None
+
+        with mock.patch.object(
+            thread, "_run_tool_loop",
+            new=fake_run_tool_loop.__get__(thread, WorkerThread),
+        ):
+            thread.run()
+        return json.loads(thread._output_queue.get_nowait())["telemetry"]
+
+    def test_restricted_turn_reports_reason_and_agent_cut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-cut")
+            budget = TimeBudget.resolve(requested=1200)
+            telemetry = self._run_once(
+                thread,
+                restriction_reason="timeout",
+                timeout_triggered=True,
+                budget=budget,
+            )
+
+        self.assertEqual(telemetry["restriction_reason"], "timeout", telemetry)
+        cut = telemetry["cut"]
+        self.assertIsNotNone(cut, telemetry)
+        self.assertEqual(cut["cut_by"], "agent_turn_restriction", cut)
+        self.assertEqual(cut["requested_seconds"], 1200, cut)
+        self.assertEqual(cut["effective_seconds"], 600, cut)
+        self.assertEqual(cut["effective_seconds"], budget.effective, cut)
+        self.assertIs(cut["clamped"], True, cut)
+        # The ceiling owner is a FACT carried from the budget, not a literal.
+        self.assertEqual(cut["clamped_by"], CEILING_OWNER, cut)
+        self.assertTrue(cut["clamped_by"], cut)
+
+    def test_free_uncut_turn_reports_no_reason_and_no_cut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-free")
+            telemetry = self._run_once(
+                thread,
+                restriction_reason=None,
+                timeout_triggered=False,
+                budget=TimeBudget.resolve(requested=120),
+            )
+
+        self.assertIsNone(telemetry["restriction_reason"], telemetry)
+        self.assertIsNone(telemetry["cut"], telemetry)
+        self.assertIs(telemetry["timeout_triggered"], False, telemetry)
+
+    def test_soft_timeout_without_budget_names_unknown_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-nobudget", timeout=60)
+            # A bare thread never saw a dispatch hop: no budget object exists.
+            self.assertIsNone(getattr(thread, "_time_budget", None))
+            telemetry = self._run_once(
+                thread,
+                restriction_reason=None,
+                timeout_triggered=True,
+            )
+            effective = thread._timeout_seconds
+
+        self.assertIsNone(telemetry["restriction_reason"], telemetry)
+        cut = telemetry["cut"]
+        self.assertIsNotNone(cut, telemetry)
+        self.assertIsNone(cut["requested_seconds"], cut)
+        self.assertIsNone(cut["clamped"], cut)
+        self.assertIsNone(cut["clamped_by"], cut)
+        # The bound the loop actually ran against is still reported.
+        self.assertEqual(cut["effective_seconds"], effective, cut)
+        self.assertEqual(cut["effective_seconds"], 60, cut)
+        self.assertEqual(cut["cut_by"], "unknown", cut)
 
 
 if __name__ == "__main__":
