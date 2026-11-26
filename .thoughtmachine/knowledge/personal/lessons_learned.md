@@ -1499,3 +1499,18 @@ or by `ppid == backend_pid`.
 **DockerCodeRunner is dead in this workspace**: `/workspace/.git` shadow bind target has no host source (`~/.thoughtmachine/workspaces/default/.git-shadow-mask` missing). `infra/container_create.py:115-147` refuses rather than letting docker materialise the mask as a directory — correct refusal, but `thoughtmachine/workspace_capabilities.py` only creates the mask from `setup_workspace.py`, so pre-existing vault workspaces never get one. This is why the container write path is unavailable and host_bash became a single point of failure. Fix queued as its own PR.
 
 **Host-process kill-switch contract** (`tests/test_host_port_kill_switch.py` + `tests/test_tool_import_declaration_match.py`): every module under `agent, infra, mcp_examples, scripts, security, thoughtmachine, tools, web_ui` that reaches the host must go through `thoughtmachine.host_port.host_run()`. Declaring an exception needs BOTH an exact-path `ALLOWED_OFFENDERS` entry with a reason AND a `PINNED_SITE_COUNTS` pin — an allowlist entry without a pin fails as "unpinned". Removing `import subprocess` from a module clears the importer/import-match tests entirely, so shrink the surface before declaring the residue. `tests/` is not scanned, so tests may use subprocess.
+
+## MACHINERY DEFECT — FileSearchTool is token-pathological on long single files (2026-11-26, gen67)
+
+Measured inside a worker turn (worker's own report, its `tool_issues` field): one `FileSearchTool` call over `scripts/forensics_after_reboot.sh` (455 lines) returned **~10k tokens**, because the tool re-emits the whole file block once per match pattern — 5 hits = the same file 5×. The worker spent its entire turn budget (187.8 s, 123 tool calls, 58,860 tokens) reading and produced ZERO edits. Same file read with `FilePreviewTool` + explicit line range costs a fraction.
+
+Consequence for briefs: **never let a worker discover a long file by search.** Hand over exact line numbers in the brief, or order `FilePreviewTool` with a range. This has now cost one full turn.
+
+Related, and unfixed (all F1 shape — a tool answering confidently and wrongly):
+- `GlobTool` returns "Page 1 of 0" for `*` / `*/` over a directory with 110 subdirs (false negative, and it looks authoritative).
+- `DirectoryTreeTool` `max_depth=0` means UNLIMITED (one call produced a 2.9M-token dump). A "zero" depth must mean zero, or refuse.
+- Absolute paths: `ReadFileTool` REFUSES them, `FileEditor` ACCEPTS them — the same path gets two different answers from the same root.
+- `FileSearchTool` refuses repo-wide search above ~33.5k files.
+- Worker timeout is granted-but-not-honoured: **480 s requested (clamp reported `false`, `timeout_source: worker_thread.spawn`), cut at 187.8 s** with `timeout_triggered: true`. Earlier in the same session: 420 granted, cut at 140 s and 163 s. The cut never names its layer. Mitigation that works: order the brief "edit code first, tests second, report third" so a cut still leaves work on disk, and never put the report before the work.
+
+Ticket candidate: one PR "tools answer truthfully" covering the four tool defects above.
