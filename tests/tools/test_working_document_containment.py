@@ -158,8 +158,27 @@ def test_create_append_read_round_trip(workspace, docs_dir):
     toc = json.loads(_run(action="read", doc_id=doc_id))
     assert toc["title"] == "Plan"
     assert set(toc["sections"]) == {"notes", "todo"}
-    assert toc["sections"]["notes"] == 1
-    assert toc["sections"]["todo"] == 0
+
+    # NOTE: the integer-count contract asserted here previously (``== 1`` /
+    # ``== 0``) WAS the bug -- a count where text belongs is why a section could
+    # look written and be empty -- and is deliberately not preserved.
+    notes_summary = toc["sections"]["notes"]
+    todo_summary = toc["sections"]["todo"]
+    # Each entry is TEXT describing the section (naming its line count), not a
+    # bare number standing in for the body.
+    assert isinstance(notes_summary, str)
+    assert isinstance(todo_summary, str)
+    assert "1" in notes_summary and "line" in notes_summary
+    assert "0" in todo_summary and "line" in todo_summary
+    # The summary is a description, not the content: what ``read`` returns for
+    # a section is exactly the text stored on disk -- the appended entry, with
+    # its timestamp -- and the untouched section stores empty text, not a 0.
+    stored = json.loads((docs_dir / f"{doc_id}.json").read_text(encoding="utf-8"))
+    assert "first line" in stored["sections"]["notes"]
+    assert body == stored["sections"]["notes"]
+    assert stored["sections"]["todo"] == ""
+    assert notes_summary != body
+    assert _run(action="read", doc_id=doc_id, section="todo") != todo_summary
 
 
 def test_append_to_missing_section_is_created(docs_dir):
