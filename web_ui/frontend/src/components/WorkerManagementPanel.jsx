@@ -88,6 +88,11 @@ const STATUS_DOT_COLORS = {
   busy: '#a6e3a1',     /* green with pulse — actively processing */
   completed: '#6c7086', /* muted grey — finished */
   error: '#f38ba8',    /* red — something went wrong */
+  /* failed/orphaned are NOT thread.status values: _list_entry_for overrides
+     runtime_status for a child that never started (failed) and for a worker
+     whose last dispatch expired (orphaned). */
+  failed: '#f38ba8',   /* red — the child never started; the report is a mock */
+  orphaned: '#f9e2af', /* amber — dispatch expired; state is not knowable */
   pausing: '#f9e2af',  /* amber — pause in flight (not yet paused) */
   paused: '#f9e2af',   /* amber — paused; matches session StatusBar */
   detaching: '#f9e2af', /* amber — detach (stop) in flight, not yet parked */
@@ -105,6 +110,8 @@ const STATUS_LABELS = {
   busy: 'busy',
   completed: 'completed',
   error: 'error',
+  failed: 'failed',
+  orphaned: 'Orphaned',
   pausing: 'Pausing…',
   paused: 'Paused',
   detaching: 'Detaching…',
@@ -119,6 +126,8 @@ const STATUS_TEXT_COLORS = {
   busy: '#89b4fa',
   completed: '#a6adc8',
   error: '#f38ba8',
+  failed: '#f38ba8',
+  orphaned: '#f9e2af',
   pausing: '#f9e2af',
   paused: '#f9e2af',
   detaching: '#f9e2af',

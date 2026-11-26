@@ -985,6 +985,59 @@ def _dispatch_error_context(tool: Any) -> tuple:
     return handle, runtime_mode
 
 
+def _record_dispatch_expiry(
+    thread: Any,
+    *,
+    query_id: Any = None,
+    action: Any = None,
+    stage: Any = None,
+    when: Any = None,
+) -> dict:
+    """Mark *thread* as having had a dispatch EXPIRE, and return what was kept.
+
+    Diagnostic only: the timeout paths keep their hands on teardown (the kill
+    still happens); this just records the fact so ``action='list'`` and
+    ``action='inspect'`` can report ``runtime_status='orphaned'`` instead of a
+    status that reads as if the dispatch were still healthy.
+
+    Never raises -- a thread object that refuses attributes must not break the
+    timeout path it is being called from.
+    """
+    try:
+        expired_at = time.time() if when is None else float(when)
+        thread._dispatch_expired_at = expired_at
+        thread._dispatch_expired_query_id = query_id
+        thread._dispatch_expired_action = action
+    except Exception:  # noqa: BLE001 - diagnostics must never raise
+        return {}
+    logger.debug(
+        "worker dispatch expired: stage=%s action=%s query_id=%s at=%s",
+        stage,
+        action,
+        query_id,
+        expired_at,
+    )
+    return {
+        "dispatch_expired_at": expired_at,
+        "dispatch_expired_query_id": query_id,
+        "dispatch_expired_action": action,
+    }
+
+
+def _clear_dispatch_expiry(thread: Any) -> None:
+    """Forget a previously recorded dispatch expiry on *thread*.
+
+    Called on the paths where a delivery SUCCEEDED, so the expiry marker cannot
+    outlive the condition it describes.  Never raises.
+    """
+    try:
+        thread._dispatch_expired_at = None
+        thread._dispatch_expired_query_id = None
+        thread._dispatch_expired_action = None
+    except Exception:  # noqa: BLE001 - diagnostics must never raise
+        pass
+
+
 def _list_entry_for(
     base: dict, instance_id: Any, thread: Any, handle: Any = None
 ) -> dict:
@@ -993,7 +1046,9 @@ def _list_entry_for(
     ``runtime_status`` is ``thread.status`` -- the BODY's own report -- except
     where that report cannot be true: a process-mode instance whose child never
     started is not ``ready``, so it is reported ``failed`` with the start error.
-    ``None`` liveness is NOT failure -- it means "not yet probed".
+    ``None`` liveness is NOT failure -- it means "not yet probed".  An instance
+    whose last dispatch EXPIRED (``_record_dispatch_expiry``) is reported
+    ``orphaned``, with when it expired and which query it was.
     """
     entry = dict(base)
     name = base.get("name", "")
@@ -1039,6 +1094,14 @@ def _list_entry_for(
     if alive is False and start_error:
         entry["runtime_status"] = "failed"
         entry["error"] = str(start_error)
+    else:
+        expired_at = getattr(thread, "_dispatch_expired_at", None)
+        if expired_at is not None:
+            entry["runtime_status"] = "orphaned"
+            entry["dispatch_expired_at"] = expired_at
+            entry["dispatch_expired_query_id"] = getattr(
+                thread, "_dispatch_expired_query_id", None
+            )
     return entry
 
 
@@ -7619,6 +7682,13 @@ class Worker(ToolBase):
                     })
                 else:
                     entry.update(handle.substrate())
+                expired_at = getattr(thread, "_dispatch_expired_at", None)
+                entry["orphaned"] = expired_at is not None
+                if expired_at is not None:
+                    entry["dispatch_expired_at"] = expired_at
+                    entry["dispatch_expired_query_id"] = getattr(
+                        thread, "_dispatch_expired_query_id", None
+                    )
                 entries.append(entry)
 
         return {
@@ -7989,6 +8059,7 @@ class Worker(ToolBase):
                 response = deliver_query_to_worker(
                     reuse_thread, dispatch_text, timeout=wait
                 )
+                _clear_dispatch_expiry(reuse_thread)
             except TimeoutError as exc:
                 return {
                     "error": str(exc),
@@ -9185,6 +9256,7 @@ class Worker(ToolBase):
             response = deliver_query_to_worker(
                 thread, delivered_query, timeout=wait
             )
+            _clear_dispatch_expiry(thread)
             elapsed = thread._last_elapsed()
             result = {
                 "worker_name": self.worker_name,
@@ -9209,6 +9281,12 @@ class Worker(ToolBase):
             # query timeout calls kill(). Still not Thread.kill (the OS verb):
             # the thread exits via its own run() teardown. Best-effort: if it
             # raises, run() teardown remains authoritative.
+            _record_dispatch_expiry(
+                thread,
+                query_id=getattr(thread, "_current_query_id", None),
+                action="query",
+                stage="query_timeout",
+            )
             try:
                 thread.kill()
             except Exception:
