@@ -1,19 +1,18 @@
-"""A ``None`` from the worktree resolver must not block a worker from booting.
+"""Spawning a worker must not create a per-session git worktree.
 
-The property pinned here is the one that was mistakenly believed to be broken:
-``resolve_worker_worktree_root`` is FAIL-OPEN (``tools/workspace/worktree_defaults.py``
-logs and returns ``None`` on every unprovable precondition -- no host grant, no
-git, ``git worktree add`` exited non-zero, ...).  That ``None`` reaches exactly
-one branch, ``worker_thread._build_agent_config``'s ``if _default_worktree_root:``,
-so ``worktree_root`` is simply left unset and the worker runs on the fallback
-``workspace_path`` (the project root).  Nothing on that path raises, and it is
-reached only from ``run()`` -- on the worker's first query, i.e. long after the
-spawn side returned.
+Per-session worktree isolation is OPT-IN.  ``worker_thread._build_agent_config``
+no longer calls ``resolve_worker_worktree_root`` and never sets
+``worktree_root`` on its own, so a worker runs in the registered workspace root
+-- the tree the agent's git tools and the docker mount use -- and logs one INFO
+naming that root.  Everything the resolver does
+(``tools/workspace/worktree_defaults.py``) is still FAIL-OPEN, but it only runs
+when a caller explicitly asks for isolation by setting ``worktree_root``.
 
 Covered here:
 
   * ``_build_agent_config`` still returns a config, with the ``workspace_path``
-    fallback and no ``worktree_root``;
+    fallback and no ``worktree_root`` -- and the resolver is NOT consulted:
+    the ``resolver_calls`` fixture patches it and the tests assert zero calls;
   * the worker body still boots: it registers its per-worker event bus and
     publishes ``WORKER_SPAWNED`` (the event the bridge subscribes on).  The
     query loop is never entered (``_stop_event`` is pre-set), so there is no
@@ -24,12 +23,12 @@ Covered here:
     which is why a production log without the string ``WORKER_SPAWNED`` used to
     prove nothing at all.
 
-Note on the patch target: the resolver is imported INSIDE
-``_build_agent_config`` (``from tools.workspace.worktree_defaults import
-resolve_worker_worktree_root``), so ``tools.workspace.worker_thread`` has no
-module-level ``resolve_worker_worktree_root`` attribute to patch.  The
-reference resolved at call time is the attribute on
-``tools.workspace.worktree_defaults``, and that is what is patched.
+Note on the patch target: ``resolver_calls`` patches the attribute on the
+defining module, ``tools.workspace.worktree_defaults.resolve_worker_worktree_root``
+-- the one any lazy ``from ... import`` would read at call time -- and then
+asserts it was never called.  Patching the definer rather than a caller's
+namespace keeps that assertion independent of how (or whether) a caller
+imports the symbol.
 
 Hermetic: a real but never-started ``WorkerThread`` against pytest ``tmp_path``.
 """
@@ -86,7 +85,11 @@ def project_root(tmp_path):
 
 @pytest.fixture
 def resolver_calls(monkeypatch):
-    """Force the worktree resolver to fail open, recording that it ran."""
+    """Record any consult of the worktree resolver.
+
+    The spawn path must make none: a per-session worktree is opt-in, so the
+    resolver is only reached by a caller that decided to isolate.
+    """
     calls = []
 
     def _resolver(workspace_root, session_id, **kwargs):
@@ -136,33 +139,36 @@ class _BoomBus:
         raise RuntimeError("event bus unavailable")
 
 
-def test_resolver_none_still_returns_agent_config(
+def test_agent_config_skips_resolver_and_uses_workspace_root(
     tmp_path, project_root, resolver_calls
 ):
     thread = _thread(tmp_path, project_root)
 
     cfg = thread._build_agent_config()
 
-    assert cfg is not None, "a failed worktree bootstrap must not cost the config"
-    # The fallback root, unchanged from before the worktree feature.
+    assert cfg is not None, "the config build must never be skipped"
+    # The registered workspace root, i.e. what the git tools and the docker
+    # mount see -- not a per-session worktree.
     assert cfg.workspace_path == str(project_root)
     # Worktree root absent -> the config field keeps its default.
     assert cfg.worktree_root is None
-    assert resolver_calls, "the resolver must actually have been consulted"
+    assert not resolver_calls, (
+        "spawning a worker must not create a per-session worktree; "
+        f"resolver calls: {resolver_calls}"
+    )
 
 
-def test_resolver_none_does_not_prevent_spawn(
+def test_spawn_does_not_consult_resolver(
     tmp_path, project_root, registry_snapshot, resolver_calls
 ):
-    """The worker body boots and publishes WORKER_SPAWNED despite the ``None``.
+    """The worker body boots and publishes WORKER_SPAWNED with no resolver call.
 
-    Scope note: the resolver is reachable ONLY from ``run()`` -- its single call
-    site is ``_build_agent_config``, which ``run()`` invokes when the first query
-    is dequeued.  ``Worker._action_spawn`` therefore cannot be affected by it and
-    is not driven here.  What is asserted is the thing the operator's hypothesis
-    claimed was lost -- the boot of the worker body, its bus registration and its
-    WORKER_SPAWNED publish -- driven through the real ``run()`` up to and
-    including that first-query Agent build.
+    Scope note: ``_build_agent_config`` is invoked from ``run()`` when the first
+    query is dequeued, so driving ``run()`` is what exercises it.
+    ``Worker._action_spawn`` builds no worktree either and is not driven here.
+    What is asserted is the boot of the worker body, its bus registration and
+    its WORKER_SPAWNED publish -- through the real ``run()`` up to and including
+    that first-query Agent build -- plus the absence of any worktree resolution.
 
     The ``Agent`` class itself is stubbed to raise, which is the path that turns
     any Agent-construction failure into a clean error reply plus a loop exit, so
@@ -186,10 +192,10 @@ def test_resolver_none_does_not_prevent_spawn(
     assert bus.bus_at_spawn_publish is not None, (
         "the per-worker event bus was not registered at WORKER_SPAWNED time"
     )
-    assert resolver_calls, "the resolver must actually have been consulted"
-    # Fail-open resolution ran against the project-root fallback, this session.
-    assert resolver_calls[0][0] == str(project_root)
-    assert resolver_calls[0][1] == SESSION
+    assert not resolver_calls, (
+        "the spawn path must not resolve a per-session worktree; "
+        f"resolver calls: {resolver_calls}"
+    )
 
 
 def test_publish_failure_is_logged(

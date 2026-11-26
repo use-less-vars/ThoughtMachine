@@ -4097,30 +4097,24 @@ class WorkerThread(threading.Thread):
         if "workspace_path" not in worker_cfg and self._project_root:
             worker_cfg["workspace_path"] = self._project_root
 
-        # ── Default worktree_root: one worktree per session ────────────
-        # An explicitly configured root (the parent session's) always wins.
-        # Otherwise give the worker its own checkout under
-        # ``<workspace>/.worktrees/<session>`` so its file operations cannot
-        # collide with the main agent's.  Fail-open: no workspace root, no git
-        # binary, no repository, or a failing ``git worktree add`` all leave
-        # worktree_root unset, i.e. exactly the pre-existing behaviour.  The
-        # directory is created HERE because ``worktree_root`` is validated
-        # fail-closed downstream — the validator is never relaxed.
-        # It is checked out on ``wt/<session>`` so the worker can commit; a
-        # detached worktree makes every git_write verb refuse with
-        # ``_DETACHED_HEAD_ERROR``.  Do not detach here.
+        # ── worktree_root is OPT-IN: no per-session checkout by default ──
+        # A worker's file tools operate on the tree bound to its
+        # ``worktree_root``; that same tree is what the git tools inspect and
+        # what the docker container mounts (infra/container_manager.py mounts
+        # ``self.workspace_path``, and both docker callers resolve the
+        # registered workspace root).  Auto-creating
+        # ``<workspace>/.worktrees/<session>`` here therefore put every worker
+        # edit in a tree no diff, commit, CI run or container could see.
+        # Default to the registered workspace root instead: an explicitly
+        # configured root still always wins, and ``worktree_root`` stays
+        # validated fail-closed downstream.  A caller that wants isolation asks
+        # for it by setting ``worktree_root``.
         if not worker_cfg.get("worktree_root"):
-            from tools.workspace.worktree_defaults import (
-                resolve_worker_worktree_root,
-            )
-
-            _default_worktree_root = resolve_worker_worktree_root(
+            logger.info(
+                "Worker file root: registered workspace root %s (no per-session "
+                "worktree; set worktree_root to isolate).",
                 worker_cfg.get("workspace_path") or self._project_root,
-                self.session_id,
-                effective_permissions=worker_cfg.get("session_permissions"),
             )
-            if _default_worktree_root:
-                worker_cfg["worktree_root"] = _default_worktree_root
 
         # Safety net: ensure max_turns is a valid int (fall back to 100)
         if "max_turns" not in worker_cfg or worker_cfg.get("max_turns") is None:
