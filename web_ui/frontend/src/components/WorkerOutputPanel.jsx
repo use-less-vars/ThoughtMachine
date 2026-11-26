@@ -20,6 +20,8 @@ const STATUS_DOT = {
   pausing: { color: '#f9e2af', busy: false, label: 'Pausing…', title: 'Pausing worker…' },
   paused: { color: '#f9e2af', busy: false, label: 'Paused', title: 'Worker is paused' },
   error: { color: '#f38ba8', busy: false, label: 'Error', title: 'Worker error' },
+  failed: { color: '#f38ba8', busy: false, label: 'Failed', title: 'Worker failed to start' },
+  orphaned: { color: '#f9e2af', busy: false, label: 'Orphaned', title: 'Last dispatch expired — worker state is not knowable' },
   stopped: { color: '#6c7086', busy: false, label: 'Stopped', title: 'Worker is stopped' },
   terminated: { color: '#6c7086', busy: false, label: 'Stopped', title: 'Worker is stopped' },
   completed: { color: '#6c7086', busy: false, label: 'Completed', title: 'Worker completed' },
