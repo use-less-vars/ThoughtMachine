@@ -2336,6 +2336,61 @@ def _job_registry_reporter(
     return _report
 
 
+def _close_sync_dispatch_job(
+    registry: Any,
+    job_id: str,
+    status: str,
+    envelope: Optional[dict] = None,
+    *,
+    worker_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+    instance_id: Optional[int] = None,
+) -> None:
+    """Close the record a SYNCHRONOUS query dispatch opened for *job_id*.
+
+    A blocking ``action='query'`` registers its job before it starts waiting, so
+    the record MUST be moved out of ``submitted`` when the call ends -- by
+    whatever route it ends. ``completed`` goes through ``complete`` (it stores
+    the envelope and derives the preview); every other outcome (``timeout``,
+    ``error``) goes through ``terminalize``, which carries the envelope without
+    pretending the query produced a reply.
+
+    Best-effort and idempotent, like :func:`_job_registry_reporter`: a missing
+    registry is a no-op, the registry refuses to overwrite a terminal record,
+    and no failure here may reach the caller -- the caller is already returning
+    the real outcome of the dispatch, and a bookkeeping fault must not shadow
+    it. ``worker_name``/``session_id``/``instance_id`` are recorded on the
+    record this closes (terminal writes are all a later reader gets).
+    """
+    if registry is None:
+        return
+    try:
+        if status == "completed":
+            registry.complete(
+                job_id,
+                envelope or {},
+                worker_name=worker_name,
+                session_id=session_id or "",
+                instance_id=instance_id,
+            )
+            return
+        registry.terminalize(
+            job_id,
+            status=status,
+            envelope=envelope,
+            worker_name=worker_name,
+            session_id=session_id or "",
+            instance_id=instance_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must never raise
+        logger.warning(
+            "job registry close for %s failed: %s: %s",
+            job_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
@@ -9247,6 +9302,35 @@ class Worker(ToolBase):
                 wait,
                 wait - QUERY_WAIT_GRACE_SECONDS,
             )
+        # RECORDABLE DISPATCH: open the job record BEFORE the blocking delivery.
+        # A synchronous query holds this tool thread for its whole budget, so
+        # registering afterwards made the job invisible for exactly the window
+        # in which a caller most wants to see it (a second tool call asking
+        # "what is this worker doing?") -- job_status reported nothing, and a
+        # timeout left no trace at all. The record is closed below on EVERY
+        # exit path (completed / timeout / error), so it never stays
+        # "submitted".
+        sync_job_id = uuid.uuid4().hex
+        registry = _get_worker_job_registry()
+        try:
+            if registry is not None:
+                registry.register(
+                    sync_job_id,
+                    self.worker_name,
+                    self.session_id or "",
+                    instance_id=iid,
+                )
+        except Exception as exc:  # noqa: BLE001 - registration is best-effort
+            # The query still runs: a registry fault must not turn a healthy
+            # dispatch into an error. Only the record is lost, so drop the
+            # registry reference and let the close helper no-op.
+            logger.warning(
+                "could not register synchronous query job for '%s': %s: %s",
+                self.worker_name,
+                type(exc).__name__,
+                exc,
+            )
+            registry = None
         try:
             # Block until the worker responds. Runtime-mode aware: in process
             # mode the body is a child interpreter, so this must go through the
@@ -9262,6 +9346,7 @@ class Worker(ToolBase):
                 "worker_name": self.worker_name,
                 "instance_id": iid,
                 "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                "job_id": sync_job_id,
                 "response": response,
                 "elapsed_seconds": round(elapsed, 1) if elapsed is not None else None,
             }
@@ -9269,6 +9354,17 @@ class Worker(ToolBase):
                 result["reasoning"] = thread._last_reasoning
             if context_note is not None:
                 result["context_note"] = context_note
+            # The reply IS this job's terminal state: close the record with the
+            # same envelope the caller is handed back.
+            _close_sync_dispatch_job(
+                registry,
+                sync_job_id,
+                "completed",
+                result,
+                worker_name=self.worker_name,
+                session_id=self.session_id or "",
+                instance_id=iid,
+            )
             return result
         except TimeoutError as exc:
             # Cooperative stop: the query deadline elapsed with no reply. Stop
@@ -9281,6 +9377,23 @@ class Worker(ToolBase):
             # query timeout calls kill(). Still not Thread.kill (the OS verb):
             # the thread exits via its own run() teardown. Best-effort: if it
             # raises, run() teardown remains authoritative.
+            # Close the job FIRST: everything below (kill, container reclaim,
+            # the bounded exit wait) can take its own sweet time, and a record
+            # still saying "submitted" during that window says the wrong thing
+            # about a query that already failed.
+            _close_sync_dispatch_job(
+                registry,
+                sync_job_id,
+                "timeout",
+                {
+                    "error": str(exc),
+                    "status": "timeout",
+                    "worker_name": self.worker_name,
+                },
+                worker_name=self.worker_name,
+                session_id=self.session_id or "",
+                instance_id=iid,
+            )
             _record_dispatch_expiry(
                 thread,
                 query_id=getattr(thread, "_current_query_id", None),
@@ -9351,6 +9464,7 @@ class Worker(ToolBase):
                         return {
                             "error": f"Worker appears hung (last heartbeat: {thread.last_heartbeat}, {age_seconds:.0f}s ago)",
                             "worker_name": self.worker_name,
+                            "job_id": sync_job_id,
                             "status": thread.status,
                             "current_task": thread.current_task,
                             "note": degraded_note if not clean_exit else stopped_note,
@@ -9361,6 +9475,7 @@ class Worker(ToolBase):
                 "error": str(exc),
                 "note": degraded_note if not clean_exit else stopped_note,
                 "worker_name": self.worker_name,
+                "job_id": sync_job_id,
                 "status": thread.status,
             }
         except RuntimeError as exc:
@@ -9383,6 +9498,22 @@ class Worker(ToolBase):
                 type(exc).__name__,
                 exc,
             )
+            # The delivery never happened, so the record must not keep claiming
+            # the query is in flight: close it as an error, with the same
+            # message the caller is about to receive.
+            _close_sync_dispatch_job(
+                registry,
+                sync_job_id,
+                "error",
+                {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "status": "error",
+                    "worker_name": self.worker_name,
+                },
+                worker_name=self.worker_name,
+                session_id=self.session_id or "",
+                instance_id=iid,
+            )
             if transport_missing:
                 note = (
                     "The query could not be delivered: the worker is stamped "
@@ -9401,12 +9532,32 @@ class Worker(ToolBase):
                 "error": f"{type(exc).__name__}: {exc}",
                 "note": note,
                 "worker_name": self.worker_name,
+                "job_id": sync_job_id,
                 "instance_id": iid,
                 "instance_label": _WorkerRegistry.instance_label(
                     self.worker_name, iid
                 ),
                 "status": thread.status,
             }
+        except Exception as exc:
+            # Anything else the transport raises leaves the record exactly the
+            # same way the two handlers above would: a job that stays
+            # "submitted" forever is a phantom the caller can never resolve.
+            # Re-raised unchanged -- this clause records, it does not handle.
+            _close_sync_dispatch_job(
+                registry,
+                sync_job_id,
+                "error",
+                {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "status": "error",
+                    "worker_name": self.worker_name,
+                },
+                worker_name=self.worker_name,
+                session_id=self.session_id or "",
+                instance_id=iid,
+            )
+            raise
 
     def _action_submit_query(self, workers: list) -> dict:
         """Submit a query without blocking (Phase 2B).
@@ -9537,6 +9688,19 @@ class Worker(ToolBase):
                 "has_result": rec.get("result") is not None,
                 "preview": rec.get("preview", ""),
             }
+        # NO INSTANCE FILTER. ``self.instance_id`` on this tool addresses the
+        # WORKER INSTANCE the call talks to (a spawn generation), not a property
+        # of the jobs asked about: filtering the enumeration by it silently
+        # dropped every job recorded against another generation, so a caller
+        # asking "what work does this worker have?" was answered with an empty
+        # list instead of the truth. ``instance_id=None`` means "no filter"
+        # (job_registry.jobs only filters when the argument is not None), and
+        # the filters are echoed back so the answer states its own scope.
+        filters = {
+            "worker_name": self.worker_name or None,
+            "instance_id": None,
+            "session_id": self.session_id,
+        }
         jobs = [
             {
                 "job_id": r.get("job_id"),
@@ -9547,13 +9711,14 @@ class Worker(ToolBase):
                 "has_result": r.get("result") is not None,
                 "preview": r.get("preview", ""),
             }
-            for r in registry.jobs(
-                worker_name=self.worker_name or None,
-                instance_id=self.instance_id,
-                session_id=self.session_id,
-            )
+            for r in registry.jobs(**filters)
         ]
-        return {"worker_name": self.worker_name, "jobs": jobs, "count": len(jobs)}
+        return {
+            "worker_name": self.worker_name,
+            "jobs": jobs,
+            "count": len(jobs),
+            "filters": filters,
+        }
 
     def _action_join(self, workers: list) -> dict:
         """Block until a submitted job reaches a terminal state (Phase 2B).
