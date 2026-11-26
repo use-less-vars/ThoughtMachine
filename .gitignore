@@ -141,6 +141,9 @@ config_snapshot.json
 
 # Local working docs — not part of the repo
 docs/*
+# Resource evidence base for docs/DESIGN_RESOURCES.md: `docs/*` excludes the
+# `docs/evidence/` DIRECTORY itself, so git cannot descend into it without this.
+!docs/evidence/
 # dated evidence artifacts under docs/ are tracked; the rest of docs/ is not
 !docs/ops/
 !docs/ops/*.log
@@ -505,3 +508,7 @@ web_ui/frontend/.dist-build-stamp
 # agent branches in flight. Public-tier docs need one negation line each under
 # the `docs/*` rule above; this is that line.
 !docs/DIRECTION_2026-11-24_GEN67_RULINGS.md
+# Resource-bindings design doc (branch docs/design-resources): public tier, ships
+# with the repo -- `docs/*` above is a catch-all, so the negation is required or
+# the file is never versioned and vanishes on the next clone.
+!docs/DESIGN_RESOURCES.md
