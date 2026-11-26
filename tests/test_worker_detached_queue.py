@@ -358,7 +358,20 @@ class TestQueryActionAgainstDetachedWorker:
         assert record["worker_name"] == "w-queue"
 
     def test_query_against_running_worker_still_blocks(self, tmp_path, monkeypatch, registry):
-        """Regression guard: the PAUSED/running paths keep the blocking contract."""
+        """Regression guard: the PAUSED/running paths keep the BLOCKING contract.
+
+        A synchronous ``query`` waits for the worker's reply and returns it in
+        this very call, unlike ``submit_query``, which returns immediately with
+        a merely-``submitted`` record. This test used to express that by pinning
+        ``"job_id" not in result``: a blocking query left no job record at all,
+        so the ABSENCE of its handle was the distinction. A blocking query now
+        registers a job too (so a timeout still leaves a retrievable record)
+        and closes it ``completed`` before returning, so a missing ``job_id`` no
+        longer means "blocked" -- it means nothing. The contract to guard is
+        instead: the reply came back (envelope present, content intact) AND the
+        job record was already TERMINAL by the time the call returned, which
+        ``submit_query`` never does.
+        """
         thread = _spawn_worker(tmp_path, monkeypatch)
         _record_turns(thread)
 
@@ -373,7 +386,12 @@ class TestQueryActionAgainstDetachedWorker:
         # The blocking path returns the worker's envelope, not a bare string.
         payload = json.loads(result["response"])
         assert payload["content"] == "reply:now", payload
-        assert "job_id" not in result
+        # It is also a RECORDED dispatch: the caller keeps the handle, and the
+        # record is already closed (completed) on return -- no poll needed.
+        assert result.get("job_id"), result
+        record = registry.job(result["job_id"])
+        assert record is not None, record
+        assert record["status"] == "completed", record
 
     def test_submit_query_appends_to_the_same_queue(self, tmp_path, monkeypatch, registry):
         thread = _spawn_worker(tmp_path, monkeypatch)
