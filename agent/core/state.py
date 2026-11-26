@@ -1,6 +1,6 @@
 from __future__ import annotations
 import enum
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, Iterable, List
 from dataclasses import dataclass, field
 import typing
 from agent import events as ev
@@ -21,9 +21,122 @@ from thoughtmachine.timeout_constants import (
 #
 # ``TIMEOUT_WRITE_ESCAPE_TOOLS`` (the constant this is derived from) keeps
 # working untouched: it is imported above, named in the docs, and pinned by
-# tests/test_state_timeout.py. This is the sorted tuple both allow-list
-# branches must agree on.
+# tests/test_state_timeout.py. This is the sorted tuple the rows below that
+# grant an escape hatch are built from -- there are no separate allow-list
+# branches left to keep in agreement.
 WRITE_ESCAPE_TOOLS: tuple[str, ...] = tuple(sorted(TIMEOUT_WRITE_ESCAPE_TOOLS))
+
+
+@dataclass(frozen=True)
+class RestrictionRule:
+    """What one restriction reason permits, and how narrow it is.
+
+    ``extra_tools`` is everything the reason grants ON TOP OF the base
+    Respond-only set; ``severity`` ranks how narrow the rule is (higher = more
+    restrictive) so that when several reasons are live at once the arbitration
+    below can pick the narrowest one without any caller hand-ordering names.
+    """
+    extra_tools: tuple[str, ...] = ()
+    severity: int = 0
+
+
+# The ONE restriction table. Every consumer derives from it: the display
+# allow-list (``get_allowed_tools()``), the enforcement gate
+# (``is_tool_allowed()``) and the token-critical warning sentence. That is what
+# keeps the message and the gate from contradicting each other -- the bug this
+# replaced hardcoded "Only the Respond tool is available" in one place and the
+# allow-list in another. ``describe_allowed_tools()`` stays the ONLY place tool
+# names are turned into prose.
+#
+# Severities are DECLARED, not inferred from the number of tools: 'token' and
+# 'timeout' grant exactly the same extra tools today, so tool-count could never
+# order them, and a future reason granting a superset must still be able to say
+# it is the narrower one.
+RESTRICTION_RULES: Dict[str, RestrictionRule] = {
+    # Context ceiling: SummarizeTool frees the window, and the write escape
+    # hatch lets an already-prepared edit reach disk before the summary lands
+    # (reads/searches stay refused -- they are what grows the context).
+    'token': RestrictionRule(('SummarizeTool',) + WRITE_ESCAPE_TOOLS, severity=10),
+    # Runtime budget spent: same grant as 'token' (yield, compact, dump the
+    # detail), narrower only because it is a hard stop, not a recoverable one.
+    'timeout': RestrictionRule(('SummarizeTool',) + WRITE_ESCAPE_TOOLS, severity=20),
+    # Externally paused: wait it out -- nothing to compact or land.
+    'pause': RestrictionRule((), severity=30),
+    # Turn exhausted: finish now.
+    'turn': RestrictionRule((), severity=40),
+}
+
+# The base set every rule is defined against: a restricted agent may always
+# answer (yielding is never refused).
+BASE_ALLOWED_TOOLS: tuple[str, ...] = ('Respond',)
+
+# Fail-safe for an unattributable reason (unknown, None, non-str): Respond only,
+# ranked above every known reason so it always wins arbitration. Otherwise a
+# misspelled or future reason would silently re-enable tool access.
+UNKNOWN_RESTRICTION_RULE: RestrictionRule = RestrictionRule((), severity=1000)
+
+
+def restriction_rule(reason: Any) -> RestrictionRule:
+    """The rule for `reason`, failing safe to Respond-only when unrecognised."""
+    if not isinstance(reason, str):
+        return UNKNOWN_RESTRICTION_RULE
+    return RESTRICTION_RULES.get(reason, UNKNOWN_RESTRICTION_RULE)
+
+
+def allowed_tools_for_rule(rule: RestrictionRule) -> List[str]:
+    """The allow-list one rule yields: Respond plus that rule's extra tools."""
+    return list(BASE_ALLOWED_TOOLS + rule.extra_tools)
+
+
+def arbitrate_restriction_reasons(reasons: Iterable[Any]) -> Any:
+    """Pick the most restrictive of several simultaneously live reasons.
+
+    Most-restrictive-wins, ordered by the severity each reason DECLARES in
+    ``RESTRICTION_RULES`` -- never by tool count, and never by the order the
+    reasons arrive in. AgentState holds at most one reason today
+    (``restriction_reason``, last-writer-wins), so this composes a
+    single-element list; it exists so that the rule for COMBINING reasons is
+    stated once, next to the table, instead of being re-invented when a second
+    reason source appears.
+
+    Returns the winning reason verbatim (callers keep attributing in logs and
+    telemetry). An unknown/None reason wins over every known one; ``None`` is
+    returned only for an empty input.
+    """
+    winner: Any = None
+    winner_severity = -1
+    for reason in reasons:
+        severity = restriction_rule(reason).severity
+        if severity > winner_severity:
+            winner, winner_severity = reason, severity
+    return winner
+
+
+def resolve_restriction_rule(
+    owner: Any, default_active: bool = True
+) -> Optional[RestrictionRule]:
+    """The rule ``owner``'s restriction state resolves to, or None.
+
+    The ONE place a restriction state is turned into a rule: an unbound helper
+    rather than a method because ``is_tool_allowed()`` is deliberately called
+    on objects that are not AgentState instances at all (a stub, an older
+    pickled state, a mock) -- see the fail-closed note there. Both readers
+    (``get_allowed_tools()`` for display, ``is_tool_allowed()`` for
+    enforcement) go through it, and the live reason is run through
+    ``arbitrate_restriction_reasons()`` here, so the rule for COMBINING reasons
+    exists in exactly one place.
+
+    `default_active` is the caller's fail-safe for an object with no
+    `restrictions_active` attribute, and the two callers deliberately disagree:
+    display defaults to UNRESTRICTED (an empty allow-list already means "no
+    restriction") while enforcement defaults to RESTRICTED.
+    """
+    if not getattr(owner, 'restrictions_active', default_active):
+        return None
+    reason = arbitrate_restriction_reasons(
+        [getattr(owner, 'restriction_reason', None)]
+    )
+    return restriction_rule(reason)
 
 
 def describe_allowed_tools(allowed: List[str]) -> str:
@@ -163,10 +276,10 @@ class AgentState:
                     )
                 else:
                     formatted = self._format_tokens(total_tokens)
-                    # Rendered from the SAME tuple the allow-list uses, so the
-                    # sentence cannot drift from what is actually permitted.
+                    # Rendered from the SAME table row the allow-list uses, so
+                    # the sentence cannot drift from what is actually permitted.
                     _token_allowed = ', '.join(
-                        ('Respond', 'SummarizeTool') + WRITE_ESCAPE_TOOLS
+                        allowed_tools_for_rule(restriction_rule('token'))
                     )
                     warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only {_token_allowed} are available; reads and searches stay disabled.'
                 self.last_token_warning = warning
@@ -524,40 +637,30 @@ class AgentState:
           turn. Same escape set as 'timeout', deliberately.
         - anything else (unknown, None, empty string): Only Respond.
 
-        Display-only: enforcement happens in ``is_tool_allowed()``, which
-        computes the same decision inline. The two MUST agree -- the
-        tool-rejection prose in ``agent/core/tool_executor.py`` renders its
-        ``Allowed:`` line directly from this method, so it has to name the
-        read-only set now that those tools are actually permitted.
+        Display-only: enforcement happens in ``is_tool_allowed()``. Both read
+        the same ``RESTRICTION_RULES`` row through
+        ``resolve_restriction_rule()``, so the two cannot answer differently --
+        the tool-rejection prose in ``agent/core/tool_executor.py`` renders its
+        ``Allowed:`` line directly from this method, and so do the restriction
+        warnings.
 
-        The final branch is a fail-safe: an unattributable reason must never
-        grant a broader allow-list than the narrowest one, otherwise a
-        misspelled or future reason would silently re-enable tool access.
+        An unattributable reason (see ``restriction_rule()``) must never grant
+        a broader allow-list than the narrowest one, otherwise a misspelled or
+        future reason would silently re-enable tool access.
         """
-        if not getattr(self, 'restrictions_active', False):
+        rule = resolve_restriction_rule(self, default_active=False)
+        if rule is None:
             return []
-        reason = getattr(self, 'restriction_reason', None)
-        if reason == 'token':
-            # Mirrors 'timeout' for WRITES only: the ceiling exists to protect
-            # the context window, not to strand uncommitted work, so a prepared
-            # edit can always reach disk. Reads and searches stay refused --
-            # they are exactly what grows the context.
-            return ['Respond', 'SummarizeTool'] + list(WRITE_ESCAPE_TOOLS)
-        if reason == 'timeout':
-            # Write-only escape hatch: dump the detail, then yield. Nothing
-            # here can be used to continue the investigation.
-            return ['Respond', 'SummarizeTool'] + list(WRITE_ESCAPE_TOOLS)
-        # 'turn', 'pause' and every unrecognised reason: fail safe to
-        # Respond-only rather than assuming the token allow-list.
-        return ['Respond']
+        return allowed_tools_for_rule(rule)
 
     def is_tool_allowed(self, tool_name: str) -> bool:
         """Check if a specific tool is allowed in current state.
 
         Fail-closed by construction (docs/CONTROL_PLANE.md 6.3 Option B):
-        the decision is computed here, inline, from `restrictions_active`
-        and `restriction_reason` -- never from an empty allow-list.
-        `get_allowed_tools()` remains display-only.
+        the decision is computed here from `restrictions_active` and
+        `restriction_reason` -- never from an empty allow-list.
+        `get_allowed_tools()` remains display-only, but resolves the SAME rule
+        (see ``resolve_restriction_rule()``), so the two cannot disagree.
 
         A missing `restrictions_active` attribute is treated as RESTRICTED
         (Respond-only), not as unrestricted. The prior implementation read
@@ -568,21 +671,7 @@ class AgentState:
         """
         if not getattr(self, 'restrictions_active', True):
             return True
-        reason = getattr(self, 'restriction_reason', None)
-        if reason == 'token':
-            # Must agree EXACTLY with get_allowed_tools() for 'token' -- same
-            # literal, same WRITE_ESCAPE_TOOLS tuple, same order. A prepared
-            # write is allowed (bounded input); reads and searches are not.
-            return tool_name in (
-                ('Respond', 'SummarizeTool') + WRITE_ESCAPE_TOOLS
-            )
-        if reason == 'timeout':
-            # Must agree EXACTLY with get_allowed_tools() for 'timeout' --
-            # same literal, same escape-hatch constant, same order.
-            return tool_name in (
-                ('Respond', 'SummarizeTool') + WRITE_ESCAPE_TOOLS
-            )
-        # 'turn', 'pause' and every unrecognised reason (including a missing
-        # `restriction_reason`): fail safe to Respond-only rather than assuming
-        # the token allow-list.
-        return tool_name == 'Respond'
+        rule = resolve_restriction_rule(self, default_active=True)
+        if rule is None:
+            return True
+        return tool_name in allowed_tools_for_rule(rule)

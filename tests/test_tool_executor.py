@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent.core.state import AgentState
+from agent.core.state import RESTRICTION_RULES, AgentState
 from agent.core.tool_executor import (
     DEFAULT_SESSION_PERMISSIONS,
     TOOL_REFUSAL_LOGGER_NAME,
@@ -801,13 +801,8 @@ _TOOL_NAME_PROBES = frozenset({
 })
 
 
-def _restricted_state(reason: str) -> AgentState:
-    """A REAL AgentState restricted on ``reason``.
-
-    Real rather than a stub: D5b's whole point is that the advertised
-    allow-list is derived from the SAME state the gate refuses through, and a
-    stub would let the refusal prose and the gate drift apart unobserved.
-    """
+def _unrestricted_state() -> AgentState:
+    """A REAL, freshly reset AgentState with no restriction in force."""
     config = MagicMock()
     config.turn_monitor_enabled = True
     config.max_turns = 100
@@ -818,7 +813,34 @@ def _restricted_state(reason: str) -> AgentState:
     config.time_warning_threshold = 240
     state = AgentState(config=config, logger=MagicMock())
     state.reset()
+    return state
+
+
+def _restricted_state(reason: str) -> AgentState:
+    """A REAL AgentState restricted on ``reason``.
+
+    Real rather than a stub: D5b's whole point is that the advertised
+    allow-list is derived from the SAME state the gate refuses through, and a
+    stub would let the refusal prose and the gate drift apart unobserved.
+    """
+    state = _unrestricted_state()
     state.restrict(reason)
+    return state
+
+
+def _state_with_reason(reason) -> AgentState:
+    """A real AgentState whose ``restriction_reason`` is ``reason``.
+
+    Known string reasons go through ``restrict()`` (the production mutator);
+    the unattributable ones (unknown, '', None) cannot -- ``restrict()``
+    rejects falsy and non-string reasons -- so they are written straight onto
+    the attributes, which is exactly the state both readers must fail safe on.
+    """
+    if isinstance(reason, str) and reason.strip():
+        return _restricted_state(reason)
+    state = _unrestricted_state()
+    state.restrictions_active = True
+    state.restriction_reason = reason
     return state
 
 
@@ -855,9 +877,22 @@ class TestToolRefusalMessage:
         # The old one-line prose is gone.
         assert 'Available tools:' not in message, message
 
-    @pytest.mark.parametrize('reason', ['token', 'timeout', 'turn'])
+    @pytest.mark.parametrize(
+        'reason',
+        [pytest.param(r, id=f'declared-{r}') for r in sorted(RESTRICTION_RULES)]
+        + [
+            pytest.param('something-unknown', id='unattributable-unknown'),
+            pytest.param('', id='unattributable-empty'),
+            pytest.param(None, id='unattributable-none'),
+        ],
+    )
     def test_allowed_line_is_exactly_what_the_gate_permits(self, reason):
-        state = _restricted_state(reason)
+        """Every reason in RESTRICTION_RULES, plus the unattributable ones.
+
+        Parametrized off the table itself, so a new row is exercised here the
+        day it is declared rather than the day someone remembers this file.
+        """
+        state = _state_with_reason(reason)
         message = _refusal_executor(state)._create_tool_rejection_message(
             'DockerCodeRunner'
         )

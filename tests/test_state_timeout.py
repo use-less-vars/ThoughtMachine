@@ -12,7 +12,9 @@ Covered here:
    exec / container category, exactly one tool, wired into the gate);
 3. ``describe_allowed_tools()`` -- the one place an allow-list becomes prose;
 4. ``restriction_reason`` being set/cleared on every monitor axis;
-5. the warning / critical message text.
+5. the warning / critical message text;
+6. the ONE restriction table (``RESTRICTION_RULES``), its declared severities
+   and the most-restrictive-wins arbitration both readers resolve through.
 
 Run with::
 
@@ -26,11 +28,18 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.core.state import (
+    RESTRICTION_RULES,
+    UNKNOWN_RESTRICTION_RULE,
+    WRITE_ESCAPE_TOOLS,
     AgentState,
     TimeState,
     TokenState,
     TurnState,
+    allowed_tools_for_rule,
+    arbitrate_restriction_reasons,
     describe_allowed_tools,
+    resolve_restriction_rule,
+    restriction_rule,
 )
 from thoughtmachine.timeout_constants import TIMEOUT_WRITE_ESCAPE_TOOLS
 
@@ -559,3 +568,107 @@ class TestDescribeAllowedTools:
             for non_member in ('ApplyEdits', 'ReadFile', 'ContainerExecTool'):
                 if non_member not in allowed:
                     assert non_member not in rendered, (reason, non_member, rendered)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# D4: ONE restriction table -- display, gate and warnings all derive from it
+# ════════════════════════════════════════════════════════════════════════════
+
+#: Every reason the table declares, narrowest-declared first.
+_DECLARED_REASONS = ('token', 'timeout', 'pause', 'turn')
+
+
+class TestRestrictionTable:
+    """The table is the single source of the rule; nothing restates it.
+
+    ``get_allowed_tools()`` (display, the refusal ``Allowed:`` line, the
+    warnings) and ``is_tool_allowed()`` (enforcement) both resolve through
+    ``resolve_restriction_rule()`` -> ``RESTRICTION_RULES``;
+    ``describe_allowed_tools()`` stays the only prose renderer.
+    """
+
+    def test_table_declares_exactly_the_attributable_reasons(self):
+        """A new reason must be DECLARED, never inherit a neighbouring row."""
+        assert set(RESTRICTION_RULES) == set(_DECLARED_REASONS), (
+            f'undeclared/dropped reasons: '
+            f'{sorted(set(RESTRICTION_RULES) ^ set(_DECLARED_REASONS))}'
+        )
+
+    def test_severities_are_distinct_and_unknown_outranks_them_all(self):
+        """Distinct severities are what make arbitration order-independent."""
+        severities = [RESTRICTION_RULES[r].severity for r in _DECLARED_REASONS]
+        assert len(set(severities)) == len(severities), severities
+        assert max(severities) < UNKNOWN_RESTRICTION_RULE.severity, severities
+
+    def test_escaping_rows_share_the_single_write_escape_set(self):
+        """'token' and 'timeout' grant the SAME extras, from WRITE_ESCAPE_TOOLS."""
+        expected = ('SummarizeTool',) + WRITE_ESCAPE_TOOLS
+        assert RESTRICTION_RULES['token'].extra_tools == expected
+        assert RESTRICTION_RULES['timeout'].extra_tools == expected
+        assert RESTRICTION_RULES['pause'].extra_tools == ()
+        assert RESTRICTION_RULES['turn'].extra_tools == ()
+
+    def test_most_restrictive_reason_wins_by_declared_severity(self):
+        """Arbitration is by DECLARED severity -- not tool count, not order.
+
+        'token' and 'timeout' grant identical tools, so counting tools could
+        never order them: the table declares 'timeout' the narrower one, and
+        that is the answer composition must give in either arrival order.
+        """
+        assert arbitrate_restriction_reasons(['token', 'timeout']) == 'timeout'
+        assert arbitrate_restriction_reasons(['timeout', 'token']) == 'timeout'
+        assert arbitrate_restriction_reasons(['token', 'pause']) == 'pause'
+        assert arbitrate_restriction_reasons(['pause', 'token']) == 'pause'
+        assert arbitrate_restriction_reasons(['pause', 'turn']) == 'turn'
+        assert arbitrate_restriction_reasons(['turn', 'token', 'timeout']) == 'turn'
+
+    def test_unattributable_reason_is_the_narrowest_so_it_wins(self):
+        """Fail safe: a reason no row declares outranks every declared one."""
+        assert arbitrate_restriction_reasons(
+            ['token', 'something-unknown']) == 'something-unknown'
+        assert arbitrate_restriction_reasons([None, 'turn']) is None
+        assert arbitrate_restriction_reasons(['', 'token']) == ''
+        # A single live reason is returned verbatim -- today's only real case.
+        for reason in _DECLARED_REASONS:
+            assert arbitrate_restriction_reasons([reason]) == reason
+        # Nothing to arbitrate.
+        assert arbitrate_restriction_reasons([]) is None
+
+    def test_state_resolves_its_single_reason_through_arbitration(self, state):
+        """The arbitration is wired at the ONE reason-resolution point."""
+        for reason in _DECLARED_REASONS:
+            state.restrictions_active = True
+            state.restriction_reason = reason
+            assert resolve_restriction_rule(state) is restriction_rule(reason), reason
+        state.restriction_reason = 'something-unknown'
+        assert resolve_restriction_rule(state) is UNKNOWN_RESTRICTION_RULE
+        # Unrestricted under either default: no rule at all.
+        state.restrictions_active = False
+        assert resolve_restriction_rule(state) is None
+        assert resolve_restriction_rule(state, default_active=False) is None
+
+    def test_missing_restrictions_active_keeps_the_two_fail_safes(self):
+        """Display fails OPEN ([]) and enforcement fails CLOSED, deliberately."""
+        stub = object()
+        # Display: an empty allow-list already means "no restriction".
+        assert AgentState.get_allowed_tools(stub) == []
+        # Enforcement: a state with no attribute is RESTRICTED, not armed.
+        assert AgentState.is_tool_allowed(stub, 'Respond') is True
+        assert AgentState.is_tool_allowed(stub, 'ContainerExecTool') is False
+        assert resolve_restriction_rule(
+            stub, default_active=True) is UNKNOWN_RESTRICTION_RULE
+        assert resolve_restriction_rule(
+            stub, default_active=False) is None
+
+    def test_token_critical_warning_names_the_token_row(self, state):
+        """The token-critical sentence is that same table row, verbatim."""
+        expected = ', '.join(allowed_tools_for_rule(RESTRICTION_RULES['token']))
+        state.current_conversation_tokens = 1000000
+        state.max_conversation_tokens = 1000
+        state.token_warning_threshold = 500
+        events = state.update_token_state(state.current_conversation_tokens)
+        warnings = [e for e in events if e['type'] == 'token_warning']
+        assert warnings, f'expected a token_warning at CRITICAL: {events}'
+        msg = warnings[-1].get('warning_message', '')
+        assert f'Only {expected} are available' in msg, msg
+
