@@ -427,9 +427,9 @@ def _fake_journalctl_env(tmp_path, **fake_vars):
     return env
 
 
-def _path_without_journalctl(tmp_path):
-    """A PATH with every ordinary tool on it and no journalctl at all."""
-    bin_dir = tmp_path / "nojournal-bin"
+def _path_without(tmp_path, excluded, dirname):
+    """A PATH with every ordinary tool on it except the names in `excluded`."""
+    bin_dir = tmp_path / dirname
     bin_dir.mkdir()
     for source in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"):
         try:
@@ -437,7 +437,7 @@ def _path_without_journalctl(tmp_path):
         except OSError:
             continue
         for name in names:
-            if name == "journalctl":
+            if name in excluded:
                 continue
             target = bin_dir / name
             if target.exists() or target.is_symlink():
@@ -447,6 +447,21 @@ def _path_without_journalctl(tmp_path):
             except OSError:
                 pass
     return str(bin_dir)
+
+
+def _path_without_journalctl(tmp_path):
+    """A PATH with every ordinary tool on it and no journalctl at all."""
+    return _path_without(tmp_path, ("journalctl",), "nojournal-bin")
+
+
+def _path_without_timeout(tmp_path):
+    """A PATH with every ordinary tool on it and neither timeout nor gtimeout.
+
+    That is the macOS userland model: BSD ships no GNU `timeout`, so a script
+    that bounds each command with one gets exit 127 on every query there.  The
+    binary is masked instead of the platform being borrowed.
+    """
+    return _path_without(tmp_path, ("timeout", "gtimeout"), "notimeout-bin")
 
 
 def test_earlyoom_kill_count_comes_from_the_unit_not_a_message_grep(tmp_path):
@@ -485,6 +500,83 @@ def test_a_timed_out_journal_query_is_unmeasured_and_never_zero(tmp_path):
     assert "unmeasured: 1 of 6 journal answers" in text
     # the other five queries really did run, so their 0s are measurements
     assert "kernel oom kills in prior boot: 0" in text
+
+
+def test_the_native_watchdog_bounds_a_query_where_timeout_does_not_exist(tmp_path):
+    """TM_FORENSICS_BOUND=watchdog: bash's own deadline, with 124's meaning.
+
+    macOS has no GNU `timeout`, and a report that bounds its queries with one
+    answers "journalctl could not be executed: exit 127" for EVERY query there --
+    a measurement of the missing binary, printed where the machine's answer
+    belongs.  The fallback must keep the contract the case arms already read: a
+    fake that never answers is a TIMEOUT, and a fake that answers is COUNTED,
+    through the same code path.
+    """
+    ledger = _write_ledger(tmp_path / "ledger.jsonl")
+
+    slow = _run(
+        ledger=ledger,
+        env_extra=_fake_journalctl_env(
+            tmp_path,
+            FAKE_UNIT_SLEEP=1,
+            TM_FORENSICS_BUDGET_S=2,
+            TM_FORENSICS_BOUND="watchdog",
+        ),
+    )
+    assert slow.returncode == 0, slow.stderr
+    assert (
+        "earlyoom kills in prior boot: UNMEASURED (journalctl timed out after 2 s)"
+        in slow.stdout
+    )
+    assert "earlyoom kills in prior boot: 0" not in slow.stdout
+    assert "unmeasured: 1 of 6 journal answers" in slow.stdout
+    # the missing-binary signature must not appear: that is the bug, not a bound
+    assert "could not be executed" not in slow.stdout
+
+    fast = _run(
+        ledger=ledger,
+        env_extra=_fake_journalctl_env(
+            tmp_path, FAKE_UNIT_LINES=3, TM_FORENSICS_BOUND="watchdog"
+        ),
+    )
+    assert fast.returncode == 0, fast.stderr
+    assert "earlyoom kills in prior boot: 3" in fast.stdout
+    assert "unmeasured: 0 of 6 journal answers" in fast.stdout
+
+
+def test_auto_reaches_the_watchdog_when_no_timeout_binary_exists(tmp_path):
+    """The default must RESOLVE its way to the fallback, not only be forced to.
+
+    No timeout/gtimeout on PATH is exactly macOS.  Reproduced with the binaries
+    masked on a PATH that is otherwise complete, so the branch that platform
+    takes is the branch CI takes.
+    """
+    ledger = _write_ledger(tmp_path / "ledger.jsonl")
+
+    masked_env = _fake_journalctl_env(tmp_path, FAKE_UNIT_LINES=3)
+    masked_env["PATH"] = os.pathsep.join(
+        (masked_env["PATH"].split(os.pathsep)[0], _path_without_timeout(tmp_path))
+    )
+    # the masking is real: nothing on this PATH can bound a command
+    assert shutil.which("timeout", path=masked_env["PATH"]) is None
+    assert shutil.which("gtimeout", path=masked_env["PATH"]) is None
+
+    fast = _run(ledger=ledger, env_extra=masked_env)
+    assert fast.returncode == 0, fast.stderr
+    assert "earlyoom kills in prior boot: 3" in fast.stdout
+    assert "unmeasured: 0 of 6 journal answers" in fast.stdout
+
+    masked_slow = _fake_journalctl_env(
+        tmp_path, FAKE_UNIT_SLEEP=1, TM_FORENSICS_BUDGET_S=2
+    )
+    masked_slow["PATH"] = masked_env["PATH"]
+    slow = _run(ledger=ledger, env_extra=masked_slow)
+    assert slow.returncode == 0, slow.stderr
+    assert (
+        "earlyoom kills in prior boot: UNMEASURED (journalctl timed out after 2 s)"
+        in slow.stdout
+    )
+    assert "could not be executed" not in slow.stdout
 
 
 def test_a_missing_journalctl_is_unmeasured_and_never_zero(tmp_path):

@@ -8,7 +8,7 @@
 # saturated with audit and health-poll chatter.
 #
 # Safe to run after a machine restart: no sudo, no writes, every external
-# command bounded by a timeout.  Nothing here modifies state.
+# command bounded by a DEADLINE (see bounded_run).  Nothing here modifies state.
 #
 # Every journal query is bounded TWICE, because an unbounded one is not slow --
 # it is a hang:
@@ -111,6 +111,7 @@ env:
   TM_WITNESS_LEDGER=/path/to/ledger.jsonl   override the witness ledger
   TM_FORENSICS_NO_JOURNAL=1                 skip every journalctl call (tests)
   TM_FORENSICS_BUDGET_S=N                   seconds per external command (tests)
+  TM_FORENSICS_BOUND=auto|timeout|watchdog  which limiter bounds them (tests)
   TM_FORENSICS_WINDOW_HOURS=N               default window in hours (--hours wins)
 EOF
             exit 0 ;;
@@ -133,6 +134,119 @@ esac
 if [ "${BUDGET}" -lt 1 ]; then
     usage_error "TM_FORENSICS_BUDGET_S must be a positive integer, got '${BUDGET}'"
 fi
+
+# --------------------------------------------------------------------------- #
+# the deadline: ONE bound, resolved once, whatever the userland provides
+#
+# An unbounded journalctl is not slow, it is a hang, so every external command
+# goes through bounded_run.  WHICH limiter implements the bound is decided here,
+# once, because the two implementations must be interchangeable -- not tried one
+# after the other on every call:
+#   * `timeout` (GNU coreutils), or `gtimeout` (the same binary, Homebrew name):
+#     invoked exactly as before, `-k ${KILL_GRACE} ${BUDGET}` and all;
+#   * a bash-native watchdog, for userlands that ship no `timeout` at all (BSD,
+#     i.e. macOS).  Without it every query there dies with exit 127 and the
+#     report answers "journalctl could not be executed" -- a measurement of the
+#     missing binary, printed in the place where the machine's answer belongs.
+#
+# The watchdog reproduces timeout's CONTRACT, not an approximation of it:
+#   - the command gets its OWN process group and is signalled as a GROUP, so a
+#     grandchild (`bash -c "journalctl ..."`) cannot outlive the deadline and
+#     hold the capture pipe open (see run_filtered);
+#   - exit 124 when the deadline's SIGTERM ended it, 137 when the SIGKILL after
+#     KILL_GRACE was needed -- the codes the case arms below already read;
+#   - the command's own exit status otherwise, untouched;
+#   - nothing outlives the call: the watchdog is killed and reaped here, never
+#     left to finish its grace sleep in the background.
+# A command that ends of its own accord with 128+15 is indistinguishable from one
+# the deadline ended: the watchdog has no channel back from a dead child, and the
+# deadline is the only SIGTERM this script sends.  The `timeout` path keeps its
+# usual exactness there -- the fallback narrows that one edge, it does not widen
+# the contract.
+#
+# If neither limiter can be established, bounded_run says so in the reason and
+# returns 125: the report then reads "failed: exit 125: <why>", which is true,
+# instead of running the command unbounded or reporting a count it never took.
+# TM_FORENSICS_BOUND=watchdog forces the fallback, so CI on Linux exercises the
+# path macOS actually takes.
+# --------------------------------------------------------------------------- #
+BOUND_KIND=${TM_FORENSICS_BOUND:-auto}
+BOUND_BIN=''
+BOUND_WHY=''
+resolve_bound_bin() {
+    local name
+    for name in timeout gtimeout; do
+        if command -v "${name}" >/dev/null 2>&1; then
+            BOUND_BIN=$(command -v "${name}")
+            return 0
+        fi
+    done
+    return 1
+}
+case "${BOUND_KIND}" in
+    auto)     resolve_bound_bin || true ;;
+    timeout)  resolve_bound_bin \
+        || usage_error 'TM_FORENSICS_BOUND=timeout but neither timeout nor gtimeout is on PATH' ;;
+    watchdog) BOUND_BIN='' ;;
+    *)        usage_error "TM_FORENSICS_BOUND must be auto, timeout or watchdog, got '${BOUND_KIND}'" ;;
+esac
+if [ -z "${BOUND_BIN}" ] && ! command -v sleep >/dev/null 2>&1; then
+    BOUND_WHY='neither timeout nor gtimeout is on PATH and there is no sleep to build a watchdog from'
+fi
+
+# TERM/KILL to the command's process GROUP, and to the bare pid only if this
+# shell cannot address a group -- a bare pid leaves the grandchild alive, holding
+# the pipe of the command substitution that is waiting for it.
+signal_bound() {
+    local sig=$1 pid=$2
+    kill "-${sig}" -- "-${pid}" 2>/dev/null && return 0
+    kill "-${sig}" "-${pid}" 2>/dev/null && return 0
+    kill "-${sig}" "${pid}" 2>/dev/null
+    return 0
+}
+
+bounded_run_watchdog() (
+    # A subshell, so `set -m` cannot leak into the caller: monitor mode is what
+    # puts the command in its own process group.  fd 3 carries the CALLER's
+    # stderr -- the command's own messages must still reach it -- while fd 2 goes
+    # to /dev/null, so bash's job-control chatter ("Killed  bash -c ...") can
+    # never be quoted by first_line() as the command's own error.
+    exec 3>&2 2>/dev/null
+    set -m
+    local pid wd rc
+    "$@" 2>&3 &
+    pid=$!
+    {
+        sleep "${BUDGET}"
+        signal_bound TERM "${pid}"
+        sleep "${KILL_GRACE}"
+        signal_bound KILL "${pid}"
+    } 3>&- >/dev/null 2>&1 &
+    wd=$!
+    wait "${pid}"
+    rc=$?
+    # Reaped here, not left to finish its grace sleep: no leaked child, and no
+    # stray holder of the caller's pipes.
+    signal_bound TERM "${wd}"
+    wait "${wd}" 2>/dev/null
+    case "${rc}" in
+        143) return 124 ;;   # the deadline's own SIGTERM is what ended it
+        137) return 137 ;;   # it outlived the SIGTERM; KILL_GRACE did not
+        *)   return "${rc}" ;;
+    esac
+)
+
+bounded_run() {
+    if [ -n "${BOUND_BIN}" ]; then
+        "${BOUND_BIN}" -k "${KILL_GRACE}" "${BUDGET}" "$@"
+        return $?
+    fi
+    if [ -n "${BOUND_WHY}" ]; then
+        printf 'no bound available: %s\n' "${BOUND_WHY}" >&2
+        return 125
+    fi
+    bounded_run_watchdog "$@"
+}
 
 # --------------------------------------------------------------------------- #
 # the window: which slice of boot -1 the queries may look at
@@ -166,7 +280,7 @@ JOURNAL_OK=0
 JOURNAL_NOTE='journalctl unavailable'
 if [ "${TM_FORENSICS_NO_JOURNAL:-0}" = "1" ]; then
     JOURNAL_NOTE='skipped (TM_FORENSICS_NO_JOURNAL=1)'
-elif timeout -k "${KILL_GRACE}" "${BUDGET}" journalctl --list-boots --no-pager >/dev/null 2>&1; then
+elif bounded_run journalctl --list-boots --no-pager >/dev/null 2>&1; then
     JOURNAL_OK=1
 fi
 
@@ -219,8 +333,7 @@ detect_window() {
         return 0
     fi
 
-    boots=$(timeout -k "${KILL_GRACE}" "${BUDGET}" \
-        journalctl --list-boots --no-pager -o short-iso 2>/dev/null) || boots=''
+    boots=$(bounded_run journalctl --list-boots --no-pager -o short-iso 2>/dev/null) || boots=''
     line=$(printf '%s\n' "${boots}" | awk '$1 == "-1" { print; exit }')
     if [ -n "${line}" ]; then
         BOOT_START=$(printf '%s\n' "${line}" | awk '{ print $4 " " $5 }')
@@ -229,8 +342,7 @@ detect_window() {
     if [ -z "${BOOT_END}" ]; then
         # Fallback: the newest entry of boot -1.  `-n 1` reads from the END, so
         # this stays cheap even on a twelve-day boot.
-        BOOT_END=$(timeout -k "${KILL_GRACE}" "${BUDGET}" \
-            journalctl -b -1 -n 1 --no-pager -o short-iso 2>/dev/null \
+        BOOT_END=$(bounded_run journalctl -b -1 -n 1 --no-pager -o short-iso 2>/dev/null \
             | head -1 | awk '{ print $1 }') || BOOT_END=''
     fi
 
@@ -296,7 +408,7 @@ detect_window
 # But "no entries" is the OTHER way round: journalctl exits 1 when nothing
 # matched and announces it on stderr, and that is a measured 0 -- reporting it
 # as UNMEASURED would make "measurably none" look like "could not look".
-# The query keeps its --since/--until window and its `timeout -k` bound; the
+# The query keeps its --since/--until window and its bounded_run deadline; the
 # optional regex is applied here, with the pattern handed to awk through the
 # ENVIRONMENT (see denoise()) so no backslash is ever eaten.
 
@@ -321,7 +433,7 @@ journal_count() {
     # stdout AND stderr in ONE variable: `-- No entries --` arrives on stderr,
     # so a stdout-only capture cannot tell an empty result from a broken read.
     # Nothing is written to disk -- no temp file, least of all in the repo.
-    out=$(timeout -k "${KILL_GRACE}" "${BUDGET}" bash -c "${cmd}" 2>&1)
+    out=$(bounded_run bash -c "${cmd}" 2>&1)
     rc=$?
     case "${rc}" in
         0) ;;
@@ -366,7 +478,7 @@ orderly_answer() {
     fi
     # -n 1: the newest matching entry, read from the end of the window.  The
     # grep moves into -g (PCRE2) so journalctl can stop as soon as it has one.
-    out=$(timeout -k "${KILL_GRACE}" "${BUDGET}" bash -c \
+    out=$(bounded_run bash -c \
         "journalctl ${TIME_BOUND} -b -1 --no-pager -g 'Reached target.*(Power-Off|Reboot)' -n 1 2>&1")
     rc=$?
     case "${rc}" in
@@ -565,13 +677,13 @@ run_filtered() {
         printf '%s\n' "${JOURNAL_NOTE}"
         return 0
     fi
-    # `timeout -k` WITHOUT --foreground.  --foreground signals only the direct
-    # child, so journalctl -- a grandchild, through bash -c -- survives the
-    # budget, keeps the pipe's write end open, and leaves denoise (and therefore
-    # this command substitution) waiting for an EOF that never comes.  Without
-    # --foreground, timeout puts the child in its own process group and signals
-    # the WHOLE pipeline; -k 5 turns a wedged SIGTERM into a SIGKILL.
-    out=$(timeout -k "${KILL_GRACE}" "${BUDGET}" bash -c "${cmd}" 2>&1 | denoise)
+    # bounded_run signals the WHOLE process group of the command, never just the
+    # direct child: journalctl -- a grandchild, through bash -c -- would survive
+    # a pid-only signal, keep the pipe's write end open, and leave denoise (and
+    # therefore this command substitution) waiting for an EOF that never comes.
+    # That is why the `timeout` path passes no --foreground, and why the watchdog
+    # puts the command in a group of its own before signalling it.
+    out=$(bounded_run bash -c "${cmd}" 2>&1 | denoise)
     if [ -n "${out}" ]; then
         printf '%s\n' "${out}"
     else
