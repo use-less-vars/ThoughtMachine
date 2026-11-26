@@ -1,10 +1,19 @@
-"""Default per-session git worktree for workers.
+"""Per-session git worktree for workers -- OPT-IN, not the default.
 
 A worker inherits the parent session's ``worktree_root`` when the session has
-one; otherwise it used to run straight in the registered workspace root.  This
-module gives it a ``worktree_root`` of its own -- ``<workspace>/.worktrees/
-<session-id>`` -- so worker file operations cannot collide with the main
-agent's checkout.
+one; otherwise it runs straight in the registered workspace root.  This module
+gives it a ``worktree_root`` of its own -- ``<workspace>/.worktrees/
+<session-id>`` -- and is reached only when a caller explicitly decides to
+isolate a session by setting ``worktree_root`` to the value this helper
+returns.
+
+Why the default moved to OPT-IN: a worker confined to
+``<workspace>/.worktrees/<session>`` could neither see nor commit the tree the
+agent's git tools and the docker mount use -- the container mounts
+``source=self.workspace_path``, i.e. the registered workspace root -- so its
+edits became a copy no diff, commit or CI run ever saw.  Reuse also
+short-circuited on any non-empty directory with zero git contact, so a
+re-summoned session kept whatever base its first spawn left behind.
 
 Everything here is deliberately FAIL-OPEN, and the side effect is WIDER than
 the worktree directory:
