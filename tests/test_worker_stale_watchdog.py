@@ -156,6 +156,34 @@ def _isolate_announce_observer():
         watchdog_module._ANNOUNCE_OBSERVER = saved
 
 
+@pytest.fixture(autouse=True)
+def _quiesce_escalation_threads():
+    """Wait out any phase-B episode a test started before the next one runs.
+
+    A tick that announces a stale frame also STARTS phase B out-of-band --
+    ``_start_escalation`` starts a ``worker-stale-escalation:<name>`` daemon
+    thread -- and that thread emits its verdict through
+    ``worker_stale_watchdog``'s own ``logger.warning`` (``_record_episode``).
+    The tick deliberately never joins it, so when a test body returns the
+    record can still be in flight and lands inside whichever test runs next:
+    that is how ``test_stale_check_disabled_by_default`` came to see two
+    warnings, only one of which it caused. Joining here keeps every record a
+    test causes inside the test that caused it.
+
+    The join is bounded at 5s because every episode in this module ends at
+    ``no_runtime`` at once -- the fake handles expose no ``ping`` seam -- so
+    there is never anything to wait for beyond the thread's own exit. A future
+    test that gives a handle a REAL probe must raise this bound above the
+    episode's own timeouts.
+    """
+    try:
+        yield
+    finally:
+        for thread in threading.enumerate():
+            if thread.name.startswith("worker-stale-escalation:"):
+                thread.join(timeout=5.0)
+
+
 # -- 1 -----------------------------------------------------------------------
 
 
