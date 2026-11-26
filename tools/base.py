@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 import logging
+import threading
 
 
 # Import centralized security
@@ -32,6 +33,13 @@ def _safe_stderr_print(message: str) -> None:
         print(message, file=sys.stderr)
     except Exception:
         pass
+
+
+# One receipt per (worktree_root, registered root) pair. A tool instance is
+# built per call, so the dedupe has to live at module scope: the INFO must be
+# emitted ONCE per worker/spawn, not once per tool call.
+_IGNORED_WORKTREE_ROOTS: set = set()
+_IGNORED_WORKTREE_ROOTS_LOCK = threading.Lock()
 
 
 class ToolBase(BaseModel):
@@ -387,17 +395,50 @@ class ToolBase(BaseModel):
 
     def _resolve_workspace_root(self) -> Optional[str]:
         """
-        Resolve the effective root for path-anchored tool operations.
+        Resolve the ONE root that anchors every path-anchored tool operation.
 
-        Returns the validated ``worktree_root`` when configured, else the
-        registered workspace root. Path-anchored tools (file-walk bases,
-        container bind-mount sources, git working dirs) should call this
-        instead of :meth:`_resolve_registry_workspace` directly.
+        There is exactly one filesystem root for file tools: the REGISTERED
+        workspace root. Path-anchored tools (file-walk bases, container
+        bind-mount sources, git working dirs, and the read side exactly as
+        much as the write side) call this instead of
+        :meth:`_resolve_registry_workspace` directly.
+
+        A configured ``worktree_root`` no longer narrows anything. It is still
+        fed through :meth:`_worktree_root` -- so an unprovable value keeps
+        failing closed with ``ValueError`` -- and then reported once at INFO
+        level and IGNORED. Narrowing only the write side is what let
+        ``ReadFile`` read the main checkout while ``FileEditor`` wrote a
+        ``.worktrees/<uuid>`` tree that no diff, commit, CI run or container
+        mount could see.
         """
-        wt = self._worktree_root()
-        if wt:
-            return wt
-        return self._resolve_registry_workspace()
+        worktree = self._worktree_root()
+        registered = self._resolve_registry_workspace()
+        if worktree and registered:
+            self._note_ignored_worktree_root(worktree, registered)
+        return registered
+
+    def _note_ignored_worktree_root(self, worktree: str, root: str) -> None:
+        """Emit the ONE receipt for a configured-but-ignored worktree root.
+
+        A value that resolves to the registered root itself is not being
+        ignored, so it says nothing at all. Every other value is reported
+        exactly once per process for that (worktree, root) pair.
+        """
+        worktree_real = os.path.realpath(worktree)
+        root_real = os.path.realpath(root)
+        if worktree_real == root_real:
+            return
+        key = (worktree_real, root_real)
+        with _IGNORED_WORKTREE_ROOTS_LOCK:
+            if key in _IGNORED_WORKTREE_ROOTS:
+                return
+            _IGNORED_WORKTREE_ROOTS.add(key)
+        logging.getLogger(self.__class__.__name__).info(
+            "worktree_root %s ignored: file tools use the registered "
+            "workspace root %s",
+            worktree_real,
+            root_real,
+        )
 
     def execute(self) -> str:
         raise NotImplementedError

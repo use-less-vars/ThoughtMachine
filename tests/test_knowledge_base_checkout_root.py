@@ -2,11 +2,15 @@
 
 Two defects are pinned here:
 
-1. **Wrong checkout.** The workspace KB root was always derived from the
-   session's *registered* workspace root, so a caller working in a linked
-   git worktree of that workspace wrote (and then read) the KB inside the main
-   checkout instead of its own worktree. The root must follow the checkout the
-   caller is actually in -- and reads must agree with writes.
+1. **Wrong root.** The workspace KB root is derived from the session's
+   *resolved* workspace root -- the same root every file tool is anchored at.
+   It used to be re-targeted by an injected ``worktree_root``, which put
+   notes in a ``.worktrees/<uuid>`` tree while the session's files were edited
+   in the registered workspace root: two roots, one workspace. An injected
+   ``worktree_root`` must therefore change nothing about where the KB lives.
+   The separate, pre-existing rule that a caller whose *cwd* is a checkout of
+   the same repository keeps its notes in that checkout is unchanged (section
+   1), and reads must always agree with writes.
 
 2. **Double heading.** `append` unconditionally prepended
    ``## YYYY-MM-DD -- <summary>`` to the entry, so an entry that already
@@ -167,16 +171,22 @@ def test_registered_root_outside_a_checkout_is_not_retargeted(tmp_path, monkeypa
     assert not (main / ".thoughtmachine").exists()
 
 
-def test_explicit_worktree_root_wins_over_the_caller_cwd(tmp_path, monkeypatch):
-    """A session bound to a worktree writes there even with a cwd elsewhere."""
+def test_explicit_worktree_root_does_not_retarget_the_kb(tmp_path, monkeypatch):
+    """An injected ``worktree_root`` must not move the notes off the file root.
+
+    File tools ignore ``worktree_root`` and write the registered workspace
+    root, so the KB has to land there too -- otherwise a single session keeps
+    notes and files in two different trees.
+    """
     main = _make_main_checkout(tmp_path)
     wt = _make_worktree(main, "worker", inside=True)
     monkeypatch.chdir(main)
 
     result = _run(main, worktree_root=str(wt), mode="append", entry="worker note")
     assert DOMAIN in result
-    assert "worker note" in (_kb(wt) / REL_PATH).read_text(encoding="utf-8")
-    assert not (main / ".thoughtmachine").exists()
+    # Same root as the file tools: the registered workspace root.
+    assert "worker note" in (_kb(main) / REL_PATH).read_text(encoding="utf-8")
+    assert not (wt / ".thoughtmachine").exists()
 
 
 # ---------------------------------------------------------------------------

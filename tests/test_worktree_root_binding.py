@@ -1,12 +1,18 @@
-"""Opt-in ``worktree_root`` binding: one narrower root, failing closed.
+"""``worktree_root`` is validated, then IGNORED: one root for every tool.
 
-The feature lets a session point path-anchored tool operations at a git
-worktree that lives INSIDE the registered workspace (e.g.
-``<workspace>/.worktrees/feat``). Six things have to hold, and each has its
-own group below:
+A configured ``worktree_root`` (a git worktree living INSIDE the registered
+workspace, e.g. ``<workspace>/.worktrees/feat``) used to narrow the
+path-anchored tools. Narrowing only the write side is what let ``ReadFile``
+read the main checkout while ``FileEditor`` wrote a ``.worktrees/<uuid>`` tree
+that no diff, commit, CI run or container mount could see. The value is now
+still validated -- fail closed, never a silent fallback -- and then ignored:
+every path-anchored tool is anchored at the SAME registered workspace root, and
+the ignored value is reported once at INFO level. Six things have to hold, and
+each has its own group below:
 
-1. ``TestRedirect`` -- the mandated proof: a relative path resolves under the
-   worktree, and the same relative path does not appear in the wider root.
+1. ``TestOneRoot`` -- the mandated proof: a relative path resolves under the
+   REGISTERED root (the worktree copy is untouched), and the ignoring is
+   reported.
 2. ``TestFailsClosed`` -- every unprovable value raises ``ValueError`` and the
    tool does not execute: ``..`` traversal, an absolute sibling that only
    shares a STRING prefix with the root, a non-directory, and a worktree with
@@ -17,9 +23,9 @@ own group below:
 4. ``TestSchemaHygiene`` -- the field is infrastructure, so it is not
    advertised to the model in the tool schema nor in the "Valid fields:"
    error text.
-5. ``TestDockerCodeRunnerBinding`` -- the container bind SOURCE narrows to the
-   worktree while the bind TARGET stays ``/workspace`` and the existing
-   ``working_dir`` rules are untouched.
+5. ``TestDockerCodeRunnerBinding`` -- the container bind SOURCE is the
+   registered root (never the worktree) while the bind TARGET stays
+   ``/workspace`` and the existing ``working_dir`` rules are untouched.
 6. ``TestRespawnTier`` -- changing ``worktree_root`` re-anchors every tool, so
    it is a restart-required field, not a hot swap.
 """
@@ -76,17 +82,17 @@ def tree(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 1. The mandated proof
+# 1. The mandated proof: ONE root
 # ---------------------------------------------------------------------------
 
 
-class TestRedirect:
-    def test_relative_write_lands_in_the_worktree(self, tree):
+class TestOneRoot:
+    def test_relative_write_lands_in_the_registered_root(self, tree):
         root, worktree = tree
         tool = FileEditor(
             operation="write",
             filename="proof.txt",
-            content="bound to the worktree\n",
+            content="bound to the registered root\n",
             workspace_path=str(root),
             worktree_root=str(worktree),
             effective_permissions={"filesystem": "full"},
@@ -95,27 +101,34 @@ class TestRedirect:
         out = tool.execute()
 
         assert "Error" not in out, out
-        assert (worktree / "proof.txt").read_text() == "bound to the worktree\n"
-        # The same relative path must NOT appear in the wider root: a silent
-        # fallback to the registered workspace is the failure this prevents.
-        assert not (root / "proof.txt").exists()
+        assert (root / "proof.txt").read_text() == "bound to the registered root\n"
+        # The worktree copy must NOT be written: a path edit that no diff,
+        # commit, CI run or container mount can see is the failure this
+        # prevents. ``worktree_root`` is validated, then ignored.
+        assert not (worktree / "proof.txt").exists()
 
-    def test_validate_path_resolves_relative_against_the_worktree(self, tree):
+    def test_validate_path_resolves_relative_against_the_registered_root(self, tree):
         root, worktree = tree
         tool = _bound(root, worktree)
 
         resolved = tool._validate_path("sub/file.txt")
 
-        assert resolved == os.path.join(os.path.realpath(worktree), "sub", "file.txt")
-        assert not resolved.startswith(os.path.realpath(root) + os.sep + "sub")
+        assert resolved == os.path.join(os.path.realpath(root), "sub", "file.txt")
+        # Not under the (now ignored) worktree.
+        assert not resolved.startswith(
+            os.path.join(os.path.realpath(worktree), "sub")
+        )
 
     def test_absolute_path_inside_the_worktree_is_accepted(self, tree):
+        """The worktree is inside the one root, so an absolute path there is
+        still a legitimate in-workspace path."""
         root, worktree = tree
         tool = _bound(root, worktree)
 
         resolved = tool._validate_path(str(worktree / "abs.txt"))
 
         assert resolved == os.path.join(os.path.realpath(worktree), "abs.txt")
+        assert resolved.startswith(os.path.realpath(root) + os.sep)
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +354,7 @@ def fake_manager(monkeypatch):
 
 
 class TestDockerCodeRunnerBinding:
-    def test_bind_source_is_the_worktree_and_the_workdir_stays_workspace(
+    def test_bind_source_is_the_registered_root_and_the_workdir_stays_workspace(
         self, fake_manager, tree
     ):
         from tools.docker_code_runner import DockerCodeRunner
@@ -357,8 +370,10 @@ class TestDockerCodeRunnerBinding:
 
         assert payload["success"] is True, payload
         manager = fake_manager.instances[-1]
-        # Bind SOURCE: narrowed to the worktree.
-        assert manager.kwargs["workspace_path"] == os.path.realpath(worktree)
+        # Bind SOURCE: the registered root -- the SAME tree the file tools edit
+        # and the git tools inspect, so what runs in the container is what the
+        # session is actually changing.
+        assert manager.kwargs["workspace_path"] == os.path.realpath(root)
         # Bind TARGET is untouched: still the fixed /workspace mount point, so
         # every command keeps seeing the same path inside the container.
         assert manager.exec_calls[-1]["workdir"] == "/workspace"
