@@ -8,7 +8,7 @@
 # saturated with audit and health-poll chatter.
 #
 # Safe to run after a machine restart: no sudo, no writes, every external
-# command bounded by a timeout.  Nothing here modifies state.
+# command bounded by a DEADLINE (see bounded_run).  Nothing here modifies state.
 #
 # Every journal query is bounded TWICE, because an unbounded one is not slow --
 # it is a hang:
@@ -33,6 +33,14 @@
 # Exit: 0 report printed, 2 usage error, 3 witness ledger missing (the report
 #       is STILL printed in full: see the ledger-MISSING note below).
 # Skip every journalctl call with TM_FORENSICS_NO_JOURNAL=1 (used by the tests)
+# BOUND the per-command budget with TM_FORENSICS_BUDGET_S=N (used by the tests)
+#
+# Every number in the summary is either a count of what was actually read or the
+# literal UNMEASURED (<reason>): a query that timed out, failed or could not run
+# must never print 0, because "0 kills" and "could not look" are different
+# statements.  The header and the summary both state how many answers were
+# unmeasured.  Kill counts come from journalctl unit selectors (-t), never from
+# a MESSAGE grep: `-g earlyoom` matches the word, not the process.
 
 set -uo pipefail
 
@@ -102,6 +110,8 @@ usage: bash scripts/forensics_after_reboot.sh [--quiet|-q] [--full] [--hours N]
 env:
   TM_WITNESS_LEDGER=/path/to/ledger.jsonl   override the witness ledger
   TM_FORENSICS_NO_JOURNAL=1                 skip every journalctl call (tests)
+  TM_FORENSICS_BUDGET_S=N                   seconds per external command (tests)
+  TM_FORENSICS_BOUND=auto|timeout|watchdog  which limiter bounds them (tests)
   TM_FORENSICS_WINDOW_HOURS=N               default window in hours (--hours wins)
 EOF
             exit 0 ;;
@@ -114,8 +124,129 @@ done
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
 LEDGER=${TM_WITNESS_LEDGER:-${REPO_ROOT}/logs/witness/ledger.jsonl}
-BUDGET=30     # seconds per external command
+# seconds per external command.  TM_FORENSICS_BUDGET_S is a TEST hook: the
+# timing-out path is asserted against a real short budget, not a 30 s one.
+BUDGET=${TM_FORENSICS_BUDGET_S:-30}
 KILL_GRACE=5  # seconds between that SIGTERM and the follow-up SIGKILL
+case "${BUDGET}" in
+    ''|*[!0-9]*) usage_error "TM_FORENSICS_BUDGET_S must be a positive integer, got '${BUDGET}'" ;;
+esac
+if [ "${BUDGET}" -lt 1 ]; then
+    usage_error "TM_FORENSICS_BUDGET_S must be a positive integer, got '${BUDGET}'"
+fi
+
+# --------------------------------------------------------------------------- #
+# the deadline: ONE bound, resolved once, whatever the userland provides
+#
+# An unbounded journalctl is not slow, it is a hang, so every external command
+# goes through bounded_run.  WHICH limiter implements the bound is decided here,
+# once, because the two implementations must be interchangeable -- not tried one
+# after the other on every call:
+#   * `timeout` (GNU coreutils), or `gtimeout` (the same binary, Homebrew name):
+#     invoked exactly as before, `-k ${KILL_GRACE} ${BUDGET}` and all;
+#   * a bash-native watchdog, for userlands that ship no `timeout` at all (BSD,
+#     i.e. macOS).  Without it every query there dies with exit 127 and the
+#     report answers "journalctl could not be executed" -- a measurement of the
+#     missing binary, printed in the place where the machine's answer belongs.
+#
+# The watchdog reproduces timeout's CONTRACT, not an approximation of it:
+#   - the command gets its OWN process group and is signalled as a GROUP, so a
+#     grandchild (`bash -c "journalctl ..."`) cannot outlive the deadline and
+#     hold the capture pipe open (see run_filtered);
+#   - exit 124 when the deadline's SIGTERM ended it, 137 when the SIGKILL after
+#     KILL_GRACE was needed -- the codes the case arms below already read;
+#   - the command's own exit status otherwise, untouched;
+#   - nothing outlives the call: the watchdog is killed and reaped here, never
+#     left to finish its grace sleep in the background.
+# A command that ends of its own accord with 128+15 is indistinguishable from one
+# the deadline ended: the watchdog has no channel back from a dead child, and the
+# deadline is the only SIGTERM this script sends.  The `timeout` path keeps its
+# usual exactness there -- the fallback narrows that one edge, it does not widen
+# the contract.
+#
+# If neither limiter can be established, bounded_run says so in the reason and
+# returns 125: the report then reads "failed: exit 125: <why>", which is true,
+# instead of running the command unbounded or reporting a count it never took.
+# TM_FORENSICS_BOUND=watchdog forces the fallback, so CI on Linux exercises the
+# path macOS actually takes.
+# --------------------------------------------------------------------------- #
+BOUND_KIND=${TM_FORENSICS_BOUND:-auto}
+BOUND_BIN=''
+BOUND_WHY=''
+resolve_bound_bin() {
+    local name
+    for name in timeout gtimeout; do
+        if command -v "${name}" >/dev/null 2>&1; then
+            BOUND_BIN=$(command -v "${name}")
+            return 0
+        fi
+    done
+    return 1
+}
+case "${BOUND_KIND}" in
+    auto)     resolve_bound_bin || true ;;
+    timeout)  resolve_bound_bin \
+        || usage_error 'TM_FORENSICS_BOUND=timeout but neither timeout nor gtimeout is on PATH' ;;
+    watchdog) BOUND_BIN='' ;;
+    *)        usage_error "TM_FORENSICS_BOUND must be auto, timeout or watchdog, got '${BOUND_KIND}'" ;;
+esac
+if [ -z "${BOUND_BIN}" ] && ! command -v sleep >/dev/null 2>&1; then
+    BOUND_WHY='neither timeout nor gtimeout is on PATH and there is no sleep to build a watchdog from'
+fi
+
+# TERM/KILL to the command's process GROUP, and to the bare pid only if this
+# shell cannot address a group -- a bare pid leaves the grandchild alive, holding
+# the pipe of the command substitution that is waiting for it.
+signal_bound() {
+    local sig=$1 pid=$2
+    kill "-${sig}" -- "-${pid}" 2>/dev/null && return 0
+    kill "-${sig}" "-${pid}" 2>/dev/null && return 0
+    kill "-${sig}" "${pid}" 2>/dev/null
+    return 0
+}
+
+bounded_run_watchdog() (
+    # A subshell, so `set -m` cannot leak into the caller: monitor mode is what
+    # puts the command in its own process group.  fd 3 carries the CALLER's
+    # stderr -- the command's own messages must still reach it -- while fd 2 goes
+    # to /dev/null, so bash's job-control chatter ("Killed  bash -c ...") can
+    # never be quoted by first_line() as the command's own error.
+    exec 3>&2 2>/dev/null
+    set -m
+    local pid wd rc
+    "$@" 2>&3 &
+    pid=$!
+    {
+        sleep "${BUDGET}"
+        signal_bound TERM "${pid}"
+        sleep "${KILL_GRACE}"
+        signal_bound KILL "${pid}"
+    } 3>&- >/dev/null 2>&1 &
+    wd=$!
+    wait "${pid}"
+    rc=$?
+    # Reaped here, not left to finish its grace sleep: no leaked child, and no
+    # stray holder of the caller's pipes.
+    signal_bound TERM "${wd}"
+    wait "${wd}" 2>/dev/null
+    case "${rc}" in
+        143) return 124 ;;   # the deadline's own SIGTERM is what ended it
+        137) return 137 ;;   # it outlived the SIGTERM; KILL_GRACE did not
+        *)   return "${rc}" ;;
+    esac
+)
+
+bounded_run() {
+    if [ -n "${BOUND_BIN}" ]; then
+        "${BOUND_BIN}" -k "${KILL_GRACE}" "${BUDGET}" "$@"
+        return $?
+    fi
+    if [ -n "${BOUND_WHY}" ]; then
+        printf 'no bound available: %s\n' "${BOUND_WHY}" >&2
+        return 125
+    fi
+    bounded_run_watchdog "$@"
+}
 
 # --------------------------------------------------------------------------- #
 # the window: which slice of boot -1 the queries may look at
@@ -149,7 +280,7 @@ JOURNAL_OK=0
 JOURNAL_NOTE='journalctl unavailable'
 if [ "${TM_FORENSICS_NO_JOURNAL:-0}" = "1" ]; then
     JOURNAL_NOTE='skipped (TM_FORENSICS_NO_JOURNAL=1)'
-elif timeout -k "${KILL_GRACE}" "${BUDGET}" journalctl --list-boots --no-pager >/dev/null 2>&1; then
+elif bounded_run journalctl --list-boots --no-pager >/dev/null 2>&1; then
     JOURNAL_OK=1
 fi
 
@@ -202,8 +333,7 @@ detect_window() {
         return 0
     fi
 
-    boots=$(timeout -k "${KILL_GRACE}" "${BUDGET}" \
-        journalctl --list-boots --no-pager -o short-iso 2>/dev/null) || boots=''
+    boots=$(bounded_run journalctl --list-boots --no-pager -o short-iso 2>/dev/null) || boots=''
     line=$(printf '%s\n' "${boots}" | awk '$1 == "-1" { print; exit }')
     if [ -n "${line}" ]; then
         BOOT_START=$(printf '%s\n' "${line}" | awk '{ print $4 " " $5 }')
@@ -212,8 +342,7 @@ detect_window() {
     if [ -z "${BOOT_END}" ]; then
         # Fallback: the newest entry of boot -1.  `-n 1` reads from the END, so
         # this stays cheap even on a twelve-day boot.
-        BOOT_END=$(timeout -k "${KILL_GRACE}" "${BUDGET}" \
-            journalctl -b -1 -n 1 --no-pager -o short-iso 2>/dev/null \
+        BOOT_END=$(bounded_run journalctl -b -1 -n 1 --no-pager -o short-iso 2>/dev/null \
             | head -1 | awk '{ print $1 }') || BOOT_END=''
     fi
 
@@ -270,33 +399,114 @@ detect_window() {
 
 detect_window
 
-# count of non-blank stdout lines of an arbitrary command string; "n/a" when the
-# journal cannot be read, so a missing journal is never reported as "0 kills".
+# One bounded journalctl query, counted.
+#
+#   journal_count <command string> [<message regex>]
+#
+# A count is an ANSWER, so a query that did not run must never produce one: a
+# timeout, a failure and an absent journalctl all print UNMEASURED (<reason>).
+# But "no entries" is the OTHER way round: journalctl exits 1 when nothing
+# matched and announces it on stderr, and that is a measured 0 -- reporting it
+# as UNMEASURED would make "measurably none" look like "could not look".
+# The query keeps its --since/--until window and its bounded_run deadline; the
+# optional regex is applied here, with the pattern handed to awk through the
+# ENVIRONMENT (see denoise()) so no backslash is ever eaten.
+
+# The first non-empty line of a capture, unindented: the reason string for a
+# query that really failed.  "" when the capture was empty.
+first_line() {
+    printf '%s\n' "$1" | sed -n 's/^[[:space:]]*//; /^$/d; p' | head -n 1
+}
+
+# Did journalctl say it found nothing?  Exit 1 is returned for that AND for a
+# real failure; only the message tells them apart.
+said_no_entries() {
+    printf '%s\n' "$1" | grep -q 'No entries'
+}
+
 journal_count() {
-    local out
+    local cmd=$1 pattern=${2:-} out rc reason
     if [ "${JOURNAL_OK}" -ne 1 ]; then
-        printf '%s' "${JOURNAL_NOTE}"
+        printf 'UNMEASURED (%s)' "${JOURNAL_NOTE}"
         return 0
     fi
-    out=$(timeout -k "${KILL_GRACE}" "${BUDGET}" bash -c "$1" 2>/dev/null) || out=""
-    printf '%s\n' "${out}" | grep -c '[^[:space:]]' || true
+    # stdout AND stderr in ONE variable: `-- No entries --` arrives on stderr,
+    # so a stdout-only capture cannot tell an empty result from a broken read.
+    # Nothing is written to disk -- no temp file, least of all in the repo.
+    out=$(bounded_run bash -c "${cmd}" 2>&1)
+    rc=$?
+    case "${rc}" in
+        0) ;;
+        1)
+            if said_no_entries "${out}"; then
+                printf '0'
+                return 0
+            fi
+            reason=$(first_line "${out}")
+            printf 'UNMEASURED (journalctl failed: exit 1: "%s")' "${reason:-no stderr}"
+            return 0 ;;
+        124|137)
+            printf 'UNMEASURED (journalctl timed out after %s s)' "${BUDGET}"
+            return 0 ;;
+        126|127)
+            printf 'UNMEASURED (journalctl could not be executed: exit %s)' "${rc}"
+            return 0 ;;
+        *)
+            reason=$(first_line "${out}")
+            printf 'UNMEASURED (journalctl failed: exit %s: "%s")' "${rc}" "${reason:-no stderr}"
+            return 0 ;;
+    esac
+    # journalctl's own `-- ` markers ("-- No entries --", "-- Logs begin at")
+    # are not journal entries: an entry line starts with a timestamp, never
+    # with `-- `, so a marker can never be counted as a kill.
+    printf '%s\n' "${out}" | COUNT_PATTERN="${pattern}" awk '
+        BEGIN { pat = ENVIRON["COUNT_PATTERN"] }
+        /^[[:space:]]*$/ { next }
+        /^-- / { next }
+        pat != "" && $0 !~ pat { next }
+        { n++ }
+        END { print n + 0 }
+    '
 }
 
 # yes/no plus the single quoted line that decides it
 orderly_answer() {
-    local out
+    local out rc reason
     if [ "${JOURNAL_OK}" -ne 1 ]; then
-        printf '%s' "${JOURNAL_NOTE}"
+        printf 'UNMEASURED (%s)' "${JOURNAL_NOTE}"
         return 0
     fi
     # -n 1: the newest matching entry, read from the end of the window.  The
     # grep moves into -g (PCRE2) so journalctl can stop as soon as it has one.
-    out=$(timeout -k "${KILL_GRACE}" "${BUDGET}" bash -c \
-        "journalctl ${TIME_BOUND} -b -1 --no-pager -g 'Reached target.*(Power-Off|Reboot)' -n 1 2>/dev/null") || out=""
+    out=$(bounded_run bash -c \
+        "journalctl ${TIME_BOUND} -b -1 --no-pager -g 'Reached target.*(Power-Off|Reboot)' -n 1 2>&1")
+    rc=$?
+    case "${rc}" in
+        0) ;;
+        1)
+            # "no entries" here MEANS something: no shutdown marker was found in
+            # boot -1.  That is an answer about the boot, not a failed read.
+            if said_no_entries "${out}"; then
+                printf 'no -- no shutdown target entry (Reached target Power-Off|Reboot) in the window'
+                return 0
+            fi
+            reason=$(first_line "${out}")
+            printf 'UNMEASURED (journalctl failed: exit 1: "%s")' "${reason:-no stderr}"
+            return 0 ;;
+        124|137)
+            printf 'UNMEASURED (journalctl timed out after %s s)' "${BUDGET}"
+            return 0 ;;
+        *)
+            # "unreadable" is not "orderly": say which one happened.
+            reason=$(first_line "${out}")
+            printf 'UNMEASURED (journalctl failed: exit %s: "%s")' "${rc}" "${reason:-no stderr}"
+            return 0 ;;
+    esac
+    out=$(printf '%s\n' "${out}" | grep -v '^-- ' || true)
     if [ -n "${out}" ]; then
         printf 'yes -- %s' "${out}"
     else
-        printf 'no -- no "Reached target (Power-Off|Reboot)" line in boot -1'
+        printf 'no -- journalctl matched nothing for boot -1'
     fi
 }
 
@@ -318,6 +528,147 @@ verdict_answer() {
     fi
 }
 
+# --------------------------------------------------------------------------- #
+# signals: WHO signalled WHOM, from the witness ledger
+#
+# A signal record -- "kind" (or "event") == "signal" -- is the only evidence in
+# the ledger that names the SENDER of a kill, so it is reported per event and
+# not merely counted.  The witness NAMES THE SENDER, NOT THE VICTIM: the fields
+# its records actually carry are si_pid, si_uid, sender_comm, signame (with
+# signo), origin and run_id -- there is no target_pid and no victim pid of any
+# kind.  The section is therefore titled "(sender -> run)", and a line says
+# "target=run <run_id>" instead of promising a pid the data cannot supply.
+# The count and the lines come from the SAME single scan, so "signals: N" can
+# never disagree with the lines printed underneath it.  A ledger that is absent
+# or not JSONL is UNMEASURED, never 0.
+# --------------------------------------------------------------------------- #
+SIG_COUNT=''    # "N", or UNMEASURED (<reason>)
+SIG_EVENTS=''   # formatted per-event lines, '' when there are none
+
+sig_load() {
+    local scan count records json
+    if [ ! -f "${LEDGER}" ]; then
+        SIG_COUNT="UNMEASURED (ledger MISSING: ${LEDGER})"
+        SIG_EVENTS=''
+        return 0
+    fi
+    if ! scan=$(awk '
+        BEGIN { q = sprintf("%c", 34) }
+        function f(line, key,   pat, rest, c) {
+            # No optional opening quote: consuming it would put the quoted
+            # branch below out of reach, and the bare-token scan then stops at
+            # '+' -- truncating "...T02:51:58.123456+00:00" at the offset.
+            pat = q key q "[[:space:]]*:[[:space:]]*"
+            if (!match(line, pat)) return ""
+            rest = substr(line, RSTART + RLENGTH)
+            if (substr(rest, 1, 1) == q) {
+                rest = substr(rest, 2)
+                c = index(rest, q)
+                return c ? substr(rest, 1, c - 1) : ""
+            }
+            c = 0
+            while (substr(rest, c + 1, 1) ~ /[-0-9A-Za-z_.:]/) c++
+            return substr(rest, 1, c)
+        }
+        # f() returns the raw token: a JSON null is spelled "null" and must not
+        # be printed as if it were a value.
+        function val(line, key,   v) { v = f(line, key); return (v == "null") ? "" : v }
+        tolower($0) ~ (q "(kind|event)" q "[[:space:]]*:[[:space:]]*" q "signal" q) {
+            ts   = val($0, "ts");         if (ts   == "") ts   = val($0, "timestamp")
+            sign = val($0, "signame");   if (sign == "") sign = val($0, "signo")
+            spid = val($0, "si_pid");     if (spid == "") spid = val($0, "sender_pid")
+            comm = val($0, "sender_comm")
+            orig = val($0, "origin")
+            # NO fallback to a bare `pid`: these records name the SENDER
+            # (si_pid) and the witnessed run (run_id), and a `pid` field, where
+            # one exists at all, is the sender pid -- falling back to it would
+            # print the aggressor as the victim.  A target pid is printed only
+            # when the record really carries one; otherwise the target is the
+            # run named by run_id, and the line says so.
+            tpid = val($0, "target_pid")
+            run  = val($0, "run_id")
+            if (tpid != "")   tgt = "target_pid=" tpid
+            else if (run != "") tgt = "target=run " run
+            else              tgt = "target not recorded"
+            printf "%s  %s  sender=%s%s  origin=%s  ->  %s\n", (ts == "" ? "unknown" : ts), (sign == "" ? "signal=unknown" : "signal=" sign), (spid == "" ? "unknown" : spid), (comm == "" ? "" : " (" comm ")"), (orig == "" ? "unknown" : orig), tgt
+            found++
+            next
+        }
+        {
+            records++
+            if (index($0, "{") > 0) json++
+        }
+        END {
+            printf "#meta count %d\n",   found + 0
+            printf "#meta records %d\n", records + 0
+            printf "#meta json %d\n",    json + 0
+        }
+    ' "${LEDGER}" 2>/dev/null); then
+        SIG_COUNT="UNMEASURED (ledger unreadable: awk failed on ${LEDGER})"
+        SIG_EVENTS=''
+        return 0
+    fi
+    count=$(printf '%s\n' "${scan}" | sed -n 's/^#meta count //p')
+    records=$(printf '%s\n' "${scan}" | sed -n 's/^#meta records //p')
+    json=$(printf '%s\n' "${scan}" | sed -n 's/^#meta json //p')
+    SIG_EVENTS=$(printf '%s\n' "${scan}" | grep -v '^#meta ' || true)
+    if [ "${records:-0}" -gt 0 ] && [ "${json:-0}" -eq 0 ]; then
+        SIG_COUNT="UNMEASURED (ledger is not JSONL: no '{' in ${records} record(s))"
+        SIG_EVENTS=''
+        return 0
+    fi
+    SIG_COUNT=${count:-0}
+}
+
+# --------------------------------------------------------------------------- #
+# ANSWERS, computed once and BEFORE the header, so the header can state how many
+# of them are UNMEASURED instead of the report only admitting it line by line.
+# (A counter bumped inside journal_count would be lost: it runs inside a command
+# substitution, which is a subshell.)
+# --------------------------------------------------------------------------- #
+JOURNAL_ANSWERS=6
+A_ORDERLY=''; A_KERNEL_OOM=''; A_MEMCG=''; A_SEGFAULT=''; A_EARLYOOM=''; A_OOMD=''
+A_VERDICTS=''
+A_EARLYOOM_GREP=''   # CROSS-CHECK only, never an answer: see answers_load
+UNMEASURED_ANSWERS=0
+
+answers_load() {
+    local tally
+    A_ORDERLY=$(orderly_answer)
+    A_KERNEL_OOM=$(journal_count \
+        "journalctl ${TIME_BOUND} -b -1 -k --no-pager -g 'Out of memory: Killed process|oom-kill:'")
+    A_MEMCG=$(journal_count \
+        "journalctl ${TIME_BOUND} -b -1 -k --no-pager -g 'Memory cgroup out of memory'")
+    A_SEGFAULT=$(journal_count \
+        "journalctl ${TIME_BOUND} -b -1 -k --no-pager -g 'segfault at|traps:'")
+    # -t selects the earlyoom UNIT.  `-g earlyoom` only greps the MESSAGE text: a
+    # message that merely mentions the word then counts as a kill, and a kill
+    # worded differently does not.  The unit selector is the count.
+    A_EARLYOOM=$(journal_count \
+        "journalctl ${TIME_BOUND} -b -1 --no-pager -t earlyoom" \
+        'sending SIGTERM|sending SIGKILL')
+    A_OOMD=$(journal_count \
+        "journalctl ${TIME_BOUND} -b -1 --no-pager -t systemd-oomd" \
+        'Killed /|due to memory pressure')
+    # CROSS-CHECK, not an answer: whether `-t earlyoom` matches this systemd is
+    # a claim no test here can settle.  If the unit query reports a measured 0
+    # while the MESSAGE grep sees lines, the selector -- not the machine -- is
+    # the suspect, and the summary says so.  The answer itself is NOT rewritten:
+    # silently substituting one number for another is the bug this report exists
+    # to prevent, so the contradiction is stated and the untrustworthy number is
+    # named.  Same window, same budget, same UNMEASURED discipline.
+    A_EARLYOOM_GREP=$(journal_count \
+        "journalctl ${TIME_BOUND} -b -1 --no-pager -g 'earlyoom'" \
+        'sending SIGTERM|sending SIGKILL')
+    A_VERDICTS=$(verdict_answer)
+    tally=$(printf '%s\n' "${A_ORDERLY}" "${A_KERNEL_OOM}" "${A_MEMCG}" \
+        "${A_SEGFAULT}" "${A_EARLYOOM}" "${A_OOMD}" | grep -c '^UNMEASURED')
+    UNMEASURED_ANSWERS=${tally:-0}
+}
+
+sig_load
+answers_load
+
 # raw journal section: bounded, de-noised, labelled
 run_filtered() {
     local label=$1 cmd=$2 out
@@ -326,13 +677,13 @@ run_filtered() {
         printf '%s\n' "${JOURNAL_NOTE}"
         return 0
     fi
-    # `timeout -k` WITHOUT --foreground.  --foreground signals only the direct
-    # child, so journalctl -- a grandchild, through bash -c -- survives the
-    # budget, keeps the pipe's write end open, and leaves denoise (and therefore
-    # this command substitution) waiting for an EOF that never comes.  Without
-    # --foreground, timeout puts the child in its own process group and signals
-    # the WHOLE pipeline; -k 5 turns a wedged SIGTERM into a SIGKILL.
-    out=$(timeout -k "${KILL_GRACE}" "${BUDGET}" bash -c "${cmd}" 2>&1 | denoise)
+    # bounded_run signals the WHOLE process group of the command, never just the
+    # direct child: journalctl -- a grandchild, through bash -c -- would survive
+    # a pid-only signal, keep the pipe's write end open, and leave denoise (and
+    # therefore this command substitution) waiting for an EOF that never comes.
+    # That is why the `timeout` path passes no --foreground, and why the watchdog
+    # puts the command in a group of its own before signalling it.
+    out=$(bounded_run bash -c "${cmd}" 2>&1 | denoise)
     if [ -n "${out}" ]; then
         printf '%s\n' "${out}"
     else
@@ -351,6 +702,8 @@ printf 'boot_id   : %s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || 
 printf 'uptime_s  : %s\n' "$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo unknown)"
 printf 'boot -1   : %s\n' "${BOOT_SPAN_TEXT}"
 printf 'window    : %s\n' "${WINDOW_TEXT}"
+printf 'unmeasured: %s of %s journal answers could not be measured (see summary)\n' \
+    "${UNMEASURED_ANSWERS}" "${JOURNAL_ANSWERS}"
 if [ -n "${COVERAGE_WARNING}" ]; then
     printf 'WARNING   : %s\n' "${COVERAGE_WARNING}"
 fi
@@ -365,18 +718,25 @@ run_filtered "boots (last 3)" 'journalctl --list-boots --no-pager | tail -3'
 # --------------------------------------------------------------------------- #
 section "summary"
 printf 'scope     : %s\n' "${SUMMARY_SCOPE}"
-printf 'prior boot ended orderly?: %s\n' "$(orderly_answer)"
-printf 'kernel oom kills in prior boot: %s\n' "$(journal_count \
-    "journalctl ${TIME_BOUND} -b -1 -k --no-pager -g 'Out of memory: Killed process|oom-kill:'")"
-printf 'cgroup memcg kills in prior boot: %s\n' "$(journal_count \
-    "journalctl ${TIME_BOUND} -b -1 -k --no-pager -g 'Memory cgroup out of memory'")"
-printf 'segfaults/traps in prior boot: %s\n' "$(journal_count \
-    "journalctl ${TIME_BOUND} -b -1 -k --no-pager -g 'segfault at|traps:'")"
-printf 'earlyoom kills in prior boot: %s\n' "$(journal_count \
-    "journalctl ${TIME_BOUND} -b -1 --no-pager -g earlyoom | grep -E 'sending SIGTERM|sending SIGKILL|low memory'")"
-printf 'systemd-oomd kills in prior boot: %s\n' "$(journal_count \
-    "journalctl ${TIME_BOUND} -b -1 --no-pager -g 'systemd-oomd' | grep -E 'Killed /|due to memory pressure'")"
-printf 'witness verdicts (from ledger): %s\n' "$(verdict_answer)"
+printf 'unmeasured: %s of %s journal answers could not be measured (marked UNMEASURED below)\n' \
+    "${UNMEASURED_ANSWERS}" "${JOURNAL_ANSWERS}"
+printf 'prior boot ended orderly?: %s\n' "${A_ORDERLY}"
+printf 'kernel oom kills in prior boot: %s\n' "${A_KERNEL_OOM}"
+printf 'cgroup memcg kills in prior boot: %s\n' "${A_MEMCG}"
+printf 'segfaults/traps in prior boot: %s\n' "${A_SEGFAULT}"
+printf 'earlyoom kills in prior boot: %s\n' "${A_EARLYOOM}"
+if [ "${A_EARLYOOM}" = '0' ]; then
+    case "${A_EARLYOOM_GREP}" in
+        ''|*[!0-9]*) ;;   # no clean cross-check number: nothing to contradict
+        *)
+            if [ "${A_EARLYOOM_GREP}" -gt 0 ]; then
+                printf 'WARNING   : earlyoom cross-check: the unit query said 0 but %s journal lines mention earlyoom -- the -t selector may not match this systemd; treat the kill count as UNMEASURED\n' "${A_EARLYOOM_GREP}"
+            fi ;;
+    esac
+fi
+printf 'systemd-oomd kills in prior boot: %s\n' "${A_OOMD}"
+printf 'witness verdicts (from ledger): %s\n' "${A_VERDICTS}"
+printf 'signals: %s\n' "${SIG_COUNT}"
 
 # --------------------------------------------------------------------------- #
 # witness ledger (evidence)
@@ -411,6 +771,16 @@ if [ "${LEDGER_MISSING}" -eq 0 ]; then
     section "witness ledger: births (last 5)"
     grep -F '"event":"birth"' "${LEDGER}" | tail -n 5 || printf '(no birth records)\n'
 fi
+
+# Unconditional: when the ledger is missing or unreadable this section still
+# prints, saying UNMEASURED and why.  An absent file is not "no signals".
+section "witness ledger: signals (sender -> run)"
+if [ -n "${SIG_EVENTS}" ]; then
+    printf '%s\n' "${SIG_EVENTS}"
+else
+    printf '(no signal records)\n'
+fi
+printf 'signals: %s\n' "${SIG_COUNT}"
 
 # --------------------------------------------------------------------------- #
 # raw evidence -- only with --full
