@@ -516,3 +516,8 @@ web_ui/frontend/.dist-build-stamp
 # the repo -- `docs/*` above is a catch-all, so the negation is required or the
 # file is never versioned and vanishes on the next clone.
 !docs/DESIGN_CREDENTIALS.md
+# Workers-as-things design doc (branch docs/design-workers): public tier, ships with
+# the repo -- `docs/*` above is a catch-all, so the negation is required or the file
+# is never versioned and vanishes on the next clone.
+!docs/DESIGN_WORKERS.md
+
