@@ -5,7 +5,8 @@ What this is
 ------------
 One :class:`ProcessWorkerRuntime` per worker *instance* (D1): an ``spawn``-ed
 OS process running :func:`tools.workspace.worker_runtime_main.worker_runtime_main`,
-an ``AF_UNIX`` socketpair between the two (§4.1), one :class:`FrameEmitter` and
+a portable ``SOCK_STREAM`` socket pair between the two (:func:`make_ipc_channel`,
+§4.1), one :class:`FrameEmitter` and
 one :class:`FrameDecoder` **per direction** (§4.2), and a ``pending`` map from
 ``query_id`` to a :class:`concurrent.futures.Future` (§4.8).
 
@@ -171,6 +172,211 @@ class WorkerQueryTimeout(TimeoutError):
         #: The terminal ``reply`` for this query: synthesised here when this side
         #: expired first, else the runtime's own frame; ``ok`` is ``False``.
         self.reply = reply
+
+
+class WorkerIpcUnavailableError(RuntimeError):
+    """No IPC channel could be built between supervisor and runtime (§4.1).
+
+    Raised when every portable way of producing a connected socket pair has
+    failed. Loud on purpose: the channel is what process mode *is*, so there is
+    nothing left to fall back to that would still be process mode. Quietly
+    running the worker in thread mode instead would answer a different question
+    with the same handle, and the caller would never learn that the address
+    space it asked for was never built.
+
+    The message names every attempt, the environment the attempts ran in, and
+    the remedy (``WORKER_RUNTIME_MODE=thread``); the underlying cause travels
+    as ``__cause__``.
+    """
+
+
+class WorkerStartMethodUnsupported(RuntimeError):
+    """The configured multiprocessing start method does not exist here (§4.1).
+
+    ``get_context`` raises a bare ``ValueError`` naming the method it was given
+    but not the ones this platform offers, and the set differs between Windows
+    and POSIX (``fork`` does not exist on Windows at all). Naming both is the
+    difference between a message an operator can act on and one they have to
+    research.
+    """
+
+
+#: Which channel the factory last produced, so :func:`ipc_capability` can report
+#: it without re-probing. Process-wide and last-writer-wins: the value answers
+#: "what does a channel on this platform look like", not "what did this call
+#: use", and every caller in one interpreter gets the same answer.
+_IPC_CHANNEL_CHOICE: Dict[str, str] = {
+    "chosen_family": "unknown",
+    "how": "not_attempted",
+}
+
+
+def _family_name(sock: "socket.socket") -> str:
+    """``'AF_INET'``-style name for a socket's family, for readable reports."""
+    family = getattr(sock, "family", None)
+    return getattr(family, "name", None) or str(family)
+
+
+def _record_channel_choice(how: str, sock: "socket.socket") -> None:
+    """Remember which attempt succeeded and which family it produced."""
+    _IPC_CHANNEL_CHOICE["how"] = how
+    _IPC_CHANNEL_CHOICE["chosen_family"] = _family_name(sock)
+
+
+def ipc_capability() -> dict:
+    """What this interpreter can do for the worker IPC channel (§4.1).
+
+    Side-effect free: it reports the environment and the LAST channel this
+    process built, and builds nothing itself -- a capability probe must never be
+    the thing that consumes a socket or a port. ``chosen_family`` is
+    ``'unknown'`` until :func:`make_ipc_channel` has run at least once, which is
+    the honest answer for a process that has not tried yet.
+
+    Shaped for an error envelope: three facts, no payload.
+    """
+    return {
+        "af_unix_available": hasattr(socket, "AF_UNIX"),
+        "chosen_family": _IPC_CHANNEL_CHOICE["chosen_family"],
+        "how": _IPC_CHANNEL_CHOICE["how"],
+    }
+
+
+def _ipc_unavailable_message(attempts: "list[str]") -> str:
+    """The refusal text: what was tried, where, and what to do about it.
+
+    Every field here is something an operator on a strange platform needs in
+    order to be believed; the exception type alone said nothing before.
+    """
+    return (
+        "the process-mode worker IPC channel could not be built: no usable "
+        "socket pair exists in this interpreter (tried, in order: "
+        + "; ".join(attempts)
+        + "). This is a refusal, not a fallback: process mode is not quietly "
+        "served as thread mode. Environment: "
+        f"sys.version={sys.version!r}, sys.executable={sys.executable!r}, "
+        f"socket.__file__={getattr(socket, '__file__', None)!r}, "
+        f"sys.platform={sys.platform!r}, "
+        f"has socket.AF_UNIX={hasattr(socket, 'AF_UNIX')!r}, "
+        f"has socket.socketpair={hasattr(socket, 'socketpair')!r}. "
+        "Remedy: set WORKER_RUNTIME_MODE=thread for this workspace (which runs "
+        "the worker in this interpreter), or run on an interpreter whose "
+        "socket module provides AF_UNIX or socketpair()."
+    )
+
+
+def _loopback_pair() -> "tuple[socket.socket, socket.socket]":
+    """A hand-rolled connected pair over ``127.0.0.1`` (attempt 3).
+
+    Self-owned on purpose: a listener bound to port 0, one ``accept``, and the
+    listener closed again. No stdlib-internal assumption about how
+    ``socketpair`` would have been implemented, and no listening socket left
+    behind for the rest of the process's life.
+
+    The listener is closed in ``finally`` on every path -- including the one
+    where ``accept`` raises -- because a leaked listener is a port nobody can
+    account for, and the failure it accompanies is the one where an operator is
+    already reading socket state.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            client.connect(listener.getsockname())
+            server, _ = listener.accept()
+        except BaseException:
+            client.close()
+            raise
+    finally:
+        listener.close()
+    return server, client
+
+
+def make_ipc_channel() -> "tuple[socket.socket, socket.socket]":
+    """Build the supervisor<->runtime IPC channel, portably (§4.1).
+
+    Contract: two CONNECTED ``SOCK_STREAM`` sockets, in any family, one per
+    side. Nothing downstream may assume a family: the pair is used only for
+    ``sendall``/``recv`` of framed bytes and for ``close``. Portable across
+    POSIX and Windows, and it does NOT require ``socket.AF_UNIX`` to exist, nor
+    ``socket.socketpair``, nor a particular ``multiprocessing`` start method.
+
+    Attempt order, first success wins:
+
+    1. ``socketpair(AF_UNIX, SOCK_STREAM)`` -- only when ``socket.AF_UNIX``
+       exists, which is what stops the old ``AttributeError`` before any process
+       is asked for;
+    2. ``socketpair()`` with no family -- CPython's own portable form, which
+       picks a family this platform supports;
+    3. :func:`_loopback_pair` -- a ``127.0.0.1`` listener plus one accepted
+       connection, built here rather than borrowed from the stdlib.
+
+    All three failing raises :class:`WorkerIpcUnavailableError` with the cause
+    chained. There is no silent substitute for a missing channel.
+
+    The successful attempt is recorded for :func:`ipc_capability`.
+    """
+    attempts: "list[str]" = []
+
+    if hasattr(socket, "AF_UNIX"):
+        try:
+            pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        except (OSError, AttributeError) as exc:
+            attempts.append(
+                "socketpair(AF_UNIX, SOCK_STREAM): "
+                f"{type(exc).__name__}: {exc}"
+            )
+        else:
+            _record_channel_choice("socketpair_af_unix", pair[0])
+            return pair
+    else:
+        attempts.append(
+            "socketpair(AF_UNIX, SOCK_STREAM): skipped, socket.AF_UNIX does not "
+            "exist in this interpreter"
+        )
+
+    try:
+        pair = socket.socketpair()
+    except (OSError, AttributeError) as exc:
+        attempts.append(f"socketpair() with no family: {type(exc).__name__}: {exc}")
+    else:
+        _record_channel_choice("socketpair_default", pair[0])
+        return pair
+
+    try:
+        pair = _loopback_pair()
+    except (OSError, AttributeError) as exc:
+        attempts.append(
+            "AF_INET loopback listener + connect pair: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        raise WorkerIpcUnavailableError(_ipc_unavailable_message(attempts)) from exc
+
+    _record_channel_choice("af_inet_loopback", pair[0])
+    return pair
+
+
+def _validated_start_method(start_method: str) -> str:
+    """Return *start_method* if this platform has it, else refuse loudly.
+
+    ``get_context`` raises ``ValueError: cannot find context for 'fork'``, which
+    names neither the methods that DO exist here nor the fact that the value
+    came from configuration. On Windows ``fork`` is absent entirely, so this is
+    the difference between "fix your config" and "something is broken".
+
+    The method is unchanged: ``spawn`` is already the default
+    :class:`ProcessWorkerRuntime` uses, and it is the only one Windows has.
+    """
+    available = list(multiprocessing.get_all_start_methods())
+    if start_method not in available:
+        raise WorkerStartMethodUnsupported(
+            f"multiprocessing start method {start_method!r} does not exist on "
+            f"this platform (sys.platform={sys.platform!r}); available: "
+            f"{available} (§4.1)"
+        )
+    return start_method
 
 
 def _briefing_only(
@@ -486,10 +692,10 @@ class ProcessWorkerRuntime:
         if self._started:
             raise RuntimeError("ProcessWorkerRuntime.start() may be called once")
         self._started = True
-        context = multiprocessing.get_context(self._start_method)
-        parent_sock, child_sock = socket.socketpair(
-            socket.AF_UNIX, socket.SOCK_STREAM
+        context = multiprocessing.get_context(
+            _validated_start_method(self._start_method)
         )
+        parent_sock, child_sock = make_ipc_channel()
         process = context.Process(
             target=worker_runtime_main,
             args=(child_sock, self._spec),
