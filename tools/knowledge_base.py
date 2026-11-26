@@ -425,42 +425,23 @@ class KnowledgeBaseTool(ToolBase):
                 kb_root = GLOBAL_KB_DIR
             init_result = None  # global KB is self-initialising
         else:
-            # === Resolve workspace path from registries (primary) ===
-            ws_path = None
-            if self.session_id:
-                try:
-                    from session.session_registry import SessionRegistry
-                    from thoughtmachine.workspace_registry import WorkspaceRegistry
-                    session_info = SessionRegistry.get_default().get(self.session_id)
-                    ws_id = session_info.get("workspace_id") if session_info else None
-                    if ws_id:
-                        entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
-                        ws_path = entry.root_path if entry else None
-                except Exception:
-                    pass
-
-            # Fallback to deprecated AgentConfig.workspace_path
-            if not ws_path:
-                ws_path = getattr(self, 'workspace_path', None)
-                if ws_path:
-                    self._log_debug(
-                        "KnowledgeBaseTool falling back to deprecated AgentConfig.workspace_path")
-
-            # An explicitly bound `worktree_root` (injected by ToolExecutor when
-            # the session is bound to a narrower checkout) is the tree the
-            # caller is actually in, so it outranks the ambient root. It is
-            # validated fail-closed by ToolBase._worktree_root(): an invalid
-            # value refuses the operation rather than silently redirecting the
-            # KB into the main checkout.
+            # === ONE root for files AND notes ===
+            # The KB root is anchored at exactly the same resolved root every
+            # file tool is anchored at. It used to be overridden by an
+            # injected `worktree_root`, which put notes in a `.worktrees/<uuid>`
+            # tree while the session's files were edited in the registered
+            # workspace root -- two roots, one workspace. That override is gone.
+            # An unprovable `worktree_root` still refuses (fail closed).
             try:
-                worktree_root = self._worktree_root()
+                ws_path = self._resolve_workspace_root()
             except ValueError as exc:
                 return json.dumps({"error": f"Error: {exc}"})
 
-            if worktree_root:
-                kb_root = Path(worktree_root) / ".thoughtmachine" / "knowledge"
-            else:
-                kb_root = _kb_workspace_kb_root(ws_path)
+            # No worktree override. `_kb_workspace_kb_root` still applies its
+            # own pre-existing rule (a caller whose cwd is a checkout of the
+            # SAME repository keeps its notes there); `worktree_root` no
+            # longer feeds into it.
+            kb_root = _kb_workspace_kb_root(ws_path)
             # The skeleton is materialised only AFTER the permission gate below.
             init_result = None
 
