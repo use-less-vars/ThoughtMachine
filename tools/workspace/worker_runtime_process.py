@@ -47,7 +47,7 @@ import threading
 import time
 import uuid
 from concurrent import futures
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from tools.workspace.worker_runtime_main import worker_runtime_main
 from tools.workspace.worker_runtime_protocol import (
@@ -358,6 +358,22 @@ def make_ipc_channel() -> "tuple[socket.socket, socket.socket]":
     return pair
 
 
+def _available_start_methods() -> Optional[List[str]]:
+    """The start methods this ``multiprocessing`` can name, or ``None``.
+
+    A diagnostic must never become a new source of failure: a stubbed or partial
+    ``multiprocessing`` (a ``SimpleNamespace`` in a test, an odd embedded build)
+    that cannot answer simply has no answer, which is not an error here.
+    """
+    enumerator = getattr(multiprocessing, "get_all_start_methods", None)
+    if not callable(enumerator):
+        return None
+    try:
+        return list(enumerator())
+    except Exception:  # noqa: BLE001 - an unanswerable probe is not a failure
+        return None
+
+
 def _validated_start_method(start_method: str) -> str:
     """Return *start_method* if this platform has it, else refuse loudly.
 
@@ -366,11 +382,15 @@ def _validated_start_method(start_method: str) -> str:
     came from configuration. On Windows ``fork`` is absent entirely, so this is
     the difference between "fix your config" and "something is broken".
 
+    Enumeration unavailable: ``get_context`` is the authority and its refusal is
+    re-worded at the call site. This check is a diagnostic and must not become a
+    new reason a start fails.
+
     The method is unchanged: ``spawn`` is already the default
     :class:`ProcessWorkerRuntime` uses, and it is the only one Windows has.
     """
-    available = list(multiprocessing.get_all_start_methods())
-    if start_method not in available:
+    available = _available_start_methods()
+    if available is not None and start_method not in available:
         raise WorkerStartMethodUnsupported(
             f"multiprocessing start method {start_method!r} does not exist on "
             f"this platform (sys.platform={sys.platform!r}); available: "
@@ -692,9 +712,25 @@ class ProcessWorkerRuntime:
         if self._started:
             raise RuntimeError("ProcessWorkerRuntime.start() may be called once")
         self._started = True
-        context = multiprocessing.get_context(
-            _validated_start_method(self._start_method)
-        )
+        method = _validated_start_method(self._start_method)
+        try:
+            context = multiprocessing.get_context(method)
+        except (ValueError, TypeError) as exc:
+            # ``get_context`` is the authority on what exists here, and its own
+            # refusal ("cannot find context for 'fork'") names neither the
+            # methods this platform has nor the configuration that asked. On
+            # Windows that must be a named refusal, not a bare ValueError.
+            available = _available_start_methods()
+            detail = (
+                f"available: {available}"
+                if available is not None
+                else "this multiprocessing module could not enumerate its start "
+                "methods"
+            )
+            raise WorkerStartMethodUnsupported(
+                f"multiprocessing start method {method!r} does not exist on "
+                f"this platform (sys.platform={sys.platform!r}); {detail} (§4.1)"
+            ) from exc
         parent_sock, child_sock = make_ipc_channel()
         process = context.Process(
             target=worker_runtime_main,

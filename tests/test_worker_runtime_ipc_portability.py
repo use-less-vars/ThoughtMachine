@@ -34,6 +34,7 @@ the portability logic rather than the spawn.
 
 from __future__ import annotations
 
+import multiprocessing
 import socket
 import sys
 from types import SimpleNamespace
@@ -42,7 +43,10 @@ import pytest
 
 from tools.workspace import worker_runtime, worker_runtime_process
 from tools.workspace.worker_runtime_process import (
+    ProcessWorkerRuntime,
     WorkerIpcUnavailableError,
+    WorkerStartMethodUnsupported,
+    _validated_start_method,
     ipc_capability,
     make_ipc_channel,
 )
@@ -172,3 +176,93 @@ def test_start_failure_is_recorded_and_not_alive(monkeypatch) -> None:
     assert "WORKER_RUNTIME_MODE=thread" in handle.process_start_error
     # (c) the liveness predicate now reports death evidence, not ignorance.
     assert handle.alive is False
+
+
+# ── start-method validation: a diagnostic, not a new failure ──────────────────
+#
+# The validation exists only to turn ``get_context``'s bare ``ValueError`` into a
+# message naming the platform and the methods it really has (§4.1). It must not
+# become a NEW reason a start fails: a ``multiprocessing`` that cannot enumerate
+# its methods (a stub, a partial build) is a missing answer, not a refusal.
+
+
+def _stubbed_multiprocessing(monkeypatch, get_context) -> None:
+    """Install the fake ``multiprocessing`` the replay tests install.
+
+    Same shape, deliberately: ``types.SimpleNamespace`` carrying ONLY
+    ``get_context``, so ``get_all_start_methods`` is absent -- which is exactly
+    the attribute the unguarded call reached for
+    (``tests/test_worker_replay_resistance.py:142-146``).
+    """
+    monkeypatch.setattr(
+        worker_runtime_process,
+        "multiprocessing",
+        SimpleNamespace(get_context=get_context),
+    )
+
+
+def test_start_method_validation_tolerates_a_stubbed_multiprocessing(
+    monkeypatch,
+) -> None:
+    """An un-enumerable module is not a refusal: the method passes through.
+
+    Enumeration is a diagnostic. Where it is impossible the authority
+    (``get_context``) decides, so ``start`` works exactly as it did before the
+    validation existed. Before the fix this raised ``AttributeError``.
+    """
+    _stubbed_multiprocessing(monkeypatch, lambda method: None)
+
+    assert _validated_start_method("spawn") == "spawn"
+
+
+def test_get_context_refusal_becomes_a_named_error(monkeypatch) -> None:
+    """The authority refusing is still a NAMED refusal, not a bare ValueError.
+
+    This is the Windows ``fork`` shape reproduced through ``start()``: the
+    method cannot be enumerated away, so ``get_context`` refuses, and its
+    refusal is re-worded into the §4.1 message with the cause chained.
+    """
+
+    def _no_context(method: str) -> None:
+        raise ValueError(f"cannot find context for {method!r}")
+
+    _stubbed_multiprocessing(monkeypatch, _no_context)
+
+    def _refuse_channel():
+        raise AssertionError("start() must refuse before it builds a channel")
+
+    monkeypatch.setattr(worker_runtime_process, "make_ipc_channel", _refuse_channel)
+
+    runtime = ProcessWorkerRuntime(
+        {"worker": "ipc-alpha", "instance": 1, "epoch": 0, "worker_factory": None},
+        start_method="fork",
+    )
+
+    with pytest.raises(WorkerStartMethodUnsupported) as caught:
+        runtime.start()
+
+    message = str(caught.value)
+    assert "fork" in message
+    # Nothing could be enumerated here, so the message says THAT rather than
+    # inventing an empty list of methods.
+    assert "could not enumerate" in message
+    assert sys.platform in message
+    assert isinstance(caught.value.__cause__, ValueError)
+
+
+def test_start_method_unsupported_names_the_available_methods() -> None:
+    """The loud path is unchanged: an invented method lists the real ones.
+
+    Pins that tolerating an un-enumerable module did not soften the refusal
+    where enumeration DOES work.
+    """
+    with pytest.raises(WorkerStartMethodUnsupported) as caught:
+        _validated_start_method("forkserver-but-typo")
+
+    message = str(caught.value)
+    assert "forkserver-but-typo" in message
+    assert sys.platform in message
+    real_methods = multiprocessing.get_all_start_methods()
+    assert real_methods  # precondition: this platform names its methods
+    for method in real_methods:
+        assert method in message
