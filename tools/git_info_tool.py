@@ -58,6 +58,11 @@ _HOST_COMMIT_HOOKS_REFUSAL = (
 #: ``.githooks/pre-commit`` between the repository root and the workspace root.
 _MAX_HOOK_ANCESTOR_STEPS = 8
 
+#: Cap on the changed-path list rendered by ``diff`` with ``name_only=True``.
+#: A capped list must never read as the whole change set: the renderer then
+#: reports ``complete: false`` and says how many paths it withheld.
+_NAME_ONLY_MAX_PATHS = 2000
+
 
 class GitUnavailableError(FileNotFoundError):
     """The git executable could not be run (missing binary / unspawnable).
@@ -462,6 +467,14 @@ class GitReadTool(ToolBase):
         "commit (selective commit) operations. Accepts a single path (string) or "
         "multiple paths (list of strings)."
     )
+    name_only: bool = Field(
+        default=False,
+        description="diff only: return the LIST of changed paths instead of a "
+        "patch. The tool adds --name-only to its fixed argv (it is not a "
+        "caller-supplied flag) and reports the path count plus a 'complete' "
+        "flag, so a capped list is never mistaken for the whole change set."
+    )
+
     
     # Log parameters
     max_count: Optional[int] = Field(
@@ -1727,6 +1740,8 @@ class GitReadTool(ToolBase):
         # diff drivers can never render diffs (hardened_args also clears
         # diff.external).
         args = ["diff", "--no-ext-diff", "--no-textconv"]
+        if self.name_only:
+            args.append("--name-only")
         if self.commit1:
             args.append(self.commit1)
         if self.commit2:
@@ -1756,6 +1771,14 @@ class GitReadTool(ToolBase):
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
         output = self._run_git(repo_root, args)
+        if self.name_only:
+            rendered = self._render_name_only(output)
+            truncated = self._truncate_output(rendered)
+            if truncated != rendered:
+                # The output budget cut the list as well: it must not claim to
+                # be the whole change set.
+                truncated = truncated.replace("complete: true", "complete: false", 1)
+            return self._with_mode(truncated)
         if not output.strip():
             # An empty ``git diff`` is ambiguous on its own: "nothing changed"
             # and "the named path matched nothing" look IDENTICAL. Say which
@@ -1770,6 +1793,35 @@ class GitReadTool(ToolBase):
                 self._truncate_output(self._empty_diff_hint(scoped))
             )
         return self._with_mode(self._truncate_output(output))
+
+    def _render_name_only(self, output: str) -> str:
+        """Render ``git diff --name-only`` output as an honestly-bounded list.
+
+        A patch scraped for paths truncates at the output budget, so the
+        scraped list silently under-reports the change set. This rendering
+        states the path count and an explicit ``complete`` flag, and names the
+        withheld remainder when the list had to be capped.
+        """
+        if output.startswith("Git command failed") or output.startswith("Error"):
+            # A failed git must never be rendered as a (short) path list.
+            return output
+        paths = [line for line in output.splitlines() if line.strip()]
+        total = len(paths)
+        cap = _NAME_ONLY_MAX_PATHS
+        complete = total <= cap
+        shown = paths if complete else paths[:cap]
+        lines = [
+            f"changed_paths: {total}",
+            f"complete: {'true' if complete else 'false'}",
+        ]
+        if not complete:
+            lines.append(
+                f"(list CAPPED at {cap} of {total} changed paths: the remaining "
+                f"{total - cap} are NOT shown -- this is not the whole change set)"
+            )
+        if not shown:
+            lines.append("(no changed paths)")
+        return "\n".join(lines + shown)
 
     def _empty_diff_hint(self, rels: List[str]) -> str:
         """Explain an EMPTY ``git diff`` result: no changes vs. nothing matched.
