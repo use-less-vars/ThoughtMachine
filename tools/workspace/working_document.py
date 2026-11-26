@@ -55,10 +55,13 @@ class WorkingDocument(ToolBase):
         description="List of section names (required for create action).",
     )
 
-    # append / read
+    # create / append / read
     doc_id: Optional[str] = Field(
         default=None,
-        description="Document ID (required for append, read actions).",
+        description=(
+            "Document ID (required for append, read actions; optional for create \u2014 "
+            "when given, the document is stored under exactly this id)."
+        ),
     )
     section: Optional[str] = Field(
         default=None,
@@ -66,7 +69,10 @@ class WorkingDocument(ToolBase):
     )
     content: Optional[str] = Field(
         default=None,
-        description="Content to append (required for append action).",
+        description=(
+            "Content to append (required for append action). On create it is accepted "
+            "only when exactly one section is named, and it becomes that section's text."
+        ),
     )
 
     # ── Validators ────────────────────────────────────────────────────
@@ -129,27 +135,81 @@ class WorkingDocument(ToolBase):
 
     # ── Create ────────────────────────────────────────────────────────
 
+    def _write_document(self, filepath: Path, document: dict) -> None:
+        """Write ``document`` to ``filepath`` and confirm that it landed.
+
+        A ``json.dump`` that raises nothing is not proof of a write, and this
+        tool must never report success for a document that did not reach disk:
+        the file is re-read and the stored content compared to what was sent.
+
+        Raises:
+            OSError: if the write did not persist.
+        """
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(document, f, indent=2, ensure_ascii=False)
+        with open(filepath, "r", encoding="utf-8") as f:
+            stored = json.load(f)
+        if stored != document:
+            raise OSError(f"write to '{filepath}' did not persist: stored content differs")
+
     def _handle_create(self, docs_dir: Path) -> str:
         if not self.title:
             return "Error: 'title' is required for create action."
-        if not self.sections:
+
+        section_names = list(self.sections or [])
+
+        # ``content`` on create has exactly one home: the single named section.
+        # With no section, or with several, there is no defined target, so the
+        # text is REFUSED rather than dropped (which is what this path used to
+        # do) or placed by a rule the caller was never told about.
+        if self.content is not None and len(section_names) != 1:
+            named = ", ".join(section_names) if section_names else "none"
+            return (
+                f"Error: 'content' needs exactly one target section, but "
+                f"{len(section_names)} section(s) were named ({named}). Name "
+                f"exactly one section to receive the content, or omit 'content' "
+                f"and write the text with the append action."
+            )
+
+        if not section_names:
             return "Error: 'sections' is required for create action."
 
-        doc_id = uuid4().hex[:12]
-        now = datetime.now().isoformat()
+        # A caller-supplied id is honoured; it is never silently replaced.
+        doc_id = self.doc_id or uuid4().hex[:12]
+        filepath = self._resolve_doc_path(doc_id, docs_dir)
+        if filepath.exists():
+            existing_title = ""
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    existing_title = json.load(f).get("title", "")
+            except (OSError, json.JSONDecodeError):
+                pass
+            named = f" (title '{existing_title}')" if existing_title else ""
+            return (
+                f"Error: Document '{doc_id}'{named} already exists at '{filepath}'. "
+                f"Refusing to overwrite it: pass a different 'doc_id', or 'append' "
+                f"to the existing document."
+            )
 
+        sections = {s: "" for s in section_names}
+        if self.content is not None:
+            # Exactly one section was named, guaranteed by the refusal above.
+            sections[section_names[0]] = self.content
+
+        now = datetime.now().isoformat()
         document = {
             "doc_id": doc_id,
             "title": self.title,
-            "sections": {s: "" for s in self.sections},
+            "sections": sections,
             "created_at": now,
             "updated_at": now,
         }
 
-        filepath = self._resolve_doc_path(doc_id, docs_dir)
-        docs_dir.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, ensure_ascii=False)
+        try:
+            self._write_document(filepath, document)
+        except (OSError, ValueError) as e:
+            return f"Error: Document '{doc_id}' was not created: {e}"
 
         return json.dumps({"doc_id": doc_id, "path": str(filepath)}, ensure_ascii=False)
 
@@ -174,22 +234,35 @@ class WorkingDocument(ToolBase):
         if self.section not in document["sections"]:
             document["sections"][self.section] = ""
 
+        current = document["sections"][self.section]
+        if not isinstance(current, str):
+            # A legacy value left by the old create bug: a bare line count, not
+            # text. Never coerce it (that would launder the damage) and never
+            # destroy it by overwriting the section behind the caller's back.
+            return (
+                f"Error: Section '{self.section}' in document '{self.doc_id}' holds "
+                f"an unreadable value ({current!r}), not text — refusing to append "
+                f"to it."
+            )
+
         # Build timestamped entry
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{timestamp}] {self.content}"
 
         # Append (with newline separator if non-empty)
-        current = document["sections"][self.section]
-        if current:
-            document["sections"][self.section] = current + "\n" + entry
-        else:
-            document["sections"][self.section] = entry
+        document["sections"][self.section] = (
+            current + "\n" + entry if current else entry
+        )
 
         document["updated_at"] = datetime.now().isoformat()
 
-        docs_dir.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2, ensure_ascii=False)
+        try:
+            self._write_document(filepath, document)
+        except (OSError, ValueError) as e:
+            return (
+                f"Error: append to section '{self.section}' in document "
+                f"'{self.doc_id}' did not complete: {e}"
+            )
 
         return f"Appended to section '{self.section}' in document '{self.doc_id}'."
 
@@ -211,18 +284,46 @@ class WorkingDocument(ToolBase):
             toc = {
                 "title": document["title"],
                 "sections": {
-                    name: len(value.splitlines()) if value else 0
+                    name: self._section_summary(value)
                     for name, value in document["sections"].items()
                 },
             }
             return json.dumps(toc, ensure_ascii=False, indent=2)
-        else:
-            if self.section not in document["sections"]:
-                return f"Error: Section '{self.section}' not found in document '{self.doc_id}'."
-            text = document["sections"][self.section]
-            if not text:
-                return f"(empty section '{self.section}')"
-            return text
+
+        if self.section not in document["sections"]:
+            return f"Error: Section '{self.section}' not found in document '{self.doc_id}'."
+
+        text = document["sections"][self.section]
+        if not isinstance(text, str):
+            # Report what is actually stored, raw value included. Coercing this
+            # to text is how a line count got read as a body in the first place.
+            return (
+                f"Error: Section '{self.section}' in document '{self.doc_id}' is "
+                f"unreadable: its stored value is {type(text).__name__} {text!r}, "
+                f"not text. A section holding a number was written by an older "
+                f"version of this tool, which stored a line count instead of the text."
+            )
+        if not text:
+            return f"(empty section '{self.section}')"
+        return text
+
+    # ── Table-of-contents rendering ───────────────────────────────────
+
+    @staticmethod
+    def _section_summary(value: object) -> str:
+        """Render one table-of-contents entry as TEXT.
+
+        A bare integer here is indistinguishable from content to a reader of
+        the JSON (``0`` looked like a body of zero lines, not like an unwritten
+        section), so the entry says what it is: the line count plus the opening
+        text, or the raw value when the stored value is not text at all.
+        """
+        if not isinstance(value, str):
+            return f"unreadable value {value!r} (not text)"
+        if not value:
+            return "empty (0 lines)"
+        lines = value.splitlines()
+        return f"{len(lines)} line(s); starts: {lines[0][:80]}"
 
     # ── List ──────────────────────────────────────────────────────────
 
