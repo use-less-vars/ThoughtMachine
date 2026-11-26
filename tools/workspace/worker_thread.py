@@ -19,6 +19,7 @@ import queue
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -859,6 +860,186 @@ def _join_would_raise(thread: Any, *, worker_label: Any, context: str) -> bool:
         worker_label,
     )
     return True
+
+
+def _traceback_tail(limit: int = 5) -> List[str]:
+    """The last *limit* traceback lines -- called from inside the handler.
+
+    The TAIL (innermost frames) is what makes a failed dispatch self-describing
+    without shipping a whole traceback through a tool envelope.
+    """
+    try:
+        lines = traceback.format_exc().strip().splitlines()
+    except Exception:  # noqa: BLE001 - a diagnostic may never raise
+        return []
+    return lines[-limit:] if lines else []
+
+
+def build_dispatch_error_envelope(
+    exc: BaseException,
+    *,
+    action: Any,
+    runtime_mode: Any = None,
+    handle: Any = None,
+    stage: Optional[str] = None,
+) -> dict:
+    """Build the envelope for a FAILED dispatch so the failure names itself.
+
+    ``{'error': ..., 'action': ...}`` alone forced the caller to re-diagnose the
+    failure from a message.  ``error_stage`` is DERIVED, never guessed: an
+    ``ipc_channel`` / ``start_method`` refusal never reached the handler, a
+    ``runtime_start`` one died launching the child, and ``handler`` is the
+    honest residue for everything else.  ``refusal`` is OMITTED -- never
+    ``False`` -- when the refusal types cannot be imported, because an
+    unconfirmed "not a refusal" is worse than no claim.  Pure, never raises.
+    """
+    ipc_unavailable = False
+    start_method_unsupported = False
+    refusal: Optional[bool] = None
+    try:
+        from tools.workspace.worker_runtime_process import (
+            WorkerIpcUnavailableError,
+            WorkerStartMethodUnsupported,
+        )
+    except Exception:  # noqa: BLE001 - the envelope must survive a bad import
+        pass
+    else:
+        ipc_unavailable = isinstance(exc, WorkerIpcUnavailableError)
+        start_method_unsupported = isinstance(exc, WorkerStartMethodUnsupported)
+        refusal = ipc_unavailable or start_method_unsupported
+
+    try:
+        start_error = getattr(handle, "process_start_error", None)
+    except Exception:  # noqa: BLE001 - a broken handle must not mask the failure
+        start_error = None
+
+    if ipc_unavailable:
+        error_stage = "ipc_channel"
+    elif start_method_unsupported:
+        error_stage = "start_method"
+    elif start_error:
+        error_stage = "runtime_start"
+    else:
+        error_stage = stage or "handler"
+
+    envelope: dict = {
+        "error": str(exc),
+        "error_type": type(exc).__name__,
+        "action": action,
+        "runtime_mode": runtime_mode,
+        "error_stage": error_stage,
+        "traceback_tail": _traceback_tail(),
+    }
+    if refusal is not None:
+        envelope["refusal"] = refusal
+    if start_error:
+        envelope["process_start_error"] = str(start_error)
+    if error_stage in ("ipc_channel", "start_method", "runtime_start"):
+        # Only a stage that is ABOUT the substrate earns the capability report;
+        # on a handler bug it would be noise.
+        try:
+            from tools.workspace.worker_runtime_process import ipc_capability
+
+            envelope["ipc_capability"] = ipc_capability()
+        except Exception:  # noqa: BLE001 - a diagnostic may never raise
+            pass
+    return envelope
+
+
+def _dispatch_error_context(tool: Any) -> tuple:
+    """Best-effort ``(handle, runtime_mode)`` for a dispatch that just failed.
+
+    Never raises and never scans the registry: ONE keyed read, and only when the
+    caller named an instance (handles are keyed per session/name/INSTANCE, so a
+    name-only read could only miss).  A miss is reported as a miss.  Without a
+    handle ``runtime_mode`` falls back to the CONFIGURED mode, so the envelope
+    still names the substrate the failure happened under.
+    """
+    try:
+        session_key = getattr(tool, "session_id", None) or _NO_SESSION_KEY
+        worker_name = getattr(tool, "worker_name", None)
+        instance_id = getattr(tool, "instance_id", None)
+    except Exception:  # noqa: BLE001 - the error path may not raise
+        return None, None
+
+    handle = None
+    if worker_name is not None and instance_id is not None:
+        try:
+            from tools.workspace.worker_runtime import runtime_handle_for
+
+            handle = runtime_handle_for(session_key, worker_name, instance_id)
+        except Exception:  # noqa: BLE001
+            handle = None
+
+    try:
+        runtime_mode = getattr(handle, "mode", None)
+    except Exception:  # noqa: BLE001
+        runtime_mode = None
+    if runtime_mode is None:
+        try:
+            from tools.workspace.worker_runtime import resolve_runtime_mode
+
+            runtime_mode = resolve_runtime_mode()
+        except Exception:  # noqa: BLE001
+            runtime_mode = None
+    return handle, runtime_mode
+
+
+def _list_entry_for(
+    base: dict, instance_id: Any, thread: Any, handle: Any = None
+) -> dict:
+    """One ``action='list'`` row for one live instance of one worker.
+
+    ``runtime_status`` is ``thread.status`` -- the BODY's own report -- except
+    where that report cannot be true: a process-mode instance whose child never
+    started is not ``ready``, so it is reported ``failed`` with the start error.
+    ``None`` liveness is NOT failure -- it means "not yet probed".
+    """
+    entry = dict(base)
+    name = base.get("name", "")
+    entry["instance_id"] = instance_id
+    entry["instance_label"] = (
+        thread.instance_label
+        if hasattr(thread, "instance_label")
+        else _WorkerRegistry.instance_label(name, instance_id)
+    )
+    entry["runtime_status"] = thread.status
+    entry["current_task"] = thread.current_task
+    entry["last_heartbeat"] = thread.last_heartbeat
+    entry["error"] = thread.error
+
+    start_error = None
+    if handle is not None:
+        try:
+            start_error = getattr(handle, "process_start_error", None)
+        except Exception:  # noqa: BLE001 - a broken handle is "unknown", not fatal
+            start_error = None
+    if start_error:
+        entry["process_start_error"] = str(start_error)
+
+    alive = None
+    if handle is not None:
+        try:
+            alive = getattr(handle, "alive", None)
+        except Exception:  # noqa: BLE001
+            alive = None
+    if alive is None:
+        # No handle, or a handle that has not probed yet: ask the liveness
+        # predicate the rest of the module already trusts.  Imported HERE rather
+        # than at module scope because the child process loads this module.
+        try:
+            from tools.workspace.worker_runtime import worker_is_live
+
+            alive = bool(worker_is_live(thread))
+        except Exception:  # noqa: BLE001
+            alive = None
+    if alive is not None:
+        entry["alive"] = alive
+
+    if alive is False and start_error:
+        entry["runtime_status"] = "failed"
+        entry["error"] = str(start_error)
+    return entry
 
 
 # Hard blocklist: tools that workers must NEVER use, regardless of permissions.
@@ -6784,7 +6965,13 @@ class Worker(ToolBase):
             return json.dumps(result, indent=2, default=str)
         except Exception as exc:
             logger.exception("Worker failed")
-            error_envelope = {"error": str(exc), "action": self.action}
+            handle, runtime_mode = _dispatch_error_context(self)
+            error_envelope = build_dispatch_error_envelope(
+                exc,
+                action=self.action,
+                runtime_mode=runtime_mode,
+                handle=handle,
+            )
             if self.action not in self.CONTEXT_ACTIONS and self.context is not None:
                 # Even a failed action must not drop a context invisibly.
                 error_envelope["context_ignored"] = (
@@ -7338,7 +7525,12 @@ class Worker(ToolBase):
     # -- action implementations --------------------------------------
 
     def _action_list(self, workers: list) -> dict:
-        """Return all known worker definitions plus runtime status."""
+        """Return all known worker definitions plus runtime status.
+
+        Each live instance carries its plain liveness (``alive``) next to the
+        status the body reports, so a row can no longer claim ``ready`` for an
+        instance that nothing is running (see ``_list_entry_for``).
+        """
         from tools.workspace.worker import _registry_lock, _worker_registry
         session_key = self.session_id or _NO_SESSION_KEY
         augmented = []
@@ -7353,19 +7545,11 @@ class Worker(ToolBase):
                     if key[0] == session_key and key[1] == name
                 ]
             if instances:
+                from tools.workspace.worker_runtime import runtime_handle_for
+
                 for iid, thread in sorted(instances, key=lambda item: item[0]):
-                    entry = dict(base)
-                    entry["instance_id"] = iid
-                    entry["instance_label"] = (
-                        thread.instance_label
-                        if hasattr(thread, "instance_label")
-                        else _WorkerRegistry.instance_label(name, iid)
-                    )
-                    entry["runtime_status"] = thread.status
-                    entry["current_task"] = thread.current_task
-                    entry["last_heartbeat"] = thread.last_heartbeat
-                    entry["error"] = thread.error
-                    augmented.append(entry)
+                    handle = runtime_handle_for(session_key, name, iid)
+                    augmented.append(_list_entry_for(base, iid, thread, handle))
             else:
                 entry = dict(base)
                 entry["instance_id"] = None
@@ -8525,19 +8709,37 @@ class Worker(ToolBase):
                         "Worker '%s': %s-mode spawn dispatch failed",
                         self.worker_name, _spawn_mode, exc_info=True,
                     )
-                    final_result = json.dumps({
-                        "error": (
-                            f"Worker '{self.worker_name}' spawn query failed "
-                            f"in {_spawn_mode} mode: "
-                            f"{type(exc).__name__}: {exc}"
-                        ),
-                        "note": (
-                            "The worker's runtime did not answer the spawn "
-                            "query. It is registered and can be retried via "
-                            "action='query'."
-                        ),
-                        "runtime_mode": _spawn_mode,
-                    })
+                    # The same self-describing envelope the generic dispatch
+                    # path returns: error_type, error_stage, traceback_tail and
+                    # the substrate diagnostics (refusal, ipc_capability,
+                    # process_start_error) arrive via this merge, so a failed
+                    # spawn query names the substrate instead of only quoting
+                    # str(exc).  'error' is OVERWRITTEN after the merge: the
+                    # spawn wording predates the envelope and is kept
+                    # byte-identical for callers that already match on it.
+                    _spawn_error = build_dispatch_error_envelope(
+                        exc,
+                        action="spawn",
+                        runtime_mode=_spawn_mode,
+                        handle=_spawn_handle,
+                        stage="spawn_dispatch",
+                    )
+                    _spawn_error["error"] = (
+                        f"Worker '{self.worker_name}' spawn query failed "
+                        f"in {_spawn_mode} mode: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    _spawn_error["note"] = (
+                        "The worker's runtime did not answer the spawn "
+                        "query. It is registered and can be retried via "
+                        "action='query'."
+                    )
+                    _spawn_error["runtime_mode"] = _spawn_mode
+                    _spawn_error.setdefault("instance_id", thread.instance_id)
+                    _spawn_error.setdefault(
+                        "instance_label", thread.instance_label
+                    )
+                    final_result = json.dumps(_spawn_error)
             elif _spawn_mode is not None and _spawn_mode != MODE_THREAD:
                 # Fail fast instead of burning the budget: in a non-thread mode
                 # there is no producer for _output_queue, so the fallback below

@@ -52,6 +52,13 @@ from tools.workspace.worker_thread import WorkerThread
 
 mp = multiprocessing.get_context("spawn")
 
+# The fake worker's reply delay in the timeout tests, and the hold the delayed
+# outbox imposes on a dispatch. Large on purpose: the 50 ms deadline must be a
+# reliable deadline on any platform, so a stored-clock overshoot of a few
+# hundred ms on a loaded macOS runner must not be able to turn a timeout into a
+# success by letting the reply arrive inside an extended deadline.
+REPLY_AFTER_THE_DEADLINE = 2.0
+
 
 # ── C1 fakes: a container manager mirroring tests/test_worker_sync_stop.py ────
 #
@@ -438,14 +445,32 @@ def test_two_concurrent_queries_never_cross_talk():
         runtime.close(grace_ms=50)
 
 
-def test_a_late_reply_never_satisfies_the_next_query():
+def test_a_late_reply_never_satisfies_the_next_query(capsys):
     """§4.8: a timed-out query's reply is dropped, not handed to its successor."""
-    runtime = ProcessWorkerRuntime(_spec(delay=0.15))
+    runtime = ProcessWorkerRuntime(_spec(delay=REPLY_AFTER_THE_DEADLINE))
     try:
         runtime.start()
         with pytest.raises(WorkerQueryTimeout) as caught:
             runtime.dispatch_query("first", timeout=0.05)
         assert caught.value.reply.envelope["status"] == "timeout"
+        # "Dropped" is only a claim once the stale frame has actually arrived, so
+        # wait for the runtime's own verdict, printed on its reader thread when
+        # it discards a reply nobody is waiting for -- bounded at 10s, never an
+        # unbounded sleep. ``elapsed_seconds == 0.0`` means this side expired
+        # first (§4.4), so a frame is still on its way; in the other ordering the
+        # runtime's frame is already in hand and nothing stale is left.
+        stale_id = caught.value.reply.query_id
+        if caught.value.reply.elapsed_seconds == 0.0:
+            dropped = f"dropping a reply nobody is waiting for (query_id={stale_id!r})"
+            deadline = time.monotonic() + 10.0
+            transcript = ""
+            while dropped not in transcript:
+                transcript += capsys.readouterr().err
+                assert time.monotonic() < deadline, (
+                    f"the stale reply for {stale_id} was never dropped within "
+                    f"10s (§4.8); the runtime said: {transcript!r}"
+                )
+                time.sleep(0.02)
         assert runtime.dispatch_query("second", timeout=30) == "ok:second"
         assert runtime.lost is False
     finally:
@@ -503,11 +528,13 @@ def test_a_runtime_reported_timeout_is_not_a_lost_runtime(monkeypatch):
     ``TimeoutError`` path -- decides the exception. A healthy child must not be
     reported as gone, and the next query must still be served by it (§4.8).
     """
-    runtime = ProcessWorkerRuntime(_spec(delay=0.15))
+    runtime = ProcessWorkerRuntime(_spec(delay=REPLY_AFTER_THE_DEADLINE))
     try:
         runtime.start()
         monkeypatch.setattr(
-            runtime, "_outbox", _DelayedDispatchOutbox(runtime._outbox, 0.2)
+            runtime,
+            "_outbox",
+            _DelayedDispatchOutbox(runtime._outbox, REPLY_AFTER_THE_DEADLINE),
         )
         with pytest.raises(WorkerQueryTimeout) as caught:
             runtime.dispatch_query("first", timeout=0.05)

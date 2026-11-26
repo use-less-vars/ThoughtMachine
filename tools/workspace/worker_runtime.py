@@ -768,6 +768,13 @@ class WorkerRuntimeHandle:
         # ``None`` until the first ``dispatch_query`` asks for them.
         self._spec: Optional[dict] = None
         self._process_runtime: Optional[Any] = None
+        # Whether a start was ever ATTEMPTED, and what it raised. Both are
+        # evidence, and their absence is not: a handle that never tried has no
+        # body *yet*, while one that tried and failed has no body at all (see
+        # ``alive``). Recorded here rather than on the runtime because the
+        # runtime may not exist -- the failure is what stopped it existing.
+        self._process_start_attempted = False
+        self._process_start_error: Optional[str] = None
         # S4: what the last frame from a process-mode worker said, and the two
         # clocks it carried (D1). Filled by ``on_frame``; ``state`` reads the
         # state cache before it falls back to the ``status.json`` mirror.
@@ -883,6 +890,14 @@ class WorkerRuntimeHandle:
                 return None
         runtime = self._process_runtime
         if runtime is None:
+            # An ATTEMPTED start that FAILED is not the same as no start: the
+            # supervisor went looking for a body and came back with an error,
+            # so this handle's child never existed. ``False`` here is what
+            # stops a dead process-mode worker from being reported as merely
+            # unseen -- and what lets a caller act on the recorded error
+            # instead of retrying a dispatch that cannot land.
+            if self._process_start_attempted and self._process_start_error:
+                return False
             # No child yet is not a dead child: building one here would spawn
             # an OS process from a probe.
             return None
@@ -890,6 +905,18 @@ class WorkerRuntimeHandle:
             return bool(runtime.alive)
         except Exception:  # noqa: BLE001 - an unanswerable probe is no answer
             return None
+
+    @property
+    def process_start_error(self) -> Optional[str]:
+        """Why the process runtime could not be started, or ``None``.
+
+        ``'<ExceptionType>: <message>'`` from the failed
+        :meth:`_ensure_process_runtime`, kept so a dispatch site can put the
+        real reason into an envelope instead of the ``AttributeError``-less
+        silence the unguarded IPC channel used to produce. ``None`` means no
+        start failed -- which includes "no start was tried yet".
+        """
+        return self._process_start_error
 
     @property
     def epoch(self) -> Optional[int]:
@@ -1300,8 +1327,19 @@ class WorkerRuntimeHandle:
             self._spec = spec_from_worker(
                 self._worker, epoch=getattr(self._worker, "_generation", 0)
             )
-            runtime = ProcessWorkerRuntime(self._spec, on_frame=self.on_frame)
-            runtime.start()
+            self._process_start_attempted = True
+            try:
+                runtime = ProcessWorkerRuntime(self._spec, on_frame=self.on_frame)
+                runtime.start()
+            except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+                # Recorded BEFORE re-raising: the caller may well swallow the
+                # exception (dispatch sites mirror it into an envelope), and a
+                # failure nobody remembers is a failure reported as "unknown".
+                # Re-raised all the same -- the verdict belongs to this handle,
+                # the decision belongs to the caller.
+                self._process_start_error = f"{type(exc).__name__}: {exc}"
+                raise
+            self._process_start_error = None
             self._process_runtime = runtime
         return self._process_runtime
 
