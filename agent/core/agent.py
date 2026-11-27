@@ -1943,48 +1943,12 @@ class Agent:
                         # ToolCallStart / ToolCallArgumentsDelta are progress signals
                         # only (no UI event).
                     if halted:
-                        # Persist the partial answer so the truncated text is not
-                        # lost with the discarded stream. Mirror the normal commit
-                        # path exactly, but gate on has_assistant_message() so an
-                        # empty halt (stopped before any delta) leaves history
-                        # untouched instead of pushing a blank assistant message.
-                        halt_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
-                        halt_msg = {'role': 'assistant', 'content': content}
-                        if reasoning is not None:
-                            halt_msg['reasoning_content'] = reasoning
-                        halt_tx.add_assistant_message(halt_msg)
-                        if halt_tx.has_assistant_message():
-                            halt_tx.commit_assistant_only()
-                        else:
-                            halt_tx.rollback()
-                        # The model has to learn WHY its stream vanished, or the
-                        # next turn resumes as if the answer had been finished.
-                        # This cannot go through _pending_warnings: every flush
-                        # site is behind the `return` below, so it is written
-                        # straight to history -- and only now, AFTER the partial
-                        # assistant message committed above, so the truncated
-                        # answer stays ahead of the notice that explains it.
-                        if not self._stop_notice_sent:
-                            self._add_to_conversation(make_system_notice(
-                                'You were stopped by the user. Review your current progress and resume.',
-                                kind='stop_notice',
-                            ))
-                            self._stop_notice_sent = True
-                        self.total_input_tokens += input_tokens
-                        self.total_output_tokens += output_tokens
-                        interrupted_event = {
-                            'type': 'interrupted',
-                            'stop_reason': 'interrupted',
-                            'content': content,
-                            'turn': self._display_turn,
-                            'context_length': self.state.current_conversation_tokens,
-                            'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens},
-                        }
-                        if reasoning is not None:
-                            interrupted_event['reasoning'] = reasoning
-                        self._add_conversation_data_to_event(interrupted_event)
-                        log('DEBUG', 'core.pause', f'[HALT] committed partial assistant message (chars={len(content)})')
-                        yield interrupted_event
+                        yield from self._finalize_halted_stream(
+                            content=content,
+                            reasoning=reasoning,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                        )
                         return
                     llm_duration_ms = (time.time() - llm_start_time) * 1000
                     log('DEBUG', 'core.pause', f'LLM CALL END (duration_ms={llm_duration_ms:.0f})')
@@ -2384,6 +2348,51 @@ class Agent:
             self._turn_cancel_event = None
             self.state.execution_state = ExecutionState.READY
             log('DEBUG', 'core.agent', 'process_query finished, reset execution_state to READY')
+    def _finalize_halted_stream(self, *, content, reasoning, input_tokens, output_tokens):
+        """Finalize a halted stream: a halt is terminal today, and this is the only place the partial assistant message is committed."""
+        # Persist the partial answer so the truncated text is not
+        # lost with the discarded stream. Mirror the normal commit
+        # path exactly, but gate on has_assistant_message() so an
+        # empty halt (stopped before any delta) leaves history
+        # untouched instead of pushing a blank assistant message.
+        halt_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
+        halt_msg = {'role': 'assistant', 'content': content}
+        if reasoning is not None:
+            halt_msg['reasoning_content'] = reasoning
+        halt_tx.add_assistant_message(halt_msg)
+        if halt_tx.has_assistant_message():
+            halt_tx.commit_assistant_only()
+        else:
+            halt_tx.rollback()
+        # The model has to learn WHY its stream vanished, or the
+        # next turn resumes as if the answer had been finished.
+        # This cannot go through _pending_warnings: every flush
+        # site is behind the `return` below, so it is written
+        # straight to history -- and only now, AFTER the partial
+        # assistant message committed above, so the truncated
+        # answer stays ahead of the notice that explains it.
+        if not self._stop_notice_sent:
+            self._add_to_conversation(make_system_notice(
+                'You were stopped by the user. Review your current progress and resume.',
+                kind='stop_notice',
+            ))
+            self._stop_notice_sent = True
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        interrupted_event = {
+            'type': 'interrupted',
+            'stop_reason': 'interrupted',
+            'content': content,
+            'turn': self._display_turn,
+            'context_length': self.state.current_conversation_tokens,
+            'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens},
+        }
+        if reasoning is not None:
+            interrupted_event['reasoning'] = reasoning
+        self._add_conversation_data_to_event(interrupted_event)
+        log('DEBUG', 'core.pause', f'[HALT] committed partial assistant message (chars={len(content)})')
+        yield interrupted_event
+        return
     def _apply_summary_pruning(self, summary: str, keep_recent_turns: int):
         """Add summary message to append-only history with metadata.
         
