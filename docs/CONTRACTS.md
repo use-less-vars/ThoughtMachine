@@ -4,7 +4,7 @@ This ledger names the invariants the machine actually guarantees, each with the 
 enforces it and a test that fails when the behaviour it pins is broken — proved by hand, where it has
 been proved, and marked GAP where it has not. Every test it names is run by
 the fast contract gate (`.github/workflows/contract-gate.yml`), which runs more than it names: the gate
-enumerates twenty test files today and this ledger cites ten of them, because
+enumerates twenty-one test files today and this ledger cites eleven of them, because
 `tests/test_contracts_ledger_parity.py` enforces *cited ⊆ run* rather than equality, and the uncited
 extras are gate-only additions explained in that workflow's own header. Parity with the other ledger —
 the invariant list in `.thoughtmachine/knowledge/project/architecture_invariants.md` — is enforced by
@@ -15,7 +15,7 @@ configuration — so a green gate states that the named tests passed, which is a
 tests, not a proof about the control. It does not claim the wider suite is worthless — it claims that
 these three invariants are the merge-blocking ones: Contract Gate is among the contexts `dev` requires
 (measured; see *What CI actually runs — and what this document does not claim* below), so a change
-that turns one of the twenty files red cannot merge — provided the named test detects the break,
+that turns one of the twenty-one files red cannot merge — provided the named test detects the break,
 which is the verdict column's claim and not the gate's — and a change that breaks anything else is
 still caught by the main matrix.
 
@@ -253,7 +253,7 @@ values `write`/`banned`/`ask`/`read` appears anywhere). Restoring the preset fal
 mutation-testing configuration at all: no Stryker config, no `mutation` script in
 `web_ui/frontend/package.json`, no mutmut or cosmic-ray. The two mutation proofs recorded in this
 contract's commit message are hand measurements, not a CI check, and nothing will re-run them.
-`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty files under
+`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty-one files under
 `tests/`, so it cannot run these JS suites — which is also why the JS paths above are cited without the
 backticked repo-relative form that `tests/test_contracts_ledger_parity.py` parses. What does run them is
 `platform-matrix.yml`'s `web-ui-frontend-suite` job (vitest over `src`), which cannot detect a mutation.
@@ -273,6 +273,34 @@ pass:**
    `web_ui/frontend/src/components/SessionSidebar.jsx:340` — a container read that failed (`tryGet`
    returns null) becomes `[]`, and an HTTP 200 empty payload renders identically: "No containers for this
    workspace." An unreadable set and an empty set are the same pixels.
+
+## Contract 6: A synchronous dispatch's terminal job status is the reply's status, never a default
+
+**Invariant:** When a synchronous dispatch ends, the status the job record is closed with is the status
+the reply itself claims. A reply that says its wait was interrupted must be recorded as `interrupted` —
+with the record saying the work may still be running — and never as a completed job; no default may
+stand in for a status the reply already carries.
+
+**Enforcement sites:** `tools/workspace/worker_thread.py::_reply_terminal_status` — the module-level
+helper that reads the reply envelope (a JSON *string*, so the vocabulary rides inside the text) and
+returns `"interrupted"` when the payload says `status: "interrupted"` or `interrupted: true`, else
+`None`; the synchronous dispatch call site in the same file, which closes the job with
+`_reply_terminal_status(result.get("response")) or "completed"` instead of a hardcoded literal;
+`tools/workspace/worker_thread.py::_close_sync_dispatch_job` — whose `work_may_still_be_running=(status
+== "interrupted")` puts the WAIT-ended-not-work-ended fact on the record; and
+`tools/workspace/job_registry.py::WorkerJobRegistry.terminalize`, whose keyword
+`work_may_still_be_running: bool = False` writes that key (`True`) onto the record **only** when True, so
+every other terminal status keeps the record's shape unchanged.
+
+**Mutation-proof test:** `tests/test_worker_dispatch_job_registry.py` — a synchronous dispatch whose
+reply is interrupted asserts the terminal record reads `interrupted` and carries
+`work_may_still_be_running`, so the two halves cannot drift apart. Restoring the old hardcoded
+`"completed"` literal at the dispatch call site reddens that test (the record then reads `completed` and
+lacks the flag); re-applying the fix re-greens it. Measured by hand in this tree, not by the gate.
+
+**Verdict:** ENFORCED — the helper, the call site, the close helper and the registry keyword are one
+chain, and the named test asserts the end of it (the recorded status) rather than the shape of any
+single link.
 
 ## Known gaps
 
@@ -364,11 +392,11 @@ What the trigger blocks and job names add to that table:
   contract gate, while it does run the other five workflows. Those five run on `push` to `dev` and
   `master` and on `pull_request`.
 - `contract-gate` is the only workflow with any relationship to this document, and that relationship is
-  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of twenty
+  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of twenty-one
   test files** — no glob, no `-m` expression. Two consequences worth knowing: a new test that proves a
   contract does not join the gate by existing (it must be added to the workflow *and* cited here), and
-  the parity check described in the previous section is itself one of the twenty, so it fails the
-  gate it is part of. Note the direction: the gate runs twenty files and this ledger cites ten of
+  the parity check described in the previous section is itself one of the twenty-one, so it fails the
+  gate it is part of. Note the direction: the gate runs twenty-one files and this ledger cites eleven of
   them, because the parity check enforces *cited ⊆ run*, not equality. The job carries
   `timeout-minutes: 10` and separately reports wall time against a stated 120-second budget; that
   budget is observed, not enforced.
