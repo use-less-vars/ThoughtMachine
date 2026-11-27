@@ -520,5 +520,7 @@ web_ui/frontend/.dist-build-stamp
 # the repo -- `docs/*` above is a catch-all, so the negation is required or the file
 # is never versioned and vanishes on the next clone.
 !docs/DESIGN_WORKERS.md
+# Design notes (docs/* is a catch-all; a doc without a negation is never versioned)
+!docs/DESIGN_NARROWED_HOST.md
 !docs/ONBOARDING.md
 
