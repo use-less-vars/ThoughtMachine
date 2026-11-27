@@ -1326,3 +1326,15 @@ A worker ran out of token budget mid-edit and left `agent/core/agent.py` with a 
 **Recovery (main engineer, no shell):** `git_write stash_push` — the tree had exactly one tracked modification, so the stash restored HEAD bytes exactly and kept untracked `.scratch/`/`.thoughtmachine/` intact; `git_read diff --name-only` → 0 changed paths confirmed it. Stash kept as evidence, explicitly not popped.
 
 **Prevention, now mandatory in every refactor brief:** the worker must build the new file text in memory, `ast.parse(new_text)`, print the unified diff, and only then write. Also: state the working tree is CLEAN at HEAD at the start of the brief, so a stale edit cannot be mistaken for fresh work.
+
+## 2026-11-28 (gen 68) — how the machinery actually behaves (measured, not declared)
+
+Written down because each of these cost a wrong claim in this session. Root of every line: a command that was run, not a doc that was read.
+
+1. **`git_write` push is REFUSED, by authority.** `push` is present in the tool's operation list, but the gate answers: `Permission denied: Tool requires network:outbound, but the effective grant is network:banned (denied by: session grant)`. So the agent cannot push on a network-banned session, ever; every push is the operator's. Do not put "push" in an agent's own task list. (Root: attempted push of `feat/turnstate-pause-arm`, 2026-11-28.)
+2. **`git_write` has no merge / fetch / rebase / cherry-pick.** A stacked branch therefore cannot be rebased onto its base by the agent. Either (a) hand the operator the one-line merge, or (b) put the stacked commit on the base branch and lose PR granularity. Do not plan work that needs a merge the agent cannot do.
+3. **`DockerCodeRunner` gives a FRESH container per call.** `/tmp` does not persist between calls, so "I saved a backup of the file in /tmp" is worthless. Prove a restoration byte-exact with `sha256sum` before/after in ONE call, or use `git stash`.
+4. **The shell is dash, not bash.** `PIPESTATUS`, `<(...)`, and some `set -e` idioms misbehave, and a *killed* child can still report `exit_code: 0` through a pipe. Probe the shell before trusting an exit code; a skip/zero that came through a pipe is not a pass.
+5. **vitest SIGTERM under the 512 MB cgroup is usually HOST memory pressure, not the ceiling.** The identical command passed later at the same ceiling. Re-run before blaming the container limit.
+6. **`Worker(action="spawn")` and task spellings.** The fix that lets spawn accept `worker_query` as a task spelling is on a branch (`#506`), so the RUNNING runtime still uses pre-fix code until that merges: keep sending the task in `context['query']`.
+7. **A new agent event type needs a bridge arm or it is silently dropped.** `_map_and_emit` (web_ui/backend/bridge.py) is an if/elif chain with NO else — an unknown type is a no-op, not an error. And `adaptWorkerEvent.js` is the WORKER panel path, not the session socket: wiring it there is a green on the wrong tree.
