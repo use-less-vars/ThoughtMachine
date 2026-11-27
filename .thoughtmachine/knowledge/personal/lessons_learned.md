@@ -1306,3 +1306,23 @@ the dispatch returned normally and only the turn was cut.
 **3. Timeouts are advisory, and far more so than the 120-213 s lore.** Measured dispatch walls today: 213 s, 224 s, 238 s, **424 s**, 156 s, 64 s, 18 s — with `timeout_seconds` 90-180 and `timeout_triggered: false` every time. A 180 s request ran 424 s and finished clean. Size briefs to the deliverable, never to the timeout; a long wall is not a problem, a lost artefact is.
 **4. Red-first + mutation in ONE brief is the cheapest trustworthy evidence.** Two slices today each returned: verbatim pre-fix failure, green summaries with commands, and a mutation (fix removed → red, restored → green). Pinning the exact failed assertion (`AssertionError: 0 != 1` at `:280`) is what made it checkable rather than believable.
 **5. The mutation gate is extensible data.** `scripts/mutation_specs.py` is a pure-data registry (name/path/old/new/tests/contract); adding two entries turned a hand-measured contract proof into a CI-enforced one (`GATE_SUMMARY declared=3 ran=3 killed=3 … restore_failed=0`). Prefer this over a prose claim "measured by hand" whenever the anchor is an exact once-occurring substring.
+
+## gen 68 · worker dispatch: the spawn task channel was silent (FIXED, PR pending)
+
+**Symptom.** `Worker(action="spawn")` was called with the real task in `worker_query=` and a placeholding `context={'query': 'See worker_query.'}`. The tool dispatched the placeholder and dropped the task argument with no error, no warning, no `context_ignored` note. The worker refused to invent a byte-exact file rather than guess, which is the only reason the loss was visible.
+
+**Root.** `_fold_query_into_context` (`tools/workspace/worker_thread.py:7133`) — the single pre-dispatch resolution point shared by all three spawn delivery paths — resolved only `query=` and `context['query']`. `worker_query` was read by no spawn code path.
+
+**Fix** (commit `745e775c`, branch `fix/worker-spawn-task-spellings`): a non-empty `worker_query` on spawn is a THIRD spelling of the task. Alone → runs. Disagreeing with `query=`/`context['query']` → REFUSED as ambiguous, naming both fields and the first 40 repr-chars of each value, dispatching nothing. Identical → runs once. `query`/`submit_query` semantics unchanged. 6 new tests (4 red before), 13 passed after; neighbouring worker suite 100 passed, 2 skipped.
+
+**Delivery rule until that lands in dev:** pass the task exactly once, as `context={'query': ...}`, and never a second spelling unless byte-identical. On the `query`/`submit_query` actions the rule is the mirror image: `worker_query` is authoritative and `context['query']` is dropped (reported via `context_note`).
+
+**Sub-lesson, generalisable:** the *declared* sentence is part of the control. The class docstring said a spawn task is "either the top-level `query` or `context['query']`" — pydantic lifts that docstring into the tool description an agent reads, so an agent following the declaration literally would pass `query`; an agent following its instincts passed `worker_query` and lost the work. An incomplete declaration is a lie of omission, and it is what an agent reads *before* choosing an argument.
+
+## gen 68 · a worker left a tracked file unparseable — recovery instrument
+
+A worker ran out of token budget mid-edit and left `agent/core/agent.py` with a bad dedent (`' ' * 8 + s[16:]`, double-counting the indent) → `IndentationError`, file unparseable, tools already restricted so it could not revert.
+
+**Recovery (main engineer, no shell):** `git_write stash_push` — the tree had exactly one tracked modification, so the stash restored HEAD bytes exactly and kept untracked `.scratch/`/`.thoughtmachine/` intact; `git_read diff --name-only` → 0 changed paths confirmed it. Stash kept as evidence, explicitly not popped.
+
+**Prevention, now mandatory in every refactor brief:** the worker must build the new file text in memory, `ast.parse(new_text)`, print the unified diff, and only then write. Also: state the working tree is CLEAN at HEAD at the start of the brief, so a stale edit cannot be mistaken for fresh work.
