@@ -191,6 +191,30 @@ def _ensure_gate_imported() -> bool:
 from agent.config.defaults import DEFAULT_SESSION_PERMISSIONS
 
 
+#: The one PAUSED tool-result shape.  A pause is resumable, so it must never be
+#: announced in the stop vocabulary: the envelope says so explicitly
+#: (``interrupted`` / ``paused`` / ``skipped``), and the remaining calls of the
+#: batch are skipped rather than executed.
+def _paused_tool_content(
+    message: str = "Not run: the session was paused while an earlier tool was executing.",
+) -> str:
+    return json.dumps({
+        "status": "interrupted",
+        "interrupted": True,
+        "reason": "paused",
+        "skipped": True,
+        "message": message,
+    })
+
+
+def _stopped_tool_content() -> str:
+    """The terminal STOP shape -- same text as before, now with one producer."""
+    return json.dumps({
+        "status": "stopped",
+        "message": "Worker stopped before tool execution",
+    })
+
+
 def is_interrupted_tool_entry(entry: Any) -> bool:
     """Report whether an executed tool entry records an interrupted result.
 
@@ -316,27 +340,43 @@ class ToolExecutor:
                 add_to_conversation_func(message)
         for _tc_index, tool_call in enumerate(tool_calls):
             # Cooperative cancellation: if a stop was requested between tool
-            # calls, skip execution and record a clean 'stopped' tool result
-            # for every pending call. The agent's turn_start stop_check
+            # calls, skip execution and record a clean result for every pending
+            # call -- 'stopped' for a real stop, the paused envelope for a
+            # pause, which is resumable and must not be announced as terminal.
+            # The agent's turn_start stop_check
             # checkpoint then terminates the turn with a 'stopped' event.
             # stop_check is only consulted when callable (None by default,
             # so main-agent paths are unaffected).
             stop_check = getattr(self.config, "stop_check", None)
-            if callable(stop_check) and stop_check():
-                stopped_content = json.dumps({
-                    "status": "stopped",
-                    "message": "Worker stopped before tool execution",
-                })
+            stop_signal = stop_check() if callable(stop_check) else None
+            if stop_signal:
+                # Truthiness is not the answer.  The supplier returns the truthy
+                # STRING 'PAUSED' for a pause (``should_stop`` in
+                # ``agent/controller/__init__.py``, where the park gate compares
+                # it by value) and True for a real stop, so testing truthiness
+                # alone announced a resumable pause in terminal vocabulary.
+                # Branch on WHICH signal it is, and reuse the one paused shape
+                # instead of inventing a second envelope.  The SIGNAL is the
+                # sole authority: a 'pause' left in restriction_reason by an
+                # earlier pause must not soften a later real stop into
+                # resumable vocabulary (most-restrictive-wins), and a falsy
+                # signal must not skip a batch that used to run.
+                if stop_signal == 'PAUSED':
+                    skipped_content = _paused_tool_content(
+                        "Not run: the session was paused before this tool could run."
+                    )
+                else:
+                    skipped_content = _stopped_tool_content()
                 for tc in tool_calls[_tc_index:]:
                     add_tool_result({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": stopped_content,
+                        "content": skipped_content,
                     })
                     executed_tools.append({
                         "name": tc["function"]["name"],
                         "arguments": {},
-                        "result": stopped_content,
+                        "result": skipped_content,
                         "tool_call_id": tc.get("id", ""),
                     })
                 return (executed_tools, False, None, None, None)
@@ -441,13 +481,7 @@ class ToolExecutor:
             # lets the model write its own summary.
             if (is_interrupted_tool_entry(tool_entry)
                     and getattr(self.state, 'restriction_reason', None) == 'pause'):
-                remaining_content = json.dumps({
-                    "status": "interrupted",
-                    "interrupted": True,
-                    "reason": "paused",
-                    "skipped": True,
-                    "message": "Not run: the session was paused while an earlier tool was executing.",
-                })
+                remaining_content = _paused_tool_content()
                 # One tool result per tool_call id is REQUIRED for pairing: the
                 # provider rejects an assistant tool_calls message whose ids are
                 # not all answered, so the skipped calls are padded (the same
