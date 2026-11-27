@@ -968,3 +968,92 @@ class TestToolRefusalMessage:
         assert token_advice != turn_advice, (token_advice, turn_advice)
         assert 'WorkingDocument' in token_advice, token_advice
         assert turn_advice == 'Finish your turn with Respond.', turn_advice
+
+
+# ---------------------------------------------------------------------------
+# A PAUSE must never be announced as a STOP
+#
+# ``stop_check`` (``agent.controller.should_stop``) answers with the truthy
+# STRING 'PAUSED' while paused, and ``True`` for a real stop.  The executor
+# tested only truthiness, so a paused agent was handed
+# "Worker stopped before tool execution" -- terminal vocabulary for a state the
+# operator can resume.  The paused envelope already existed further down the
+# same loop; these three tests pin that a pause reaches it and that the stop text
+# is still the stop text, byte for byte.
+# ---------------------------------------------------------------------------
+class TestPauseIsNotAnnouncedAsAStop:
+    """Pause -> the paused envelope; stop -> the stop text, unchanged."""
+
+    @staticmethod
+    def _executor(signal, state) -> ToolExecutor:
+        config = FakeConfig(None)
+        config.stop_check = lambda: signal
+        return ToolExecutor(
+            tool_classes=[PermissiveTool],
+            config=config,
+            state=state,
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+
+    @staticmethod
+    def _calls():
+        return [
+            {'id': 'tc-1', 'function': {'name': 'PermissiveTool', 'arguments': '{}'}},
+            {'id': 'tc-2', 'function': {'name': 'PermissiveTool', 'arguments': '{}'}},
+        ]
+
+    def test_a_paused_signal_is_reported_as_paused(self):
+        """'PAUSED' is not a stop: the batch is skipped as paused, not stopped."""
+        executor = self._executor('PAUSED', _state_with_reason('pause'))
+        collected = []
+        executed, *_ = executor.execute_tool_calls(
+            self._calls(), add_to_conversation_func=collected.append,
+        )
+        assert len(executed) == 2, executed
+        for entry in executed:
+            content = entry['result']
+            assert 'Worker stopped before tool execution' not in content, content
+            payload = json.loads(content)
+            assert payload['status'] == 'interrupted', payload
+            assert payload['interrupted'] is True, payload
+            assert payload['reason'] == 'paused', payload
+            assert payload['skipped'] is True, payload
+        # One result per call id: the skipped calls are padded, never dropped.
+        assert [m['tool_call_id'] for m in collected] == ['tc-1', 'tc-2'], collected
+        assert [m['content'] for m in collected] == [e['result'] for e in executed]
+
+    def test_a_real_stop_is_not_softened_by_a_stale_pause_reason(self):
+        """Most-restrictive-wins: True outranks a leftover 'pause' reason.
+
+        Pause then stop: ``should_stop`` inspects stop_event first and answers
+        True, while ``restriction_reason`` still reads 'pause'.  The signal is
+        the authority -- a reason left over from an earlier pause must never
+        relabel a terminal stop as resumable.
+        """
+        executor = self._executor(True, _state_with_reason('pause'))
+        collected = []
+        executed, *_ = executor.execute_tool_calls(
+            self._calls(), add_to_conversation_func=collected.append,
+        )
+        expected = json.dumps({
+            "status": "stopped",
+            "message": "Worker stopped before tool execution",
+        })
+        assert [e['result'] for e in executed] == [expected, expected], executed
+        assert [m['content'] for m in collected] == [expected, expected], collected
+
+    def test_a_real_stop_still_reads_worker_stopped_before_tool_execution(self):
+        """The stop phrase has a consumer now -- branching on it cannot drift."""
+        executor = self._executor(True, _unrestricted_state())
+        collected = []
+        executed, *_ = executor.execute_tool_calls(
+            self._calls(), add_to_conversation_func=collected.append,
+        )
+        expected = json.dumps({
+            "status": "stopped",
+            "message": "Worker stopped before tool execution",
+        })
+        assert [e['result'] for e in executed] == [expected, expected], executed
+        assert [m['content'] for m in collected] == [expected, expected], collected

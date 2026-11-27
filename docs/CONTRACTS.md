@@ -4,18 +4,19 @@ This ledger names the invariants the machine actually guarantees, each with the 
 enforces it and a test that fails when the behaviour it pins is broken — proved by hand, where it has
 been proved, and marked GAP where it has not. Every test it names is run by
 the fast contract gate (`.github/workflows/contract-gate.yml`), which runs more than it names: the gate
-enumerates twenty-two test files today and this ledger cites twelve of them, because
+enumerates twenty-three test files today and this ledger cites thirteen of them, because
 `tests/test_contracts_ledger_parity.py` enforces *cited ⊆ run* rather than equality, and the uncited
 extras are gate-only additions explained in that workflow's own header. Parity with the other ledger —
 the invariant list in `.thoughtmachine/knowledge/project/architecture_invariants.md` — is enforced by
 `tests/test_invariants_ledger_parity.py`, so every numbered invariant there must name a contract here
 or an explicit gap. What the gate does is re-run these tests and fail the job when one is red; it does
-not mutate the code to show that a test *can* fail — this tree carries no mutation-testing
-configuration — so a green gate states that the named tests passed, which is a statement about the
-tests, not a proof about the control. It does not claim the wider suite is worthless — it claims that
+not mutate the code to show that a test *can* fail — that job mutates nothing, while the workflow's
+separate `mutation-gate` job mutates exactly the guards declared in `scripts/mutation_specs.py`, whose
+reach is stated below — so a green gate states that the named tests passed, which is a statement about
+the tests, not a proof about the control. It does not claim the wider suite is worthless — it claims that
 the invariants this ledger names are the merge-blocking ones: Contract Gate is among the contexts
 `dev` requires (measured; see *What CI actually runs — and what this document does not claim* below),
-so a change that turns one of the twenty-two files red cannot merge — provided the named test detects
+so a change that turns one of the twenty-three files red cannot merge — provided the named test detects
 the break, which is the verdict column's claim and not the gate's — and a change that breaks anything
 else is still caught by the main matrix.
 
@@ -193,15 +194,18 @@ flip of the constant is a red test rather than a green one.
 
 **Mutation gate:** the claim is not left to a human reading `assert` lines. The mutation is declared in
 `scripts/mutation_specs.py`, data rather than a test, and run by `scripts/mutation_gate.py`; the registry
-declares one mutation for this contract:
+declares three mutations, one of them for this contract:
 `contract-3-default-mode` — the exact substring `DEFAULT_RUNTIME_MODE = MODE_PROCESS` rewritten to
 `DEFAULT_RUNTIME_MODE = MODE_THREAD` in `tools/workspace/worker_runtime.py` — with
 tests/test_worker_is_a_real_process.py as the file whose greenness the contract stands on:
 
 ```text
 MUTATION contract-3-default-mode: KILLED
-GATE_SUMMARY declared=1 ran=1 killed=1 survived=0 refused=0 restore_failed=0 exit=0
+GATE_SUMMARY declared=3 ran=3 killed=3 survived=0 refused=0 restore_failed=0 exit=0
 ```
+
+That block is this contract's verdict line plus the whole-registry summary it was printed with; the
+other two subjects in the run are Contract 8's.
 
 The verdict flip is the evidence: before the literal-pinning test existed, the same declaration came
 back SURVIVED (exit 1) with all three named tests green — Known gap 1 reproduced by the gate itself —
@@ -249,11 +253,13 @@ failed fetch ever starts rendering a posture claim. `web_ui/frontend/src/store/_
 values `write`/`banned`/`ask`/`read` appears anywhere). Restoring the preset fallback turns both red
 (measured by hand, 2 failed).
 
-**Verdict:** ENFORCED for these two surfaces, BY MANUAL MUTATION — NOT BY A GATE. This tree carries no
-mutation-testing configuration at all: no Stryker config, no `mutation` script in
-`web_ui/frontend/package.json`, no mutmut or cosmic-ray. The two mutation proofs recorded in this
-contract's commit message are hand measurements, not a CI check, and nothing will re-run them.
-`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty-two files under
+**Verdict:** ENFORCED for these two surfaces, BY MANUAL MUTATION — NOT BY A GATE. No mutation
+configuration exists for these suites: no Stryker config, no `mutation` script in
+`web_ui/frontend/package.json`, and the tree's Python mutation gate (`scripts/mutation_gate.py`, fed by
+`scripts/mutation_specs.py`) declares no JS subject, so it cannot see them. The two mutation proofs
+recorded in this contract's commit message are hand measurements, not a CI check, and nothing will
+re-run them.
+`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty-three files under
 `tests/`, so it cannot run these JS suites — which is also why the JS paths above are cited without the
 backticked repo-relative form that `tests/test_contracts_ledger_parity.py` parses. What does run them is
 `platform-matrix.yml`'s `web-ui-frontend-suite` job (vitest over `src`), which cannot detect a mutation.
@@ -338,6 +344,53 @@ the registry entry and the runtime handle — for a dispatch the fence refuses; 
 cannot prove no body started keeps its registration on purpose, which is a decision this contract
 records rather than a hole in it.
 
+## Contract 8: A pause is not a stop — the skip envelope names the state the agent is in
+
+**Invariant:** When the cooperative `stop_check` fires between tool calls, the envelope written for
+every remaining call names the state the agent is actually in. A pause gets the resumable pause
+envelope — `status: "interrupted"`, `interrupted: true`, `reason: "paused"`, `skipped: true` — and
+only a real stop gets the terminal stop text. The *signal* decides, not a reason left behind by an
+earlier pause: a pause is resumable, so announcing it in stop vocabulary tells the caller to give up
+on work that is still there.
+
+**Enforcement sites:** `agent/core/tool_executor.py::_paused_tool_content` — the module-level
+producer of the one pause shape, taking a `message` so both sites that need it can say which skip
+this was; `agent/core/tool_executor.py::_stopped_tool_content` — the terminal stop shape,
+byte-identical to the literal it replaced, so the stop phrase has one producer; the early exit in
+`ToolExecutor.execute_tool_calls`, which reads
+`stop_signal = stop_check() if callable(stop_check) else None` and then branches on *which* signal it
+is — `if stop_signal == 'PAUSED':` → `_paused_tool_content("Not run: the session was paused before
+this tool could run.")`, `else:` → `_stopped_tool_content()` — writing one result per pending call
+id, because a provider rejects an assistant `tool_calls` message whose ids are not all answered:
+skipped calls are padded, never dropped. The pre-existing interrupted-entry site further down the
+same loop now calls `_paused_tool_content()` too, and so returns that one envelope byte for byte. The
+supplier is `agent/controller/__init__.py:715-724`: `should_stop` answers the truthy string `'PAUSED'`
+for a pause and `True` for a stop, and the string is load-bearing where the controller parks the run
+(`agent/controller/__init__.py:828` compares it by value). Both answers are truthy, so truthiness is
+not the invariant — the value is.
+
+**Mutation-proof test:** `tests/test_tool_executor.py` — `TestPauseIsNotAnnouncedAsAStop` pins all
+three directions. `test_a_paused_signal_is_reported_as_paused` hands the executor `'PAUSED'` and
+asserts the pause envelope, with the stop phrase absent;
+`test_a_real_stop_is_not_softened_by_a_stale_pause_reason` hands it `True` while `restriction_reason`
+still reads `'pause'`, and asserts both results are the stop text byte for byte
+(most-restrictive-wins: the signal outranks a stale reason);
+`test_a_real_stop_still_reads_worker_stopped_before_tool_execution` pins the stop phrase itself, which
+now has a consumer. Both directions are declared mutations in `scripts/mutation_specs.py` —
+`contract-8-pause-announced-as-stop` and `contract-8-stop-softened-by-a-stale-pause-reason` — and
+`scripts/mutation_gate.py` reports each KILLED: collapse the branch to the stop shape and the pause
+test dies, let a stale `'pause'` reason outrank the signal and the stop test dies. Those verdicts are
+the gate's own measurement, not a hand one; whether the gate's job blocks a merge is a property of
+the ruleset on `dev`, not of this file.
+
+**Verdict:** ENFORCED — the supplier, the branch and the two content producers are one chain, and the
+named tests assert the envelope a paused and a stopped agent are handed rather than the shape of any
+single link. Scope, stated honestly: it covers the between-calls skip path in
+`ToolExecutor.execute_tool_calls`. The turn-start checkpoint in `agent/core/agent.py:1712` still
+upgrades the same truthy signal — `'PAUSED'` included — into a terminal `{'type': 'stopped'}` event
+and a `log_agent_end('stopped', ...)` record, so a paused agent's *event stream* still reads as
+stopped at that surface; this contract does not claim otherwise.
+
 ## Known gaps
 
 1. **Contract 3 — the literal default is unproven (CLOSED).** No test in the tree asserted
@@ -349,7 +402,10 @@ records rather than a hole in it.
    (`contract-3-default-mode`) that `scripts/mutation_gate.py` reports KILLED. The other files named
    here are still comparisons against the constant and still would not notice the flip; what stops
    them from mattering is that one literal, which is the file the mutation declaration names. What
-   remains open is automation, not the claim — the gate is not yet wired into CI. Contract 3 is cited
+   remains open is requiredness, not presence — the `mutation-gate` job in
+   `.github/workflows/contract-gate.yml` runs on every pull request against `dev`, so the mutation is
+   re-executed, but whether a KILLED verdict blocks a merge is a property of the GitHub ruleset on `dev`
+   and not of the workflow, which cannot inspect its own requiredness. Contract 3 is cited
    as ENFORCED for exactly this reason.
 2. **Contract 2 — two of the three deciders are unproven by anything named here (GAP).**
    `tests/trust/test_gate_contract.py` imports only `check_required_categories` (its line 25); neither
@@ -428,11 +484,11 @@ What the trigger blocks and job names add to that table:
   contract gate, while it does run the other five workflows. Those five run on `push` to `dev` and
   `master` and on `pull_request`.
 - `contract-gate` is the only workflow with any relationship to this document, and that relationship is
-  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of twenty-two
+  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of twenty-three
   test files** — no glob, no `-m` expression. Two consequences worth knowing: a new test that proves a
   contract does not join the gate by existing (it must be added to the workflow *and* cited here), and
-  the parity check described in the previous section is itself one of the twenty-two, so it fails the
-  gate it is part of. Note the direction: the gate runs twenty-two files and this ledger cites twelve of
+  the parity check described in the previous section is itself one of the twenty-three, so it fails the
+  gate it is part of. Note the direction: the gate runs twenty-three files and this ledger cites thirteen of
   them, because the parity check enforces *cited ⊆ run*, not equality. The job carries
   `timeout-minutes: 10` and separately reports wall time against a stated 120-second budget; that
   budget is observed, not enforced.
