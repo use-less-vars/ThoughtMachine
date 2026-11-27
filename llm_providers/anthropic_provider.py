@@ -30,6 +30,16 @@ from agent.logging import log
 # the warning would repeat once per image per turn.
 _warned_unsupported_images = set()
 
+#: Internal-only transcript roles that still have to reach the wire.
+#:
+#: ``paused_draft`` is a partial answer the user interrupted mid-stream; it is
+#: assistant content, so it travels as one.  Mapped explicitly instead of
+#: leaning on the catch-all ``'user' if role == 'user' else 'assistant'``
+#: coercion in ``_serialize_messages``, so the two adapters state the same
+#: choice in one place each rather than diverging silently (``build_wire_messages``
+#: in ``openai_compatible`` carries the OpenAI-side copy).
+_WIRE_ROLE_OVERRIDES = {'paused_draft': 'assistant'}
+
 
 class AnthropicProvider(LLMProvider):
     """
@@ -98,6 +108,8 @@ class AnthropicProvider(LLMProvider):
         last_was_tool_result = False
         for msg in messages:
             role = msg.get('role')
+            if isinstance(role, str):
+                role = _WIRE_ROLE_OVERRIDES.get(role, role)
             if role == 'system':
                 system_msg = msg.get('content')
                 continue

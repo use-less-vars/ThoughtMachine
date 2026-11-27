@@ -105,6 +105,18 @@ def _warn_unsendable_images(model: str, image_ids: List[Any]) -> None:
         )
 
 
+#: Internal-only transcript roles that still have to reach the wire.
+#:
+#: ``paused_draft`` is a partial answer the user interrupted mid-stream: it is
+#: model-facing history, but the OpenAI chat API accepts only
+#: system/user/assistant/tool and rejects the WHOLE request (400) on anything
+#: else.  Mapping it here, at the one outbound translation point for the OpenAI
+#: family, is what keeps a paused transcript sendable; it is also what makes
+#: this adapter agree with ``anthropic_provider._serialize_messages``, which
+#: maps the same role to ``assistant``.
+_WIRE_ROLE_OVERRIDES = {'paused_draft': 'assistant'}
+
+
 def build_wire_messages(
     messages: List[Dict[str, Any]],
     *,
@@ -164,6 +176,12 @@ def build_wire_messages(
 
     wire_messages: List[Dict[str, Any]] = []
     for message in messages:
+        role = message.get('role') if isinstance(message, dict) else None
+        if isinstance(role, str) and role in _WIRE_ROLE_OVERRIDES:
+            # Rewritten before any branch below: a role the API does not know
+            # would otherwise be copied through verbatim and fail the request.
+            message = dict(message)
+            message['role'] = _WIRE_ROLE_OVERRIDES[role]
         if not isinstance(message, dict) or (
             'images' not in message and not message.get(_TOMBSTONE_KEY)
         ):
