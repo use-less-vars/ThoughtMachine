@@ -6801,9 +6801,9 @@ class Worker(ToolBase):
 
     ``worker_name`` is genuinely optional: omit it (or leave it blank) and every
     action that needs a worker uses the ``default`` worker.  A spawn task may be
-    given either as the top-level ``query`` argument or as ``context['query']``
-    — the same task, run on the same blocking dispatch path; passing both is
-    only accepted when they are identical, otherwise the call is rejected as
+    given as ``query``, as ``context['query']`` or as ``worker_query`` — three
+    spellings of the same task, run on the same blocking dispatch path.  Give
+    one, or several that are identical: disagreeing spellings are rejected as
     ambiguous rather than silently dropping one of them.
     """
 
@@ -6860,7 +6860,11 @@ class Worker(ToolBase):
     worker_query: Optional[str] = Field(
         default=None,
         description="Query string to send to an already-spawned worker. "
-        "Only valid with action='query' (the call BLOCKS until the worker responds), "
+        "Valid with action='query' (the call BLOCKS until the worker responds), "
+        "action='spawn' (there it is a spelling of the TASK, the same task as "
+        "the top-level 'query' and context['query']: give one spelling, or "
+        "several that are identical -- disagreeing spellings are rejected as "
+        "ambiguous), "
         "action='submit_query' (non-blocking; returns a job handle immediately), "
         "or action='job_status' (job id to look up; empty lists jobs for the worker). "
         "On 'query'/'submit_query' any 'context' you also pass is prepended to "
@@ -7129,27 +7133,55 @@ class Worker(ToolBase):
     # -- helpers -----------------------------------------------------
 
     def _fold_query_into_context(self) -> None:
-        """Fold the top-level ``query`` argument into ``context['query']``.
+        """Fold the spawn task argument into ``context['query']``.
 
         ``context={'query': ...}`` is the long-standing spelling and the only
         one with a dispatch behind it (``_action_spawn`` copies ``context`` into
         ``thread._initial_context`` and then BLOCKS on the worker's first reply
-        because that dict has a 'query' key).  ``query=`` exists because it is
-        the shape an agent reaches for, so it is merged INTO the context instead
-        of growing a second dispatch path that could drift from the first.
+        because that dict has a 'query' key).  ``query=`` -- and, on 'spawn',
+        ``worker_query=`` -- exist because they are the shapes an agent reaches
+        for, so both are merged INTO the context instead of growing a second
+        dispatch path that could drift from the first.
 
-        Both precedence rules are explicit:
+        Precedence rules, all explicit:
 
-        * top-level ``query`` + a context WITHOUT a 'query' key -> the
-          top-level value becomes the task;
-        * both present and DIFFERENT -> ``ValueError`` naming both, because
+        * one spelling given -> it becomes the task;
+        * two present and DIFFERENT -> ``ValueError`` naming both, because
           silently picking one drops work the caller asked for;
-        * both present and equal -> accepted once (the context already carries
+        * all present and equal -> accepted once (the context already carries
           exactly that task, so nothing is duplicated or dispatched twice).
+
+        ``worker_query`` is folded ONLY on ``action='spawn'``: on
+        'query'/'submit_query' it is already the task and stays authoritative
+        (a 'query' key in the context is dropped there and reported).
         """
-        if self.query is None or not self.query.strip():
-            return
         task = self.query
+        if (
+            self.action == "spawn"
+            and self.worker_query is not None
+            and self.worker_query.strip()
+        ):
+            # A non-empty worker_query on a spawn IS a spelling of the task.
+            if task is not None and task.strip():
+                other_field, other_task = "query", task
+            elif (
+                isinstance(self.context, dict)
+                and str(self.context.get("query") or "").strip()
+            ):
+                other_field, other_task = "context['query']", str(self.context["query"])
+            else:
+                other_field, other_task = None, None
+            if other_field is not None and other_task != self.worker_query:
+                raise ValueError(
+                    f"Ambiguous task: worker_query={self.worker_query[:40]!r} "
+                    f"but {other_field}={other_task[:40]!r}. They differ, so "
+                    "this call was rejected rather than dispatching one of "
+                    "them silently -- pass the task once, as query=, "
+                    "worker_query= or context={'query': ...}."
+                )
+            task = self.worker_query
+        if task is None or not task.strip():
+            return
         if self.action != "spawn":
             raise ValueError(
                 f"'query' is only valid with action='spawn'; for "
