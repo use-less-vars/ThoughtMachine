@@ -182,7 +182,8 @@ class WorkerJobRegistry:
 
     def terminalize(self, job_id: str, status: str = "paused",
                     envelope=None, *, worker_name=None, session_id=None,
-                    instance_id=None) -> Optional[dict]:
+                    instance_id=None,
+                    work_may_still_be_running: bool = False) -> Optional[dict]:
         """Terminate a job with a non-completed terminal status (no-op if already terminal).
 
         Used when a job is interrupted (e.g. Pause All while the worker is
@@ -199,6 +200,10 @@ class WorkerJobRegistry:
         enforced here -- this method does not police ownership. Omitting
         them yields an unattributed record (``session_id == ""``,
         ``worker_name``/``instance_id`` ``None``).
+
+        ``work_may_still_be_running`` writes that key (``True``) onto the
+        record; it is written ONLY when True, so every other terminal status
+        keeps the record's shape unchanged.
         """
         with self._lock:
             existing = self._jobs.get(job_id)
@@ -225,6 +230,8 @@ class WorkerJobRegistry:
             else:
                 self._adopt_identity_locked(job, worker_name, session_id, instance_id)
             job["status"] = status
+            if work_may_still_be_running:
+                job["work_may_still_be_running"] = True
             if envelope is not None:
                 job["result"] = copy.deepcopy(envelope) if isinstance(envelope, dict) else envelope
                 job["preview"] = (

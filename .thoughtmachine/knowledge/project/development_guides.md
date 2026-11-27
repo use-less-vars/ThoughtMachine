@@ -640,3 +640,13 @@ Also: `exec_run` returns **no handle** (`container_manager.py:2595-2597` documen
 
 **Note:** `+ QUERY_WAIT_GRACE_SECONDS` (`worker_timeout.py:99`) is *designed*, not accidental (module docstring `:5-6`: the caller must out-wait the worker's own envelope). PRIORITIES:340-341's "clamp the dispatch window" would delete that grace — do not do it before an in-flight kill exists.
 
+
+## 2026-11-27 — **2026-11-27 — Two operator-preference rules for delivery, b...
+
+**2026-11-27 — Two operator-preference rules for delivery, both learned by breaking them.**
+
+1. **Never hand the operator `docker rm -f`.** Persistent containers are operator-grain by design (`lifecycle_class=persistent` ⇒ `ContainerRemoveTool` refuses agents and workers alike: *"Persistent containers can only be removed by the operator."*). The official path is the container panel's **Remove** button in the UI, which is what the operator asked for: *"in the future I'd rather use the official remove button."* So housekeeping briefs say "ask the operator to press Remove for these three", and never a docker command — a command bypasses the very fence that made the agent refuse, and it leaves no UI-visible record.
+
+2. **A shell block must contain shell, never my tool names.** I wrote `show_file path=docs/ONBOARDING.md source=committed ref=origin/dev` under a heading that said "in your shell"; the operator ran it, got `show_file: command not found`, and then tried `sudo apt install show_file`. A verification step handed to the operator must be a command their shell can run — `git cat-file -e origin/dev:docs/ONBOARDING.md && echo present`, `git merge-base --is-ancestor <sha> origin/dev`, `git log -1 --format='%H %s' origin/dev` — or it must be labelled explicitly as *my* measurement, done by me, reported as a result.
+
+Both are the same class as D1–D5: the expensive mistakes are the ones that spend the operator's time. The test before writing any block: *could this line be pasted into their shell and work?*

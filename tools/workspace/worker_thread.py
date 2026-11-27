@@ -2336,6 +2336,29 @@ def _job_registry_reporter(
     return _report
 
 
+def _reply_terminal_status(reply: Any) -> Optional[str]:
+    """The terminal job status a reply ENVELOPE claims, or ``None``.
+
+    ``send_query`` returns a JSON STRING, so the interruption vocabulary rides
+    inside the text (``WorkerThread._interrupted_reply``: ``status:
+    "interrupted"``, ``interrupted: true``) and never on the tool result. Only
+    that marker is read here: anything that is not a string, does not parse as
+    a JSON object, or names no interruption is NOT evidence of one, and the
+    caller's default (``"completed"``) stands unchanged.
+    """
+    if not isinstance(reply, str):
+        return None
+    try:
+        payload = json.loads(reply)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("status") == "interrupted" or payload.get("interrupted") is True:
+        return "interrupted"
+    return None
+
+
 def _close_sync_dispatch_job(
     registry: Any,
     job_id: str,
@@ -2352,8 +2375,10 @@ def _close_sync_dispatch_job(
     the record MUST be moved out of ``submitted`` when the call ends -- by
     whatever route it ends. ``completed`` goes through ``complete`` (it stores
     the envelope and derives the preview); every other outcome (``timeout``,
-    ``error``) goes through ``terminalize``, which carries the envelope without
-    pretending the query produced a reply.
+    ``error``, ``interrupted``) goes through ``terminalize``, which carries the
+    envelope without pretending the query produced a reply. ``interrupted``
+    additionally marks the record ``work_may_still_be_running``: the reply says
+    only that the WAIT ended.
 
     Best-effort and idempotent, like :func:`_job_registry_reporter`: a missing
     registry is a no-op, the registry refuses to overwrite a terminal record,
@@ -2378,6 +2403,7 @@ def _close_sync_dispatch_job(
             job_id,
             status=status,
             envelope=envelope,
+            work_may_still_be_running=(status == "interrupted"),
             worker_name=worker_name,
             session_id=session_id or "",
             instance_id=instance_id,
@@ -9355,11 +9381,13 @@ class Worker(ToolBase):
             if context_note is not None:
                 result["context_note"] = context_note
             # The reply IS this job's terminal state: close the record with the
-            # same envelope the caller is handed back.
+            # same envelope the caller is handed back. A reply that says its
+            # WAIT was interrupted is NOT a completed query -- record what the
+            # reply itself claims, and let the close helper mark it.
             _close_sync_dispatch_job(
                 registry,
                 sync_job_id,
-                "completed",
+                _reply_terminal_status(result.get("response")) or "completed",
                 result,
                 worker_name=self.worker_name,
                 session_id=self.session_id or "",
