@@ -4,7 +4,7 @@ This ledger names the invariants the machine actually guarantees, each with the 
 enforces it and a test that fails when the behaviour it pins is broken — proved by hand, where it has
 been proved, and marked GAP where it has not. Every test it names is run by
 the fast contract gate (`.github/workflows/contract-gate.yml`), which runs more than it names: the gate
-enumerates twenty-one test files today and this ledger cites eleven of them, because
+enumerates twenty-two test files today and this ledger cites twelve of them, because
 `tests/test_contracts_ledger_parity.py` enforces *cited ⊆ run* rather than equality, and the uncited
 extras are gate-only additions explained in that workflow's own header. Parity with the other ledger —
 the invariant list in `.thoughtmachine/knowledge/project/architecture_invariants.md` — is enforced by
@@ -13,11 +13,11 @@ or an explicit gap. What the gate does is re-run these tests and fail the job wh
 not mutate the code to show that a test *can* fail — this tree carries no mutation-testing
 configuration — so a green gate states that the named tests passed, which is a statement about the
 tests, not a proof about the control. It does not claim the wider suite is worthless — it claims that
-these three invariants are the merge-blocking ones: Contract Gate is among the contexts `dev` requires
-(measured; see *What CI actually runs — and what this document does not claim* below), so a change
-that turns one of the twenty-one files red cannot merge — provided the named test detects the break,
-which is the verdict column's claim and not the gate's — and a change that breaks anything else is
-still caught by the main matrix.
+the invariants this ledger names are the merge-blocking ones: Contract Gate is among the contexts
+`dev` requires (measured; see *What CI actually runs — and what this document does not claim* below),
+so a change that turns one of the twenty-two files red cannot merge — provided the named test detects
+the break, which is the verdict column's claim and not the gate's — and a change that breaks anything
+else is still caught by the main matrix.
 
 Verdict vocabulary: **ENFORCED** — the code site enforces it and a named test fails when that behaviour
 is broken; removal was tried by hand only where this document records that it was tried, and the gate
@@ -253,7 +253,7 @@ values `write`/`banned`/`ask`/`read` appears anywhere). Restoring the preset fal
 mutation-testing configuration at all: no Stryker config, no `mutation` script in
 `web_ui/frontend/package.json`, no mutmut or cosmic-ray. The two mutation proofs recorded in this
 contract's commit message are hand measurements, not a CI check, and nothing will re-run them.
-`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty-one files under
+`.github/workflows/contract-gate.yml` is pytest-only over a hand-enumerated list of twenty-two files under
 `tests/`, so it cannot run these JS suites — which is also why the JS paths above are cited without the
 backticked repo-relative form that `tests/test_contracts_ledger_parity.py` parses. What does run them is
 `platform-matrix.yml`'s `web-ui-frontend-suite` job (vitest over `src`), which cannot detect a mutation.
@@ -301,6 +301,42 @@ lacks the flag); re-applying the fix re-greens it. Measured by hand in this tree
 **Verdict:** ENFORCED — the helper, the call site, the close helper and the registry keyword are one
 chain, and the named test asserts the end of it (the recorded status) rather than the shape of any
 single link.
+
+## Contract 7: A spawn the fence refuses leaves no registration behind
+
+**Invariant:** When a spawn's dispatch is refused by a stale-worker fence — the one failure that proves
+no body started — the registration the spawn already wrote is undone before the failure envelope is
+returned, so a worker that never ran leaves no phantom instance behind: not drawn by the UI, not
+counted by anything, not stoppable by anyone, and not gone until restart. Every other failure (a
+timeout, a transport error, a lost runtime) deliberately keeps its registration, because it cannot
+prove no child started, and a registration that cannot be disproved is less harmful than tearing one
+out from under a caller whose worker may be running.
+
+**Enforcement sites:** `tools/workspace/worker_thread.py::Worker._release_failed_spawn_registration` —
+the undo, keyed by the same `(session_key, worker_name, instance_id, epoch)` the spawn wrote: it drops
+the registry entry through `WorkerRegistry.unregister_worker` and the published handle through
+`unregister_runtime_handle`, each leg separately guarded so cleanup on a failure path can never mask
+the failure that brought it there. The epoch record is *retained*, raised to the spawn's epoch rather
+than erased, so no later stale register or unregister can touch a key a newer incarnation may own; and
+the `except` branch around the spawn's own dispatch inside
+`tools/workspace/worker_thread.py::Worker._action_spawn` calls that helper **only** when
+`isinstance(exc, StaleWorkerFence)`. That guard is half the contract, not a formality: the fence fires
+before the request is delivered, which is what makes the registration provably stale — so a refusal
+that cannot prove it keeps its entry, and an entry that stays stays visible and stoppable by `reset`.
+
+**Mutation-proof test:** `tests/test_worker_spawn_failure_registry_cleanup.py` — drives the real
+`Worker._action_spawn` with a fake thread class and a `dispatch_query` that raises `StaleWorkerFence`,
+then asserts the call returned its error envelope *and* that the registry and the runtime-handle store
+read exactly as they did before it ran. Neutering the `_release_failed_spawn_registration` call at
+that site reddens the leftover-registration assertion; re-applying it re-greens it. Measured by hand in
+this tree, not by the gate.
+
+**Verdict:** ENFORCED — the guard, the helper and its two unregister legs are one chain, and the named
+test asserts the registry state a refused spawn leaves behind rather than the shape of any single
+link. Scope, stated honestly: it covers the writes the spawn path itself makes before it dispatches —
+the registry entry and the runtime handle — for a dispatch the fence refuses; every failure that
+cannot prove no body started keeps its registration on purpose, which is a decision this contract
+records rather than a hole in it.
 
 ## Known gaps
 
@@ -392,11 +428,11 @@ What the trigger blocks and job names add to that table:
   contract gate, while it does run the other five workflows. Those five run on `push` to `dev` and
   `master` and on `pull_request`.
 - `contract-gate` is the only workflow with any relationship to this document, and that relationship is
-  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of twenty-one
+  manual. It runs `python -m pytest -q -p no:cacheprovider` over a **hand-enumerated list of twenty-two
   test files** — no glob, no `-m` expression. Two consequences worth knowing: a new test that proves a
   contract does not join the gate by existing (it must be added to the workflow *and* cited here), and
-  the parity check described in the previous section is itself one of the twenty-one, so it fails the
-  gate it is part of. Note the direction: the gate runs twenty-one files and this ledger cites eleven of
+  the parity check described in the previous section is itself one of the twenty-two, so it fails the
+  gate it is part of. Note the direction: the gate runs twenty-two files and this ledger cites twelve of
   them, because the parity check enforces *cited ⊆ run*, not equality. The job carries
   `timeout-minutes: 10` and separately reports wall time against a stated 120-second budget; that
   budget is observed, not enforced.

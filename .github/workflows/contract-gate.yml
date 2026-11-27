@@ -89,6 +89,7 @@ jobs:
             tests/security/test_git_hardening.py \
             tests/test_onboarding_bundle_contract.py \
             tests/test_worker_dispatch_job_registry.py \
+            tests/test_worker_spawn_failure_registry_cleanup.py \
             web_ui/backend/tests/test_auth_boundary.py
           status=$?
           end=$(date +%s)
