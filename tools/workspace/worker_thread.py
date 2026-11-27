@@ -7835,6 +7835,60 @@ class Worker(ToolBase):
             )
         return (f"{rendered}\n\n{query}" if query else rendered), context_keys, None
 
+    def _release_failed_spawn_registration(
+        self, session_key: str, spawn_iid: Any, epoch: Optional[int]
+    ) -> None:
+        """Undo the registration a spawn made before the fence refused it.
+
+        ``_action_spawn`` registers the thread, seeds its epoch record and
+        publishes its runtime handle *before* the runtime handle is asked to
+        dispatch. When that dispatch is refused by a stale fence -- the one
+        failure that proves nothing was started, and the only one undone here;
+        every other failure (a timeout, a transport error) deliberately keeps
+        its registration, because it cannot prove no child started -- the
+        worker never took: leaving those writes in place would outlive the
+        failed spawn as a phantom instance -- drawn by the UI, counted by
+        nothing, stoppable by nobody, and there until restart.
+
+        Each leg is best-effort and separately guarded: this runs on a failure
+        path that is already reporting an error, and cleanup must never mask
+        the failure that brought us here.
+        """
+        try:
+            _WorkerRegistry.get_instance().unregister_worker(
+                session_key,
+                self.worker_name,
+                instance_id=spawn_iid,
+                epoch=epoch,
+            )
+        except Exception:
+            logger.debug(
+                "Spawn: could not unregister worker '%s' instance %r after a "
+                "failed spawn",
+                self.worker_name,
+                spawn_iid,
+                exc_info=True,
+            )
+        try:
+            # Function-local, like every other worker_runtime import in this
+            # module: worker_thread is also loaded inside the child interpreter.
+            from tools.workspace.worker_runtime import unregister_runtime_handle
+
+            unregister_runtime_handle(
+                self.session_id,
+                self.worker_name,
+                instance_id=spawn_iid,
+                epoch=epoch,
+            )
+        except Exception:
+            logger.debug(
+                "Spawn: could not unregister the runtime handle for worker "
+                "'%s' instance %r after a failed spawn",
+                self.worker_name,
+                spawn_iid,
+                exc_info=True,
+            )
+
     def _action_spawn(self, workers: list, ws_id: Optional[str]) -> dict:
         """Spawn a worker thread from its definition in workers.json."""
         # ── Commit 8: dispatcher-side duration instrumentation ──
@@ -8835,7 +8889,7 @@ class Worker(ToolBase):
                 getattr(thread, "_timeout_seconds", None),
                 fallback=SPAWN_QUEUE_TIMEOUT,
             )
-            from tools.workspace.worker_runtime import MODE_THREAD
+            from tools.workspace.worker_runtime import MODE_THREAD, StaleWorkerFence
 
             _spawn_mode = declared_runtime_mode(thread)
             _spawn_handle = getattr(thread, "_runtime_handle", None)
@@ -8854,6 +8908,26 @@ class Worker(ToolBase):
                         timeout=auto_wait,
                     )
                 except Exception as exc:  # noqa: BLE001 - a spawn reports, never raises
+                    # The registration, its epoch record and its runtime handle
+                    # were all written BEFORE this dispatch, so a refusal here
+                    # would leave a worker that never ran behind in the
+                    # registry. Undo them -- but ONLY for a fence refusal, the
+                    # one failure that proves nothing was running: the fence
+                    # fires before the request is delivered, so there is no
+                    # body whose registration we could be tearing out from
+                    # under the caller.
+                    #
+                    # Deny-by-default for every other failure (a timeout, a
+                    # transport error after the dispatch was entered): those
+                    # leave us unable to prove no child started, and popping
+                    # the entry of a live worker is strictly worse than a
+                    # phantom -- alive, invisible, unstoppable except by an
+                    # operator. A registration we cannot disprove therefore
+                    # stays, and stays visible and stoppable by 'reset'.
+                    if isinstance(exc, StaleWorkerFence):
+                        self._release_failed_spawn_registration(
+                            session_key, spawn_iid, _spawn_epoch
+                        )
                     # A fence, a lost runtime or a per-query timeout: each is a
                     # real answer about this worker, and none of them may
                     # escape as an exception from a spawn call.
