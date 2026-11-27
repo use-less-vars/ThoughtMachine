@@ -239,3 +239,80 @@ def test_query_is_spawn_only(drive):
     assert "only valid with action='spawn'" in result.get("error", "")
     assert "worker_query" in result.get("error", "")
     assert created == []
+
+
+# ── 3. worker_query is ALSO a spelling of the spawn task ────────────────────
+
+
+def test_spawn_worker_query_alone_dispatches(drive):
+    """A spawn carrying ONLY worker_query runs it -- it is not dropped."""
+    _tool, result, created = drive(action="spawn", worker_query="See worker_query.")
+
+    assert created[-1].received == ["See worker_query."], (
+        "the worker_query never reached the worker"
+    )
+    assert result["response"] == "ran:See worker_query."
+    assert result.get("status") != "ready", (
+        "an idle 'ready' envelope means the task was never dispatched"
+    )
+
+
+def test_spawn_worker_query_and_query_agree_accepted_once(drive):
+    """The same task spelled twice (query= + worker_query=) runs once."""
+    _tool, result, created = drive(
+        action="spawn", query="task A", worker_query="task A"
+    )
+
+    assert created[-1].received == ["task A"]
+    assert result["response"] == "ran:task A"
+
+
+def test_spawn_worker_query_disagreeing_with_query_is_rejected(drive):
+    """query= and worker_query= differ -> explicit ambiguous-task error."""
+    _tool, result, created = drive(
+        action="spawn", query="task A", worker_query="task B"
+    )
+
+    error = result.get("error", "")
+    assert "mbiguous task" in error, error
+    assert "worker_query=" in error and "query=" in error, error
+    assert repr("task A") in error and repr("task B") in error, error
+    assert created == [], "a rejected call must dispatch nothing"
+
+
+def test_spawn_worker_query_disagreeing_with_context_query_is_rejected(drive):
+    """context['query'] and worker_query= differ -> explicit ambiguous-task error."""
+    _tool, result, created = drive(
+        action="spawn", context={"query": "task A"}, worker_query="task B"
+    )
+
+    error = result.get("error", "")
+    assert "mbiguous task" in error, error
+    assert "worker_query=" in error and "context['query']=" in error, error
+    assert repr("task A") in error and repr("task B") in error, error
+    assert created == [], "a rejected call must dispatch nothing"
+
+
+def test_spawn_ambiguity_error_names_both_values_truncated_to_40_chars(drive):
+    """The ambiguous-task error quotes each value's FIRST 40 characters only."""
+    long_a, long_b = "A" * 60, "B" * 60
+    _tool, result, created = drive(
+        action="spawn", query=long_a, worker_query=long_b
+    )
+
+    error = result.get("error", "")
+    assert "A" * 40 in error and "A" * 41 not in error, error
+    assert "B" * 40 in error and "B" * 41 not in error, error
+    assert created == []
+
+
+def test_worker_query_stays_authoritative_on_followup_actions():
+    """'query'/'submit_query' are untouched: context['query'] is dropped, not ambiguous."""
+    for action in ("query", "submit_query"):
+        tool = worker_module.Worker(
+            action=action,
+            worker_query="follow-up task",
+            context={"query": "other task"},
+        )
+        tool._fold_query_into_context()  # must NOT raise: worker_query wins here
+        assert tool.context == {"query": "other task"}
