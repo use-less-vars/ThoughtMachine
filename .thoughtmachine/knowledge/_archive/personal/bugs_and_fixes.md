@@ -661,3 +661,461 @@ PROCESS LESSON — FINGERPRINT BRITTLENESS (cost one wasted spawn):
 
 ## 2026-10-12 — ## Wave 1b β read-first (2026-10-12, dev @ 15deebe9) — can a...
 
+## 2026-10-13 — LIVE ESCAPE FOUND (round-2 privilege probe, 2026-10-12): wit...
+
+LIVE ESCAPE FOUND (round-2 privilege probe, 2026-10-12): with session grain network=BANNED, `ContainerBuildTool` (→ infra/container_manager.py:3370 `def build_image(self, tag=None)`) has NO permission gate. Build succeeded and performed live DNS+TLS+~40MB of PyPI downloads (`pip install --no-cache-dir -r requirements.txt`, Step 5/9 ran non-cached). So a network-banned session can reach the internet via the build path. Amplifiers not yet weaponised: (1) requirements.txt is read from the WORKSPACE ROOT when the vault copy is absent and filesystem=write is held, so an arbitrary/URL requirement is fetched & executed at build time; (2) the default auto tag is the same `agent-executor-<hash>` convention docker_executor uses, and the build emits LABEL thoughtmachine.build_hash=<workspace hash>, so a default-tag build may overwrite the runtime image while keeping the same build_hash (image-reuse check would accept it).
+DEFENCE THAT HELD: container run/reuse/exec paths are consistently drift-gated — `_check_exec_drift` (container_manager.py:2010, exec only) and `_start_drift_decision` (:2769) both return decision=deny for network_more_permissive; creation honours the grain (network=none); name prefix `tm-res-` fail-closed (errors at :1320/:1348).
+ALSO: the permission flip reaps the session's own container and leaves the record → container name permanently wedged ("record … names docker_id … but no such container exists"), no self-heal on that path.
+REPRO NOTES: ContainerStatusTool returns live running_processes (runs a ps-style command inside the container) even for a drift-denied container — at least one verb executes in-container commands without the drift gate.
+
+## 2026-10-15 — ORCHESTRATOR REVIEW/VERIFY PATTERNS (proven 2026-10-15, bran...
+
+ORCHESTRATOR REVIEW/VERIFY PATTERNS (proven 2026-10-15, branch fix/container-capacity-slot-predicate):
+1. ALWAYS run the FULL suite (`python -m pytest tests/ -q`), not a scoped glob. A "container" glob (591 passed) hid 7 branch-level failures; a full run (4436 passed / 7 failed) surfaced them. Full suite ~275s.
+2. Attribute a failure to a commit with `git_read blame` on the exact line range. blame ALSO marks uncommitted lines as `000000000 (Not Committed Yet ...)` => cheapest way to read ONLY the new delta of a file I cannot otherwise read. (`git_read show_file` ignores line ranges and dumps the whole file: DO NOT USE. `git_read diff <file>` shows only uncommitted changes: good.)
+3. Regression root-causing: blame pinned `infra/container_manager.py:1698-1701` to my W2' commit => the 5 stale container-limit message assertions were MY regression. A test file's last-touch commit (`git_read log file_path=[...] max_count=4`) being the branch BASE proved my commits never updated them.
+4. `.client` AttributeError family: tests building `ContainerManager` via `object.__new__` bypass `__init__` (sets `self.client` at :704); a NEW call site reaching a client-dependent helper then crashes. Fix at the NEW call site with `getattr(self,'client',None)` guards, not in `__init__`/the harness.
+5. Worker A/B protocol that gave a DECISIVE answer: "record the file sha; neuter ONLY the hunk you added; re-run the 2 tests; restore and confirm the sha matches; report hunk_caused/not_hunk_caused".
+6. Envelope brief that works: <=15 lines; `ab_result`; per-file `path sha256[:16] bytes lines`; final counts; `pre_existing: <none|list>`; report path + sha; literal `no git commands run` / `no source file modified`. `action="query"` answers come back nested in a `response` JSON string (double-encoded).
+
+## 2026-10-18 — ## Container sprint close wave (branch wave/container-sprint...
+
+## 2026-10-18 — ## 2026-10-xx — OOM re-investigation: the vitest pool-sizing...
+
+## 2026-10-20 — 2026-10-20 — `hygiene/audit-sink-in-tmp` is CLOSED. Fixed by...
+
+2026-10-20 — `hygiene/audit-sink-in-tmp` is CLOSED. Fixed by the audit-log sink work: the portable audit path commit merged to `dev` as d20ea879 (PR #140) plus the follow-up on `hotfix/windows-audit-commit2` (62e22dd2) that routes the last two direct `/tmp` writes through the sink. No host-side `/tmp` open remains in the audit path.
+
+The `/tmp` literals that still exist are CORRECT and must not be "fixed":
+- `/home/agent/tmp` in `docker_code_runner.py:252` — a path INSIDE the container, not a host path.
+- `"/tmp"` as a docker tmpfs mount KEY in `agent/config/defaults.py`, `infra/container_manager.py`, `infra/resource_container_manager.py`, `infra/containers/executor.py` — these are docker mount destinations, i.e. container-internal by definition.
+
+Rule of thumb for the next `/tmp` audit: a literal is only a bug when it is opened or written by HOST code. Container mount destinations and in-container paths are not bugs, and rewriting them to a workspace path would be wrong.
+
+Also: `tools/host_bash_tool.py` has exactly one `subprocess.run` (line 303) and passes no `cwd=`, so the child inherits the SERVER PROCESS cwd, not the workspace directory. Verified by `grep -n 'cwd' tools/host_bash_tool.py` → zero hits. Any caller that assumes the bash tool starts in the workspace is relying on how the server happened to be launched.
+
+
+## 2026-10-21 — FLAKE (macOS CI): `tests/test_workspace_lifecycle_manager.py...
+
+FLAKE (macOS CI): `tests/test_workspace_lifecycle_manager.py::test_soft_timeout_warning_emitted_once` is structurally timing-dependent — NOT a mystery. Mechanism: `_emit_soft_timeout_warning` only fires when the supervisor loop observes `remaining <= 0.2 * wait_bound` (infra/workspace_lifecycle_manager.py:420-432), i.e. a ~120 ms band (0.48–0.60 s for the test's 0.6 s budget). The loop's only wake-ups come from `self._output_queue.get(timeout=min(remaining, 0.5))`, so any scheduling stall >120 ms after the 0.5 s wake-up hits `if remaining <= 0: transition_timeout(); raise TimeoutError` BEFORE the warning check. `TimeoutError` is still raised, so `pytest.raises(TimeoutError)` passes and the failure lands on `assert sup.soft_timeout_warning_emitted is True`. Shapes that fail on a loaded macOS runner and pass on fast Linux. Fix directions (not done): derive the warning threshold from the remaining budget rather than a fixed fraction, or emit the warning once on the first loop iteration where remaining < wait_bound, or assert on emitted-or-timed-out rather than emitted-only. It failed on 3 consecutive PR merge commits (0bee01a3 and predecessors) — treated as advisory, does not gate merges.
+
+
+## 2026-10-21 — REGRESSION: `85035605` deleted `.githooks/pre-commit` on a false premise
+
+**Commit:** `85035605` — *"Remove dead .githooks/pre-commit tracked hook"*.
+**Verdict:** the file was not dead. The deletion removed a live gate **and** the fail-closed guard that
+made host-mode commits refuse to bypass it. Not restored; disposition is the operator's.
+
+### The premise, verbatim from the commit message
+
+> *"The tracked .githooks/pre-commit file is unreachable: `core.hooksPath` is unset, and the
+> installed hook at the worktree gitdir (`/home/jojo/PycharmProjects/ThoughtMachine/.git/worktrees/
+> ThoughtMachine-dev/hooks/pre-commit`) declares itself the replacement … Removing the tracked file
+> to close the divergence. **A gate we cannot identify is not a gate**; leaving both in the tree
+> invites future confusion over which one fires."*
+
+The premise was inherited from the 2026-09-21 task-tracker entry ("Hook TRUTH ⇒ DORMANT"),
+which measured `core.hooksPath` **in a bare host shell**. Corrected in
+`personal/task_tracker.md` at 2026-10-21 (Gen 47) — appended, original preserved.
+
+### Why it is wrong
+
+1. **`core.hooksPath` is set, by the tool, on the path commits actually take.** Container-mode git
+   injects `-c core.hooksPath=/workspace/.githooks` on every commit —
+   `tools/git_info_tool.py:996` (construction), `:983` (rationale; the container-mapped ABSOLUTE
+   path so a nested repo cannot resolve `.githooks` elsewhere). Pinned by tests:
+   `tests/security/test_git_execution_mode.py:127`, `tests/test_permission_routing_fix.py:180`,
+   `tests/test_worker_permission_hardening.py:1155`,
+   `tests/test_git_workspace_identity.py:487/517`. The `git` resource is cataloged as `container`
+   for this workspace, so container mode **is** the normal path — the hook fired on ordinary agent
+   commits, not never.
+2. **The file was container-ONLY, not container-incompatible.** Host mode neutralizes hooks
+   (`core.hooksPath=/dev/null` + `--no-verify`, `tools/git_info_tool.py:885`) and therefore
+   **fails closed** when the file exists: `:868-878` returns
+   *"Error: refusing commit: repository hooks are configured (.githooks/pre-commit) but host
+   execution mode neutralizes them … Use container mode, or remove the configured hooks to accept
+   the bypass."* That is a deliberate tripwire whose whole purpose is to stop a silent host-mode
+   bypass. Deleting the hook removed the tripwire.
+3. **Contemporaneous record says ACTIVE.** `archive/archive_tasks_b.md:1777` (2026-08-03):
+   *"repo has an ACTIVE pre-commit hook .githooks/pre-commit (`core.hooksPath=.githooks`,
+   git-TRACKED since `8d4e1d0`) that runs `pytest tests/integration/ -x --tb=short -q` +
+   `tests/tools/test_tool_gating.py` + `test_respond.py` on EVERY commit (no staging filter)"* — and
+   Round K needed two hook-driven bug fixes before it could land, i.e. the hook demonstrably fired
+   and caught things. The same entry records that `.pre-commit-config.yaml` was deliberately **not**
+   created precisely because it conflicts with `core.hooksPath`. Two independent records, one
+   "dormant" reading, taken from a shell.
+4. **The deleted content was not trivial.** 292 lines / ~12 KB, budget < 10 s: import gate
+   (`import web_ui.backend.server`) → live `/health` poll on 127.0.0.1 with `revision == git rev-parse
+   HEAD` → hermetic WS smoke (`new_session` → `session_loaded`) → conditional contract test
+   (`tests/integration/test_session_creation_contract.py`) when steps 1-3 finished under 3 s. Every
+   subprocess under `timeout`; no Docker, no LLM, no network beyond loopback. The commit message's
+   "no hook in this repo runs the full suite" is true and irrelevant — the hook was a fast gate, not
+   a full-suite gate.
+
+### Damage still live at `51a87058`
+
+`.githooks/` **does not exist** (`DirectoryTreeTool .githooks` → no such directory). Consequences:
+
+- `tools/git_info_tool.py:868-878` is now **unreachable in practice** — `_hook.is_file()` is never
+  true, so a host-mode commit with unenforceable hooks proceeds with hooks neutralized instead of
+  raising. A guard that cannot execute. (Same class as the `admission` branch in
+  `infra/container_create.py` — see `working_docs/ticket-hygiene-container-create-admission-…`.)
+- Container-mode commits now pin `core.hooksPath=/workspace/.githooks` **at a directory that does
+  not exist**. Git tolerates a missing hooks dir, so this is silent: the local fast gate is simply
+  gone, and the only gates left are CI and whatever the operator runs by hand.
+- The worktree-gitdir hook (`.git/worktrees/ThoughtMachine-dev/hooks/pre-commit`, `pytest
+  tests/security/ tests/trust/`) is the *replacement* the commit message cited — but it is not in the
+  repo, is not created by any code path, and dies with the worktree. It is not version-controlled
+  and not reviewable.
+
+### Lesson (the general one)
+
+**`A gate we cannot identify is not a gate` is right — and it was applied to the wrong gate.** The
+unidentifiable one was the untracked worktree hook; the identifiable one was the tracked file with a
+292-line body, its own tests, and a fail-closed host guard referring to it by exact path. The
+"divergence" to close was two hooks with different scopes, not one dead file.
+
+Method failure, named in `project/operator_observations.md` (2026-10-21): **the claim and its
+verification came from the same input.** `core.hooksPath` was unset where the auditor stood, so
+"unset" proved the file unreachable — when the setter was three lines of tool code away
+(`git_info_tool.py:996`) and greppable in one command. A gate's reachability is a property of the
+**invocation path**, not of the shell you check it from.
+
+
+## 2026-10-22 — ## Session tabs from all workspaces piled into one strip (fi...
+
+## 2026-10-23 — ## PaginateTool bypassed per-call authority (fixed `0c125856...
+
+## 2026-10-25 — CORS wildcard claim disproved by direct read.
+
+**Gen 50 — CORRECTED: the CORS wildcard does not exist.** The claim that `web_ui/backend/server.py:1183-1185` mounts a wildcard `CORSMiddleware` with `allow_credentials` unset is FALSE, and it has been carried in the design-input doc, the auth-layer brief, and the design pass doc. Direct read: the block is `server.py:1194-1200`, `allow_origins=_cors_allowed_origins()` where the alias (`server.py:206-209`) points at `web_ui/backend/origin_policy.py:42-45` — `return [f"http://{host}:{port}" for host in ("localhost","127.0.0.1")]`, docstring "never a wildcard". `allow_credentials=False` is set EXPLICITLY at `:1197`. Only `allow_methods`/`allow_headers` are `["*"]`. The corpus cite `1183-1185` is stale (that is `_SERVE_FRONTEND = False`). Also: `test_browse_root_allowed` lives at `tests/test_host_api_hardening.py:188` (single occurrence) — the design doc had left it as "located by name only". Lesson: a line-number citation inherited from a corpus is not evidence; read the lines. Suspect any corpus CORS ticket (`ticket-bug-cors-wildcard-exposes-api-to-browser-origin.md`) of being already fixed.
+
+## 2026-10-28 — ## 2026-10-28 — Web UI shows whole messages instead of token...
+
+## 2026-10-28 — Web UI shows whole messages instead of token deltas (root-cause hunt)
+
+All Python hops VERIFIED streaming-per-event (no batching anywhere):
+- agent.py:107 `_iter_stream_events` = genuine `loop.run_until_complete(agen.__anext__())` per event (INNOCENT, despite being prime suspect).
+- agent.py:1266-1289 = one `text_delta` yield per `TextDelta`; ReasoningDelta accumulates into a var and yields NOTHING (silent thinking phase).
+- agent/controller/__init__.py:732-735 = `for event in process_query(): ... self._emit_event(event)`; `_emit_event` (:535-547) invokes callbacks synchronously, no queue drain/timer.
+- bridge.py:2835-2932 `_on_controller_event` -> `_map_and_emit(event)` unfiltered; :2995-3001 conversation_changed sync is version-gated by `conversation_version != _history_version` (so NOT a per-delta list re-serialize).
+- event_forwarder.py:84-96 `broadcast` = direct sync callback loop, no debounce/queue.
+- server.py:1324-1350 `event_callback` -> `asyncio.run_coroutine_threadsafe(send_event(event), _loop)`; :1307-1318 `send_event` -> `await ws.send_json(event)`. Immediate.
+- FE SessionTab.jsx:336-343 ws.onmessage->handleEvent; :593-602 assistant_delta->pushDelta; :530-536 pushDelta buffers + rAF(~16ms) flush; :522-528 flushDeltas appends to local `inFlight`; :151-154 viewMessages renders history+inFlight bubble. Correct in code.
+
+EMPIRICAL (logs/backend_startup.log, live run, 6336 text_delta lifecycle lines, 3 sessions; timestamps are 1-SECOND resolution):
+- session b6c25cd2: 2386 deltas spanning 14s, every second occupied => smooth ~170/s at the bus hop.
+- session 7780fe41 (the agent's own session): 2508/21s and 873/6s smooth, BUT 205 deltas spanning 37s occupying only 8s, and 101 deltas spanning 32s occupying 4s => CLUMPED with multi-second silences.
+=> The bus hop demonstrably can stream; the "blocks" shape is real at some turns. NEXT: compare per-second delta density at the three log hops (lifecycle EventLogger vs `_map_and_emit ENTRY` vs `send_event:`) to find which hop clumps. Remaining suspects: (a) provider/bursty SSE for some turns, (b) reasoning-model silent phase (ReasoningDelta never surfaced to UI), (c) server.py:367 websockets `_drain_helper` monkey-patch serializing drains + unbounded run_coroutine_threadsafe task pileup.
+
+
+## 2026-11-01 — ## Addendum delivery investigation (2026-xx, branch w5/adden...
+
+## 2026-11-02 — ## Flaky: tests/test_first_run.py::test_full_first_run_lifec...
+
+## 2026-11-03 — ## FINDING (open, not fixed): cancel arriving between turns ...
+
+## 2026-11-03 — ### `WorkerThread` discards `workspace_dir`, so `spec_from_w...
+
+### `WorkerThread` discards `workspace_dir`, so `spec_from_worker` rejects a real thread (blocks S4 process mode)
+
+**Status: open, pre-existing, latent (unreachable in production today).** Found during S4a chunk C and independently reproduced by a second worker.
+
+**Defect.** `WorkerThread.__init__` takes `workspace_dir: Path` and keeps only the derived `_worker_dir = workspace_dir / "workers" / instance_label`. A repo-wide grep finds **zero** assignments of `self.workspace_dir`, no property, and no class attribute; `threading.Thread` supplies none either. The parameter is dropped after the `_worker_dir` line.
+
+`spec_from_worker` (`worker_runtime_process.py`) then validates a `for attribute in ("worker_name", "instance_id", "definition", "workspace_dir")` loop and dereferences `worker.workspace_dir`, so it raises:
+
+```
+RuntimeSpecError: WorkerThread has no 'workspace_dir' attribute: process mode needs a
+worker constructed with definition, agent_config and workspace_dir (§3.3)
+```
+
+**Reproduced, not inferred.** A real `WorkerThread` constructed with the seam-test shape (`definition={}`, `agent_config={"provider":"openai","model":"gpt-4"}`, a real `tempfile.mkdtemp()`, `session_permissions={}`, `instance_id=1`) builds fine, reports `hasattr(w,"workspace_dir") -> False`, `w.__dict__` dir-keys `['_worker_dir']`, and `spec_from_worker(w)` raises the above. So the raise is not a fixture artifact.
+
+**Blast radius.** Every process-mode control verb (`dispatch_query`, `stop`, `pause`, `resume`, `cancel`) routes through `_ensure_process_runtime` → `spec_from_worker`, so all of them would raise on a real thread. `state()` is unaffected: it reads the `status.json` mirror and never builds a spec.
+
+**Why it has not bitten anyone.** There is **no production construction site** for `WorkerRuntimeHandle` — greps for `WorkerRuntimeHandle(`, `.spawn(`, `register_runtime_handle(` outside `tests/` and `.worktrees` return zero production hits, and the module's own comment says the registry is "EMPTY IN PRODUCTION TODAY". Existing `worker_runtime_process` tests pass *fakes* that do carry `workspace_dir`, which is precisely why the suite is green. Process mode is reachable only from tests.
+
+**Two candidate fixes (needs a decision, not yet applied):**
+- **(a)** `self.workspace_dir = workspace_dir` in `WorkerThread.__init__`. One line, and it matches what `spec_from_worker` documents. Preferred.
+- **(b)** Relax `spec_from_worker` to derive the workspace root from `_worker_dir.parent.parent` or accept `_worker_dir`. Keeps `WorkerThread` unchanged but makes the process spec depend on a private attribute.
+
+**Process lesson.** The test suite was green and the defect was real. Both process-runtime test doubles carried an attribute the real object lacks — a double that is *more capable* than production hides exactly this class of bug. See the S4a seam test `test_status_json_path_resolves_the_real_worker_thread_mirror`, which pins the mirror path against a **real** `WorkerThread` and is mutation-verified, for the shape that would have caught it.
+
+## 2026-11-03 — ## Live tooling friction, gen 57 session (measured, not gues...
+
+## 2026-11-03 — 2026-11-03 — Two corrections to recorded tool behaviour (bot...
+
+2026-11-03 — Two corrections to recorded tool behaviour (both observed live this session).
+
+1. WRONG: "worker soft-timeout ceiling is ~146 s". A `default` worker with `timeout_seconds=400` ran `elapsed_seconds=375.8` with `timeout_triggered=false` and self-reported `status="final"`, subjectively unhurried. So there is no soft ceiling near 146 s; the earlier number was an artefact of one particular task. Stop budgeting to 146 s — budget to `timeout_seconds` as given, and use the elapsed-vs-timeout heuristic instead of a hardcoded ceiling.
+
+2. TOOL DEFECT: `git_read operation=show_file` IGNORES `line_start`/`line_end`. Asked for lines 1220-1252 of `tools/workspace/worker_thread.py`, got the file FROM LINE 1, truncated at 10000 tokens — so the requested window was never visible. Workaround that does work: delegate a read-only worker query running `grep -n "<pattern>" <path>` (and `grep -n "<pat>" -A N`) in the Docker container at `/workspace`. That yielded exact line numbers plus quoted bodies and is now the preferred way to verify a specific symbol. Do not trust `show_file` to land on a line range in a large file; it will silently give you the head of the file instead.
+
+## 2026-11-03 — 2026-11-03 — KNOWN GAP (accepted, deliberately not fixed in ...
+
+2026-11-03 — KNOWN GAP (accepted, deliberately not fixed in S4b): the child-side per-worker event-bus attach is a bounded poll, not a subscription. `worker_runtime_main._subscribe_worker_bus` polls `worker.event_bus` every 10 ms for up to `BUS_ATTACH_TIMEOUT_SECONDS=5.0`, then subscribes or gives up silently. Root cause: `WorkerThread.__init__` sets `self._event_bus = None` (worker_thread.py L1176) and the real `EventBus()` is only constructed at L2763 inside the thread body, so no spawn-time hook exists. Consequence: if the bus takes >5 s to appear, only the global bus carries child events and there is NO visible error. Proper fix (do it when the old thread-loop is removed, NOT during S4b): add an explicit "bus created" hook/callback on `WorkerThread` that the runtime can register before `start()`, and delete the poll. Approved as-is by the engineer; S4b2 was explicitly not blocked on it.
+
+## 2026-11-03 — ## 2026-11-04 — TICKET (filed, NOT fixed, NOT scheduled): `W...
+
+## 2026-11-04 — TICKET (filed, NOT fixed, NOT scheduled): `Worker(action="spawn", force=True)` can hand back a worker holding a DIFFERENT task's context under the same session_id
+
+**Severity: high. This is the worst class of defect in the system because it is silent and it produces plausible-looking work.** Named consequence: *a worker can silently do the wrong task while appearing to work.*
+
+### What was observed (branch `w8/p3s5b`, live, by the dispatching agent)
+1. `Worker(action="spawn", force=True, worker_name="default", context={"query": <task A>})` was issued for task A. The call returned `spawned: false` with `status: busy` — i.e. **the spawn did not take**, but no error was raised and nothing on my side treated it as a failure. My dispatch for task A never reached its intended target.
+2. A follow-up `Worker(action="query", ...)` on that worker returned content answering **task B** — a different assignment in the same session ("the D3+D4 per-worker EventBus registry" work). The content was coherent, confident, and about a task I had not just asked for.
+3. Same `session_id` throughout. From the outside, the worker looked healthy: it was answering, in the right session, with high confidence.
+
+### Layer
+**Dispatch layer, not runtime layer.** Nothing in the frame-sink / process-runtime work (W8 S1–S5) causes this; the runtime did what it was told. The defect is in how a `spawn(force=True)` that cannot take effect is reported and in how a subsequent `query` resolves which context it addresses.
+
+### Relationship to the recorded gen24 finding — related, NOT a duplicate
+`bugs_and_fixes` 2026-09-24 ("spawn(force=True) is NOT a clean-context reset for an existing worker name") already established the *mechanism*: context is inherited **per worker NAME**, via the persisted transcript and/or sticky token counter. That entry records the consequence as **token/cap inflation** (a worker born at 22k, 42k, 110k tokens). The consequence proven here is **semantic, not quantitative**: the inherited transcript is not merely large, it is about a different task, and the worker answers from it. Same root mechanism, materially different blast radius — recorded separately for that reason.
+
+Note the two observations also disagree on the spawn *outcome*: gen24 saw force-spawn "succeed" and continue the predecessor's conversation; here force-spawn reported `spawned: false` / `busy`. So there is at least one more variable (instance-slot state) in play than gen24's model accounts for.
+
+### Why it was NOT patched in S5 or S6
+Third-Strike rule: this is the third distinct way the worker dispatch surface has produced a confident wrong answer, and each previous minimum fix moved the failure rather than removing it. A fix requires a design decision that is not mine to make:
+- should `spawned: false` be an **error** rather than a success-shaped envelope?
+- should a `query` addressed to a worker whose spawn failed be **refused** instead of silently routed?
+- or should worker context be keyed on something other than worker NAME (per-instance, or per explicit "clean start" flag)?
+
+Any of those changes the tool's contract. **Filed for a design pass; must not be patched opportunistically inside an unrelated sub-step.**
+
+### Status
+Pre-existing; **may be entirely unrelated to W8** — the surface predates this wave. Not claimed as a W8 regression. Not scheduled. Reported to the engineer in the S5-B report.
+
+### Cheap repro sketch for whoever takes it
+Spawn a worker name that already has a transcript, with `force=True`, while an instance of that name is alive/busy; capture the returned envelope; then `query` and ask it to state, in one line, the task it believes it is doing. Do not assume the envelope's `spawned` field tells you whether your query landed.
+
+## 2026-11-03 — ## 2026-11-04 — TICKET (filed, NOT fixed): a detach landing ...
+
+## 2026-11-04 — TICKET (filed, NOT fixed): a detach landing MID-RUN loses the in-flight result, and v1 offers the agent no resume — so the loss is unrecoverable
+
+**The incident itself is already recorded and is NOT duplicated here.** See `personal/lessons_learned.md`, "Live tooling / orchestration problems observed (reported to engineer)", item 3: `action="stop"` detached a worker while a pytest run was in flight, the in-flight result was lost, and the detached instance kept occupying instance 1, blocking a clean respawn. This entry adds **only the design-document gap**, because that is the part that was not recorded anywhere and is the part that makes a future implementer think the case is covered.
+
+### The gap
+`docs/design-worker-lifecycle.md` Q1, section **"Queries submitted while the worker is detached"**, promises FIFO queueing with the words *"queued work never vanishes silently"*. That promise is correct **for its own case**: it describes a query *submitted to an already-detached worker*, which is enqueued and later drained.
+
+It does **not** cover a detach that lands **while a query is mid-run**. That case is:
+- not queued (the work was already dequeued and executing),
+- not re-queued on detach (nothing puts a partially-executed turn back),
+- not returned (the caller's call is cut off),
+- and not reported as lost.
+
+So the property the doc appears to guarantee ("no silent loss of queued work") is true and yet the reader concludes something false from it, because the dangerous case is *outside the sentence's scope* while looking inside it. That is a documentation defect with a runtime consequence.
+
+### Why it is unrecoverable for an agent, specifically
+In v1 resume is **operator-initiated** and there is **no agent-facing resume API**. The `Worker` tool surface available to an agent is `stop` / `pause` / `reset` (and `spawn` / `query` / `submit_query` / `job_status` / `join`). Verified: nothing in that surface resumes a detached worker.
+- `stop` → detaches (parks). Does not resume.
+- `pause` → reading mode, and pausing a detached worker is not a resume.
+- `reset` → drops the worker's context.
+- re-`spawn` → the detached instance still holds instance 1, so a clean respawn is refused.
+
+Net for a long task: it loses **both** the result **and** the context, and the agent must reconstruct from disk. An agent cannot fix its own detach.
+
+### What is NOT being asked for here
+Not "make detach lossless" — detach is behaviour-neutral-by-design only in the sense that it keeps the thread and registration; interrupting a turn has to do *something*. The ask is narrower and is a documentation/design matter:
+1. the Q1 section should say explicitly that a detach arriving mid-run **does** lose the in-flight turn, since the current wording invites the opposite inference; and
+2. someone should decide whether an agent-initiated path back from `detached` exists in v1, or whether the standing advice is "never call `stop` on a worker you have work in flight with".
+
+### Status
+Filed, not fixed, not scheduled. No code change proposed. Cross-reference: `docs/design-worker-lifecycle.md` Q1.
+
+## 2026-11-03 — ## CORRECTION to the `spawn(force=True)` aliasing ticket: `s...
+
+## 2026-11-03 — ## Tooling friction observed live (S6 wave) — for the engine...
+
+## 2026-11-03 — ### Tooling friction observed live (S6c wave-close) — new en...
+
+### Tooling friction observed live (S6c wave-close) — new entries
+
+**GitWriteTool has no `merge` verb. This blocks the canonical wave-close workflow.**
+Operation enum is: commit, init, clone, push, branch_create, checkout, stage, unstage, worktree_add, worktree_remove, stash_push, stash_pop. There is no way to create a two-parent commit (`commit` cannot synthesise one), so a `--no-ff` merge is impossible from the agent side.
+Workaround attempts all fail: the worker container has **no git binary** (`command -v git` → absent, `/bin/sh: git: not found`), and the agent's git tools execute in a *separate* container — `CheckSystem capabilities` → `resources.git = {mode: containerized, image: tm-resource-git, status: running}` — which the agent cannot reach except through GitWriteTool.
+Net effect: an agent can perform every git step of a wave except the merge, and must hand that one step to an operator. **Suggested fix:** add `merge` to GitWriteTool (with `--no-ff` and `--abort` semantics), gated on the same `git_write` grain, returning conflict paths so the agent can decide abort-vs-resolve per its rulings.
+
+**`git_read log` honours only `branch`; it silently ignores `commit`, `commit1` and `ref`.**
+Verified in one place: `log(branch="dev")` → `dddcd6d4`; `log(commit="dev")` and `log(ref="dev")` → `44ba058b` (HEAD). Both silent-ignore cases return HEAD's log with no warning, which looks like a plausible answer. Same defect class as the already-known `show_file(line_start/line_end)` and `ls_tree(prefix)` drops. Practical consequence: to inspect a non-checked-out branch you must pass `branch=`, not `commit=`/`ref=`.
+
+**Pre-existing reds, now documented with reproduction on `dev`** (both pass when run alone; both reproduce on `dev`, so neither is a W8 regression):
+1. `tests/integration/test_vault_bootstrap.py` → **8 errors**, every test in the file: `ImportError: module thoughtmachine.bootstrap not in sys.modules`, when the file runs *after* `tests/integration/test_ui_permission_persistence_flow.py` or `tests/integration/test_ws_event_contracts.py`. Cause is a `sys.modules` purge that is not restored. The flow file already carries a defensive re-import at `:45-52` ("so the vault-bootstrap suite still reloads") which does not cover this ordering. Related branches already exist: `fix/harness-purge-modules-reload`, `fix/session-permission-persistence-test-order`, `fix/pre-existing-test-failures`.
+2. `tests/test_worker_operation_semantics.py::TestWorkerPauseResumeSemantics::{test_next_operator_turn_clears_stranded_main_pause, test_worker_turn_does_not_clear_main_pause}` → `llm_providers.exceptions.ProviderNotFoundError: Provider 'openai_compatible' not found. Available: ['echotool']` when preceded by other worker test files. Cause: global LLM provider registry polluted by an earlier test. File alone = 60/60 passed; 12-file chunk = 2 failed / 177 passed (branch) vs 2 failed / 170 passed (`dev`, which lacks the wave-added `test_worker_generation_allocation.py`).
+
+**A 82s file can masquerade as a hang.** `tests/test_worker_cap.py` was killed at 55s and again at 85s inside chunks, printing only progress dots — looked exactly like a deadlock. It is a legitimate `10 passed in 81.70s`, and `--durations=10` shows all of it is **teardown** (15.05/15.01/15.01/15.01s + 5.06/5.01/5.00/5.00s). Measured 81.85s on `dev`, so pre-existing. `--timeout` never fires because nothing is stuck inside a test body.
+
+## 2026-11-03 — ### 2026-10-25 — `EventBus.subscribe()` returns `None` → bri...
+
+### 2026-10-25 — `EventBus.subscribe()` returns `None` → bridge never detaches from `global_event_bus` → `'_RecordingForwarder' object has no attribute '_callbacks'` (NOT fixed, needs scope decision)
+
+- **Where:** `agent/events.py` `EventBus.subscribe` (registration branch has no `return`); consumers at `web_ui/backend/bridge.py:715-716` (+7 sibling `*_sub` attrs) and teardown `web_ui/backend/bridge.py:898`.
+- **Trigger in tests:** `tests/test_bridge_stop_semantics.py:154,184` swap `bridge._forwarder = _RecordingForwarder()` (double has no `_callbacks`); the file's `bridge` fixture is a bare `return`, no teardown.
+- **Error surface:** `bridge.py:930` reads `self._forwarder._callbacks` before the session guard; `publish()` swallows and logs `Error in event subscriber for {type}: {e}`.
+- **Status:** already filed as `.thoughtmachine/working_docs/ticket-hygiene-eventbus-subscribe-returns-none-bridge-leaks-listeners.md` ("recorded, NOT fixed").
+- **Repro:** does **not** reproduce on `dev @ dddcd6d4` — 12-file CI slice ending at `tests/test_worker_lifecycle_routes.py` is `115 passed`; direct pairs green. Branch `fix/recording-forwarder-leak` was cut for this but holds no commit.
+- **Blocker:** the clean fix touches `agent/events.py` + `web_ui/backend/bridge.py`, both on the agent's banned-file list for this wave; a test-only band-aid (two-arg `unsubscribe` in the fixture, or giving the doubles a `_callbacks` dict) suppresses the symptom without fixing the leak, and cannot be verified locally because no red exists here.
+- **Friction (tooling/environment), same session:** (a) my 12-file-per-process sweep structurally cannot detect this class of cross-test red — it needs *shared-process, same-order* runs; (b) `/workspace` carries 11 sibling `.worktrees/*` checkouts, so any `grep -r` over the repo inflates by ~12x and reports phantom duplicates at identical line numbers — always `--exclude-dir=.worktrees`; (c) worker container has no `git` binary, so branch/file-set comparisons must be done by the agent, not the worker.
+
+## 2026-11-03 — ### 2026-10-25 — LIVE TOOLING PROBLEM: worker instance hung ...
+
+### 2026-10-25 — LIVE TOOLING PROBLEM: worker instance hung mid-task with a frozen heartbeat; transcript lost on kill
+
+**What happened:** dispatched a worker on a 2-file fix. It completed the edits (visible in `git status`) then stopped heartbeating. Observed sequence: dispatch returned `did not respond within 300.0s (last heartbeat 204s ago)`, instance `status: busy`, and `last_heartbeat` frozen at a single timestamp across two `check` calls ~7s apart (206s → 213s age, same timestamp). A follow-up `action="query"` asking for a short status report also timed out (`last heartbeat 517s ago`) and the instance was killed: *"stopped cooperatively (its containers were reclaimed)"*. `current_task` still showed the **first** sentence of the original query, and `conversation_length` was 48 — i.e. the worker had done substantial work, so the frozen `current_task` field is not a reliable progress indicator.
+
+**Impact:** ~10 minutes of wall clock, one lost transcript, and no way to retrieve the worker's own verification (its RED/GREEN evidence). Work was saved only because the edits were already on disk and I re-derived the verification with a fresh instance (`force=True`).
+
+**Workarounds that worked:**
+1. **Trust the filesystem, not the worker.** `git_read status` / `git_read diff` immediately showed `M web_ui/backend/bridge.py` + `?? tests/test_event_bus_subscription_leak.py`, which let me review the production change *while the worker was hung* — the review happened during dead time, for free.
+2. **Re-spawn with `force=True` and a `purpose="reviewing"` brief** that says "a previous instance made the changes and hung; verify from the filesystem". Fast (71s) and it does not need the dead instance's context.
+3. **Ask for print-as-you-go output.** The second instance printed each check's result as it went; the first one batched everything into a final `Respond`, so the hang cost 100% of its evidence.
+
+**Symptoms to watch for:** dispatch timeout at exactly 300s while `status` stays `busy` and `alive: true`; `last_heartbeat` not advancing between two `check` calls; `stale: false` even though the heartbeat is minutes old (the `stale` flag did **not** flip, so it cannot be used to detect this).
+
+## 2026-11-03 — ## TICKET (open) — macOS symlinked-path bug: `realpath` vs `...
+
+## 2026-11-03 — ## TICKET (open) — `SessionConfig.from_agent_config` does no...
+
+## 2026-11-04 — ## TICKET (record only — do NOT fix now): "Git Tooling Frict...
+
+## 2026-11-04 — ### load_session "workspace ... could not be resolved" on ma...
+
+### load_session "workspace ... could not be resolved" on macOS (symlinked roots) — FIXED on `fix/macos-ci-test-hardening` @ `4bb33ddc`
+**Symptom (macOS CI only):** `⚠ load_session: workspace for /var/folders/... could not be resolved; project path unchanged.` → `session_loaded` never emitted → `tests/integration/test_session_loaded_contract.py::test_apply_config_{same,different}_workspace_path_*` both fail.
+**Root cause — two mixed path normalisations at comparison sites:**
+1. `web_ui/backend/bridge.py::_resolve_workspace_id` (~:259) realpath-normalises the request (`_normalise_workspace_root`) and `_build_workspace_id_cache` (~:206-227) realpath-normalises registered roots, but the registry fallback delegates to `WorkspaceRegistry.resolve_by_root`, which compares with `_normalize_path` = **os.path.abspath only** (no symlink collapse, `workspace_registry.py` ~:98-108, ~:440-456). With an empty/stale `_workspace_id_cache` the fallback compared a realpath'd request against an unresolved stored root → never matched.
+2. `web_ui/backend/server.py` apply_config baseline (~:1627) used `os.path.normpath(session_ws or _project_path)` while the candidate `new_workspace_path` is realpath'd via `_confine_workspace_path` → `_confine_to_home`. normpath vs realpath ⇒ an UNCHANGED workspace in a symlinked root looked like a *switch*.
+**Fix:** after `resolve_by_root` returns None, re-scan `registry.list_workspaces()` comparing `_normalise_workspace_root(candidate.root_path) == normalised` (same normalisation the cache uses); canonicalise the server baseline with `os.path.realpath(os.path.abspath(...))` so both sides use one definition of "same root".
+**Regression harness (works on Linux!):** macOS `/var → /private/var` is reproducible on Linux by pointing TMPDIR at a symlinked dir. The symlink MUST be created in the same script as the pytest run (DockerCodeRunner containers do not share /tmp):
+`rm -rf /tmp/realtmp /tmp/lnktmp; mkdir -p /tmp/realtmp; ln -sfn /tmp/realtmp /tmp/lnktmp; TMPDIR=/tmp/lnktmp python3 -m pytest tests/integration/test_session_loaded_contract.py -q` → was 2 failed/3 passed, now 5 passed.
+**Class of bug to watch for:** the codebase mixes `normpath`/`abspath` (registry) with `realpath` (bridge `_normalise_workspace_root`, `_confine_to_home`). Any future "these paths look different" bug is one of these mismatches.
+**NOT fixed (not reproducible on Linux):** `tests/test_worker_heartbeat.py::test_heartbeat_payload_shape` (`'w2' != 'w-hb3'`, passes alone and per-file; cross-file registry/EventBus pollution needs full-suite ordering) and `tests/test_workspace_lifecycle_manager.py::test_soft_timeout_warning_emitted_once` (20/20 pass on Linux; suspected macOS wall-clock race). Needs the macOS runner to discriminate.
+
+## 2026-11-04 — ### 2026-11-04 — `_RecordingForwarder` `_callbacks` CI red: ...
+
+### 2026-11-04 — `_RecordingForwarder` `_callbacks` CI red: NOT a 3.13 quirk, NOT a production leak. Fixture teardown + a pre-guard log line. FIXED (`ada1a469`, branch `fix/py313-event-bus-leak`).
+Human (Gen 58) dispatched a fix based on a plausible-but-wrong chain: "test double injected into the GLOBAL event bus / missing `_callbacks` that 3.13 strictly expects". Prior-art KB said the same shape (production leak via `EventBus.subscribe()` returning None). **Both were stale.** Verified at HEAD:
+- The production leak was ALREADY closed: `bridge._subscribe_global` (`web_ui/backend/bridge.py`, ~462-477) returns `(event_type, callback)` and teardown unpacks it and calls the two-arg `global_event_bus.unsubscribe`. `EventBus.subscribe` still returns None on the registration path, but **no production caller consumes its return value** — verified by grepping all 9 call sites.
+- Real cause: `tests/test_bridge_stop_semantics.py`'s `bridge` fixture was a bare `return` with **no teardown**, while `WebAgentBridge.__init__` subscribes to the PROCESS-GLOBAL bus. Two tests swap `_forwarder` for `_RecordingForwarder` (no `_callbacks`), so the bridge stays subscribed for the rest of the pytest session and every later `WORKER_*` publish runs a leaked handler that raises. Deterministic reproduction: run `tests/test_bridge_stop_semantics.py` + `tests/test_worker_lifecycle_routes.py` + `tests/test_per_worker_eventbus_bridge.py` in ONE process → **14** logged errors; after fix **0**.
+- Why it is invisible locally: `agent.events.publish` wraps each callback in try/except and `log()`s — the text never reaches pytest stdout/stderr. Counts had to be taken by patching `agent.events.log` with a throwaway plugin. **A `grep` of pytest output will always show 0.** If you need to reproduce, patch the log sink, don't grep.
+- Second, genuinely-worth-fixing defect: `_on_worker_spawned`'s TOKEN_PIPELINE debug line read `self._forwarder._callbacks` **before** the session-mismatch guard (and `_security_prompt_handler` gated on it). Now `hasattr`/`getattr`-defensive. An event handler must not die building a log line.
+- Explicitly rejected the dispatched fix "add `_callbacks = {}` to the double": it would have hidden the leaked-bridge defect and left the pre-guard dereference in production.
+
+### 2026-11-04 — container cannot run Python 3.13, and the repo `.venv` is internally inconsistent
+- `/usr/bin/python3.13` = 3.13.5 exists but has no pytest and no site-packages; no network, so it cannot be provisioned.
+- `python3` = 3.12.15 with pytest 9.2.0 → all real test runs happen here.
+- Repo `.venv` is broken for anyone assuming it works: `pyvenv.cfg` says 3.12.3, `.venv/bin/python3` → `/usr/bin/python3` → **3.13.5**, while packages live in `.venv/lib/python3.12/site-packages` (cp312 `.so`s) ⇒ `.venv/bin/python -m pytest` → `No module named pytest`; `PYTHONPATH`-ing 3.13 at the 3.12 site-packages → `ImportError: cannot import name 'ArgsKwargs' from 'pydantic_core._pydantic_core'`. Use `python3 -m pytest`, never `.venv/bin/python`.
+- Consequence: any "verify on 3.13" instruction in a dispatch is **unexecutable here** and must be done on the host. Say so instead of faking it.
+
+
+## 2026-11-04 — ## Rebase-conflict resolution + three live tooling failures ...
+
+## 2026-11-05 — ## 2026-11-05 — Tooling lies by omission (found live while r...
+
+## 2026-11-05 — Tooling lies by omission (found live while running W11 recon)
+
+1. `git_read status` returns an EMPTY body when the tree is dirty and even when files were just written. A worker reported "git status is clean" as evidence and was wrong — the KB files it had just created/modified are untracked in HEAD (proved independently with `ls_tree`). **Never accept a "clean tree" claim from `git_read status`; prove file presence with `ls_tree`/`diff --file_path=[...]`.**
+2. `ls_tree` with a plain directory path (e.g. `docs`) returns only the tree OID, not the entries. It silently looks like success. Must pass `recursive=True` to get a listing.
+3. `Worker(action="spawn")` docs say the default worker is used without a name; the tool actually errors `worker_name is required for action 'spawn'`. Must name `default` / `default2` explicitly.
+4. Worker spawn envelopes are inconsistent: one worker returned a proper top-level envelope (`content`/`status`/`telemetry`), another returned `spawned:false, status:"ready"` with the whole answer as a JSON **string** nested under `response`. Parsers must handle both.
+5. `git_read diff` still returns an empty body when `file_path` is a plain string — must be a list.
+
+
+## 2026-11-05 — ## 2026-11-05 — BLOCKER: worker session lost its permission ...
+
+## 2026-11-05 — BLOCKER: worker session lost its permission sidecar mid-session; every grain failed closed at once
+
+**Symptom.** A worker (`default2`) that had been successfully reading files earlier in the same thread suddenly could not use *any* tool. Verbatim error, identical across five different tools:
+
+`Permission denied: Tool requires filesystem:read, but session allows filesystem:banned (fail-closed: PermissionStoreError: no permission source for session '745bd7d3-...' in workspace 'gentle-wolf-72': no sidecar at /home/jojo/.thoughtmachine/workspaces/gentle-wolf-72/sessions/745bd7d3-.../permissions.json)`
+
+Denied simultaneously: `ReadFile` (`filesystem:read`), `FileSearchTool` (`filesystem:read`), `DockerCodeRunner` (`filesystem:write`), `host_bash` (`host_bash:allow`), `git_read` (`git:read`) — i.e. **all grains** flipped to `banned` with no intervening policy change.
+
+**Diagnosis.** The cause is named in the error itself and is worth separating from a deliberately narrowed envelope: **a missing permission sidecar bans every grain at once.** The sidecar file `sessions/<session_id>/permissions.json` disappeared (or was never written and was previously satisfied from elsewhere). The worker's own observation was correct and useful: "the same DockerCodeRunner worked earlier in this thread, so this is not a policy for the task."
+
+**Cost.** The task was a 3-step, few-minute job (find a `.gitignore` rule, copy one file with a sha256 proof, delete one line). It could not be half-done: copying, hash comparison and the delete decision all depend on reading `.gitignore`, so the worker produced **zero** artefacts. Time lost ~18s plus a full dispatch cycle; more importantly the worker had to burn 76 tool calls retrying five different tools to establish that *everything* was denied.
+
+**What would have helped (ranked):**
+1. **A sidecar-free read path.** One tool that can read a file or list a tree without consulting the permission store (or that degrades to read-only) would have let the worker deliver the decision-critical half — "is the rule a specific path or a broad glob?" — instead of nothing. Fail-closed is right for writes; it is very expensive for reads.
+2. **A distinct error shape for "no permission source" vs "permission denied by policy."** Both currently surface as `Permission denied: Tool requires X, but session allows X:banned`. The first is a system fault to escalate; the second is a legitimate refusal. Conflating them invites the agent to treat a broken machine as a denied request and give up politely.
+3. **Fail-fast detection at spawn.** If the sidecar is missing when a worker spawns, say so once, up front, instead of letting the worker discover it across five tools.
+
+**Workaround used:** none available to the worker. Recovery requires either the sidecar being restored or a fresh session; the agent cannot repair a permission store (correctly — it is not a writer of its own grants).
+
+**Status:** open. Not a code fix I can make from inside a worker.
+
+## 2026-11-05 — ## 2026-11-05 — Worker spawn is not a fresh spawn; session i...
+
+## 2026-11-05 — Worker spawn is not a fresh spawn; session id is the agent's, not the worker's
+
+Three probes today, all with the purpose of establishing whether a new worker gets a working permission source. Findings, each independently observed:
+
+1. **Every worker inherits the *parent agent's* session id.** A worker name never used in this workspace (`default2`) came up carrying session `745bd7d3-b643-4be4-b323-1de76e39a660` — the same id as the agent's session and the same id in every permission refusal. **Consequence: a worker can never have permissions independent of the agent session, so "respawn the worker to fix a permission problem" does not work by construction.** When the agent's session has no permission sidecar, *every* worker it can spawn is dead on arrival, and respawn count is irrelevant.
+2. **`Worker(spawn)` with `force=True` reported `spawned: true` but did not produce a fresh instance.** The returned `instance_id` was `1` again, the `tool_call_count` accumulated (35 → 79 across separate spawns), and the worker itself reported: *"my context was NOT empty — I began with a system-provided summary of this same session plus earlier successful tool output... so I am a continuation of this session, not a fresh instance."* So `spawned: true` is not evidence that anything was spawned. **Do not read `spawned` as a success signal; read the worker's own account of its starting context.**
+3. **Context leaks across worker names within one session.** `default2` arrived pre-loaded with a summary of work done via `default`. Each instance therefore believes it has history it did not have. This is the mechanism behind the operator's observation that workers "refer to old sessions that don't exist anymore" — the worker is not confused about a session; it is being handed a summary of the *agent's* session and reasonably treats it as its own memory.
+
+**Why this matters beyond today's outage:** it makes the failure mode undiagnosable from inside. A worker that thinks it is a continuation will report continuity as fact, and an agent that trusts `spawned: true` will conclude the environment was reset when nothing was.
+
+**Also recorded:** with `filesystem:banned`, `DockerCodeRunner` is refused for a bare `echo probe-ok` (requires `filesystem:write`). There is no exec workaround for a filesystem permission failure.
+
+**What would help:** (a) workers should get their own session id, or at minimum report *which* session id they inherited at spawn; (b) `spawned: true` should mean a new instance exists — if an existing thread is reused, say `reused: true`; (c) a fresh worker should not receive the parent's conversation summary unless explicitly requested.
+
+**Workaround found (agent side):** `git_read blame` with `line_start`/`line_end` reads repository source with **no filesystem permission at all** — it reads git objects on the host. `git_read cat_file` with `object="HEAD:<path>"` does the same for a whole file. `git_read show_file` requires `path` (not `file_path`) and **ignores line ranges entirely**, so it is useless for targeted reads of large files. This made a full security audit possible while every worker was dead — worth making a documented read path rather than an accident.
+
+## 2026-11-05 — BUG (open, 2026-11-05): Worker sub-agents cannot write files...
+
+BUG (open, 2026-11-05): Worker sub-agents cannot write files — fail-closed to filesystem:banned due to stale workspace binding.
+
+Symptom: any worker (tested `default` and `default2`) is denied BOTH filesystem:write and filesystem:read:
+  "Permission denied: Tool requires filesystem:write, but session allows filesystem:banned
+   (fail-closed: PermissionStoreError: no permission source for session '<sid>' in workspace 'gentle-wolf-72':
+    no sidecar at .../workspaces/gentle-wolf-72/sessions/<sid>/permissions.json)"
+
+Key findings:
+- Parent session resolves fine: workspace_id=fierce-owl-43, filesystem=write, permission_origin=executor-disk (source=gate).
+- Worker sessions share the PARENT session id (79cf146f-e6b0-4da5-9c73-d7167a81e4df) per running_workers, yet the permission store looks them up under a DIFFERENT workspace: `gentle-wolf-72`.
+- vault_status (scoped to fierce-owl-43) shows NO `workspaces/gentle-wolf-72/` directory at all -> the sidecar path can never exist. Session meta `sessions/_meta_79cf146f-....json` DOES exist under fierce-owl-43, so the session is registered to the right workspace; only the worker permission lookup disagrees.
+- Reproduced across 3 successive parent sessions (745bd7d3, 9348fac6, 79cf146f) -> systemic, not a stale file.
+- Related smell: `workspaces/745bd7d3-b643-4be4-b323-1de76e39a660/config.json` exists as a WORKSPACE, but 745bd7d3 is one of those session UUIDs -> session-id/workspace-id confusion in provisioning.
+
+Impact: workers are useless for any file task; they cannot read, write, or (consequently) fix this themselves. Only the operator can repair it (Vault Health / re-bind session->workspace, or fix worker permission resolution to use the parent's effective workspace instead of a registry-cached one).
+
+Note: both `default` and `default2` LACK the CheckSystem tool, so structured permission introspection from inside a worker is impossible — error strings are the only signal available there.
+
+## 2026-11-05 — ## Post-fix retest: worker filesystem STILL denied (operator...
+
+## 2026-11-05 — UPDATE (2026-11-05, post-fix): Worker filesystem write STILL...
+
+UPDATE (2026-11-05, post-fix): Worker filesystem write STILL broken after merging PR #291 `fix/worker-workspace-crosswiring` (HEAD 965f5a31, runtime_commit 965f5a3, dirty=false).
+
+Test result: identical failure, identical error string, still names stale workspace `gentle-wolf-72` and session 79cf146f. Tried three times this round: plain spawn, plain spawn (2nd worker), and spawn with force=True. No change.
+
+The fix itself is correct and present in HEAD:
+- tools/workspace/worker_thread.py: new `_resolve_worker_workspace_id()` (injected `workspace_path` beats SessionRegistry), `_workspace_id_from_parent_path()`, `_workspace_id_from_registry()`, `_same_workspace_root()`, and `_build_agent_config` now passes the parent path. tools/workspace/worker.py was NOT touched (facade only).
+- tests/test_worker_workspace_resolution.py hardcodes PARENT_WORKSPACE_ID="fierce-owl-43", STALE_WORKSPACE_ID="gentle-wolf-72" — i.e. this exact field failure.
+
+Why it still fails (ranked hypotheses):
+1. LEADING: worker instance state is PERSISTED. The `default` worker survived the process restart (conversation_length 101 -> 111 -> "ninth identical result") and survived force=True. Its AgentConfig — including the stale workspace binding — was built pre-fix and is rehydrated, so the new resolution code never runs for it.
+2. `_resolve_worker_workspace_id` ends with `return path_id or registry_id`. If the executor does not inject `workspace_path` into the Worker tool call (or `resolve_workspace_id(parent_path)` returns None), path_id is None and the STALE registry id silently wins — the fix is inert and no cross-wiring WARNING is logged (warning only fires when both ids exist and differ). This is the fallback codified by test_unresolvable_path_falls_back_to_registry.
+3. INDEPENDENT second blocker: no session permissions sidecar exists at all. vault_status shows `workspaces/fierce-owl-43/sessions/` containing `Agent Session *.json` and `_meta_*.json` but NO `permissions.json`. Parent is gated with permission_origin=`executor-disk` (workspace config), while the worker goes through `read_session_permissions` and fail-closes with PermissionStoreError. So even with the correct workspace id the error would just rename gentle-wolf-72 -> fierce-owl-43.
+
+Next diagnostics (fast):
+- grep app log for "Worker tool workspace cross-wiring": absent => hypothesis 2 (path_id is None), present => hypothesis 1 (stale rehydrated config).
+- Confirm ToolExecutor injects tool_args['workspace_path'] for the Worker tool (agent/core/tool_executor.py).
+- Purge persisted worker state (or open a genuinely NEW session) so the worker's AgentConfig is rebuilt from scratch; the current session's registry record is permanently poisoned toward gentle-wolf-72.
+- Whoever writes session permissions must actually create the sidecar; nothing in the parent path does today.
+
+## 2026-11-05 — LIVE REPRO (2026-11-05, workspace fierce-owl-43) — worker fi...
+
+LIVE REPRO (2026-11-05, workspace fierce-owl-43) — worker file I/O is fully dead despite PR #291 (`fix/worker-workspace-crosswiring`, rev 965f5a31, branch dev, clean tree).
+
+Evidence: both `default` and `default2` workers, on every filesystem/git/container tool call, return:
+"Permission denied: Tool requires filesystem:write, but session allows filesystem:banned (fail-closed: PermissionStoreError: no permission source for session '3aa316d7-23e6-40f9-93bf-3991248d4154' in workspace 'gentle-wolf-72': no sidecar at /home/jojo/.thoughtmachine/workspaces/gentle-wolf-72/sessions/3aa316d7-..../permissions.json)"
+Parent session: filesystem=write, permission_origin=executor-disk, workspace fierce-owl-43. `git status` clean → worker never wrote anything anywhere in this repo.
+
+Root-cause hypothesis (high confidence): the fix's path-first precedence depends on the Worker tool's injected `self.workspace_path`, which comes from `AgentConfig.workspace_path`. My runtime config (`CheckSystem my_config.raw_config`) has NO workspace_path key. So `_workspace_id_from_parent_path()` returns None and `_build_agent_config()` falls back to the stale registry root → child gates against `gentle-wolf-72` → fail-closed banned. Unit tests pass because tests construct `Worker(workspace_path=PARENT_WORKSPACE_PATH)` explicitly.
+
+Vault corroboration of the cross-wiring hazard: `workspaces/745bd7d3-b643-4be4-b323-1de76e39a660/` exists as a workspace whose NAME is a session UUID, while the same session 745bd7d3 also appears under `workspaces/fierce-owl-43/sessions/`. Duplicate session records across workspace dirs = exactly the "first found wins" hazard the fix's block comment describes.
+
+Blocked: with every category banned in the worker, no worker can implement a fix in this workspace. Fix must be landed/verified outside the worker economy (host edit) or by making the gate inherit the parent's resolved workspace id + effective permissions.
+
