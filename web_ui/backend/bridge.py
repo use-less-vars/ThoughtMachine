@@ -3790,6 +3790,26 @@ class WebAgentBridge:
                 "turn": raw_event.get("turn"),
             })
 
+        elif event_type == "stream_paused":
+            # A mid-stream PAUSE, which is NOT a halt: the agent kept the text it
+            # had already produced as a ``paused_draft`` row (agent.py
+            # ``_finalize_paused_stream``) and the version sync above has
+            # already shipped it in a conversation_changed. This event only
+            # tells the frontend to fold the in-flight bubble away and render
+            # that row as a provisional draft. Deliberately NO stop_reason: a
+            # pause is resumable, so no terminal stop vocabulary (and no
+            # ``interrupted`` event type) belongs here. Nothing extra is needed
+            # to clear the busy pill: when the turn ends the controller settles
+            # the run axis through ``set_execution_state`` (emitting
+            # ``execution_state_change``, mapped to ``state_changed`` at :3675)
+            # and then emits ``session_stop`` (mapped to an IDLE
+            # ``state_changed`` at :3840).
+            self._forwarder.broadcast(self._session_id, "stream_paused", {
+                "session_id": self._session_id,
+                "text": raw_event.get("content", "") or "",
+                "turn": raw_event.get("turn"),
+            })
+
         elif event_type in ("user_query", "turn", "tool_result"):
             # Session has been updated by the agent; sync to frontend.
             if self._session is not None:

@@ -1184,6 +1184,44 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
       }
 
+      case 'stream_paused': {
+        // Mid-stream PAUSE — resumable, so NOT the halt vocabulary: the agent
+        // kept the text it had already produced as a `paused_draft` row (with a
+        // trailing marker line) instead of committing an assistant message.
+        // `conversation_changed` is a server-authoritative REPLACE of the whole
+        // history (see the case below) and the backend syncs the conversation
+        // version BEFORE dispatching this event, so the draft normally lands
+        // there first, marker and all. Appending a local copy only when the tail
+        // is not already that draft therefore keeps the partial visible EXACTLY
+        // ONCE in either arrival order: a later replace overwrites the local copy
+        // instead of joining it, and the prefix test tolerates the trailing
+        // marker line the persisted row carries and the local copy does not.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] stream_paused for different session, ignoring:', msg.session_id)
+          break
+        }
+        const pausedKey = msg.session_id || currentSessionIdRef.current
+        const pausedPartial = typeof msg.text === 'string' ? msg.text : ''
+        if (pausedPartial && pausedKey) {
+          const existing = useStore.getState().sessionMessages[pausedKey] || []
+          const tail = existing[existing.length - 1]
+          const alreadyDrafted = !!(tail && tail.role === 'paused_draft'
+            && typeof tail.content === 'string' && tail.content.startsWith(pausedPartial))
+          if (!alreadyDrafted) {
+            useStore.getState().receiveConversationChanged(
+              pausedKey,
+              [{ role: 'paused_draft', content: pausedPartial }],
+              { mode: 'append' }
+            )
+          }
+        }
+        // Always clear, even when the pause produced no text: this turn is over
+        // (a resume starts a NEW turn), so the in-flight bubble must not survive
+        // it — no stuck spinner, no bubble joined to the draft row.
+        clearInFlight()
+        break
+      }
+
       case 'session_stop':
         // Defensive: the bridge normally folds session_stop into state_changed
         // + conversation_changed and never forwards the raw type, but handle it
