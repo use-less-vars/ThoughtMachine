@@ -173,3 +173,34 @@ def test_job_status_enumeration_is_not_narrowed_to_the_callers_instance(monkeypa
     by_id = _tool(instance_id=OTHER_IID, worker_query="job-1")._action_job_status([])
     assert by_id.get("error") is None, by_id
     assert by_id["status"] == "submitted", by_id
+
+
+def test_sync_dispatch_records_interrupted_reply_as_interrupted(monkeypatch):
+    """A reply that says "interrupted" must CLOSE the record as interrupted.
+
+    ``send_query`` answers with ``{"status": "interrupted", "interrupted":
+    true, ...}`` when its WAIT was cut short (``WorkerThread._interrupted_reply``)
+    -- only the wait ended, the worker may still be running the query. The
+    synchronous dispatch treats every reply as ``"completed"``
+    (``_close_sync_dispatch_job(..., "completed", result)``), so the record
+    claims a finished query and carries no "work may still be running" flag.
+    """
+    registry = WorkerJobRegistry(event_bus=_NullBus())
+    thread = _StubBody()
+    interrupted_reply = (
+        '{"status": "interrupted", "interrupted": true, '
+        '"reason": "turn_cancelled", "query_id": "q-partial", '
+        '"partial_response": "3 of 7 steps done"}'
+    )
+    _patch(
+        monkeypatch, registry, thread,
+        lambda worker, query, *, timeout: interrupted_reply,
+    )
+
+    result = _tool()._action_query([])
+
+    record = registry.job(result["job_id"])
+    assert record is not None, "the interrupted query left no job record"
+    assert record["status"] == "interrupted", record
+    assert record.get("work_may_still_be_running") is True, record
+    assert record["result"]["response"] == interrupted_reply, record["result"]
