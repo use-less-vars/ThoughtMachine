@@ -4745,6 +4745,8 @@ class WorkerThread(threading.Thread):
                 # Log heartbeat for liveliness checks and flush to disk
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
                 self._write_status_file()
+                # Tick too, or a busy turn emits no Heartbeat frame and no WORKER_HEARTBEAT.
+                self._heartbeat_tick()
 
                 # Check stop signal
                 if self._stop_event.is_set():
@@ -6581,7 +6583,8 @@ class WorkerThread(threading.Thread):
 
         Updates ``last_heartbeat`` in memory (status.json writes remain the
         responsibility of the existing status-file machinery). Called from the
-        idle loop, the pause loop, and the busy query path.
+        idle loop, both park loops (paused and detached), and the busy
+        per-agent-event site in ``_run_tool_loop``.
         """
         now = time.monotonic()
         if now - self._last_heartbeat_monotonic < HEARTBEAT_INTERVAL_S:
