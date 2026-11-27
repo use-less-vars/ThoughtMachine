@@ -13,6 +13,7 @@ Run:  python3 -m pytest tests/test_worker_heartbeat.py -q
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -218,6 +219,77 @@ class TestIdleHeartbeat(_RunSafetyPatches):
             # Event metadata carries source/session.
             self.assertEqual(evt.metadata.source, "worker:w-hb3")
             self.assertEqual(evt.metadata.session_id, "s1")
+
+
+class _FakeAgent:
+    """Minimal agent stand-in for the busy path: yields events, holds state."""
+
+    def __init__(self, events):
+        self._events = events
+        self.state = None
+
+    def process_query(self, query):
+        for event in self._events:
+            yield event
+
+
+class TestBusyPathHeartbeat(_RunSafetyPatches):
+    """A query in flight must tick too: the busy path is not a silent worker."""
+
+    def test_busy_turn_emits_heartbeat_while_agent_yields(self):
+        """_run_tool_loop's per-event site must emit heartbeat evidence.
+
+        Drives the REAL ``_run_tool_loop``; only the peripherals it touches on
+        the way (journal, status file, command poll, budgets, presenter) are
+        stubbed.  ``_heartbeat_tick`` is NOT stubbed -- the property under test
+        is that the busy path reaches it at all.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-hb-busy")
+            # Non-None skips the presenter lazy-init; context_length=0 keeps the
+            # post-loop token capture off a real bridge.
+            thread._state_bridge = mock.Mock(context_length=0)
+            thread._worker_bus_adapter = None
+            thread._event_processor = None
+            thread._journal_adopted = object()  # no predecessor to adopt
+            thread._poll_command = lambda: None
+            thread._budget_check = lambda: None
+            thread._write_status_file = lambda: None
+            thread._journal_write = lambda *a, **k: None
+            thread._journal_clear = lambda *a, **k: None
+            thread._publish_event = lambda *a, **k: None
+            thread._agent = _FakeAgent([
+                {"type": "agent_message", "content": "one"},
+                {"type": "agent_message", "content": "two"},
+                {"type": "agent_message", "content": "three"},
+            ])
+            # The interval gate must be OPEN for the first per-event tick and
+            # CLOSED for the next two: _last_heartbeat_monotonic is 0.0 and the
+            # frozen clock sits at 31.0, so 31.0 - 0.0 >= 30 fires once and
+            # 31.0 - 31.0 < 30 throttles the rest.  No sleep.
+            thread._last_heartbeat_monotonic = 0.0
+            clock = FakeMonotonic(31.0)
+            # Freeze wall-clock too: the per-event site re-stamps
+            # ``last_heartbeat`` on every event, so only a frozen value can tell
+            # the tick's timestamp apart from the later status writes.
+            fixed = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+            with mock.patch("tools.workspace.worker.time.monotonic", clock), \
+                    mock.patch(
+                        "tools.workspace.worker_thread.datetime",
+                        mock.Mock(now=lambda tz=None: fixed),
+                    ):
+                thread._run_tool_loop("do the thing")
+
+            hb_events = [
+                e for e in self.heartbeat_events()
+                if e.data.get("worker_name") == "w-hb-busy"
+            ]
+            # RED before the fix: three yielded events, zero heartbeat evidence
+            # -- the whole busy turn was silent.
+            self.assertEqual(len(hb_events), 1)
+            self.assertEqual(
+                hb_events[0].data["last_heartbeat"], thread.last_heartbeat
+            )
 
 
 class TestPausedHeartbeat(_RunSafetyPatches):
