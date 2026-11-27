@@ -650,3 +650,33 @@ Also: `exec_run` returns **no handle** (`container_manager.py:2595-2597` documen
 2. **A shell block must contain shell, never my tool names.** I wrote `show_file path=docs/ONBOARDING.md source=committed ref=origin/dev` under a heading that said "in your shell"; the operator ran it, got `show_file: command not found`, and then tried `sudo apt install show_file`. A verification step handed to the operator must be a command their shell can run — `git cat-file -e origin/dev:docs/ONBOARDING.md && echo present`, `git merge-base --is-ancestor <sha> origin/dev`, `git log -1 --format='%H %s' origin/dev` — or it must be labelled explicitly as *my* measurement, done by me, reported as a result.
 
 Both are the same class as D1–D5: the expensive mistakes are the ones that spend the operator's time. The test before writing any block: *could this line be pasted into their shell and work?*
+
+## 2026-11-27 — Standing rules learned the hard way (grep targets, stale copies, push contracts)
+
+**Never grep a stale copy.** `tools/workspace/worker_thread.py.bak.1793932636` sat in the tree (355,830 bytes,
+Nov 6) with entirely different line numbers from the live file (512,304 bytes, 10,386 lines) and would have
+poisoned every citation. Deleted 2026-11-27. Rule: before citing `file:line` in a large module, confirm the file
+you opened is the one at HEAD (`git show HEAD:<path>` exists) — a `.bak`/`.orig`/`~` sibling is a trap, and a
+"verified" line number from the wrong copy is worse than no line number.
+
+**`fix/envelope-status` is not a vocabulary fix.** It is a 169-file branch spanning containers, CI and providers —
+an old generation's work. Check `git diff --name-only dev <branch>` before assuming a branch name means what it
+says.
+
+**A one-producer, zero-consumer string is a latent trap, not a safe edit.** `"Worker stopped before tool
+execution"` (`agent/core/tool_executor.py:328`) has 1 producer and 0 consumers — but ~21 sites branch on
+`"stopped"` as a status value. Measure the consumer set before changing a status vocabulary; the missing part is
+usually the *test* that should pin the new text.
+
+**`should_stop()` returning the truthy string `'PAUSED'` is load-bearing.** `agent/controller/__init__.py:826-838`
+is the pause park gate and the ONLY site in the repo that distinguishes pause from stop. Changing that return to
+False-on-pause makes the controller fall through to `query_queue.get` and dispatch a query while paused. Fix the
+*misreaders* (`tool_executor.py:325` truthiness; `agent.py:1712` upgrading a pause into a terminal `'stopped'`
+event consumed by `bridge.py:166` and `adaptWorkerEvent.js:389`), not the supplier.
+
+**Documentation has two gates, not one.** `.github/workflows/contract-gate.yml` runs pytest over a hand-enumerated
+file list AND `scripts/verify_doc_citations.py --doc docs/CONTRACTS.md`, which resolves `file.py::symbol` against
+the AST and fails on a miss. Prefer `::symbol` over line numbers in `docs/CONTRACTS.md`; the parity test
+(`tests/test_contracts_ledger_parity.py`) is only a backticked-`tests/**.py` regex plus a substring check against
+the workflow text. Adding a contract therefore costs three things: the row, the gate line, and the ledger's own
+counts ("twenty-two files ... cites twelve of them").

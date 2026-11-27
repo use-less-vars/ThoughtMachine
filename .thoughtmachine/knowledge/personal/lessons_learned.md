@@ -1286,3 +1286,15 @@ Repo facts worth keeping (root: read this session):
 - `git_read`'s `show_file` takes `path=`, not `file_path=` (three wasted calls).
 - The Docker image has no `git` binary; container `python3 -m pytest` works, host `git` comparison must go
   through `git_read`.
+
+## 2026-11-27 — CORRECTION to "the worker wall is 120 s" (same day, later measurement)
+
+Earlier today I recorded the worker wall as a hard 120 s (`cut_by: agent_turn_restriction`). That is too strong.
+Measured since: dispatches ran **112 s** and **157 s** to completion, and one `submit_query` job ran **96 s** with
+its ledger timestamp frozen throughout. The restriction is applied **at the next barrier**, not at a wall — a
+dispatch already in flight is allowed to finish, and the *next* tool call is what gets refused.
+
+That is the same shape as pause: everything in this machine is enforced at barriers, so every control is observed
+late by construction. Practical consequence for briefs: a slice that will take longer than ~120 s is still a lost
+slice (the next call is refused), but "the worker died at 120 s" is never the correct diagnosis — check whether
+the dispatch returned normally and only the turn was cut.
