@@ -90,6 +90,7 @@ jobs:
             tests/test_onboarding_bundle_contract.py \
             tests/test_worker_dispatch_job_registry.py \
             tests/test_worker_spawn_failure_registry_cleanup.py \
+            tests/test_tool_executor.py \
             web_ui/backend/tests/test_auth_boundary.py
           status=$?
           end=$(date +%s)
@@ -120,14 +121,18 @@ jobs:
   # plainly, because a workflow that describes its own enforcement in flattering
   # terms is worse than no workflow at all:
   #
-  # 1. It mutates ONE declared guard at a time -- today exactly one,
+  # 1. It mutates ONE declared guard at a time -- today three:
   #    `contract-3-default-mode`, the one-token rewrite of
-  #    `DEFAULT_RUNTIME_MODE = MODE_PROCESS` in tools/workspace/worker_runtime.py
-  #    -- runs ONLY the tests that are supposed to notice that mutation,
+  #    `DEFAULT_RUNTIME_MODE = MODE_PROCESS` in tools/workspace/worker_runtime.py,
+  #    and Contract 8's `contract-8-pause-announced-as-stop` and
+  #    `contract-8-stop-softened-by-a-stale-pause-reason`, which put the
+  #    pause/stop branch in agent/core/tool_executor.py back to the shapes it
+  #    replaced -- runs ONLY the tests that are supposed to notice that mutation,
   #    restores the file, and verifies the restoration by sha256 before scoring
   #    anything. It is a spot check of claims made in docs/CONTRACTS.md, not a
   #    sweep of the tree, and the number of contracts it covers is the number of
-  #    entries in the registry -- nothing wider.
+  #    DISTINCT contracts those entries name -- two today, from three entries --
+  #    not the number of contracts in this ledger. Nothing wider.
   # 2. A verdict of SURVIVED is a finding about the CONTRACT, not an error in the
   #    gate. It means the "test that would fail if this were removed" the ledger
   #    claims does not fail: the guard can be deleted with every named test still

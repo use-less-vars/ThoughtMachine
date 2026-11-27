@@ -55,4 +55,29 @@ MUTATIONS: list[Mutation] = [
         tests=["tests/test_worker_is_a_real_process.py"],
         contract="Contract 3 -- the default runtime mode is the process substrate",
     ),
+    Mutation(
+        name="contract-8-pause-announced-as-stop",
+        path="agent/core/tool_executor.py",
+        old="if stop_signal == 'PAUSED':",
+        new="if stop_signal is True:",
+        tests=[
+            "tests/test_tool_executor.py::TestPauseIsNotAnnouncedAsAStop"
+            "::test_a_paused_signal_is_reported_as_paused",
+        ],
+        contract="Contract 8 -- a pause is not a stop",
+    ),
+    Mutation(
+        name="contract-8-stop-softened-by-a-stale-pause-reason",
+        path="agent/core/tool_executor.py",
+        old="if stop_signal == 'PAUSED':",
+        new=(
+            "if stop_signal == 'PAUSED'"
+            " or getattr(self.state, 'restriction_reason', None) == 'pause':"
+        ),
+        tests=[
+            "tests/test_tool_executor.py::TestPauseIsNotAnnouncedAsAStop"
+            "::test_a_real_stop_is_not_softened_by_a_stale_pause_reason",
+        ],
+        contract="Contract 8 -- a pause is not a stop",
+    ),
 ]
