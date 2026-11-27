@@ -1252,3 +1252,37 @@ The earlier framing — "two latches, the supervisor has no reader for its own" 
 Lesson: "no reader found" and "no such object exists" are different findings, and the second one retires a design question instead of answering it. The cheap discriminator is the enclosing-def/class resolution (`awk 'NR<=N && /^class |^def |^    def /{last=NR": "$0}'`), not more reading.
 
 **Same session, second lesson:** a control that cannot do its job refused correctly. `ContainerRemoveTool` is present in a worker's toolset and hard-refuses `lifecycle_class=persistent` ("Persistent containers can only be removed by the operator"). Three 5.7 GB zombies therefore stayed until the operator pressed Remove — the fence working, not a broken tool. It also exposed a live orphan: `wt-mut` still carried an 18-hour-old `pip list` pair (pids 159021/159034) — descendant-survival evidence obtained without running a kill test, and then destroyed with the container. Recorded here because the observation no longer exists anywhere else.
+
+## 2026-11-27 — Worker delegation: the wall is 120 s and the token gate is ~85k. Order the deliverable FIRST.
+
+Measured, twice, with roots:
+
+- `Worker(timeout_seconds=240)` does not buy 240 s. The dispatch was cut at **120.9 s** with
+  `effective_seconds: 120`, `clamped: null`, `cut_by: "agent_turn_restriction"` — the turn restriction
+  wins over the requested timeout, so any brief that needs more than ~110 s of real work must be split.
+  (The earlier 90 s spawn finished normally, `timeout_triggered: false` — under the wall is fine.)
+- A second cap: telemetry `token_usage` 86,255 with `restriction_reason: "token"` cut the worker down to
+  `Respond`/`WorkingDocument` mid-task. Warning 65k, critical 85k. A worker that has burned 60k+ on
+  discovery will be cut before it writes anything — re-spawn fresh rather than `query`-ing it for the
+  actual writes.
+
+The expensive mistake (mine, both times): I ordered *discovery or verification first, the deliverable
+last*. Both slices lost the deliverable — a contract row once, a 109-line PR body once — while the cheap
+reads landed. **Cheapest correct order: read the one file the format depends on -> write the artefact ->
+run the checks last.** A brief whose last step is "write the document" is a brief that returns a document;
+one whose last step is "write it" is a brief that returns an excuse.
+
+Related, same session: a length budget ("60-110 lines") is real only if something measures it — the worker
+hit 131 then 114 lines before landing 109, and reported `wc -c` / `wc -l` without being told twice.
+
+Repo facts worth keeping (root: read this session):
+- `.github/workflows/contract-gate.yml` hand-enumerates 21 test files (was 20). The gate ALSO runs
+  `python scripts/verify_doc_citations.py --doc docs/CONTRACTS.md` as a non-pytest step, so a ledger row can
+  be parity-green and still fail the gate. Cite code as `file.py::symbol` (AST-resolved); a symbol miss is a
+  hard failure, not a warning.
+- `tests/test_contracts_ledger_parity.py` = one regex for backticked `tests/**.py` paths + a raw substring
+  test against the workflow text. So a backticked citation IS the enforcement, and adding the path anywhere
+  in the workflow satisfies it.
+- `git_read`'s `show_file` takes `path=`, not `file_path=` (three wasted calls).
+- The Docker image has no `git` binary; container `python3 -m pytest` works, host `git` comparison must go
+  through `git_read`.
