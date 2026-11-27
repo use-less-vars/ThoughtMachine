@@ -45,6 +45,7 @@ const ROLE_STYLE = {
   tool_call:   { className: 'message-tool-call',       label: 'Tool Call' },
   tool_result: { className: 'message-tool-result',     label: 'Tool Result' },
   summary:     { className: 'message-summary',           label: '📝 Summary' },
+  paused_draft: { className: 'message-paused-draft',      label: '⏸ Paused draft' },
   final:       { className: 'message-final',            label: '🎯 Final' },
   question:    { className: 'message-question',          label: '❓ Question' },
   system:      { className: 'message-system-as-user',  label: 'System' },
@@ -491,6 +492,12 @@ function MessageContent({ msg, sessionId }) {
       return <TruncatableContent text={msg.content} />
     case 'system':
       return <SystemNoticeText content={msg.content} />
+    case 'paused_draft':
+      /* A resumable partial: the user watched this text stream in, but the
+         answer was never finished, so it must read as PROVISIONAL (the muted
+         italic treatment lives on .message-paused-draft in styles.css) and
+         never as a final assistant message. */
+      return <p className="message-text">{msg.content}</p>
     default:
       /* System notification messages with role 'user' render as system style */
       if (msg.is_system_notification) {

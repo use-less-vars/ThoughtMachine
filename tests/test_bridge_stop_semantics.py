@@ -215,6 +215,93 @@ def test_interrupted_event_with_empty_content_still_broadcasts(bridge):
     assert payload["session_id"] == bridge._session_id
 
 
+def test_stream_paused_event_crosses_the_bridge_hop(bridge):
+    """The mid-stream PAUSE must reach the socket — as ``stream_paused``.
+
+    The pause arm persists the partial text as a ``paused_draft`` row and emits
+    ``stream_paused`` (agent/core/agent.py:2478). ``_map_and_emit``'s type chain
+    has NO ``else``, so an unhandled type is silently DROPPED and the frontend
+    would never fold the in-flight bubble away (stuck spinner) or mark the draft.
+    The type must also survive unrewritten: ``interrupted`` is terminal stop
+    vocabulary and a pause is resumable.
+    """
+    forwarder = _RecordingForwarder()
+    bridge._forwarder = forwarder
+
+    bridge._map_and_emit({
+        "type": "stream_paused",
+        "content": "Partial",
+        "turn": 4,
+    })
+
+    paused = [b for b in forwarder.broadcasts if b[1] == "stream_paused"]
+    assert len(paused) == 1, (
+        f"expected exactly one 'stream_paused' broadcast, got {forwarder.broadcasts!r}"
+    )
+
+    _session_id_arg, _event_type, payload = paused[0]
+    assert payload["text"] == "Partial", "the draft partial must survive the hop"
+    assert payload["turn"] == 4
+    assert payload["session_id"] == bridge._session_id, (
+        "broadcast() ignores its session_id argument, so the payload must carry it"
+    )
+    # A pause is not a stop: no fabricated terminal vocabulary, no rename.
+    assert "stop_reason" not in payload, (
+        f"a resumable pause must not invent a stop_reason: {payload!r}"
+    )
+    assert [b for b in forwarder.broadcasts if b[1] == "interrupted"] == [], (
+        f"the pause must never be re-typed as the terminal 'interrupted': "
+        f"{forwarder.broadcasts!r}"
+    )
+
+
+def test_pause_turn_end_clears_the_busy_pill_via_the_agents_own_frames(bridge):
+    """1b: the pause arm adds NO idle ``state_changed`` — the agent already does.
+
+    ``_finalize_paused_stream`` RETURNS from ``process_query``, so the
+    controller's ``_run`` ``finally`` block runs unconditionally: it settles the
+    run axis through ``_set_execution_state``
+    (agent/controller/__init__.py:916 → state.py:509 emits
+    ``execution_state_change``) and then emits ``session_stop``
+    (agent/controller/__init__.py:923). Both cross the bridge as ``state_changed``
+    (bridge.py:3675 and :3840) with ``is_running`` false, and the store derives
+    ``isRunning`` from ``state === 'RUNNING'`` alone — so a paused turn PARKED on
+    PAUSED already clears the pill. Hence this half must NOT broadcast an idle
+    ``state_changed`` of its own (that would be a second, invented terminal).
+    """
+    forwarder = _RecordingForwarder()
+    bridge._forwarder = forwarder
+    # ``session_stop`` logs ``self._controller.is_running``; the fake controller
+    # only models the two stop levers, so give it the (idle) thread flag.
+    controller = _FakeController(busy=False)
+    controller.is_running = False
+    bridge._controller = controller
+
+    # The pause frame itself: no stop_reason, so the end-of-method tail (which
+    # only fires on a truthy stop_reason) emits nothing either.
+    bridge._map_and_emit({"type": "stream_paused", "content": "Partial", "turn": 4})
+    assert [b for b in forwarder.broadcasts if b[1] == "state_changed"] == [], (
+        f"the pause arm must not fabricate a state_changed: {forwarder.broadcasts!r}"
+    )
+
+    # The frames the controller emits right after it (unconditionally) do clear
+    # the pill. Feeding them here proves the delivery hop; the emission itself is
+    # controller.py:916/:923.
+    bridge._map_and_emit({
+        "type": "execution_state_change",
+        "old_state": "pausing",
+        "new_state": "paused",
+    })
+    bridge._map_and_emit({"type": "session_stop", "stop_reason": "completed"})
+
+    states = [b[2] for b in forwarder.broadcasts if b[1] == "state_changed"]
+    assert len(states) >= 2, f"expected the turn-end state frames, got {states!r}"
+    assert states[-1]["state"] == "IDLE", f"no settling IDLE frame: {states!r}"
+    assert all(s["is_running"] is False for s in states), (
+        f"a paused turn end must never look busy: {states!r}"
+    )
+
+
 def test_request_stop_without_request_halt_returns_false(bridge, monkeypatch):
     """(d) A controller predating request_halt() cannot halt a turn — say so."""
     events = _record_log(monkeypatch)

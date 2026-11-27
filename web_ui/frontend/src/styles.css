@@ -532,6 +532,21 @@ body {
   overflow-x: auto;
 }
 
+/* Mid-stream PAUSE draft: resumable, unfinished partial text. Muted + italic so
+   it reads as provisional and never as an answer the assistant stands behind. */
+.message-paused-draft {
+  align-self: flex-start;
+  background: #2a2a33;
+  border-left: 3px dashed #8a8fa3;
+  border-bottom-left-radius: 2px;
+  opacity: 0.8;
+  font-style: italic;
+}
+
+.message-paused-draft .message-text {
+  color: #b9bcc9;
+}
+
 /* Summary tool results (dark golden bubble, full markdown, no truncation) */
 .message-summary {
   align-self: flex-start;
