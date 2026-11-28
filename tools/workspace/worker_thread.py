@@ -7839,9 +7839,57 @@ class Worker(ToolBase):
             payload["style"] = self.style
         if self.meta is not None:
             payload["meta"] = self.meta
-        # Reserved slot for workspace-scoped recall, not authority; always empty today.
-        payload["kb_recall"] = []
+        # Workspace-scoped recall, added by the MACHINE (never supplied by a
+        # caller), so it is not a briefing and never carries authority.
+        payload["kb_recall"] = self._spawn_kb_recall(payload)
         return payload
+
+    def _spawn_kb_recall(self, payload: dict) -> list:
+        """Select at most a handful of KB pointers for THIS spawn's query.
+
+        Selection is pure (``tools.workspace.kb_recall``); the knobs are the
+        session/agent config's ``kb_injection_max_hits`` /
+        ``kb_injection_max_bytes`` (0 disables).  Anything unexpected -- a
+        missing KB, an unreadable one, a bad knob -- yields ``[]``: recall is a
+        nicety and must never break a spawn.
+        """
+        try:
+            from tools.workspace.kb_recall import select_recall
+
+            cfg = self.agent_config or {}
+            session_cfg = cfg.get("session_config")
+            if not isinstance(session_cfg, dict):
+                session_cfg = {}
+            max_hits = cfg.get("kb_injection_max_hits")
+            if max_hits is None:
+                max_hits = session_cfg.get("kb_injection_max_hits", 3)
+            max_bytes = cfg.get("kb_injection_max_bytes")
+            if max_bytes is None:
+                max_bytes = session_cfg.get("kb_injection_max_bytes", 1200)
+            max_hits = int(max_hits)
+            max_bytes = int(max_bytes)
+            if max_hits <= 0 or max_bytes <= 0:
+                return []
+            ws_path = getattr(self, "workspace_path", None)
+            if not ws_path:
+                return []
+            kb_root = Path(str(ws_path)) / ".thoughtmachine" / "knowledge"
+            query = payload.get("query")
+            query = query if isinstance(query, str) else ""
+            # The BRIEFING carries the identifiers when the query does not
+            # ("continue" names nothing); the module's 60-token cap bounds it.
+            briefing = payload.get("briefing")
+            text = query
+            if isinstance(briefing, str) and briefing:
+                text = f"{query}\n{briefing}" if query else briefing
+            if not text:
+                return []
+            return select_recall(
+                kb_root, text, max_hits=max_hits, max_bytes=max_bytes
+            )
+        except Exception as exc:  # never break a spawn over recall
+            logger.debug(f"KB recall skipped for spawn: {exc}")
+            return []
 
     def _reuse_dispatch_context(self, query: str) -> tuple:
         """Compose the text delivered to an ALREADY-EXISTING instance.

@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import queue
 import unittest
+from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -137,7 +138,7 @@ class TestSpawnBriefingDelivery(unittest.TestCase):
             self._registry._worker_registry[(session, name, iid)] = t
         return t
 
-    def _spawn(
+    def _make_worker(
         self,
         name: str,
         session: str = SESSION,
@@ -145,13 +146,19 @@ class TestSpawnBriefingDelivery(unittest.TestCase):
         style=None,
         purpose=None,
         meta=None,
-    ) -> dict:
+        workspace_path: str = "/tmp/test_ws",
+        agent_config=None,
+    ):
         kwargs = dict(
             action="spawn",
             worker_name=name,
             session_id=session,
-            workspace_path="/tmp/test_ws",
-            agent_config={"provider": "openai", "model": "gpt-4"},
+            workspace_path=workspace_path,
+            agent_config=(
+                agent_config
+                if agent_config is not None
+                else {"provider": "openai", "model": "gpt-4"}
+            ),
         )
         if context is not None:
             kwargs["context"] = context
@@ -161,7 +168,37 @@ class TestSpawnBriefingDelivery(unittest.TestCase):
             kwargs["purpose"] = purpose
         if meta is not None:
             kwargs["meta"] = meta
-        return _parse_result(Worker(**kwargs).execute())
+        return Worker(**kwargs)
+
+    def _spawn(self, name: str, **kwargs) -> dict:
+        return _parse_result(self._make_worker(name, **kwargs).execute())
+
+    def _seed_workspace_kb(self, workspace_path: str) -> tuple:
+        """Write a REAL ``<ws>/.thoughtmachine/knowledge/project`` fixture.
+
+        Returns ``(line_number, stripped_line)`` of the only line carrying the
+        distinctive identifier ``hollow_promise``.
+        """
+        kb_dir = (
+            Path(workspace_path) / ".thoughtmachine" / "knowledge" / "project"
+        )
+        kb_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "unrelated filler about containers and budgets",
+            "- the hollow_promise flag is checked before dispatch",
+        ]
+        (kb_dir / "lessons_learned.md").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+        return 2, lines[1].strip()
+
+    def _real_workspace(self) -> str:
+        import shutil
+        import tempfile
+
+        ws = tempfile.mkdtemp(prefix="kb-recall-ws-")
+        self.addCleanup(shutil.rmtree, ws, True)
+        return ws
 
     def _spawn_and_capture(self, name: str, **kwargs):
         """Spawn against a seeded live instance and return (envelope, calls)."""
@@ -369,6 +406,63 @@ class TestSpawnBriefingDelivery(unittest.TestCase):
         self.assertIn(identifier, payload["query"])
         self.assertEqual(payload["kb_recall"], [])
         self.assertEqual(list(payload)[-1], "kb_recall")
+
+    # ── 9. the recall slot is WIRED (knob read, not phoned in) ─────────
+
+    def test_filled_recall_slot_carries_a_real_kb_pointer(self):
+        """D1: a real workspace KB under ``<ws>/.thoughtmachine/knowledge``
+        produces a real pointer in the slot -- the wiring is live, not a
+        silent ``[]`` fallback."""
+        ws = self._real_workspace()
+        line_no, line_text = self._seed_workspace_kb(ws)
+
+        worker = self._make_worker(
+            "w1", context={"query": "explain hollow_promise"}, workspace_path=ws
+        )
+        self.assertIsNotNone(
+            getattr(worker, "agent_config", None),
+            "Worker has no agent_config attribute: the kb_injection_* knobs "
+            "cannot be read from it",
+        )
+        result = _parse_result(worker.execute())
+        self.assertTrue(result.get("spawned"), f"fresh spawn: {result}")
+
+        payload = self._created[-1]._initial_context
+        recall = payload["kb_recall"]
+        self.assertEqual(
+            recall,
+            [{"domain": "lessons_learned", "line": line_no, "text": line_text}],
+        )
+        self.assertEqual(list(payload)[-1], "kb_recall")
+
+    def test_zero_max_hits_disables_injection(self):
+        """D2: ``kb_injection_max_hits=0`` on the Worker's own config switches
+        the slot back off -- proof the knob is READ, not ignored."""
+        ws = self._real_workspace()
+        self._seed_workspace_kb(ws)
+        context = {"query": "explain hollow_promise"}
+
+        on = self._make_worker("w1", context=context, workspace_path=ws)
+        self.assertIsNotNone(
+            getattr(on, "agent_config", None),
+            "Worker has no agent_config attribute: the kb_injection_* knobs "
+            "cannot be read from it",
+        )
+        self.assertTrue(_parse_result(on.execute()).get("spawned"))
+        self.assertEqual(len(self._created[-1]._initial_context["kb_recall"]), 1)
+
+        off = self._make_worker(
+            "w1",
+            context=context,
+            workspace_path=ws,
+            agent_config={
+                "provider": "openai",
+                "model": "gpt-4",
+                "kb_injection_max_hits": 0,
+            },
+        )
+        self.assertTrue(_parse_result(off.execute()).get("spawned"))
+        self.assertEqual(self._created[-1]._initial_context["kb_recall"], [])
 
 
 if __name__ == "__main__":
