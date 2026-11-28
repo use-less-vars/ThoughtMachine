@@ -167,3 +167,18 @@ describe('user message starting with the tag', () => {
     expect(paragraph.getAttribute('title')).toBeNull()
   })
 })
+
+// ==========================================================================
+// 5. Paused draft is provisional, never an assistant answer
+// ==========================================================================
+describe('paused draft', () => {
+  it('renders with the paused-draft role style and its own content path', () => {
+    const text = 'The answer stopped mid-sentence because the run was paused'
+    const { bubble, paragraph } = renderBubble({ role: 'paused_draft', content: text })
+    expect(bubble.classList.contains('message-paused-draft')).toBe(true)
+    expect(bubble.classList.contains('message-assistant')).toBe(false)
+    expect(bubble).toHaveTextContent('⏸ Paused draft')
+    expect(paragraph).toHaveTextContent(text)
+  })
+})
+

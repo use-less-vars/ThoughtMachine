@@ -210,8 +210,18 @@ def test_addendum_updated_is_delivered_on_the_done_terminal():
     assert at < types.index('turn'), types
 
 
-def test_drain_sits_after_the_halt_poll_and_before_the_type_ladder():
-    """Source order: halt poll, then drain, then the isinstance ladder.
+def test_drain_sits_after_the_demand_poll_and_before_the_type_ladder():
+    """Source order: demand poll, then drain, then the isinstance ladder.
+
+    Both mid-stream signals are read through ONE ``compose_demand()`` call: the
+    hard stop and the in-turn pause are composed there, and STOP outranking
+    PAUSE is that single precedence table's job (agent/core/turn_demand.py),
+    not two stacked ``if`` guards here. So the poll is anchored on the CALLS
+    that feed the table -- ``self.should_halt()`` and
+    ``self.should_pause_stream()`` -- and never on the ``if`` syntax around
+    them: a pin on the old ``if self.should_halt():`` shape breaks on every
+    shape change to the guard (as this one just did) without the ordering ever
+    moving. That is the difference between pinning syntax and pinning intent.
 
     Pinned structurally rather than behaviourally because the ``Interrupted``
     rung cannot be driven end to end: it re-raises an ``LLMError`` into the
@@ -222,12 +232,18 @@ def test_drain_sits_after_the_halt_poll_and_before_the_type_ladder():
     source = inspect.getsource(Agent.process_query)
 
     drain_at = source.index('self._drain_addendum_queue()')
-    halt_at = source.rindex('if self.should_halt():', 0, drain_at)
+    # ``find`` bounded by the drain rather than ``index``: when a poll moves
+    # BELOW the drain the bounded ``index`` would die on an opaque
+    # ``ValueError: substring not found`` instead of reporting the ordering
+    # regression the test exists to name.
+    halt_at = source.find('self.should_halt()', 0, drain_at)
+    pause_at = source.find('self.should_pause_stream()', 0, drain_at)
     ladder_at = source.index('if isinstance(stream_event, TextDelta):', drain_at)
     done_at = source.index('isinstance(stream_event, Done)', ladder_at)
     interrupted_at = source.index('isinstance(stream_event, Interrupted)', ladder_at)
 
-    assert halt_at < drain_at, 'the drain runs before the halt poll'
+    assert halt_at != -1, 'the drain runs before the halt poll'
+    assert pause_at != -1, 'the drain runs before the pause poll'
     assert drain_at < ladder_at, 'the drain runs after the event-type ladder opens'
     assert ladder_at < done_at < interrupted_at, (
         f'the ladder no longer runs TextDelta -> Done -> Interrupted: '
@@ -236,6 +252,10 @@ def test_drain_sits_after_the_halt_poll_and_before_the_type_ladder():
 
     # Exactly one drain call site in the loop: the poll is not duplicated.
     assert source.count('self._drain_addendum_queue()') == 1
+    # ...and each signal is read exactly once, inside the single composed poll:
+    # one precedence table decides, the loop never re-asks either question.
+    assert source.count('self.should_halt()') == 1
+    assert source.count('self.should_pause_stream()') == 1
 
 
 # ---------------------------------------------------------------------------

@@ -524,3 +524,6 @@ web_ui/frontend/.dist-build-stamp
 !docs/DESIGN_NARROWED_HOST.md
 !docs/ONBOARDING.md
 
+# agent scratch: local notes, PR bodies written for --body-file, never code
+.scratch/
+.thoughtmachine/pr/

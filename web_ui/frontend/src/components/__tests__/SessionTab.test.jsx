@@ -939,6 +939,56 @@ describe('SessionTab — assistant_delta streaming', () => {
     );
   });
 
+  it('keeps the streamed partial as a paused draft when the run is paused mid-stream', async () => {
+    renderTab({ sessionId: 'sess-pause' });
+    const ws = await connectWs();
+    act(() =>
+      ws.receive({
+        type: 'conversation_changed',
+        session_id: 'sess-pause',
+        messages: [{ role: 'user', content: 'pause-midstream-prompt' }],
+      })
+    );
+    expect(await screen.findByText('pause-midstream-prompt')).toBeInTheDocument();
+
+    // Two deltas for the SAME turn coalesce into one local in-flight bubble.
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-pause', text: 'Draft', turn: 1 }));
+    act(() => ws.receive({ type: 'assistant_delta', session_id: 'sess-pause', text: 'text', turn: 1 }));
+    expect(await screen.findByText('Drafttext')).toBeInTheDocument();
+
+    // Mid-stream PAUSE (resumable, NOT a halt): the agent kept the text it had
+    // already produced as a `paused_draft` row and announces it with
+    // `stream_paused` instead of a terminal `interrupted`.
+    act(() => ws.receive({ type: 'stream_paused', session_id: 'sess-pause', text: 'Drafttext' }));
+
+    // (a) The text the user watched stream in is visible EXACTLY ONCE: the
+    // in-flight bubble was folded away, not joined to the draft row.
+    const draftEls = screen.getAllByText('Drafttext');
+    expect(draftEls).toHaveLength(1);
+    const bodyText = document.body.textContent || '';
+    expect(bodyText.match(/Drafttext/g) || []).toHaveLength(1);
+    expect(bodyText).not.toContain('DrafttextDrafttext');
+
+    // (b) It is NOT a final assistant message: the store holds a `paused_draft`
+    // row and no assistant row at all for the partial.
+    const stored = useStore.getState().sessionMessages['sess-pause'];
+    expect(stored).toHaveLength(2);
+    expect(stored[1]).toEqual({ role: 'paused_draft', content: 'Drafttext' });
+    expect(stored.filter((m) => m.role === 'assistant')).toHaveLength(0);
+
+    // ...and it RENDERS as a provisional draft, not as an assistant bubble.
+    const draftBubble = draftEls[0].closest('.message');
+    expect(draftBubble).not.toBeNull();
+    expect(draftBubble.className).toContain('message-paused-draft');
+    expect(draftBubble.className).not.toContain('message-assistant');
+
+    // (c) No in-flight bubble/spinner is left behind.
+    expect(document.querySelectorAll('.message-assistant')).toHaveLength(0);
+    await waitFor(() =>
+      expect((document.body.textContent || '').match(/Drafttext/g) || []).toHaveLength(1)
+    );
+  });
+
   it('discards the in-flight bubble when the run ends without a terminal turn', async () => {
     renderTab({ sessionId: 'sess-crash' });
     const ws = await connectWs();

@@ -42,6 +42,7 @@ from .stream_events import Done, Interrupted, ReasoningDelta, TextDelta, ToolCal
 from .conversation_manager import ConversationManager
 from .tool_executor import ToolExecutor, is_interrupted_tool_entry
 from .turn_transaction import TurnTransaction
+from .turn_demand import Demand, compose_demand
 from .debug_context import DebugContext
 from .message_utils import group_messages_into_turns, group_messages_into_turns_with_indices
 if TYPE_CHECKING:
@@ -633,6 +634,15 @@ class Agent:
         self._paused = False
         self._should_reset = False
         self._pause_requested = False
+        # Pause EPOCH: a monotonic counter bumped by the single pause writer,
+        # enter_reading_mode().  The stream loop compares it against the epoch
+        # captured at turn start, so a pause that LANDS mid-stream cuts the
+        # stream WITHOUT consuming _pause_requested (the reading-mode
+        # checkpoints own that consume, and their edge must not be stolen),
+        # while a pause that predates the turn can never cut a stream it was
+        # never asked to cut.
+        self._pause_epoch = 0
+        self._turn_pause_epoch = 0
         # Reading mode: at most ONE pause nudge per turn.
         self._pause_nudge_sent = False
         # Resume notice: armed by leave_reading_mode() when a 'pause'-owned
@@ -695,6 +705,22 @@ class Agent:
         except Exception as e:
             log('WARNING', 'core.agent', f'halt_check raised, treating as no halt: {e}')
             return False
+
+    def should_pause_stream(self) -> bool:
+        """Return True when a PAUSE has landed since this turn began.
+
+        The comparison is a LEVEL comparison of a monotonic counter: the pause
+        epoch bumped by enter_reading_mode() against the epoch captured at turn
+        start.  It therefore never consumes the request -- consuming it is the
+        reading-mode checkpoints' job, and a stream loop that ate the edge would
+        silently disarm them -- and it never resurrects a pause that ended
+        before the turn began: such a pause is already inside the captured
+        baseline, so the epoch cannot differ because of it.
+
+        Returns:
+            bool: True if a pause arrived after the turn-start capture.
+        """
+        return self._pause_epoch != self._turn_pause_epoch
 
     def _drain_addendum_queue(self):
         """Yield every queued Tier-1 addendum notification exactly once.
@@ -1422,7 +1448,17 @@ class Agent:
         changed = self.state.restrict(reason)
         log('INFO', '[CONTROL_PLANE_PAUSE]', f'event=enter_reading_mode reason={reason} session_id={self.session_id} state_id={id(self.state)}')
         self._pause_requested = True
-        pause_debug(f'enter_reading_mode({reason!r}) -> changed={changed}')
+        # The single WRITER of the pause epoch (see should_pause_stream).  Unlike
+        # the assignments above, this is a read-modify-write and NOT atomic --
+        # and it does not need to be: the reader captures the epoch once at turn
+        # start and only ever tests it for INEQUALITY, never against a baseline
+        # that could be restored, so the counter just has to stay monotonic.  A
+        # lost increment (two presses interleaving so one update is overwritten)
+        # collapses two presses into one, and that single bump still fires the
+        # pause; the residual risk is a missed second notification, never a
+        # pause that fails to fire.
+        self._pause_epoch += 1
+        pause_debug(f'enter_reading_mode({reason!r}) -> changed={changed} epoch={self._pause_epoch}')
         return changed
 
     def leave_reading_mode(self, reason: str = 'pause') -> bool:
@@ -1659,6 +1695,10 @@ class Agent:
             self._pause_requested = False
             self._pause_nudge_sent = False
             self._stop_notice_sent = False
+            # Per-QUERY capture: a pause already in force now is part of this
+            # turn's baseline, so only a pause that lands DURING the turn can
+            # cut its stream (should_pause_stream).
+            self._turn_pause_epoch = self._pause_epoch
             # The wind-down grant is scoped to a single query.
             self._pause_winddown = False
             # A resume that happened while the session was IDLE delivers its
@@ -1861,6 +1901,7 @@ class Agent:
                     output_tokens = 0
                     final_pending = False
                     halted = False
+                    paused_midstream = False
                     # Per-turn tool observations; empty on a tool-less turn.
                     executed_tools: list = []
                     stream_agen = self.llm_client.stream_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
@@ -1880,9 +1921,17 @@ class Agent:
                         # A partially received tool call is safe to discard: tool
                         # execution happens AFTER this loop, so breaking here can
                         # never act on a half-parsed call.
-                        if self.should_halt():
+                        stream_demand = compose_demand(
+                            stop=self.should_halt(),
+                            paused=self.should_pause_stream(),
+                        )
+                        if stream_demand.demand is Demand.STOP:
                             log('DEBUG', 'core.pause', f'[HALT] hard stop requested mid-stream (turn={turn})')
                             halted = True
+                            break
+                        if stream_demand.demand is Demand.PAUSE:
+                            log('DEBUG', 'core.pause', f'[PAUSE] pause requested mid-stream (turn={turn})')
+                            paused_midstream = True
                             break
                         # Tier 1 drain (ruling D-5): fires on EVERY stream event,
                         # including the Done and Interrupted terminals below,
@@ -1942,6 +1991,14 @@ class Agent:
                             raise _exception_for_interrupted(stream_event.reason or '')
                         # ToolCallStart / ToolCallArgumentsDelta are progress signals
                         # only (no UI event).
+                    if paused_midstream:
+                        yield from self._finalize_paused_stream(
+                            content=content,
+                            reasoning=reasoning,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                        )
+                        return
                     if halted:
                         yield from self._finalize_halted_stream(
                             content=content,
@@ -2392,6 +2449,43 @@ class Agent:
         self._add_conversation_data_to_event(interrupted_event)
         log('DEBUG', 'core.pause', f'[HALT] committed partial assistant message (chars={len(content)})')
         yield interrupted_event
+        return
+    def _finalize_paused_stream(self, *, content, reasoning, input_tokens, output_tokens):
+        """Finalize a stream cut by a mid-stream PAUSE: the partial stays a DRAFT.
+
+        A pause is RESUMABLE, so none of the halt vocabulary applies here: no
+        assistant commit (the answer was not finished, and committing a
+        truncated one would present half an answer as the answer), no
+        'interrupted' event and no stop notice -- 'interrupted' is terminal and a
+        pause is not.  The partial text the user already watched arrive is
+        persisted under its own ``paused_draft`` role so the next turn can see
+        how far the model got without mistaking it for something it stands
+        behind.
+
+        ``_pause_requested`` and the 'pause' state restriction are deliberately
+        left EXACTLY as they were: the reading-mode checkpoints own that edge and
+        the session is still paused until it is resumed.
+        """
+        marker = '[Paused by the user - partial draft, resumable]'
+        self._add_to_conversation({
+            'role': 'paused_draft',
+            'content': f'{content}\n{marker}' if content else marker,
+        })
+        # The tokens were spent, even though the answer was not finished.
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        paused_event = {
+            'type': 'stream_paused',
+            'content': content,
+            'turn': self._display_turn,
+            'context_length': self.state.current_conversation_tokens,
+            'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens},
+        }
+        if reasoning is not None:
+            paused_event['reasoning'] = reasoning
+        self._add_conversation_data_to_event(paused_event)
+        log('DEBUG', 'core.pause', f'[PAUSE] kept partial answer as paused_draft (chars={len(content)})')
+        yield paused_event
         return
     def _apply_summary_pruning(self, summary: str, keep_recent_turns: int):
         """Add summary message to append-only history with metadata.
