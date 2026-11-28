@@ -1738,6 +1738,84 @@ class GitReadTool(ToolBase):
             output = _reconcile_status_paths(output)
         return self._with_mode(self._truncate_output(output))
     
+    def _run_git_capture(
+        self,
+        repo_root: Path,
+        args: List[str],
+        timeout: int = 30,
+    ) -> tuple:
+        """Run git and return ``(exit_code, stdout, stderr)`` WITHOUT flattening.
+
+        ``_run_git`` folds a non-zero exit into one string, which makes "git
+        failed" indistinguishable from "git printed that text". A machine-
+        readable diff verdict needs the exit code itself, so the diff verbs use
+        this seam: the same backend, the same fail-closed exception policy as
+        ``_run_git`` (a timeout or a permission denial is RE-RAISED, never
+        reported as data), and ``(-1, "", reason)`` only when no git process
+        could be started at all -- which the verdict renders as ``unknown``.
+        """
+        self._validate_repo_root(repo_root)
+        try:
+            exit_code, stdout, stderr = self._run_git_raw(
+                repo_root,
+                args,
+                timeout=timeout,
+            )
+            return exit_code, stdout, stderr
+        except subprocess.TimeoutExpired:
+            # Fail closed, same reason as _run_git: a timeout must not be
+            # reported as diff data.
+            raise
+        except TimeoutError:
+            raise
+        except FileNotFoundError as e:
+            # No git executable: nothing ran, so the diff is UNKNOWN, not empty.
+            return -1, "", f"git executable not available: {e}"
+        except PermissionError:
+            raise
+        except RuntimeError:
+            raise
+        except Exception as e:
+            return -1, "", f"error running git command: {e}"
+
+    @staticmethod
+    def _diff_scope(rels: List[str]) -> str:
+        """The paths a diff was scoped to, comma-joined (``whole-repo`` if none)."""
+        return ",".join(rels) if rels else "whole-repo"
+
+    @staticmethod
+    def _diff_verdict_line(
+        rc: int,
+        stdout: str,
+        stderr: str,
+        scope: str,
+        source: str,
+    ) -> str:
+        """Render the FIRST line of a diff result as fixed ``key: value`` fields.
+
+        ``identical: false`` = git produced hunks, ``true`` = git produced none,
+        ``unknown`` = git did not answer (non-zero exit, or it could not be run).
+        An empty output is therefore never ambiguous, and a failure can never be
+        mistaken for a clean tree. ``rc`` is reported only when unknown (a
+        successful run has no exit code worth reading), and ``stderr`` only when
+        git actually wrote some: it is collapsed onto ONE line and cut at 200
+        characters so the verdict stays parseable at a fixed position.
+        """
+        if rc != 0:
+            line = (
+                f"identical: unknown | scope: {scope} | source: {source}"
+                f" | rc: {rc}"
+            )
+            cleaned = (stderr or "")
+            for newline in ("\r\n", "\r", "\n"):
+                cleaned = cleaned.replace(newline, " ")
+            cleaned = cleaned[:200].rstrip()
+            if cleaned:
+                line += f" | stderr: {cleaned}"
+            return line
+        verdict = "false" if stdout.strip() else "true"
+        return f"identical: {verdict} | scope: {scope} | source: {source}"
+
     def _git_diff(self, repo_root: Path) -> str:
         """Run git diff."""
         # Belt-and-suspenders for Bug A: --no-ext-diff guarantees external
@@ -1753,11 +1831,11 @@ class GitReadTool(ToolBase):
         else:
             # If only commit1 is specified, compare commit1 to working tree
             pass
+        rels: List[str] = []
         if self.file_path:
             # Validate file paths are within workspace (list-safe)
             try:
                 paths = self.file_path if isinstance(self.file_path, list) else [self.file_path]
-                rels = []
                 for p in paths:
                     if not isinstance(p, str):
                         raise ValueError(
@@ -1773,9 +1851,19 @@ class GitReadTool(ToolBase):
                     args.append("--")
                     args.extend(rels)
             except ValueError as e:
+                # A REFUSED path never reached git, so it carries no verdict: it
+                # must not read as "identical" (git never said so).
                 return self._truncate_output(f"Error: {e}")
-        output = self._run_git(repo_root, args)
+        rc, stdout, stderr = self._run_git_capture(repo_root, args)
         if self.name_only:
+            # ``--name-only`` already reports machine-readably (``changed_paths:``
+            # / ``complete:``), and its consumers read every non-header line as a
+            # changed PATH -- a verdict line here would be listed as a path. The
+            # header keeps today's shape; only the source of the text changes.
+            output = (
+                f"Git command failed (exit code {rc}):\n{stderr}"
+                if rc != 0 else stdout
+            )
             rendered = self._render_name_only(output)
             truncated = self._truncate_output(rendered)
             if truncated != rendered:
@@ -1783,20 +1871,19 @@ class GitReadTool(ToolBase):
                 # be the whole change set.
                 truncated = truncated.replace("complete: true", "complete: false", 1)
             return self._with_mode(truncated)
-        if not output.strip():
-            # An empty ``git diff`` is ambiguous on its own: "nothing changed"
-            # and "the named path matched nothing" look IDENTICAL. Say which
-            # one it was instead of returning a silent empty result.
-            try:
-                scoped = self._validated_rel_paths(repo_root, self.file_path) \
-                    if self.file_path else []
-            except ValueError:
-                scoped = [p for p in (self.file_path if isinstance(self.file_path, list)
-                                      else [self.file_path]) if isinstance(p, str)]
-            return self._with_mode(
-                self._truncate_output(self._empty_diff_hint(scoped))
-            )
-        return self._with_mode(self._truncate_output(output))
+        # An empty ``git diff`` is ambiguous on its own: "nothing changed" and
+        # "the named path matched nothing" look IDENTICAL -- and so does a git
+        # that failed to answer at all. The verdict line states which one it was.
+        verdict = self._diff_verdict_line(
+            rc, stdout, stderr, self._diff_scope(rels), "working-tree-vs-index",
+        )
+        if rc != 0:
+            body = f"Git command failed (exit code {rc}):\n{stderr}"
+        elif stdout.strip():
+            body = stdout
+        else:
+            body = self._empty_diff_hint(rels)
+        return self._with_mode(self._truncate_output(f"{verdict}\n{body}"))
 
     def _render_name_only(self, output: str) -> str:
         """Render ``git diff --name-only`` output as an honestly-bounded list.
@@ -1985,21 +2072,56 @@ class GitReadTool(ToolBase):
             f"\nfailure_reason: {self._last_failure_reason or 'none'}"
         )
 
+    def _empty_staged_hint(self, rels: List[str]) -> str:
+        """Explain an EMPTY ``git diff --cached``: nothing is STAGED.
+
+        It used to return a silent blank, which reads exactly like a git that
+        never ran. The scope decides the diagnosis, and the hint names the verb
+        that undoes what the caller may have expected to see.
+        """
+        base = self.commit1 or "HEAD"
+        if rels:
+            scope = ", ".join(rels)
+            return (
+                f"(no diff output) Nothing staged inside '{scope}' against "
+                f"{base}: the index matches {base} for those paths, so no hunk "
+                "was produced. Stage the change first (git add) if you expected "
+                "one; to UNSETAGE a staged change, restore the index with "
+                "'git reset HEAD -- <path>'."
+            )
+        return (
+            f"(no diff output) Nothing staged: the index matches {base}, so no "
+            "hunk was produced. Stage the change first (git add) if you expected "
+            "one; to UNSETAGE a staged change, restore the index with "
+            "'git reset' (all paths) or 'git restore --staged <path>'."
+        )
+
     def _git_diff_cached(self, repo_root: Path) -> str:
         """Run git diff --cached (staged changes)."""
         # Same belt-and-suspenders as _git_diff: --no-ext-diff guarantees
         # external diff drivers can never render diffs.
         args = ["diff", "--cached", "--no-ext-diff", "--no-textconv"]
+        rels: List[str] = []
         if self.file_path:
             try:
                 rels = self._validated_rel_paths(repo_root, self.file_path)
             except ValueError as e:
+                # Refused before git ran: no verdict (see _git_diff).
                 return self._truncate_output(f"Error: {e}")
             if rels:
                 args.append("--")
                 args.extend(rels)
-        output = self._run_git(repo_root, args)
-        return self._with_mode(self._truncate_output(output))
+        rc, stdout, stderr = self._run_git_capture(repo_root, args)
+        verdict = self._diff_verdict_line(
+            rc, stdout, stderr, self._diff_scope(rels), "index-vs-HEAD",
+        )
+        if rc != 0:
+            body = f"Git command failed (exit code {rc}):\n{stderr}"
+        elif stdout.strip():
+            body = stdout
+        else:
+            body = self._empty_staged_hint(rels)
+        return self._with_mode(self._truncate_output(f"{verdict}\n{body}"))
 
     def _git_branch_list(self, repo_root: Path) -> str:
         """Run git branch --list (explicit list operation)."""

@@ -396,13 +396,15 @@ def test_diff_path_list_returns_hunks_for_every_named_path(tmp_path):
         "b.txt": "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old-b\n+new-b\n",
     }
 
-    def fake(repo_root, args, timeout=30):
+    def fake_raw(repo_root, args, timeout=30):
         argv.append(list(args))
-        # git renders ONE stream carrying a hunk per changed path.
-        return "".join(hunk for path, hunk in hunks.items() if path in args)
+        # git renders ONE stream carrying a hunk per changed path, and the
+        # diff verdict is derived from the EXIT CODE, so the seam under test is
+        # the ``(rc, stdout, stderr)`` one, not the string one.
+        return 0, "".join(hunk for path, hunk in hunks.items() if path in args), ""
 
     tool = _tool(tmp_path, argv, operation="diff", file_path=["a.txt", "b.txt"])
-    object.__setattr__(tool, "_run_git", fake)
+    object.__setattr__(tool, "_run_git_raw", fake_raw)
 
     out = tool._git_diff(tmp_path)
 
@@ -797,4 +799,249 @@ def test_restore_path_is_reachable_through_run(tmp_path):
         assert gate not in body, (
             f"a write-capable session must be PERMITTED to restore a path: {body!r}"
         )
+
+
+
+# ---------------------------------------------------------------------------
+# diff / diff_cached: a MACHINE-READABLE verdict line FIRST
+#
+# Before this, a caller had to read English prose to learn whether the diff was
+# empty ("(no diff output) No changes: ...") and could not tell a genuinely
+# clean tree from a git that never ran: both used to be a string.  The first
+# line of a patch-mode ``diff`` / ``diff_cached`` result is now a fixed
+# key/value verdict; the human body follows UNCHANGED, and the
+# ``execution_mode:``/``failure_reason:`` trailer stays last.
+# ---------------------------------------------------------------------------
+
+_VERDICT_KEYS = ("identical:", "scope: ", "source: ", "rc: ", "stderr: ")
+
+
+def _first(out: str) -> str:
+    return out.splitlines()[0]
+
+
+def test_diff_patch_mode_first_line_is_identical_false(tmp_path):
+    """Hunks => ``identical: false``, with the scope/source named on line 1."""
+    (tmp_path / "a.txt").write_text("x\n")
+    argv: list = []
+    hunks = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n"
+
+    tool = _tool(tmp_path, argv, raw=(0, hunks, ""), operation="diff")
+    out = tool._git_diff(tmp_path)
+    lines = out.splitlines()
+
+    assert lines[0] == (
+        "identical: false | scope: whole-repo | source: working-tree-vs-index"
+    ), f"line 1 must be the machine-readable verdict: {out!r}"
+    # The human body is untouched, and starts on line 2.
+    assert _body(out).splitlines()[1:] == hunks.splitlines(), (
+        f"the hint/hunks body must be unchanged after the verdict: {out!r}"
+    )
+    # The diagnostics trailer is still LAST.
+    assert lines[-2].startswith("execution_mode:"), out
+    assert lines[-1].startswith("failure_reason:"), out
+
+
+def test_diff_empty_patch_mode_first_line_is_identical_true(tmp_path):
+    """An empty patch-mode diff is ``identical: true`` -- not a silent blank."""
+    argv: list = []
+    tool = _tool(tmp_path, argv, raw=(0, "", ""), operation="diff")
+
+    out = tool._git_diff(tmp_path)
+
+    assert _first(out) == (
+        "identical: true | scope: whole-repo | source: working-tree-vs-index"
+    ), f"line 1 must be the machine-readable verdict: {out!r}"
+    assert "no diff output" in out and "No changes" in out, (
+        f"the whole-tree empty hint must survive verbatim after the verdict: {out!r}"
+    )
+
+
+def test_diff_empty_patch_mode_scope_names_the_paths(tmp_path):
+    """Scoped + empty => ``identical: true`` with the comma-joined path scope."""
+    (tmp_path / "a.txt").write_text("x\n")
+    (tmp_path / "b.txt").write_text("x\n")
+    argv: list = []
+    tool = _tool(
+        tmp_path, argv, raw=(0, "", ""), operation="diff",
+        file_path=["a.txt", "b.txt"],
+    )
+
+    out = tool._git_diff(tmp_path)
+
+    assert _first(out) == (
+        "identical: true | scope: a.txt,b.txt | source: working-tree-vs-index"
+    ), f"scoped verdict must name the paths it was scoped to: {out!r}"
+    assert "Nothing matched" in out and "a.txt" in out, (
+        f"the scoped empty hint must survive verbatim after the verdict: {out!r}"
+    )
+
+
+def test_diff_cached_empty_scoped_first_line_is_identical_true(tmp_path):
+    """``diff_cached`` names its OWN source: index-vs-HEAD, not working tree."""
+    (tmp_path / "a.txt").write_text("x\n")
+    argv: list = []
+    tool = _tool(
+        tmp_path, argv, raw=(0, "", ""), operation="diff_cached",
+        file_path=["a.txt"],
+    )
+
+    out = tool._git_diff_cached(tmp_path)
+
+    assert _first(out) == (
+        "identical: true | scope: a.txt | source: index-vs-HEAD"
+    ), f"line 1 must be the machine-readable verdict: {out!r}"
+    assert argv == [
+        ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--", "a.txt"]
+    ], f"the argv must not change: {argv!r}"
+    assert "Nothing staged" in out and "git reset" in out, (
+        f"an empty --cached diff must say nothing is STAGED and how to undo: {out!r}"
+    )
+
+
+def test_diff_cached_patch_mode_first_line_is_identical_false(tmp_path):
+    """Staged hunks => ``identical: false`` + the hunks, unchanged."""
+    argv: list = []
+    hunks = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n"
+    tool = _tool(tmp_path, argv, raw=(0, hunks, ""), operation="diff_cached")
+
+    out = tool._git_diff_cached(tmp_path)
+
+    assert _first(out) == (
+        "identical: false | scope: whole-repo | source: index-vs-HEAD"
+    ), f"line 1 must be the machine-readable verdict: {out!r}"
+    assert _body(out).splitlines()[1:] == hunks.splitlines(), (
+        f"the staged hunks must be unchanged after the verdict: {out!r}"
+    )
+
+
+def test_diff_failure_first_line_is_identical_unknown_with_rc_and_stderr(tmp_path):
+    """A git failure is ``unknown`` (NOT ``false``): it names rc and stderr.
+
+    Domain boundary of this test: the failure is injected at the tool's git
+    SEAM (``_run_git_raw``) -- this image has no git binary, so no real
+    non-zero-exit git run is involved.  What is pinned is the tool's
+    rendering of a bad exit code it received from git.
+    """
+    argv: list = []
+    stderr = "fatal: bad revision 'nope'\nsecond line\n"
+    tool = _tool(
+        tmp_path, argv, raw=(128, "", stderr), operation="diff", commit1="nope",
+    )
+
+    out = tool._git_diff(tmp_path)
+    lines = out.splitlines()
+
+    assert lines[0] == (
+        "identical: unknown | scope: whole-repo | source: working-tree-vs-index"
+        " | rc: 128 | stderr: fatal: bad revision 'nope' second line"
+    ), f"a failed git must never read as identical: {out!r}"
+    # Diagnostics stay last, and today's error body is kept.
+    assert lines[-2].startswith("execution_mode:"), out
+    assert lines[-1].startswith("failure_reason:"), out
+    assert "Git command failed (exit code 128)" in out, (
+        f"the existing failure body must survive after the verdict: {out!r}"
+    )
+
+
+def test_diff_failure_stderr_is_collapsed_and_capped_at_200(tmp_path):
+    """The stderr field is ONE line: newlines -> spaces, first 200 chars."""
+    argv: list = []
+    tool = _tool(
+        tmp_path, argv, raw=(1, "", "x" * 300 + "\n"), operation="diff",
+    )
+
+    out = tool._git_diff(tmp_path)
+    first = _first(out)
+    field = first.split(" | stderr: ", 1)[1]
+
+    assert "\n" not in first, f"the verdict must stay on ONE line: {first!r}"
+    assert len(field) == 200, f"the stderr field must be capped at 200: {first!r}"
+    assert first.startswith(
+        "identical: unknown | scope: whole-repo | source: working-tree-vs-index"
+        " | rc: 1 | stderr: x"
+    ), first
+
+
+def test_diff_failure_without_stderr_omits_the_stderr_field(tmp_path):
+    """No stderr from git => no empty ``| stderr:`` field (rc still reported)."""
+    argv: list = []
+    tool = _tool(tmp_path, argv, raw=(1, "", ""), operation="diff")
+
+    first = _first(tool._git_diff(tmp_path))
+
+    assert first == (
+        "identical: unknown | scope: whole-repo | source: working-tree-vs-index"
+        " | rc: 1"
+    ), f"an empty stderr must not produce an empty field: {first!r}"
+
+
+@pytest.mark.parametrize(
+    "operation, path, needle",
+    [
+        # ``diff`` validates inline (a wildcard is passed through to git there),
+        # so the escape that refuses before git is an out-of-workspace path.
+        ("diff", "../outside.txt", "outside.txt"),
+        # ``diff_cached`` goes through ``_validated_rel_paths``: wildcards and
+        # whole-tree paths are refused there.
+        ("diff_cached", "*.txt", "'*.txt'"),
+        ("diff_cached", "../outside.txt", "outside.txt"),
+        ("diff_cached", ".", "whole-tree"),
+    ],
+)
+def test_diff_refusals_emit_no_verdict_line(tmp_path, operation, path, needle):
+    """A REFUSED diff never ran git, so it must not carry a verdict at all.
+
+    ``identical:`` means "git told us"; a rejected path never reached git.
+
+    Note: a NON-STR path cannot be exercised here -- ``GitReadTool`` declares
+    ``file_path: str | list[str]``, so pydantic rejects it before the tool code
+    runs (the ``Invalid file path type`` branches are unreachable defence).
+    """
+    (tmp_path / "a.txt").write_text("x\n")
+    argv: list = []
+    tool = _tool(tmp_path, argv, operation=operation, file_path=path)
+
+    out = getattr(tool, f"_git_{operation}")(tmp_path)
+
+    assert "identical:" not in out, (
+        f"a refusal is not a diff result and must not fake a verdict: {out!r}"
+    )
+    assert needle in out, f"the refusal must name what was rejected: {out!r}"
+    assert argv == [], f"a refused path must never reach git: {argv!r}"
+
+
+def test_name_only_diff_keeps_its_header_and_gains_no_verdict(tmp_path):
+    """DELIBERATE DEVIATION, pinned so it cannot drift silently.
+
+    ``--name-only`` already emits a machine-readable header
+    (``changed_paths:`` / ``complete:``), and the pinned contract in
+    ``tests/tools/test_git_name_only.py`` reads every non-header line as a
+    PATH -- a verdict line in front would be reported as a changed path.  So
+    the verdict is emitted for PATCH-mode ``diff`` and for ``diff_cached``
+    only; ``name_only`` keeps today's header and today's failure string.
+    """
+    argv: list = []
+    tool = _tool(
+        tmp_path, argv, raw=(0, "a.txt\nb.txt\n", ""), operation="diff",
+        name_only=True,
+    )
+
+    out = tool._git_diff(tmp_path)
+
+    assert "identical:" not in out, (
+        f"name_only already has a machine-readable header: {out!r}"
+    )
+    assert _body(out).splitlines()[0] == "changed_paths: 2", out
+
+    argv2: list = []
+    failed = _tool(
+        tmp_path, argv2, raw=(128, "", "fatal: boom\n"), operation="diff",
+        name_only=True,
+    )._git_diff(tmp_path)
+
+    assert "identical:" not in failed, failed
+    assert "Git command failed (exit code 128)" in failed, (
+        f"name_only keeps today's failure rendering: {failed!r}"
+    )
 

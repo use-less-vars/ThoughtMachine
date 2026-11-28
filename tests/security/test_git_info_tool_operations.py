@@ -872,7 +872,10 @@ class TestLegacyOperationsTrailer:
         tool = _read_host_tool(tmp_path, operation=op)
         result = getattr(tool, f"_git_{op}")(tmp_path)
 
-        assert result.startswith("ok")
+        # Position is not the contract: the diff verbs put a machine-readable
+        # verdict line first, so success is pinned as its own line rather than as
+        # the first characters.
+        assert "ok" in result.splitlines()
         assert "execution_mode: host" in result
         assert "failure_reason: none" in result
 
