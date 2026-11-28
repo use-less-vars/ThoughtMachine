@@ -93,7 +93,7 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
         "infra/containers/executor.py",
         "docker image rebuild reads the committed requirements through a "
         "`subprocess.run([\"git\", \"show\", \"HEAD:requirements.txt\"])` call "
-        "(line 1302, `cwd=` the workspace, no timeout) instead of GitReadTool / "
+        "(line 1310, `cwd=` the workspace, no timeout) instead of GitReadTool / "
         "SandboxedExecution, and never calls host_run(); that path therefore has "
         "neither the grain check nor the kill switch. Tracked debt, not approved "
         "design.",
@@ -206,13 +206,22 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
     ),
     (
         "tools/git_info_tool.py",
-        "imports `subprocess` ONLY for `subprocess.TimeoutExpired` (lines 731 "
-        "and 861); the git spawn itself already goes through SandboxedExecution.",
+        "exempted for its `import subprocess` and nothing else: the module names "
+        "`subprocess.TimeoutExpired` only in `except` clauses (the "
+        "`_git_repo_root` availability mapping, and the fail-closed re-raise in "
+        "`_run_git`) but spawns nothing -- every git command goes through "
+        "SandboxedExecution / `_run_git_raw`. The import is the tripwire: it "
+        "stays a counted site, so a real spawn added here is a new site, not a "
+        "silent ride on this entry.",
     ),
     (
         "tools/git_write_tool.py",
-        "imports `subprocess` ONLY for `subprocess.TimeoutExpired` (line 429); "
-        "every git spawn goes through GitReadTool._run_git / SandboxedExecution.",
+        "exempted for its `import subprocess` and nothing else: one `except "
+        "(subprocess.TimeoutExpired, TimeoutError)` clause in the "
+        "`_git_repo_root` availability mapping, so the class name is mentioned "
+        "and no process is started -- every git spawn goes through "
+        "GitReadTool._run_git / SandboxedExecution. The import stays a counted "
+        "site, so a real spawn added here is a new site.",
     ),
     (
         "tools/mcp_client.py",
@@ -222,22 +231,25 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
     ),
     (
         "tools/mcp_server_connect.py",
-        "imports `subprocess` ONLY to catch `subprocess.TimeoutExpired` "
-        "(line 106); nothing is spawned here.",
+        "exempted for its `import subprocess` and nothing else: it catches the "
+        "`subprocess.TimeoutExpired` that SandboxedExecution.run() raises around "
+        "the MCP handshake, so the class name is mentioned and no process is "
+        "started here -- the executor owns the process. The import stays a "
+        "counted site, so a real spawn added here is a new site.",
     ),
     (
         "tools/workspace/worker_execution.py",
         "container teardown fallback: `docker exec <id> kill <pid>` via "
-        "`subprocess.run` (line 384) in terminate_all().",
+        "`subprocess.run` (line 387) in terminate_all().",
     ),
     (
         "web_ui/backend/server.py",
         "three import-time `subprocess.run` git lookups (`git rev-parse HEAD` "
         "line 456, `git rev-parse --abbrev-ref HEAD` line 478, `git status "
         "--porcelain` line 497, each `timeout=5.0`) feeding the /health payload, "
-        "plus the frontend build at line 6730 (`vite build`, else `npm run "
+        "plus the frontend build at line 6837 (`vite build`, else `npm run "
         "build`, `timeout=120`, PATH prefixed with node_modules/.bin, "
-        "`subprocess.TimeoutExpired` handled at line 6746). None of them consults "
+        "`subprocess.TimeoutExpired` handled at line 6853). None of them consults "
         "the host permission grains and none calls host_run(). Tracked debt, not "
         "approved design.",
     ),
@@ -263,28 +275,32 @@ ALLOWED_OFFENDERS: tuple[tuple[str, str], ...] = (
 #: failure and not a silent ride on the old entry.  It is deliberately exact in
 #: BOTH directions: one site more is red, and one site fewer is red too -- the
 #: pin may only ever be tightened deliberately, never drift.  Measured by running
-#: this module's own scanner over the real tree on 2026-11-24 (19 files, 70
-#: sites; scripts/tm_witness.py was added later, on its own line below).
+#: this module's own scanner -- with :data:`SPAWN_SUBPROCESS_ATTRS` in force --
+#: over the real tree on 2026-11-28: 240 ``*.py`` files scanned, 46 sites in 21
+#: files, 44 of them across these 20 pins plus 2 in the sanctioned
+#: ``thoughtmachine/host_port.py``.  The pre-whitelist census was 77 sites in the
+#: same 21 files; the 31 that went away were exception classes, the
+#: completed-result record and the stdio constants, none of which can spawn.
 PINNED_SITE_COUNTS: dict[str, int] = {
     "infra/containers/executor.py": 2,
     "infra/workspace_lifecycle_manager.py": 1,
-    "mcp_examples/test_client.py": 9,
+    "mcp_examples/test_client.py": 3,
     "scripts/ci_assert_collected.py": 2,
-    "scripts/ci_doctor_poller.py": 7,
-    "scripts/doctor_checks.py": 3,
+    "scripts/ci_doctor_poller.py": 4,
+    "scripts/doctor_checks.py": 2,
     "scripts/gen_handoff.py": 2,
-    "scripts/mutation_gate.py": 5,
+    "scripts/mutation_gate.py": 3,
     "scripts/tm_witness.py": 1,
-    "scripts/verify_fix.py": 8,
-    "security/sandboxed_execution.py": 3,
-    "thoughtmachine/doctor.py": 3,
-    "tools/ci_read_tool.py": 3,
-    "tools/git_info_tool.py": 3,
-    "tools/git_write_tool.py": 2,
-    "tools/mcp_client.py": 5,
-    "tools/mcp_server_connect.py": 2,
+    "scripts/verify_fix.py": 4,
+    "security/sandboxed_execution.py": 2,
+    "thoughtmachine/doctor.py": 2,
+    "tools/ci_read_tool.py": 2,
+    "tools/git_info_tool.py": 1,
+    "tools/git_write_tool.py": 1,
+    "tools/mcp_client.py": 2,
+    "tools/mcp_server_connect.py": 1,
     "tools/workspace/worker_execution.py": 2,
-    "web_ui/backend/server.py": 6,
+    "web_ui/backend/server.py": 5,
     "web_ui/backend/tests/test_auth_boundary.py": 2,
 }
 
@@ -299,6 +315,23 @@ DANGER_OS_NAMES = frozenset(
     {"system", "popen"}
     | {f"exec{v}" for v in ("l", "le", "lp", "lpe", "v", "ve", "vp", "vpe")}
     | {f"spawn{v}" for v in ("l", "le", "lp", "lpe", "v", "ve", "vp", "vpe")}
+)
+
+#: ``subprocess`` attributes that can start a process -- the symmetry of
+#: :data:`DANGER_OS_NAMES` for the other module that spawns.  ``subprocess`` is
+#: imported to *catch* its exceptions at least as often as to spawn with, so only
+#: these names count as a site; naming or catching an exception class
+#: (``TimeoutExpired``, ``CalledProcessError``, ``SubprocessError``), annotating
+#: a finished result (``CompletedProcess``) or passing a stdio constant
+#: (``PIPE``, ``STDOUT``, ``DEVNULL``) cannot execute anything.  The
+#: ``import subprocess`` / ``from subprocess import ...`` form stays a site
+#: (see :func:`_collect_import_bindings`), which is what keeps this narrowing
+#: from becoming a hole: a new file that wants to spawn must import
+#: ``subprocess`` and is flagged on the import, and a new ``subprocess.run`` in an
+#: already-exempted file is flagged as a new site.  Nothing that can spawn stops
+#: counting -- only symbols that cannot execute anything do.
+SPAWN_SUBPROCESS_ATTRS = frozenset(
+    {"Popen", "run", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
 )
 
 
@@ -369,7 +402,7 @@ def _collect_uses(tree: ast.AST, bindings: _Bindings) -> list[Site]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             base = node.value.id
-            if base in bindings.subprocess_names:
+            if base in bindings.subprocess_names and node.attr in SPAWN_SUBPROCESS_ATTRS:
                 sites.append(Site(node.lineno, f"subprocess.{node.attr}"))
             elif base in bindings.os_module_names and node.attr in DANGER_OS_NAMES:
                 sites.append(Site(node.lineno, f"os.{node.attr}"))
@@ -655,7 +688,119 @@ def test_scanner_flags_subprocess_call():
     sites = scan_source(source)
     constructs = [s.construct for s in sites]
     assert "subprocess.Popen" in constructs, sites
-    assert "subprocess.PIPE" in constructs, sites
+    # ``PIPE`` is a stdio constant, not a spawn: the site is the call, the
+    # ``import subprocess`` above, and nothing else.
+    assert "subprocess.PIPE" not in constructs, sites
+
+
+def test_scanner_counts_the_import_but_not_the_exception_clause():
+    """``import subprocess`` + ``except subprocess.TimeoutExpired`` == ONE site.
+
+    Catching a timeout cannot start a process.  Before the
+    :data:`SPAWN_SUBPROCESS_ATTRS` filter this source produced two sites, which
+    is what made a file that spawns nothing (every git call in it goes through
+    SandboxedExecution) look like a file that spawns twice.
+    """
+    source = textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        def helper():
+            try:
+                return 1
+            except subprocess.TimeoutExpired:
+                return 2
+        '''
+    )
+    assert [(s.lineno, s.construct) for s in scan_source(source)] == [
+        (1, "import subprocess")
+    ], scan_source(source)
+
+
+def test_scanner_still_flags_every_spawn_attribute():
+    """Every name in :data:`SPAWN_SUBPROCESS_ATTRS` is still a site."""
+    for attr in sorted(SPAWN_SUBPROCESS_ATTRS):
+        source = f"import subprocess\n\nsubprocess.{attr}(['ls'])\n"
+        constructs = [s.construct for s in scan_source(source)]
+        assert f"subprocess.{attr}" in constructs, (attr, constructs)
+
+
+def test_scanner_ignores_every_non_spawn_subprocess_symbol():
+    """Naming an exception class, a result record or a stdio constant is not a site."""
+    for attr in (
+        "CalledProcessError",
+        "SubprocessError",
+        "CompletedProcess",
+        "PIPE",
+        "STDOUT",
+        "DEVNULL",
+    ):
+        source = f"import subprocess\n\nsymbol = subprocess.{attr}\n"
+        assert [s.construct for s in scan_source(source)] == ["import subprocess"], (
+            attr,
+            scan_source(source),
+        )
+
+
+def test_from_subprocess_import_counts_whatever_the_symbol_is():
+    """The residual asymmetry, documented on purpose.
+
+    ``from subprocess import ...`` is counted in full, symbol and all, because
+    that form *is* the import: the file is one edit away from spawning and the
+    binding it created is invisible to the attribute walk.
+    """
+    sites = scan_source("from subprocess import TimeoutExpired\n")
+    assert [(s.lineno, s.construct) for s in sites] == [
+        (1, "from subprocess import TimeoutExpired")
+    ], sites
+
+
+def test_spawn_attribute_whitelist_is_the_whole_spawn_surface():
+    """The whitelist is frozen, and it covers what the codebase actually uses.
+
+    Shrinking :data:`SPAWN_SUBPROCESS_ATTRS` would silently stop counting a real
+    spawn, so the seven names are asserted verbatim.  And every
+    ``subprocess.<name>`` the scanned tree actually names must be classified --
+    spawn-capable in that set, otherwise one of the documented non-spawn
+    symbols -- so an unclassified new name is a red instead of a guess.
+    """
+    assert SPAWN_SUBPROCESS_ATTRS == frozenset(
+        {"Popen", "run", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
+    ), sorted(SPAWN_SUBPROCESS_ATTRS)
+
+    non_spawn = frozenset(
+        {
+            "TimeoutExpired",
+            "CalledProcessError",
+            "SubprocessError",
+            "CompletedProcess",
+            "PIPE",
+            "STDOUT",
+            "DEVNULL",
+        }
+    )
+    used: set[str] = set()
+    for path in _scanned_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "subprocess"
+            ):
+                used.add(node.attr)
+
+    unclassified = sorted(used - SPAWN_SUBPROCESS_ATTRS - non_spawn)
+    assert not unclassified, (
+        "subprocess attribute(s) used under the scanned trees but classified "
+        f"neither as a spawn (SPAWN_SUBPROCESS_ATTRS) nor as inert: {unclassified}. "
+        "Decide which it is before it decides for you."
+    )
+    assert used & SPAWN_SUBPROCESS_ATTRS, (
+        "no spawn-capable subprocess attribute is used anywhere in the scanned "
+        f"trees (used: {sorted(used)}); the classification guard is vacuous"
+    )
 
 
 def test_scanner_flags_os_system():
