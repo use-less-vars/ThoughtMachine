@@ -102,7 +102,8 @@ def _ambient_git_identity(environ=None) -> Optional[dict]:
 class GitWriteTool(GitReadTool):
     """
     Git write operations tool (commit, init, clone, push, branch_create,
-    checkout, stage, unstage).
+    checkout, stage, unstage, worktree_add, worktree_remove, stash_push,
+    stash_pop, stash_drop, restore_path).
     Every write is gated (fail closed) on the effective session git
     permission (the effective ``git`` grain, session x workspace, injected by
     the ToolExecutor) being write-capable (``write``, ``full`` or
@@ -118,8 +119,9 @@ class GitWriteTool(GitReadTool):
     trailer, and adds the write dispatch.
     Parameters:
         working_dir: repository root (defaults to workspace root).
-        file_path: single path or list of paths, used by stage, unstage and
-            commit (selective commit; always required, never ``-A``).
+        file_path: single path or list of paths, used by stage, unstage,
+            restore_path and commit (selective commit; always required, never
+            ``-A``).
         branch: branch name for branch_create, checkout and push.
         message: commit message (required for commit).
         clone_url / clone_target: remote URL and target directory for clone.
@@ -196,11 +198,11 @@ class GitWriteTool(GitReadTool):
     operation: Literal[
         "commit", "init", "clone", "push", "branch_create", "checkout",
         "stage", "unstage", "worktree_add", "worktree_remove", "stash_push",
-        "stash_pop", "stash_drop",
+        "stash_pop", "stash_drop", "restore_path",
     ] = Field(
         description="Git write operation to perform: commit, init, clone, "
         "push, branch_create, checkout, stage, unstage, worktree_add, "
-        "worktree_remove, stash_push, stash_pop, stash_drop"
+        "worktree_remove, stash_push, stash_pop, stash_drop, restore_path"
     )
 
     force: bool = Field(
@@ -491,6 +493,8 @@ class GitWriteTool(GitReadTool):
                 return self._git_stash_pop(repo_root)
             elif self.operation == "stash_drop":
                 return self._git_stash_drop(repo_root)
+            elif self.operation == "restore_path":
+                return self._git_restore_path(repo_root)
             else:
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         except Exception as e:
@@ -783,6 +787,59 @@ class GitWriteTool(GitReadTool):
         # Path-scoped reset only; a bare `git reset` is never issued.
         output = self._run_git(repo_root, ["reset", "HEAD", "--"] + rels)
         return self._with_mode(self._truncate_output(output))
+
+    def _git_restore_path(self, repo_root: Path) -> str:
+        """Restore named path(s) from a revision (git checkout <sha> -- <paths>).
+
+        Restoring a single file used to mean a WHOLE-TREE ``checkout <ref>``,
+        which moves HEAD and can discard unrelated work.  This verb is scoped
+        three ways: the revision is resolved to an immutable SHA first (and
+        refused when it does not resolve), the paths are validated BEFORE
+        anything is checked out, and the checkout always carries the ``--``
+        separator, so HEAD never moves, no other path is touched, and it is
+        never a bare checkout.  Restoring from a revision writes the named
+        paths into the working tree AND stages them in the index -- that is
+        what ``git checkout <tree-ish> -- <pathspec>`` does, and it is why
+        ``git restore --source`` exists as the index-safe successor.  Only the
+        named paths are affected.
+        """
+        # git permission gate (fail closed): direct callers must also
+        # pass the session git permission check.
+        if not self._git_write_allowed():
+            return self._flag_gate_error()
+        rev = self.commit or "HEAD"
+        sha, why = self._resolve_ref_sha(repo_root, rev)
+        if not sha:
+            return self._truncate_output(
+                f"Error: could not resolve revision {rev!r} to a commit SHA: "
+                f"{why}. Nothing was restored."
+            )
+        # Path scope BEFORE any checkout: an invalid or whole-tree path list
+        # must refuse the call, never degrade into a bare checkout.
+        try:
+            rels = self._validated_rel_paths(repo_root, self.file_path)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        if not rels:
+            return (
+                "Error: file_path is required for restore_path operation "
+                "(at least one path)"
+            )
+        # Path-scoped checkout only: '--' keeps HEAD where it is. No --staged,
+        # no --ours/--theirs, and never a checkout without the separator.
+        output = self._run_git(repo_root, ["checkout", sha, "--"] + rels)
+        if self._is_git_error_output(output):
+            return self._with_mode(self._truncate_output(output))
+        lines = [
+            f"Restored {len(rels)} path(s) from {rev!r} ({sha}):",
+            *[f"  {rel}" for rel in rels],
+            "HEAD not moved; the named paths were restored into the working "
+            "tree and staged in the index.",
+        ]
+        stdout_only = (output or "").strip()
+        if stdout_only:
+            lines.append(stdout_only)
+        return self._with_mode(self._truncate_output("\n".join(lines)))
 
     def _is_git_error_output(self, output: str) -> bool:
         """True when a _run_git/_git_add result string signals failure.

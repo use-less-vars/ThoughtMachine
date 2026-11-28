@@ -23,6 +23,7 @@ What is pinned here:
 """
 
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -620,4 +621,180 @@ def test_show_file_working_bound_tolerates_a_char_cut_by_the_bound(
     assert "first 8 bytes only" in out, (
         f"a bounded read must declare itself: {out!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# WRITE verb: restore_path -- `git checkout <sha> -- <paths>`
+#
+# The verb exists because the only way to put a path back was a WHOLE-TREE
+# `checkout <ref>`, which moves HEAD and can discard unrelated work.  Every
+# contract below is about that difference: the revision is resolved to an
+# immutable SHA, the checkout is PATH-SCOPED, exactly one git invocation runs,
+# and an unresolvable revision or a whole-tree path list is REFUSED rather than
+# degraded into a bare checkout.
+# ---------------------------------------------------------------------------
+
+
+def test_restore_path_issues_path_scoped_checkout(tmp_path):
+    """One `checkout <resolved sha> -- a.txt`; never the raw ref, never bare."""
+    argv: list = []
+    sha = "c0ffee1"
+    tool = _write_tool(
+        tmp_path, argv, raw=(0, f"{sha}\n", ""),
+        operation="restore_path", commit="v1.2.3", file_path="a.txt",
+    )
+
+    body = _body(tool._git_restore_path(tmp_path))
+
+    checkouts = [call for call in argv if call[:1] == ["checkout"]]
+    assert checkouts == [["checkout", sha, "--", "a.txt"]], (
+        f"the revision must be resolved to a SHA and the checkout must be "
+        f"path-scoped: {argv!r}"
+    )
+    assert "Error:" not in body, body
+
+
+def test_restore_path_accepts_a_path_list(tmp_path):
+    """A path LIST is one invocation: a single `--`, then every named path."""
+    argv: list = []
+    sha = "c0ffee2"
+    tool = _write_tool(
+        tmp_path, argv, raw=(0, f"{sha}\n", ""),
+        operation="checkout", commit="HEAD~2", file_path=["a.txt", "dir/b.txt"],
+    )
+    object.__setattr__(tool, "operation", "restore_path")
+
+    body = _body(tool._git_restore_path(tmp_path))
+
+    checkouts = [call for call in argv if call[:1] == ["checkout"]]
+    assert checkouts == [["checkout", sha, "--", "a.txt", "dir/b.txt"]], (
+        f"one checkout for the whole list, one '--' marker: {argv!r}"
+    )
+    assert checkouts[0].count("--") == 1, (
+        f"the '--' separator must not repeat per path: {checkouts[0]!r}"
+    )
+    assert "Error:" not in body, body
+
+
+def test_restore_path_refuses_unresolvable_rev(tmp_path):
+    """An unresolvable revision must NOT fall back to HEAD or to a bare ref."""
+    argv: list = []
+    tool = _write_tool(
+        tmp_path, argv, raw=(128, "", "error: unknown thing\n"),
+        operation="checkout", commit="no-such-rev", file_path="a.txt",
+    )
+    object.__setattr__(tool, "operation", "restore_path")
+
+    body = _body(tool._git_restore_path(tmp_path))
+
+    assert [call for call in argv if call[:1] == ["checkout"]] == [], (
+        f"nothing may be checked out when the revision is unknown: {argv!r}"
+    )
+    assert "revision" in body.lower(), (
+        f"the refusal must name the REVISION as the failing input: {body!r}"
+    )
+    assert "no-such-rev" in body, (
+        f"the refusal must name the revision that failed: {body!r}"
+    )
+    assert "path is required" not in body.lower(), (
+        f"the paths were fine; the revision was not: {body!r}"
+    )
+
+
+def test_restore_path_never_issues_bare_checkout(tmp_path):
+    """EVERY checkout this verb runs is path-scoped; HEAD is never moved."""
+    argv: list = []
+    sha = "c0ffee4"
+    tool = _write_tool(
+        tmp_path, argv, raw=(0, f"{sha}\n", ""),
+        operation="checkout", file_path="a.txt",
+    )
+    object.__setattr__(tool, "operation", "restore_path")
+
+    tool._git_restore_path(tmp_path)
+
+    checkouts = [call for call in argv if call[:1] == ["checkout"]]
+    assert checkouts, f"a restore must actually run a checkout: {argv!r}"
+    for call in checkouts:
+        assert "--" in call, (
+            f"a checkout without '--' would move HEAD: {call!r}"
+        )
+        assert call != ["checkout", sha], (
+            f"a whole-tree checkout discards unrelated work: {call!r}"
+        )
+        assert call[1] == sha, (
+            f"the checkout target must be the resolved SHA: {call!r}"
+        )
+
+
+def test_restore_path_refuses_whole_tree_path_list(tmp_path):
+    """``file_path=["."]`` is a whole-tree sweep: refuse it, do not run git."""
+    argv: list = []
+    sha = "c0ffee5"
+    tool = _write_tool(
+        tmp_path, argv, raw=(0, f"{sha}\n", ""),
+        operation="checkout", commit="HEAD", file_path=["."],
+    )
+    object.__setattr__(tool, "operation", "restore_path")
+
+    body = _body(tool._git_restore_path(tmp_path))
+
+    assert [call for call in argv if call[:1] == ["checkout"]] == [], (
+        f"a whole-tree path list must not reach git: {argv!r}"
+    )
+    assert "whole-tree" in body, (
+        f"the refusal must name the whole-tree path: {body!r}"
+    )
+
+
+def test_restore_path_is_write_level():
+    """Restoring over the working tree mutates the workspace: git:write."""
+    tool = GitReadTool(
+        session_id="s-verbs",
+        workspace_id="ws-verbs",
+        session_permissions={},
+        operation="status",
+    )
+    object.__setattr__(tool, "operation", "restore_path")
+
+    assert tool._get_operation_level([]) == "write", (
+        "restore_path overwrites working-tree content and must be write-level"
+    )
+
+
+def test_restore_path_is_reachable_through_run(tmp_path):
+    """``execute()`` DISPATCHES to restore_path: the verb is reachable, not
+    merely implemented.
+
+    Every other restore_path test above calls ``_git_restore_path`` directly,
+    so a dispatch branch routed to the WRONG ``_git_*`` method would still
+    leave them green (only the structural registration test looks at the
+    dispatch table, and only for its presence).  This test drives the real
+    entry point -- ``GitWriteTool.execute()``, the same entry
+    ``tests/test_git_write_filesystem_binding.py`` uses -- and pins the argv
+    dispatch actually produces.
+    """
+    argv: list = []
+    sha = "c0ffee6"
+    tool = _write_tool(
+        tmp_path, argv, raw=(0, f"{sha}\n", ""),
+        operation="restore_path", commit="HEAD", file_path=["a.txt"],
+    )
+    # execute() resolves the repo root itself; stub only the probe that would
+    # need a real git binary, so the dispatch under test is untouched.
+    with mock.patch.object(tool, "_git_repo_root", return_value=tmp_path):
+        out = tool.execute()
+
+    body = _body(out)
+    checkouts = [call for call in argv if call[:1] == ["checkout"]]
+    assert checkouts == [["checkout", sha, "--", "a.txt"]], (
+        f"execute() must dispatch to restore_path's path-scoped checkout: {argv!r}"
+    )
+    assert "Unknown operation" not in body, (
+        f"the dispatch table does not route restore_path: {body!r}"
+    )
+    for gate in ("Error: git:write denied", "Error: git:write requires"):
+        assert gate not in body, (
+            f"a write-capable session must be PERMITTED to restore a path: {body!r}"
+        )
 
