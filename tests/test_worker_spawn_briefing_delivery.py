@@ -216,6 +216,23 @@ class TestSpawnBriefingDelivery(unittest.TestCase):
         deliver.assert_called_once()
         self.assertEqual(deliver.call_args[0][1], "just q", result)
 
+    def test_filled_recall_slot_is_not_a_phantom_briefing(self):
+        """A NON-EMPTY recall slot must not change routing either: it is
+        machine-added, so a filled slot is still not a supplied briefing."""
+        self._seed_fake(SESSION, "w1", 1)
+        fake_payload = {
+            "kb_recall": [{"domain": "lessons_learned", "line": 730, "text": "x"}]
+        }
+        with mock.patch.object(
+            Worker, "_spawn_context_payload", return_value=fake_payload
+        ):
+            result, deliver = self._spawn_and_capture("w1")
+
+        deliver.assert_not_called()
+        self.assertFalse(result.get("spawned"))
+        self.assertIn("reusing", result.get("message", "").lower())
+        self.assertNotIn(IGNORED_KEY, result)
+
     def test_reuse_supplied_style_is_delivered(self):
         self._seed_fake(SESSION, "w1", 1)
         result, deliver = self._spawn_and_capture(
@@ -305,6 +322,7 @@ class TestSpawnBriefingDelivery(unittest.TestCase):
             "purpose": "coding",
             "style": "exploratory",
             "meta": {"m": 2},
+            "kb_recall": [],
         }
         got = self._created[-1]._initial_context
         self.assertEqual(list(got), list(expected))  # ORDER matters (payload bytes)
@@ -313,6 +331,44 @@ class TestSpawnBriefingDelivery(unittest.TestCase):
             initial_context_message(got)["content"],
             initial_context_message(expected)["content"],
         )
+
+    # ── 8. the reserved KB-recall slot is present, last, and empty ────────
+
+    def test_fresh_spawn_payload_has_empty_kb_recall_slot_last(self):
+        """C1: the reserved recall slot exists, is LAST, and injects nothing."""
+        result = self._spawn("w1", context={"query": "review src/"})
+        self.assertTrue(result.get("spawned"), f"fresh spawn: {result}")
+        self.assertTrue(self._created, "no WorkerThread was constructed")
+
+        payload = self._created[-1]._initial_context
+        self.assertIn("kb_recall", payload)
+        self.assertEqual(payload["kb_recall"], [])
+        self.assertEqual(list(payload)[-1], "kb_recall")  # reserved slot is LAST
+
+    def test_kb_recall_stays_empty_for_a_query_naming_a_kb_identifier(self):
+        """C2: a query naming a REAL lessons_learned.md identifier still
+        injects nothing -- the slot is reserved, not wired."""
+        import re
+        from pathlib import Path
+
+        kb_file = (
+            Path(__file__).resolve().parents[1]
+            / ".thoughtmachine/knowledge/project/lessons_learned.md"
+        )
+        if not kb_file.is_file():
+            self.skipTest(f"KB file not present: {kb_file}")
+        kb_text = kb_file.read_text(encoding="utf-8")
+        identifiers = re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", kb_text)
+        self.assertTrue(identifiers, "no snake_case identifier found in the KB")
+        identifier = identifiers[0]
+        self.assertIn(identifier, kb_text)  # it really came from the KB
+
+        result = self._spawn("w1", context={"query": f"explain {identifier}"})
+        self.assertTrue(result.get("spawned"), f"fresh spawn: {result}")
+        payload = self._created[-1]._initial_context
+        self.assertIn(identifier, payload["query"])
+        self.assertEqual(payload["kb_recall"], [])
+        self.assertEqual(list(payload)[-1], "kb_recall")
 
 
 if __name__ == "__main__":

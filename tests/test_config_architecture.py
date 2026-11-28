@@ -244,6 +244,15 @@ def test_config_unknown_key_raises():
         SessionConfig(bogus=1)
 
 
+def test_kb_injection_bounds():
+    """KB injection knobs: 0 is legal (disables), out-of-range is refused."""
+    assert AgentConfig().kb_injection_max_hits == 3
+    assert AgentConfig().kb_injection_max_bytes == 1200
+    assert AgentConfig(kb_injection_max_hits=0).kb_injection_max_hits == 0
+    with pytest.raises(ValidationError):
+        AgentConfig(kb_injection_max_bytes=8001)
+
+
 # ---------------------------------------------------------------------------
 # 3. Full resolution chain precedence
 # ---------------------------------------------------------------------------

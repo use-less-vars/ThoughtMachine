@@ -94,6 +94,8 @@ FALLBACK_FRONTEND_CONFIG: Dict[str, Any] = {
     "rag_truncate_dim": 256,
     "kb_enabled": True,
     "kb_path": None,
+    "kb_injection_max_hits": 3,
+    "kb_injection_max_bytes": 1200,
     "tool_output_token_limit": 10000,
     "mode": "agent",
     "detail": "normal",

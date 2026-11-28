@@ -470,6 +470,16 @@
           "required": false,
           "description": "Enable the knowledge base."
         },
+        "kb_injection_max_hits": {
+          "type": "int",
+          "required": false,
+          "description": "Maximum number of knowledge-base hits injected into a spawn brief (0 disables injection)."
+        },
+        "kb_injection_max_bytes": {
+          "type": "int",
+          "required": false,
+          "description": "Maximum size in bytes of the whole injected knowledge-base block."
+        },
         "detail": {
           "type": "string",
           "required": false,

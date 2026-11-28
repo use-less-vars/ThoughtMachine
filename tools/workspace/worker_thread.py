@@ -7839,6 +7839,8 @@ class Worker(ToolBase):
             payload["style"] = self.style
         if self.meta is not None:
             payload["meta"] = self.meta
+        # Reserved slot for workspace-scoped recall, not authority; always empty today.
+        payload["kb_recall"] = []
         return payload
 
     def _reuse_dispatch_context(self, query: str) -> tuple:
@@ -7858,6 +7860,11 @@ class Worker(ToolBase):
             # supplied briefing, so it must neither appear as a phantom context
             # block nor turn a context-less spawn into a dispatch.
             extras.pop("style", None)
+        # The recall slot is machine-added, never caller-supplied: routing must
+        # never read it as a supplied briefing -- not while it is empty, and not
+        # later when a hit fills it. (Unlike ``style``, whose pop is conditional
+        # because a caller CAN supply it.)
+        extras.pop("kb_recall", None)
         context_keys = list(extras)
         if not extras:
             return query, context_keys, None

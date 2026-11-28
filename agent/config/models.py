@@ -121,6 +121,8 @@ class AgentConfig(BaseModel):
         'rag_truncate_dim': RESTART_REQUIRED,
         'kb_enabled': RESTART_REQUIRED,
         'kb_path': RESTART_REQUIRED,
+        'kb_injection_max_hits': RESTART_REQUIRED,
+        'kb_injection_max_bytes': RESTART_REQUIRED,
         'tool_output_token_limit': HOT_SWAPPABLE,
         'enabled_tools': HOT_SWAPPABLE,
         'provider_id': RESTART_REQUIRED,
@@ -209,6 +211,8 @@ class AgentConfig(BaseModel):
     rag_truncate_dim: int = Field(default=256, description='Dimension to truncate embeddings to for memory efficiency')
     kb_enabled: bool = Field(default=True, description="Enable the project knowledge base")
     kb_path: Optional[str] = Field(default=None, description="Path to knowledge base directory (None = default .thoughtmachine/knowledge/)")
+    kb_injection_max_hits: int = Field(default=3, ge=0, le=10, description="Maximum number of knowledge-base hits injected into a spawn brief (0 disables injection)")
+    kb_injection_max_bytes: int = Field(default=1200, ge=0, le=8000, description="Maximum size in bytes of the whole injected knowledge-base block")
     tool_output_token_limit: int = Field(default=10000, description='Maximum token limit for tool outputs (default 10,000 tokens)')
     detail: Literal['minimal', 'normal', 'verbose'] = Field(default='normal', description='Detail level for event display')
     enabled_tools: List[str] = Field(default_factory=lambda: [cls.tool_name() for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool names (stable tool_name(); legacy class names also accepted)')
