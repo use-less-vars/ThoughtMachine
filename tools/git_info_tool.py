@@ -463,9 +463,9 @@ class GitReadTool(ToolBase):
     )
     file_path: Optional[Union[str, List[str]]] = Field(
         default=None,
-        description="File path(s) for diff, diff_cached, log, blame, stage, unstage, or "
-        "commit (selective commit) operations. Accepts a single path (string) or "
-        "multiple paths (list of strings)."
+        description="File path(s) for diff, diff_cached, log, blame, stage, unstage, "
+        "restore_path, or commit (selective commit) operations. Accepts a single "
+        "path (string) or multiple paths (list of strings)."
     )
     name_only: bool = Field(
         default=False,
@@ -511,7 +511,8 @@ class GitReadTool(ToolBase):
     # Show parameters
     commit: Optional[str] = Field(
         default="HEAD",
-        description="Commit reference for show operation"
+        description="Commit reference for show operation, and the revision "
+        "restore_path restores the named paths FROM (default: HEAD)"
     )
     format: Optional[str] = Field(
         default=None,
@@ -1677,8 +1678,10 @@ class GitReadTool(ToolBase):
         """Return the permission level ('read'/'write') for a git invocation.
 
         Derived from the declared operation: anything that mutates repository
-        state (commit/init/clone/push/branch_create/checkout/stage/unstage)
-        requires ``git:write``; everything else is ``git:read``. A push mutates
+        state (commit/init/clone/push/branch_create/checkout/stage/unstage/
+        worktree_add/worktree_remove/stash_push/stash_pop/stash_drop/
+        restore_path) requires ``git:write``; everything else is
+        ``git:read``. A push mutates
         the REMOTE repository (and writes remote-tracking refs locally), so it
         is a write-level operation like every other mutating verb. ``args`` is
         accepted for future operation-level granularity (e.g. write detection
@@ -1686,7 +1689,8 @@ class GitReadTool(ToolBase):
         """
         if self.operation in (
             "commit", "init", "clone", "push", "branch_create", "checkout",
-            "stage", "unstage",
+            "stage", "unstage", "worktree_add", "worktree_remove",
+            "stash_push", "stash_pop", "stash_drop", "restore_path",
         ):
             return "write"
         return "read"
